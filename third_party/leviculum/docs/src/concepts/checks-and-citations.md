@@ -1,0 +1,1395 @@
+# Checks That Are Actually Checks
+
+A check makes two promises: that it *ran*, and that it *could have
+failed*. A citation makes a third: that it still points at what it
+claims. None is self-evident, and this codebase has broken all three —
+silently, and for months at a time.
+
+This page records the three mechanical guarantees that make those
+promises verifiable, what they cost, and what they do not reach.
+
+The underlying rule is in [Evidence and Honesty](evidence-and-honesty.md):
+*a check you have never seen fail is not a check*. That page tells a
+person what to do. This one is about the cases where the person forgot.
+
+## The incidents, and which guarantee would have caught each
+
+| Defect | Caught by |
+|---|---|
+| `execute_benchmark` ended in an unconditional `Ok(())` (`periculum/src/assertions.rs`); 6 of 10 recorded runs carried zero packets and reported GREEN | **neither** — a scenario step, not a Rust test |
+| the sx1262 RX-extend guard tested IRQ flags its own latch mask had disabled (#144, fixed 26ce3a0) | **neither** — no test at all, and `exclude` (`Cargo.toml:59`) puts `leviculum-nrf` outside the workspace |
+| `status_parity` `#[ignore]`d with a reason naming a procedure no script implements; never executed by any gate (#189) | **B** |
+| 14 further ignored tests in `rnsd_interop` executed by nothing (#189) | **B** |
+| scenario steps across the corpus produced a delivery figure no step asserted; GREEN at 70-90 % (#188, Periculum #25) | **neither** — scenario steps |
+| the status-parity volume guard compared one interface, so a whole-inventory divergence stayed green (#177) | **A**, only if the author's negative control covers the whole inventory rather than the one interface they compared |
+| drifted `file:line` citations — six across five concept documents in the 2026-07 manual audit (`leviculum-std/tests/doc_citations.rs:9`), sixteen across the whole book on the guard's first automated run | **C** |
+| `reference/LXMF` sat twelve commits behind its gitlink for five weeks; every LXMF citation meant something other than it said | **C**, and the red `reference_lock` test that should have said so was itself unobserved — a **B** failure masking a **C** failure |
+| a `Co-Authored-By:` naming a model reached a periculum commit on 2026-08-07, against a rule the same author had cited correctly hours earlier (#205) | **neither** — a commit message, which all three explicitly do not reach |
+| `PROCESSOR_TICK_BUDGET` justified the only number in a public API constant with "the number comes off `docs/…/core-lock-budget.md`" and then named 126.6 ms; that figure occurred exactly once in the tree, in that comment (#200) | **C**, only since the figure check below — a prose attribution carries no line and no identifier, so the resolver never saw it |
+| `just standard` held a decided red for two hours, alive and silent, because a test that aborted in a destructor leaked a daemon holding the gate's stdout pipe (2026-08-07) | **none of the three** — every one of them reports, and a gate that never terminates reports nothing at all. See [A gate must pass, fail, or say it gave up](#a-gate-must-pass-fail-or-say-it-gave-up) |
+| seven orphaned `scripts/test_daemon.py` processes alive at once on 2026-08-07, the oldest over four hours, from several different runs — every one of them left by a test whose `Drop` was written correctly and did not run | **none of the three**, and nothing else either: an orphan makes no gate red, so the only thing that ever reported it was somebody running `pgrep` by hand. Now **B**, via the census and the SIGKILL proof under [A harness that spawns a process must ensure it dies with the harness](#a-harness-that-spawns-a-process-must-ensure-it-dies-with-the-harness) |
+
+The last row is worth reading twice: the guarantees are not
+independent. A rotted citation had a test attached, and that test ran
+nowhere. **Guarantees that only report are worth what their observation
+is worth.**
+
+## Guarantee A — every pin carries its own negative control
+
+A **pin** is a test that fixes a claim we rely on: a wire-field
+semantic, a deliberate deviation, a measured protection level, a chosen
+non-behaviour.
+
+The rule: **a pin must contain an assertion that fails when the claim it
+pins is broken**, in the same test, on every run. The pattern is in the
+tree — `announce_signature_covers_reference_byte_order_on_the_wire`
+(`leviculum-core/src/destination.rs:2271`) verifies its signature, then
+drops the destination hash from the front and asserts that verification
+now fails.
+
+### The gate checks presence. Only the audit checks efficacy.
+
+A registry gives the gate a citation. The strongest thing it can check
+is that the cited assertion still exists where it says — drift
+detection. **It cannot see a vacuous control**: one that verifies
+against a random key, one behind an early return, one in a branch the
+test never takes. Efficacy is checkable only by mutating the pin's
+subject and confirming the pin dies.
+
+**A is therefore not in force until the audit runs.** The registry gate
+will land first because it is cheap; a tree that has only the registry
+has drift detection on negative controls and nothing more, and should
+not be described as having Guarantee A.
+
+### Why mutation cannot be the per-batch gate
+
+`-j` used to be unsafe here, and ports were the reason. Storage never
+was: the suites take theirs from `tempfile::tempdir()`, and
+`cargo-mutants` gives each job its own copy of the tree anyway. Both
+the mvr and `rnsd_interop` suites drew listeners from a counter over a
+fixed band, 61000-65000, and that counter was per-process: each test
+binary started at the same base and walked the same numbers, so two
+concurrent processes raced in the alloc → bind handoff window. Measured
+on two concurrent runs of the mvr binary under `strace -e trace=bind`:
+10 ports bound by both processes and ~80 `EADDRINUSE` binds in the band
+per run, none of which went red, because the probe loop retried.
+
+That is fixed. `next_port_candidate`
+(`leviculum-std/tests/support/port_alloc.rs`) draws from one counter per
+*host*, kept in a file and bumped under `flock`, so no two processes are
+handed the same number — the same measurement after the change reports
+0 and 0. `tests/port_alloc_multiprocess.rs` pins it with four concurrent
+worker processes and a negative control that must collide.
+
+What is left is cost, not correctness: cold baseline builds and
+hang-mutant timeouts, and the rebuild term below.
+
+Measured on a 32-core host (musl, warm; the CI host has four cores,
+where every figure below is worse): incremental rebuild after a content
+change in `leviculum-core/src/transport.rs` ~1.65 s; the downstream
+`leviculum-std --test mvr` binary ~1.8 s; `leviculum-core --lib`
+build-and-run 4.3 s. Floor ~2 s per mutant. `cargo-mutants` generates
+roughly 3-15 mutants per subject (its documented behaviour, not measured
+here). At an *assumed* 200 pins that is 600-3000 mutants:
+**realistically over an hour**, against a ~15 min batch budget. The
+dominant term is the rebuild, which scales with the codebase, not with
+the number of pins.
+
+Two reach limits. `cargo-mutants` replaces a function body with a
+guessed value, swaps binary operators, deletes unary ones, deletes match
+arms a wildcard still covers, replaces match guards with `true` and
+`false`, and deletes fields from struct literals that have a base
+expression. It does not substitute literals and does not mutate consts —
+where this project's semantics live: `PATHFINDER_RETRIES`
+(`leviculum-core/src/constants.rs:157`). The #192 defect was
+`retries: 0` where `PATHFINDER_RETRIES` belonged, and the fixed site
+writes `PATHFINDER_RETRIES` (`leviculum-core/src/transport.rs:11323`)
+into a literal that spells every field out — so not even the
+field-deletion operator reaches it, and no operator substitutes one
+const for another.
+
+### What is a pin
+
+Marked in the test by a doc-comment tag, **and** listed in
+`scripts/pins.txt` with the location of its negative control. The gate
+checks both directions: every tag has an entry and every entry has a
+tag. Registration alone would make pinhood circular — the gate would
+check that everything in the registry is in the registry, and a
+pin-worthy test nobody registers would be silently absent.
+
+The location is checked by reusing the window rule from
+`leviculum-std/tests/doc_citations.rs`, so a moved control is caught the
+same way a moved doc citation is. That is Guarantee C doing A's work,
+which is the point of having all three on one page.
+
+## Guarantee B — every test is executed by some gate
+
+Half of it exists: `scripts/check-ignored-counts.py` enumerates tests
+per unit and pins the ignored count. That stops the bucket growing
+silently; it says nothing about whether anything in the bucket runs.
+
+The other half:
+
+1. **Every gate emits a manifest of what it executed**, by test name,
+   per binary, **derived from run output, not from `cargo test --list`**
+   — a list records intent. The hazard this must catch is a by-name
+   selector that matches nothing: `cargo test <filter>` runs zero tests
+   and exits 0, so a gate that selects by name reads green whether or
+   not it measured anything. `scripts/run-status-parity.sh` already
+   closes that hole by hand, pinning `EXPECTED=3` and parsing the
+   summary line back — which is one gate's worth of what a manifest
+   gives every gate.
+2. **A check reports every test that exists and appears in no manifest**,
+   by name.
+
+### Enumerate at runtime, pin only counts
+
+Item 2 must cover **all** tests, not only pins and declared exceptions.
+The 14 unrun `rnsd_interop` tests were ordinary tests; a report scoped
+to pins would not have seen them, and the per-unit count would have
+stayed right the whole time — which is the argument against counts,
+reintroduced.
+
+The existing set is enumerated at run time, the way
+`check-ignored-counts.py` already does it. Nothing needs a checked-in
+list of ~3600 names, which would invite a `--bless` flag that silently
+blesses the deletion it exists to catch.
+
+What *is* pinned is **counts per unit**, and only for deletion
+detection: a test that vanishes leaves both the manifest and the
+runtime enumeration, so only a baseline catches it. Counts suffice for
+that, and the file stays the size of `ignored-counts.txt`.
+
+Note the per-configuration caveat: `leviculum-ffi` is gnu-only and
+outside `default-members`, `leviculum-nrf` outside the workspace, so the
+canonical configuration for the counts must be named.
+
+Rollout has an ordering constraint: counts and reporting cannot be
+enforced until every gate emits manifests, or everything reads as unrun.
+Manifests first, enforcement second.
+
+Step 1 is built: `scripts/run-with-manifest.py` wraps a gate's test
+command, parses the names out of the run and writes one JSON manifest per
+gate under `~/.local/state/leviculum-ci/test-manifests/`, next to the
+other CI run state rather than in the tree or in `target/` — the tiers
+run with their own `CARGO_TARGET_DIR`, so a manifest under `target/`
+would split the union into one per tier.
+
+Coverage was the problem the manifests then made visible: fourteen gates
+emitted, and their union covered 3361 of the 3719 tests the workspace
+held. The 358 outside it were 31 `#[ignore]`d and **327 ordinary tests
+executed by no gate at all** — `leviculum-cli` and `leviculum-micron`
+entirely, most of `leviculum-lxmf`, the `jl`/`jldiff` suites and every
+`lnomad` test (#194).
+
+Naming the missing 327 is what produced the gap: naming is a list, and a
+list loses something again with every new test file. The fix inverts it.
+`just complete`, in the `extensive` tier, runs
+`cargo test --workspace --all-targets --no-fail-fast` and
+`cargo test --workspace --doc --no-fail-fast`, selects nothing by name,
+and therefore covers everything by construction. **Tiers define latency,
+not coverage**, and leaving the complete run is what has to be declared.
+
+Sixteen gates emit today and the union covers 3690 of 3721; the 31
+outside it are `#[ignore]`d, and no ordinary test is outside it.
+
+Two spellings matter and neither is optional. `--all-targets` makes cargo
+drop doctests, so `--doc` is a second invocation. Without `--no-fail-fast`
+cargo stops after the first red binary, and the manifest would then record
+a prefix of the workspace while reading like the whole of it.
+
+Step 2 must normalise libtest's run-time name suffixes before it can
+report anything: a `no_run` doctest is listed plainly and *run* as
+`<name> - compile`, exactly as a `#[should_panic]` test is run as
+`<name> - should panic`. Six doctests read as uncovered in the first
+measurement for that reason alone, having in fact executed.
+
+### Declared exceptions expire by execution, not by date
+
+A test may legitimately run in no automatic gate: a rig test needing
+hardware, a soak run before a release. The mechanism does not forbid it;
+it requires the fact to be declared, with who runs it and where.
+
+An expiry *date* is gateable but is the wrong quantity — it goes red on
+a day unrelated to any change, and the cheapest fix is bumping it a
+year, a one-line diff indistinguishable from maintenance. Instead: **an
+exception is stale when no manifest has recorded that test executing for
+longer than N.** It uses the manifests already being built, cannot be
+satisfied by editing a number, and folds the exception list into the
+staleness bound rather than leaving it a separate off switch.
+
+The same bound applies to manifests themselves: a union with no age
+limit counts a gate retired weeks ago.
+
+The repo tried exactly this bound for tier 2, and how it failed is worth
+recording, because the failure was not in the idea. `pre-push` blocked
+when the newest `tier2 GREEN` line in the CI ledger was over 24 hours or
+10 commits old. The only writer of that line was
+`scripts/run-tier2.sh`; the timer that started it was retired on
+2026-06-12; and the remedy the block printed — `just extensive` — drives
+periculum directly and writes no line at all. So the bound became
+unsatisfiable on the day the timer went, and stayed that way for 46 days
+and 502 commits, every one of which reached master through
+`--no-verify`. That flag disables the *whole* hook, lint and Tier 0 and
+the trailer guard with it. The block was removed on 2026-08-07 rather
+than repaired.
+
+**A staleness bound measures its writer, not its subject.** Age a
+manifest out only against a signal that something is still scheduled to
+emit, and let the remedy name that emitter rather than a recipe which
+merely looks equivalent. A bound whose remedy cannot clear it does not
+fail open or closed — it fails into `--no-verify`, and takes the checks
+that worked with it.
+
+Two reach limits: tier-3 hardware manifests and the release-only
+hardware corpus (`periculum list hardware` prints the live count; it
+grows) are produced on another host on a per-release cadence, so
+either their transport is specified or the guarantee is scoped to
+host-runnable gates. And `nextest` cannot run doctests, of
+which `scripts/ignored-counts.txt` tracks two units (`leviculum-core
+--doc` and `leviculum-std --doc`) — whichever runner is used, the
+doctest gap is explicit.
+
+## Guarantee C — every citation still points at what it claims
+
+Our method rests on citations: a pinned deviation means nothing without
+the reference line it deviates from. When a citation rots, the test
+still passes and the sentence still reads — it simply stops being true.
+
+`leviculum-std/tests/doc_citations.rs` is the working exemplar and the
+proof that this rots fast. The *practice* of checking the reference
+before auditing against it is already stated in
+[Wire Field Semantics](wire-field-semantics.md); what follows is the
+mechanism, not a restatement of the method.
+
+### 1. The submodule check is O(1), and that is the whole incident
+
+The five-week LXMF drift was not hundreds of citations going wrong
+individually. It was **one fact**: the checked-out submodule disagreed
+with its gitlink. The cheap catch is a per-batch assertion that
+`git submodule status` reports no `+`/`-` for the four vendored
+references — a few lines of shell, in a gate rather than in a `#[test]`
+that Guarantee B can fail to observe.
+
+That, and nothing more, would have caught the incident on day one.
+
+### 2. Re-verification on a bump is a separate, larger problem
+
+Binding every citation to a submodule commit and failing until they are
+re-verified is a different mechanism, and it did not cause the incident.
+If it is built, it must be incremental or it will not be used: on a
+bump, `git diff --name-only old..new` inside the submodule bounds the
+work to citations into changed files — usually a handful, not hundreds.
+
+**This is what makes gap 3 a prerequisite rather than an afterthought.**
+A citation written as ``ident` (`path:line`)` can be re-located
+mechanically at the new commit and its line updated. A bare
+`Transport.py:2970` can only be re-verified by a person reading it. So
+converting *reference* citations to the identifier-adjacent form is what
+turns a submodule bump from hundreds of manual re-reads into a
+mechanical re-resolve.
+
+### 3. Coverage: source is uncovered, and most citations are weak
+
+The guard reads `docs/src/**`. A grep for reference citations
+(`reference/…`, `Transport.py:`, `LXMRouter.py:`, `Destination.py:`)
+across `leviculum-core`, `leviculum-lxmf` and `leviculum-std` finds
+**421 in their `src/` trees, 497 counting their `tests/` directories —
+against 804 covered in the book** — and the uncovered ones are
+load-bearing, because they are what a pinned deviation cites.
+
+Extending the glob to Rust source is cheap and should be done, but be
+clear what it buys: for a bare citation it is existence-and-length
+checking, so it catches renames and deletions and not drift inside a
+file that stays long enough.
+
+Counts from the guard's own output at the commit that landed this page:
+**804 total, 72 identifier-checked, 731 bare, 1 external.** The bare
+majority is an editorial problem — the fix is to write citations in the
+identifier-adjacent form, and it cannot be mechanised without rewriting
+prose. The honest response is to publish the ratio on every run so
+nobody reads a green guard as full coverage, and to convert
+opportunistically (#167 is the standing example).
+
+That last sentence was half wrong, and section 5 below is what replaced
+it. The identifier form cannot be mechanised — but the identifier is not
+the only thing about a citation that survives a move, and the other
+thing needs no prose written at all.
+
+### 4. A prose attribution is not a citation, and was not checked
+
+`leviculum-std/tests/doc_citations.rs` resolves `path:line` and checks
+identifier proximity. A sentence that attributes a number to a document
+by name carries neither, so it sailed through — and that is not a rare
+shape. `PROCESSOR_TICK_BUDGET`
+(`leviculum-std/src/driver/processor.rs:181`) was justified with "The
+number comes off `docs/src/concepts/core-lock-budget.md`" and then named
+126.6 ms. The figure occurred exactly once in the whole tree: in that
+comment. The measurement was real — taken in the #196 design pass — but
+the page it was attributed to did not contain it, so the only number
+behind a public constant could not be traced by anyone but its author.
+
+The check: **a doc-comment paragraph naming a document under `docs/` and
+quoting a decimal figure must have that figure occur in that document.**
+`figure_attributions` in the same file, with the reach limits written
+where a reader hits them.
+
+Two decisions are worth lifting out of the code.
+
+**Paragraph scope, not sentence.** The defect attributed across a
+sentence boundary — the document named in one sentence, "The failure
+mode it names is 126.6 ms" two sentences later — so a sentence-scoped
+trigger would have missed the case it exists for. Reconstructed and run:
+it is reported at paragraph scope and invisible at sentence scope.
+
+**Decimal figures only, which is where the precision comes from.** In
+the paragraph the defect lived in, "126.6 ms", "3.2 ms" and "0.8 ms" are
+the page's figures; "5 ms" is the constant being defined and "~25x" is
+arithmetic done in the comment. Checking every number would have
+reported three of its own numbers alongside the one real finding — on
+the very comment the check exists for. What it gives up is integers:
+"the page names 141 ms" is unchecked, and a wrong round number is as
+believable as a wrong precise one. That is the largest known gap and it
+is stated rather than closed, because a guard with false positives gets
+switched off, and a switched-off guard is worse than none.
+
+Two paragraphs in the tree trigger it and five figures are checked. Both
+numbers are printed on every run for the same reason the citation counts
+are: with a trigger this narrow, "no failures" and "the trigger stopped
+firing" are otherwise the same output.
+
+### 5. The bare half is checkable against the tree's own history
+
+The counts above are a coverage *ratio*, and a ratio does not say how
+many of the uncovered citations are actually wrong. Measured, on
+2026-09-21: of 3228 citations in the two corpora, 2464 carry no
+identifier, and **424 of those pointed at the wrong line** — 541
+individual line numbers. Before that measurement the guard had been
+reporting zero for as long as it had existed, and the only competing
+figure was the 126 an aborted merge sweep happened to touch.
+
+Nothing in the tree as it stands can check a bare `file.rs` at line 810. The
+file exists and has 810 lines, and it goes on having them after the
+cited code slides to 883. But the *text of the cited line* survives a
+move exactly the way an identifier does, and unlike an identifier it is
+already there — no citation has to be rewritten to acquire one. The
+tree's own history is where it is kept:
+
+1. `git blame` the line the citation sits on gives the commit that last
+   wrote it — the newest moment anyone can be assumed to have looked at
+   the citation.
+2. The cited file as of that commit, at the cited line, is the anchor.
+   For `reference/<submodule>` citations that means the submodule's own
+   history at the gitlink this tree pinned back then, so a citation into
+   Python-RNS is checked against the reference we actually pinned.
+3. If the cited line still holds that text, the citation still points at
+   what it pointed at.
+4. If not, and that text now sits at exactly one other line, the number
+   is wrong and the guard says by how much.
+
+The unique match in step 4 fails a run with a repair. That is the
+load-bearing choice: the cited text is demonstrably in the file at a line
+the citation does not name, so the report needs no judgement about what
+the citing sentence meant, and a guard with false positives gets switched
+off.
+
+An anchor that has vanished fails a run too, but without a number: the
+code was rewritten in place, and what the sentence should point at now is
+for a reader to decide, so the report says the text is gone and sends the
+reader to the sentence. Until 2026-10-05 this verdict was computed and
+then filed as undecidable whenever no endpoint of the citation was fresh
+or moved, which is every single-line citation. The status line read
+"0 rewritten in place" on every run, and 33 cited lines whose text was
+gone sat in the undecidable count, green; 16 of them pointed into the
+Python reference after it moved to 1.3.5.
+
+Everything else is counted in the open and decides nothing. The run
+prints the undecidable count split by reason, so this census is on every
+run rather than in a one-off instrumentation; on 2026-10-05, after the 33
+were fixed:
+
+| Undecidable because | doc | source | Could a rule decide it? |
+|---|---:|---:|---|
+| the cited line was blank when it was cited | 48 | 147 | Only when the citation's worded endpoints place it; a blank line alone, never |
+| the cited file was absent at the citing commit | 30 | 3 | Yes: every sampled case is the `reticulum-*` to `leviculum-*` crate rename, so following the rename to read the old blob would decide them |
+| the cited text is on several lines | 16 | 11 | Some: a wider context window than one line either side; a wordless line (`}`) alone, never |
+| the cited file was shorter than the citation when cited | 7 | 4 | Decidable as an error, not as drift: the citation was wrong when it was written |
+| the cited line carries no word to anchor to | 2 | 0 | Never on its own, by design (below) |
+| the citing line is not committed | 0 | 0 | Once it is committed |
+| **Sum** | **103** | **165** | |
+
+Two refinements earned their place by being needed on the real corpus,
+and both place endpoints by evidence rather than by inference:
+
+- **A line that is ambiguous alone is often unique with its
+  neighbours.** `else:` is forty lines in `Transport.py`; `else:` with
+  the line above and below it is usually one.
+- **A range whose endpoints agree on one displacement can carry the
+  endpoint that placed nothing.** `Transport.py` lines 1722-1764 end on a `]`
+  the reference now has four of, and exactly one of them is a line from
+  where the opening line's +145 puts it.
+
+And one anti-refinement, which the corpus also demanded: **an anchor
+carrying no word never establishes drift.** Nobody cites a docstring
+delimiter on purpose. `Identity.py` lines 84 and 383 pointed at a stray one the
+day it was written and at the right constant today; "repairing" it to
+where that delimiter went would have broken a correct citation. A
+wordless anchor can still be carried along by a displacement the rest of
+the citation has established — that is what keeps the `]` case
+repairable — but on its own it says nothing.
+
+**What this cannot see, stated rather than hidden.** The baseline is the
+citing line's own last edit, so a citation that was already wrong when
+it was written passes, and reflowing a paragraph re-baselines every
+citation in it. A citation whose *sentence* went wrong while the cited
+line stayed put is invisible here as it is to every other check on this
+page. The number is a floor, not a census.
+
+**The identifier-anchored class gets the same anchor, since
+2026-10-06.** Both classes run through one anchoring pass and are
+reported apart (`bare-citation anchors`, `identifier-citation anchors`),
+so a count can still be compared with a run from before. For a named
+citation the identifier decides nothing on its own: it only breaks the
+tie when the anchored text now sits on several lines, picking the
+occurrence nearest a line that carries the name, and only within
+`WINDOW` of one.
+
+Until then that class was checked by proximity alone: the identifier
+anywhere within `WINDOW` (8) lines of the cited span, or enclosing it,
+held. A shift of up to eight lines was green by design, and so was a span
+that never covered what it claimed as long as the name was close by.
+Turning the anchor on found **108** named citations that tolerance had
+hidden (129 moved endpoints in the book, 2 in source, 2 rewritten in
+place, measured 2026-10-05), and the day it was measured showed the cost
+live: the pass that measured it moved the `Placed::Proved` line this
+page cites, and the guard stayed green, because the enum variant `Proved`
+sat three lines from the stale number. The proximity check still runs;
+it is now the second check a named citation passes, not the only one.
+
+The fixer repairs a named citation on the same evidence it acts on for a
+bare one, and on nothing weaker. All three must hold:
+
+1. **Every endpoint moved by one common shift.** A range whose ends
+   moved by different amounts grew or shrank, and whether it still
+   covers what it meant is a question for a reader.
+2. **Every endpoint's text is unique in the file now**, alone or with
+   its two neighbours. An endpoint that only the shift or the
+   identifier's tie-break placed is inferred from the rest of the
+   citation, and the inference carries forward whatever offset the
+   citation had when it was written. The `select4` range in the
+   embedded developer guide is the case: it opened on a `))` four lines
+   above the call it meant, and the shift its unique end established
+   would have kept that error exactly.
+3. **The identifier sits inside the repaired span.** The text moving is
+   what says the line moved; the name being in the new span is what
+   says the citation's subject moved with it.
+
+Landing the rule, the fixer rewrote 83 citations in one run (the 108,
+less those it refused, plus the ones the rule's own edit to the guard
+displaced) and refused 28, which were read by hand one at a time and
+committed apart so their diff can be read alone. A refused citation is
+reported with the number the anchor would give it and the condition
+that failed, never with a bare "should read".
+
+**Four standing controls** keep the verdicts honest, each a fixture pair
+under `leviculum-std/tests/fixtures/` (`citation_anchor_target.rs.in`
+and `citation_anchor_doc.md.in`, one bare and one identifier-anchored
+citation) committed into a scratch repository and then perturbed:
+`anchor_control_a_moved_line_is_named_with_its_new_number` (the bare
+citation is reported moved with its new number, the identifier citation
+holds at +1), `anchor_control_a_rewritten_line_is_named_rewritten_not_undecidable`
+(reported rewritten in place, with no number offered),
+`anchor_control_an_identifier_moved_past_the_window_is_drift` (the
+identifier one line past the window is drift, with the distance named),
+and `anchor_control_an_identifier_citation_moved_three_lines_is_named_and_repaired`
+(the named citation's line moves by three, inside the window: the
+proximity check still holds it, the anchor names the new line, and the
+fixer rewrites it). `an_identifier_citation_is_renumbered_only_on_proof`
+refuses each of the fixer's three conditions on its own.
+
+Because the finder knows where the text went, it can also put the
+citation there: `LEVICULUM_CITATION_FIX=1` rewrites the repairable ones
+in place. Finder and fixer are the same code deliberately — a separate
+fixing script would be a second implementation of the anchor rule, and
+the first symptom of the two disagreeing is a repair pointed at the
+wrong line. 445 of the 2026-09-21 findings were repaired that way; the
+remaining 21 were spans whose other end a human had to locate, and eight
+of those left the bare class entirely by acquiring the identifier they
+should have had.
+
+Until 2026-10-06 that fixer reached the bare class only; it now reaches
+a named citation as well, on the three conditions above. What repairs
+the identifier-anchored classes when the anchor cannot, without
+re-anchoring them onto their identifiers, is section 7.
+
+The fixer has one trap worth naming, because it sprang once: this guard
+is itself in the corpus it guards, so a fixture string naming a git hook
+and a line number in its own tests is a citation as far as the scan is
+concerned, and got "repaired" to the line that text had moved to —
+breaking the assertion beneath it. Fixture citations in that file are
+now built rather than spelled out, which is what the canary fixtures
+already did and for the same reason.
+
+The standing canary is a miniature git repository: two bare citations,
+one of which a second commit makes wrong by moving the code under it.
+Both directions are asserted, because every failure mode of a check made
+of subprocess calls — blame returning nothing, a `cat-file` batch
+desynchronising — produces no findings, which reads exactly like a clean
+tree.
+
+### 6. A reference table names its subject, and was read as naming nothing
+
+Sections 1-5 divide every citation into two classes by one question:
+does an identifier sit immediately before it? That question has a third
+answer, and it is the densest citation shape in the book. A reference
+table writes
+
+```text
+| `fn has_path(&self, dest_hash: &DestinationHash) -> bool` — `driver/mod.rs:NNNN` | Whether a path is known |
+```
+
+The row names its subject as plainly as a citation can, and the
+adjacency rule read it as naming nothing, because the name is inside a
+signature several words from the citation. `docs/src/developer/rust-api-spec.md`
+is 113 such citations on its own — the largest single bare cluster in
+the corpus — and a 17-row `ReticulumNode` method table in it had aged
+past a thousand lines under a green guard (Codeberg #307).
+
+So: inside a table row, a `fn NAME(` in a backticked span names the next
+citation on that row. A row rather than a cell, because the corpus
+writes the signature and the citation in one cell and in adjacent cells
+about equally, and where the `|` falls between them is a typesetting
+choice. What replaces adjacency as the guarantee of an unambiguous
+pairing is that a citation *between* the signature and this one takes
+the signature for itself — the row's second citation stays bare, exactly
+as it was.
+
+Section 5's history anchor does not reach this case and could not: the
+method table's citing lines were last written in a restructuring commit
+older than the file they cite at its current path, so there is no blob
+to anchor against and every one of them counted as undecidable. A name
+the row already carries needs no history at all.
+
+The measurement, on the corpus the day it landed: 76 book citations
+moved from bare to drift-checked, and **59 of the 59 signature rows in
+`rust-api-spec.md` were pointing somewhere other than the item they
+name** — 41 of them far enough out to fail the guard outright, the other
+18 inside the 8-line window with the budget already spent. Each was
+re-derived from the definition in the file the section names, not
+shifted by the distance the guard reported; a citation that was already
+wrong and gets shifted to a new wrong number is harder to spot than one
+that is obviously stale.
+
+What it still does not reach, in the same file: the prose citations
+around those tables (`Defined at …`, the enum-variant rows whose name is
+in another cell, the newtype accessors written as a signature followed
+by a parenthesised citation). Those remain bare, and section 5's anchor
+is what covers them.
+
+### 7. The repair follows the diff, not the nearest name
+
+Section 5's fixer repairs a citation by its own anchor: the text of the
+line it names says where that line went. Until 2026-10-06 that anchor
+existed for the bare class only, and it still repairs a named citation
+only on the three conditions section 5 lists. What the proximity check
+prints for the identifier-anchored classes is the nearest occurrence of
+the cited identifier — and that is exactly the number a repair must not
+take.
+
+The reason is the trap the order-257 coder recorded, which is worth
+quoting rather than paraphrasing: a 16-line doc comment inserted at
+line 950 of `transport.rs` reddened 121 citations below it — 38 bare
+ones the `LEVICULUM_CITATION_FIX` mode rewrote, and 83 identifier-
+anchored ones it cannot fix, which the coder repointed by hand from the
+`git diff -U0` line map, because *the guard reports "identifier now at
+3569" for a citation that deliberately points three lines ABOVE its
+identifier (3566 after the move), so following the report would have
+re-anchored 83 citations onto their identifiers and destroyed the
+offsets their authors chose.* A manual step with a known failure mode,
+performed about 120 times in one pass, is a tool that has not been
+written yet. Three passes in one day paid that tax; one of them for a
+single citation.
+
+So the map is the diff and the proof is the text.
+
+1. `LEVICULUM_CITATION_FIX_BASE=<rev>` names the state the citations
+   were right about. The default is `HEAD` when the tree has
+   uncommitted changes to tracked files — the insertion is still in the
+   working tree — and `HEAD~1` when it has none, the insertion being
+   the commit just made. Untracked files do not count as dirty: a stray
+   log beside the tree says nothing about where a cited line was. Which
+   base was used is printed on every run, because a map read against
+   the wrong base is this mode's one failure mode.
+2. `git diff -U0 <base> -- <cited file>` is a line map. Every hunk that
+   ends above the cited line displaces it by that hunk's own length
+   change, and nothing else does. `-U0` is what makes this true: with
+   context lines a hunk's bounds say nothing about which lines actually
+   changed. A pure insertion is written `-N,0` and lands *after* old
+   line N, so it displaces every line past N and contains none —
+   reading its start as a contained line would report the line
+   immediately above an insertion as replaced by it, which is the
+   commonest shape there is.
+3. A cited line *inside* a hunk was not displaced, it was replaced. Its
+   text is not somewhere else, it is gone. That one is reported with
+   the line the hunk now starts at and never rewritten: what replaced
+   text meant is a question only a reader can answer.
+4. The rewrite happens only when the mapped line now holds the text the
+   cited line held in `<base>`. That is what makes the author's offset
+   provably preserved — the citation follows its own line, whatever
+   that line pointed at and however far the identifier has moved.
+   Otherwise the citation stays red and *both* candidates are printed,
+   the mapped line and the nearest-identifier line, for a reader to
+   choose between.
+
+Step 4 is the whole safety of the mode, and it is worth being exact
+about what it can and cannot catch. A correctly parsed diff against the
+right base cannot fail it: the map is exact by construction. It fails
+when the premise does — a base at which the cited file did not exist, a
+line past the end of that copy, a path inside a reference submodule
+whose lines this tree's diff does not move, or a base against which
+nothing under the citation moved at all. In each of those the citation
+is left red rather than renumbered from a map that has stopped
+describing the tree. All four are the same sentence: a number this
+cannot prove is a number it does not write.
+
+The fixers share their finder and their byte surgery for the reason
+section 5 gives, and they run in one invocation rather than in
+parallel: both rewrite the same citing files, and a bare repair changes
+the length of the citation it rewrites, so the identifier pass rescans
+before it places anything. While a fix run is rewriting the corpus the
+three resolving guards skip — loudly, naming the variable that silenced
+them, because an environment variable that quietly turns a guard green
+is the shape this page exists to remove. A fix run applies no verdict;
+the verdict is the next run without it.
+
+The measurement that landed it is the 257 corpus itself, replayed. A
+copy of the tree at the commit before 257 with 257's code and 257's
+stale citations — the exact state that coder faced — repairs to 38 bare
+and 83 identifier-anchored citations, which is that pass's split to the
+citation, and the resulting tree is byte-identical to the one the coder
+produced by hand across all 119 changed lines. On the tree this landed
+in, the live case was a citation into `memory.x` whose line the
+preceding commit had pushed 38 lines down: the line map places it at
+291, where the `ASSERT` it names now is, while the nearest match in the
+guard's report was line 289 — a comment that merely mentions `ASSERT`s.
+Two lines, silently, from following the report instead of the diff.
+
+Its fixture repository is in the guard's own tests: a citation three
+lines above its identifier with an insertion above both must move by
+the insertion and not onto the identifier, a citation whose line was
+replaced must stay red with both candidates named, and a citation into
+a file the base has no copy of must not be touched. Each has an
+injected-drift control, because two of the three verdicts are "leave it
+alone", and a fixer that has stopped repairing anything leaves
+everything alone.
+
+### 7a. The fixer runs once, and it runs last
+
+Once per pass, after the last edit to any file it cites into, and
+immediately before the gates. The mode could not notice that it was
+repairing its own earlier output, and what it did when handed that
+output was not to give up: it applied the same displacement a second
+time and printed `repaired by the line map`. It refuses that case now,
+by the premise test at the end of this section — but the rule stays,
+because a refusal still leaves the citation red and a reader has to
+unpick it.
+
+Step 4 above, read from the other side, is the mechanism. The proof is
+`Placed::Proved` (`leviculum-std/tests/doc_citations.rs:3450`) — the
+mapped line's text *now* against the text the *cited number* held in
+the base. The premise of the whole map is therefore that every number
+in the corpus is one the base was right about, and a citation an
+earlier run rewrote is not. Its number names a line in the post-edit
+tree, so the base text it is compared against is whatever unrelated
+line sat at that number before the insertion; a pure insertion
+displaces every line below it by the same amount, so that unrelated
+line is still exactly that far down, the comparison passes, and the
+citation moves a second time.
+
+Measured on this tree 2026-09-27 by replaying order 339's shape: HEAD
+`2242a470`, 85 lines inserted at line 191 of
+`leviculum-core/src/transport.rs`, the fixer, then three more lines at
+the same place, which is 339's "off by three". The citation under test
+sits at line 327 of `docs/src/concepts/time-and-clocks.md`, written
+seven lines above the `rank` it names. None of the numbers in the table
+is in the citation form, for the reason section 5 gives: they record
+where a citation *was*, and a later fix run would helpfully rewrite
+them.
+
+| Run | the citation reads | correct | lines to `rank` |
+|---|---|---|---|
+| before | 1389 | 1389 | 7 |
+| 1, after the 85-line insertion | 1474 | 1474 | 7 |
+| 2, after three further lines | 1562 | 1477 | 78 |
+| 3, no further edit | 1650 | 1477 | 166 |
+| revert the rewrites, insert 88, run once | 1477 | 1477 | 7 |
+
+Runs 2 and 3 each reported `2 red citation(s), 2 repaired by the line
+map, 0 left for a reader`. It neither converges nor warns. The verdict
+run afterwards is still red, so nothing lands on a lie — but every
+attempt to help moves the citation another 88 lines from its subject,
+which is why 339 could not repair its two survivors and reverted
+instead. That pass recorded the mechanism as "the map pass leaves a
+rewritten citation alone"; the measurement says the opposite, and the
+opposite is the worse of the two.
+
+The bare pass does not double-apply. It goes quiet instead: its anchor
+is read from the tree's own history, and a doc line the fixer has just
+rewritten is uncommitted, so there is no commit at which to ask what
+that line said when it was written. Run 1 reported 21 doc and 13 source
+citations moved and rewrote 31 of them; run 2, with those same
+citations now three lines stale, reported 0 moved and its undecidable
+counts up from 79 to 98 and from 17 to 29 — 19 and 12, which is the
+31 it had repaired. Undecidable is not a failure, so for the bare half
+a second run turns red into silence.
+
+Recovery is the one 339 used: revert the rewrites, rebuild the tree as
+the base commit plus the source edits, run the fixer once. Saving the
+source hunks and `git checkout -- .` is enough. No base revision
+repairs a doubly-rewritten citation, because the state its number was
+right about is a working tree nobody committed.
+
+Committing the rewrites is the other way out, and the same statement.
+With run 1's output committed, a run after three further lines moved
+1477 to 1480 and the bare pass was back to 21 moved and 31 rewritten.
+So the rule is not really "run it last": it is *the citations must be
+right about a commit*, and running the fixer last is the cheap way to
+be sure they are.
+
+**Could it detect its own earlier run?** Not by the test that suggests
+itself. "The mapped line does not hold the base text, but the line at
+the cited number does" fires on neither measured case. At `2242a470`
+line 1474 of `transport.rs` is `pub(crate) packets_sent: u64,`; the
+mapped line 1562 holds exactly that, which is *why* the repair was
+applied again; and line 1474 of the working tree holds the `age_secs`
+doc comment instead. Both halves are false, and the half that would
+have to be true is the one the code already proves. It is unsound in
+the other direction too: wherever trimmed lines repeat — `}`, a
+blank, a bare `///` — the two texts match by coincidence.
+
+The test that does fire is the premise rather than the result: the
+cited line must resolve its own identifier in the base. At `2242a470`
+nothing within eight lines of 1474 contains `rank`, and nothing within
+eight lines of the second survivor's 478 contains `TickOutput`, while
+their pre-run numbers 1389 and 393 both resolve. Replayed over the
+three logs with that rule, the enclosing-block fallback aside: 0 of the
+83 doc repairs the single clean run made would have been refused, and 2
+of 2 in each double run.
+
+So it prints a refusal in place of `repaired by the line map`, not a
+hint: *left red — line 1474 does not resolve `rank` at 2242a470
+either, so this citation was never right about the base and the line
+map cannot carry it. If an earlier fix run rewrote it, revert the
+rewrites and run once.*
+
+Built 2026-09-27. The proximity test had lived inline in the checker,
+closed over the current file's lines; it is now `ident_resolves`
+(`leviculum-std/tests/doc_citations.rs:695`), a function over the lines
+it is handed, and `place_citation` asks it a second time against the
+base copy of the file (`leviculum-std/tests/doc_citations.rs:3662`). A
+map repair is emitted only where both halves hold: the map proves the
+move, *and* the base resolved the citation's own identifier at the
+citation's own number. The refusal above is the other branch.
+
+What it costs is a real refusal, paid knowingly. A citation already
+stale *at* the base — the twenty `Justfile` numbers 339 found — is no
+longer repaired by the map pass. Correctly so: a map against that base
+says nothing about drift older than it. The bare pass still repairs
+those where it can, from the tree's own history, which is what repaired
+them in 339.
+
+The fixture is the fourth verdict of
+`a_repair_follows_the_line_map_and_not_the_nearest_name`, beside the
+three the guard already had: a citation written nineteen lines above
+the `twice_shifted` it names, displaced by the same insertion as the
+others. Its move is *proved* by the line map — asserted directly, so
+that a case 4 which passed because the map had broken for some
+unrelated reason would fail — and it is refused all the same, with the
+message above. The clean single-run repair in the same tree is the
+control, and is still made.
+
+### 8. A green guard has to say how much of the corpus it read
+
+Sections 5-7 made the guard see more. What it still did not do was say
+how much it had not seen, and that omission is the whole of Codeberg
+#307 as it was actually experienced: the guard reported the file
+carrying the 1035-line-stale `has_path` row as fine. It was not lying —
+it had checked everything it could check. What it never said was that
+this was 912 of 1188 citations.
+
+So the status line now names three groups rather than one, because they
+are three different claims:
+
+```text
+doc citations: 1684 total; 814 checked against the symbol they name
+(within 8 lines; their cited line anchored by its text, as a bare one
+is) and holding; 0 named but not holding (reported below);
+870 could not be checked by name (862 bare: anchored by the text of the
+cited line in bare_citations_still_point_at_the_text_they_cited,
+8 external: not in this workspace, 0 skipped: into a reference/
+submodule that is not checked out)
+```
+
+and when the third group is more than half the corpus, a warning line
+follows it saying so with the number. Measured 2026-09-26, all three
+corpora:
+
+| Corpus | Total | Checked against a symbol, holding | Could not be checked | Warns |
+|--------|-------|-----------------------------------|----------------------|-------|
+| doc (`docs/src/**`) | 1661 | 809 | 852 (51 %) | yes |
+| source (the four crates) | 2013 | 182 | 1831 (90 %) | yes |
+| script (`scripts/*.sh`, `Justfile`) | 8 | 1 | 7 (87 %) | yes |
+
+A warning and not a failure, deliberately. The source corpus is 90 %
+bare by nature — a `//` comment cites a line without writing the name
+beside it — and a guard that fails on that gets switched off within a
+week, which is worse than a guard that counts out loud. The number is
+the point: it is the size of the blind spot, and it is now in front of
+whoever reads a green run. Section 5's history anchor is the partial
+backstop for that class and prints its own split (on 2026-10-05, 1205
+of the book's bare cited lines still hold their text, 103 undecidable;
+2820 and 165 in source), so "could not be checked *by name*" is not the
+same as "not checked at all", and the line now says which one a corpus
+got: the book and the crates are anchored, the scripts are not, and
+their bare citations are still existence and length only. Until
+2026-10-05 the line said "existence and length only" for all three,
+which had stopped being true of two of them when the anchor landed.
+Since 2026-10-06 the named group says it is anchored too, and the
+warning no longer calls it "checked by proximity only".
+
+The same pass gave the drift report the distance it had been leaving to
+the reader. It printed the cited line and the nearest occurrence of the
+identifier and stopped there; now it prints how far apart they are,
+because that is the number #307 was argued from. "1035 lines from the
+cited span" distinguishes a citation a refactor slid past from one
+nobody has read in a year, and a reader should not have to subtract two
+four-digit line numbers to learn which one they are looking at.
+
+### What C cannot reach
+
+Issue comments, commit messages and batch reports carry hundreds of
+`file:line` claims that nothing checks — and given how much of this
+project's reasoning is recorded there rather than in the tree, that is
+the largest uncovered surface of the three guarantees. A `just cite`
+helper that emits a verified citation would reduce fabrication at the
+point of writing; nothing can verify it after the fact.
+
+### One line shape on that surface, and only one
+
+`scripts/check-commit-trailers.sh` is the first mechanical check on a
+commit message in either repository. It is worth being exact about how
+little it does: it checks **one line shape**, not one claim. A message
+may cite a file that does not exist, attribute a measurement to a page
+that never carried it, and describe a fix it did not make; none of that
+is reachable from here, and the paragraph above still stands whole.
+
+What it does reach is #205, which was not a claim going wrong but a rule
+losing to a default. `periculum/CONTRIBUTING.md:43` said "no AI
+trailers. Commit under your real name and a reachable e-mail" while the
+assistant harnesses used here instruct their agents to append exactly
+that trailer to every commit. A rule in that position, with nothing
+behind it, is not half-remembered — it is *reliably* broken, and its
+violation is invisible unless a person reads every message before every
+push. Which is how the one on 2026-08-07 was caught, and is not a
+mechanism.
+
+The check is a forge step
+(`.woodpecker/commit-trailers.yml`, and the `commit-trailers` step in
+periculum's `.woodpecker.yml`) over every commit since a pinned
+baseline. `.githooks/commit-msg` runs the same script at commit time and
+`just fast` runs it over the outgoing range, but neither is the
+enforcement: a fresh clone has no hooks, which is the whole reason the
+gate is where it is.
+
+**It matches only at column 0.** That is not a compromise, it is the
+definition: column 0 is where git's `interpret-trailers` and every forge
+harvest a trailer, so it is where the default writes and the only place
+the line is doing anything. It also leaves the one escape a message
+sometimes needs — this guard's own commit message quotes the offending
+trailer — namely the indentation git already uses for quoted material.
+The alternative was git's own trailer block, the last paragraph; that
+was rejected because the default's `Generated with <tool>` line sits in
+its own paragraph *above* it, so the rule would have covered half the
+default while reading as covering all of it.
+
+A leading space defeats the check. That is a bound, not a hole: this
+stands against a tool's default, and nothing message-shaped stands
+against a person who has decided to misattribute authorship.
+
+Sixteen commits below leviculum's baseline carry such a trailer, from
+before the rule had anything behind it. They are recorded in
+`scripts/commit-trailer-baseline.txt` rather than rewritten out of
+published history, and **their count is recomputed and compared on every
+run** — which is what stops the baseline being the off switch the expiry
+dates above are criticised for being. Moving it forward to silence a
+fresh failure moves a violation across that line and changes the number.
+
+### The rule was narrower than the check, and the gap cost a day
+
+As first written the guard scanned by message text alone. The rule the
+repositories actually hold is narrower: **a machine-authorship trailer is
+a violation on our commits and not on anyone else's** — we do not edit,
+and do not refuse, a message somebody outside the project wrote. The
+commit-msg hook in Lew's checkout had keyed on the author e-mail since
+2026-06-13 and said so in a comment; the guard did not, and could not,
+because nothing in the tree stated the policy. Merging PR #201, an
+external contribution whose commit carries such a trailer, then turned
+`just fast`, the pre-push hook and the forge check permanently red on a
+tree with nothing wrong with it. The brief for #205 argued the rule
+entirely in terms of our own harness default and never mentioned external
+contributors; the guard did exactly what it was told.
+
+This is the failure mode the page's opening promise misses. A check that
+*could* have failed and *did* run can still be red for a reason the rule
+does not hold — and a gate that is red on a clean tree gets switched off
+or bypassed, which costs more than the gate was ever worth. **A check
+also has to be able to go green on every tree the rule permits.**
+
+Authorship is the discriminator and `git log --format=%ae` is the whole
+mechanism. Two things follow, both of which are this page's own
+arguments applied one level down:
+
+- The exemption is **counted, not trusted**. `foreign` in the baseline
+  file pins how many commits above the baseline carry a trailer under an
+  author that is not ours, recomputed every run. Uncounted, an exemption
+  granted by class is an off switch anyone can reach by setting an author
+  e-mail; counted, a new external contribution lands with its message
+  intact and still moves a number in a diff, which is the outcome we
+  wanted — we want to know when it happens, we just do not want to
+  rewrite somebody else's message.
+- Who counts as ours is **a list in the reviewed file, not a constant in
+  the script**. It has to be a set: `lp@lew-palm.de` is what we use at a
+  terminal, but Codeberg stamps a web-UI edit with its own noreply
+  address, and three commits in leviculum's history carry it. A
+  single-address discriminator would have handed the foreign exemption to
+  the project lead's own commits, silently — the exact failure the guard
+  exists to prevent, arriving by accident rather than by intent. There is
+  no computed control on that list, because who is inside the project is a
+  declaration and not a fact the script can derive; the control is that
+  the list sits next to the counts, where adding a line is a diff.
+
+## A gate must pass, fail, or say it gave up
+
+There is a fourth way for a gate to end, and it is worse than any red:
+still running, verdict already determined, nobody told. On 2026-08-07
+`just standard` sat for **two hours** in exactly that state. It was found
+by noticing that its log's mtime was two hours old.
+
+The mechanism, end to end:
+
+1. `python_accepts_ratcheted_c_announce` (`leviculum-ffi`, `--test
+   ffi_interop`) panicked **in a destructor during cleanup** — "thread
+   caused non-unwinding panic. aborting." — and took SIGABRT.
+2. An abort skips unwinding, so the `Drop` that would have killed the
+   `scripts/test_daemon.py` that test had spawned never ran.
+3. The orphaned daemon had inherited cargo's stdout. Confirmed by walking
+   `/proc/*/fd`: PID 960389 held fd 2 on the same pipe.
+4. `cargo` exited and became a zombie.
+5. The wrapper read `for raw in proc.stdout:`. **That loop ends on EOF of
+   the pipe, not on exit of the child.** `proc.wait()` sat behind it and
+   was never reached. One surviving write end held the gate open.
+
+Killing the orphan by hand finished the run *immediately*, printing the
+`exit code 101` it had held for two hours.
+
+The class is wider than the test that triggered it: **a gate that waits
+for a pipe to close instead of for its child to exit can be held open by
+any leaked grandchild.** Every harness here that spawns an external
+process is exposed — the FFI tests spawn Python daemons and C binaries,
+the interop tests spawn `lnsd` and `rnsd`, others spawn docker. So the
+fix belongs in the wrapper, which is one place, and not in each spawn
+site, which is many and will grow.
+
+Three properties, in `scripts/run-with-manifest.py`:
+
+1. **The verdict waits on the child, not on the pipe.** `proc.wait()`
+   runs on the main thread and a reader thread drains stdout, so nothing
+   the wrapper decides depends on EOF ever arriving. This is the property
+   that would have ended the two hours by itself, and the only one that
+   still holds when the other two fail.
+2. **Orphans die with the gate.** The child is spawned with
+   `start_new_session=True`, so it leads its own process group, and the
+   whole group is killed once the child has exited — SIGTERM, then
+   SIGKILL after a short grace, because what leaks here is daemons
+   holding sockets, tempdirs and sometimes a serial port. The pipe then
+   closes on its own and the tail of the output is drained normally. The
+   cost on a clean run is one `/proc` scan that finds nothing.
+3. **A hard timeout that reports.** Default 1800 s per wrapped command,
+   overridable with `--timeout` per gate and `LEVICULUM_GATE_TIMEOUT`
+   globally. On expiry the gate exits 124 — `timeout(1)`'s code — naming
+   itself, how long it waited and what was still alive. The per-line
+   flush that already existed makes the partial log true for free.
+
+And the reporting rule, which is not decoration: **if the gate had to
+kill survivors, it says so, by pid and command line.** A leaked daemon is
+a bug in the test that leaked it, and a gate that cleans up silently
+hides the bug it just worked around. The manifest carries the same facts
+(`timed_out`, `killed`, `survived_sigkill`) so a nightly that kept only
+the JSON can still see it.
+
+What none of this reaches: an orphan that calls `setsid()` has left the
+group and survives the kill. It cannot hold the gate open — property 1
+does not care — but it is still alive afterwards, and the reader thread
+has to be abandoned with the tail of the log unwritten. Both facts are
+printed rather than swallowed. Interrupting the wrapper is also no longer
+free: `start_new_session` detaches the child from the terminal's
+foreground group, so INT/TERM/HUP are relayed by hand, or a Ctrl-C would
+trade the hang at the end for an escape at the start.
+
+### A harness that spawns a process must ensure it dies with the harness
+
+The wrapper is a backstop, not an excuse. The rule for the spawn sites:
+
+> **A harness that spawns a long-lived external process must ensure it
+> dies with the harness, however the harness dies. Cleanup code is a
+> convenience; the kernel is the guarantee.**
+
+Relying on Rust's `Drop` to kill a child satisfies the "cleanly" half and
+nothing else: an abort skips unwinding, and so does a SIGKILL of the test
+binary. The Linux answer is `PR_SET_PDEATHSIG` on the child, set after
+the fork and before the exec, so the kernel signals it when its parent
+dies for any reason. `Drop` then becomes the polite path rather than the
+only one.
+
+The receipt, from the afternoon this was written: **seven orphaned
+`scripts/test_daemon.py` processes alive at once, the oldest over four
+hours, from several different runs** — so the leak was the normal case
+and not the exceptional one. One of them held a pipe open and hung
+`just standard` for two hours with its verdict already decided.
+
+`leviculum_std::process::spawn_supervised` is the mechanism, and it takes
+its `Command` **by value**, so that a supervised spawn and a bare one do
+not look alike at a call site. Four things it has to get right, each of
+which has bitten somebody:
+
+1. **`PR_SET_PDEATHSIG` is per-task, not per-process.** The kernel stores
+   it on the child's `task_struct` and delivers it from
+   `forget_original_parent()`, which runs when the *forking task* exits —
+   not when that task's process exits. A tokio worker or a
+   `spawn_blocking` thread finishing mid-test would therefore kill the
+   daemon under the test, which turns the fix into a flake generator. So
+   **every supervised spawn is forked from one dedicated thread that
+   never exits**, and the only event that ends that thread is the process
+   ending. Nothing else in the design substitutes for this: the
+   `getppid()` check below reports the parent's *thread group leader*, so
+   a forking thread exiting while its process lives leaves it unchanged
+   and the check sees nothing wrong.
+
+   The same fact bites the measurement, not only the mechanism.
+   `copy_process()` clears `pdeath_signal` for every new task, threads
+   included, and libtest runs a test body on a spawned thread even under
+   `--test-threads=1` — so a canary written as a `#[test]` reads its own
+   parent-death signal as 0 while its process's main thread carries
+   `SIGKILL`. That is why the probe below is a `fn main` and not a test.
+
+2. **The race between `fork` and `prctl`.** If the parent dies inside
+   that window the signal is already missed and the child runs on
+   forever. After setting the flag the child re-reads `getppid()` and
+   `_exit`s if it no longer names the process that spawned it.
+
+3. **It does not reach grandchildren,** and the remedy is *not* `setsid`.
+   A supervised child deliberately stays in its parent's process group,
+   so `run-with-manifest.py`'s group kill still reaches everything below
+   it — an orphan that has `setsid`-ed is the one thing that wrapper
+   names as out of reach. Where a supervised process starts its own
+   long-lived children, that is a separate link needing the same
+   treatment at its own site.
+
+4. **The signal is `SIGKILL`, and the reason is the state it fires in.**
+   `PDEATHSIG` is delivered only once the parent is *already dead*, so
+   there is nobody left to wait for a polite exit and nobody to escalate
+   if the child declines. A catchable signal there is the same "cleanup
+   that usually runs" the mechanism exists to replace, and the daemon
+   whose graceful shutdown is being trusted is the one whose graceful
+   shutdown hung a gate for two hours. The polite path is still tried
+   first, by the owning `Drop`, and those destructors already end in
+   `kill()` — so this is the same signal, moved to where it cannot be
+   skipped. The cost is the child's own last wishes: `test_daemon.py`
+   removes its `mkdtemp` config directory in a `finally:` block, and
+   under `SIGKILL` that directory stays. Ports, sockets, ptys and
+   `flock`s are released by the kernel on death, so the loss is a few KiB
+   under `/tmp` in a run whose parent has already crashed.
+
+**And the other half of the same rule, in the destructors.** A `Drop`
+that owns an external process must reach the kill on **every** path.
+`PyDaemon::drop` (`leviculum-ffi/tests/support/python_daemon.rs`) did
+fallible I/O first — `query("shutdown")`, which `expect`ed a JSON
+response and got the empty body a mid-shutdown daemon returns — and a
+panic in a destructor that is itself running during unwinding is a
+non-unwinding panic, so the process aborted before reaching
+`child.kill()` two lines down. That is a second, independent reason the
+same daemon leaked. The shape to write is: try the polite shutdown,
+ignore every error it can produce, then kill unconditionally. It pairs
+with `PDEATHSIG` rather than replacing it — the kernel covers "the parent
+died", this covers "the parent lived and its cleanup threw".
+
+**Which sites.** Every spawn whose process outlives the call that made
+it: the Python `TestDaemon` and its `socat` pty pair, `PyDaemon`, the C
+`lnsd`/`lncp`/`levcat` programs in the FFI suite, `lnsd` and the vendored
+`rnsd` in the mvr, load-test, reverse-RPC and status-parity harnesses,
+the instance-conflict holder — and, outside the tests, the
+`PipeInterface` bridge program, which is the one long-lived process the
+shipped daemon starts. Deliberately not covered: everything spawned and
+awaited inside one call — `cc`, `git`, `stty`, `rnstatus`, the `jl` /
+`jldiff` filters, the `event-log-helper` and port-allocator workers.
+Those are counted rather than argued about; see the gate below.
+
+## Standing canaries
+
+Every gate on this page carries a permanent pair, checked before it
+reports anything else:
+
+- **A, registry gate**: a tagged test deliberately absent from
+  `scripts/pins.txt` that must be reported, and a correctly registered
+  one that must not be.
+- **A, mutation audit**: a deliberately weak pin that must survive and a
+  strong one that must die. Additionally: an unresolvable declared
+  subject is a hard error, `mutants_generated > 0` is asserted per pin,
+  and the equivalent-mutant allowlist carries per-entry justifications
+  and is pinned like `scripts/ignored-counts.txt`.
+- **B, manifest writer**: a fixture of libtest output, parsed before every
+  wrapped run, holding tests that must land in the manifest — including a
+  `#[should_panic]` one, which libtest names `<test> - should panic` and
+  `--list` names plainly (a `no_run` doctest is the same shape, run as
+  `<test> - compile`) — and lines that must not: an ignored test, an
+  indented look-alike a test could print. The counts are then reconciled
+  against libtest's own summary line, so a manifest that disagrees with
+  the run fails the gate.
+- **B, manifest check**: a test deliberately in no gate that must always
+  be reported, and one in a gate that must never be.
+- **B, gate termination**: a child that leaks a grandchild holding the
+  gate's stdout and then exits — the wrapper must report the child's exit
+  status promptly and must **name** what it killed — paired with a child
+  that leaks nothing, which must report no kill at all, because a kill
+  claimed on every green run is noise and noise is how a real one goes
+  unread. Two further arms: a child that never exits, which must produce
+  the named timeout rather than a wait, and an orphan that escapes the
+  process group with its own `setsid()`, which must not delay the verdict
+  past the drain grace. This canary is **bounded from outside the thing
+  it tests** — a watchdog in the canary kills the grandchild by an argv
+  marker after twenty seconds, so a regression fails in twenty seconds
+  instead of wedging the suite the way the incident wedged the run.
+  Walking into that trap while fixing it would be poor form. It costs
+  about 0.85 s per wrapped gate, which is the price of the only check
+  that can see a wrapper that has stopped terminating: every other gate
+  on this page reports nothing at all when that happens, including the
+  parser canary in the same script, which passes happily while the run it
+  belongs to never ends.
+- **B, supervised spawns**: two of them, because the property has two
+  halves that fail independently. The **census**
+  (`scripts/check-supervised-spawns.py`) classifies two fixtures before
+  it reports anything about the tree — one holding a bare spawn in each
+  of the four shapes the tree writes them in, all of which must be
+  reported, and one holding a supervised call, a runtime `spawn`, a
+  string and a comment that mention the words, none of which may be.
+  Without the first arm a classifier that has stopped matching reports a
+  clean tree forever; without the second it reports every line in it. The
+  **behaviour** (`leviculum-std/tests/supervised_spawn.rs`) SIGKILLs a
+  parent and requires its child to be gone, paired with the same
+  experiment on a child spawned bare, which must still be alive after the
+  same deadline — otherwise "the child is gone" is satisfied by a child
+  that never started. Both arms are bounded and fail loudly rather than
+  waiting, which is the mistake the incident above was about, and the
+  child's own `PR_GET_PDEATHSIG` is checked first as the cheap form: a
+  refactor that drops the `pre_exec` is named in milliseconds.
+- **C, citation guard**: a deliberately drifted citation that must be
+  reported. The existing guard has floor asserts against parser rot; the
+  canary is the stronger form.
+- **C, figure attribution**: a fixture page and a fixture doc comment
+  attributing two figures to it — one on the page, one not — plus a
+  version string that must not be read as a figure and an attribution to a
+  page that is not in the tree. Exactly two must be reported. This one is
+  not optional in the ordinary way: #200 was fixed hours before the check
+  was written, so the corpus has no failing case left and a broken trigger
+  would report zero forever against a tree that reads clean.
+- **C, commit-trailer guard**: a message carrying the trailer that must be
+  rejected and one that only quotes it, indented, that must not — both run
+  before the guard reports anything else. leviculum's pinned count of
+  sixteen below-baseline violations is the same canary in stronger form,
+  covering both directions over 1275 real commits on every run; periculum's
+  count is zero and covers only the direction that cannot rot, which is why
+  the pair is in the script rather than only in the baseline file.
+- **C, commit-trailer authorship arm**: the ours/foreign split needs its
+  own pair, because "no violation found" is what a guard that has stopped
+  noticing foreign trailers reports forever, and equally what one that has
+  started calling *everything* foreign reports forever. Two independent
+  failures, two checks. The **plumbing** is verified against git itself on
+  HEAD — a `--format` that lost `%ae` would leave every commit classified
+  as foreign and go green on our own violations from then on, and checking
+  it against a constant in the script would only prove the script agrees
+  with itself. The **classification** is verified on a synthetic set
+  carrying one hit per declared identity plus one from outside: on a tree
+  whose history happens to hold no foreign hit an inverted comparison
+  would also read green, and a comparison tightened until it stopped
+  recognising the forge's noreply address would be silent without the
+  per-identity cases. What no canary reaches is an identity *deleted* from
+  the baseline file, since that file is the only statement of who we are —
+  that one is caught by reading the diff, which is why the list lives
+  where a reviewer already looks.
+
+A one-time demonstration at implementation time is not enough. A gate
+that stops matching — a glob that no longer resolves, a parser that
+returns nothing — is green forever, which is the defect this page exists
+to remove.
+
+## Composition
+
+**A pin is exempt from no gate, and may not appear in the exception
+list.** Nothing else here makes that true: a pin that is `#[ignore]`d
+satisfies A — its negative control is present and correct — while no
+gate observes its green.
+
+## What may live in a git hook
+
+A hook is the most tempting place to put a check and the worst place to
+get it wrong, because it is the one gate that has an off switch every
+author already knows. So the admission test is narrow:
+
+> **A git hook may only contain checks that are fast, deterministic, and
+> that fail for a reason the author can fix at that moment. Anything else
+> belongs in a scheduled run or an explicit command.**
+
+Three conditions, and a check has to pass all three. Two worked examples
+from 2026-08-07, both of which were in hooks and neither of which should
+have been:
+
+- **The tier-2 staleness block** (`pre-push`) failed all three. It was
+  slow by construction — the remedy it named was a 30-90 minute docker
+  run. It was not deterministic in the sense that matters: its verdict
+  depended on a ledger line written by a process nothing scheduled, so
+  the same tree pushed on two days gave two answers for a reason
+  unrelated to the tree. And the author could not clear it at all, at any
+  moment, because `just extensive` — the remedy it printed — does not
+  write the line it read. It blocked for 46 days and 502 commits. The
+  full telling is under Guarantee B, above.
+- **`post-commit`** failed the first and the third. It detached
+  `scripts/run-tier1.sh` — `just standard` under docker, fifteen minutes
+  warm and forty cold — after every commit. A commit cannot wait forty
+  minutes, and a commit is not a unit anyone wanted tested in the first
+  place: WIP commits, amends and commits mid-refactor each started a
+  run, which is why the runner carried a dirty-flag loop to coalesce
+  them — machinery repairing a granularity that was wrong to begin with.
+  The third condition is the decisive one: when that gate came back red
+  twenty minutes later, there was nothing the author could do about it
+  *at the moment of committing*, which is the only moment a hook has. It
+  was removed on 2026-08-07 and Tier 1 became an explicit `just
+  standard`, once per batch.
+
+The condition that keeps getting skipped is the third one, so state it
+positively: a hook fires at a moment the author is still holding the
+thing being judged. That is the whole value of the position — a red
+`fast` names a file the author has open. A check whose result arrives
+after that moment has passed, or whose remedy is somewhere other than the
+work in hand, is not cheaper in a hook; it is only louder.
+
+### The corollary, which is the part that bites
+
+**A hook that is ever unsatisfiable trains people to bypass the whole
+hook.** There is no partial override. `--no-verify` is one flag for all
+of `pre-push`, so the 502 commits that walked past the tier-2 block also
+walked past the pipeline lint, Tier 0, mvr and the commit-trailer guard —
+checks that were working, that were fast, and that nobody had any
+complaint about. The unsatisfiable check did not merely fail to protect
+anything. It switched off the ones that did, and then went on being
+green-adjacent in the ledger while it did so.
+
+Two consequences worth writing down:
+
+- **The cost of a bad hook is paid by the good ones.** A check's
+  admission to a hook is therefore not a decision about that check
+  alone, and "it can't hurt to also verify X here" is false as stated.
+- **Bypassing becomes the habit, not the exception.** After the first
+  few `--no-verify`s the flag stops being a considered override and
+  becomes how one pushes. Removing the offending check does not undo
+  that by itself; the habit outlives it, which is why the removal is
+  worth recording where people read rather than only in the diff.
+
+The same reasoning is why `.githooks/commit-msg` and the Tier 0 half of
+`.githooks/pre-push` stay: milliseconds and ~3 minutes respectively,
+deterministic given the tree, and each fails naming a file the author can
+open. It is also why neither of them is the *enforcement* — a fresh clone
+has no hooks at all. The forge check is the gate; the hook is the same
+rule delivered early, at the moment it is cheapest to obey.
+
+## What none of the three reaches
+
+- **Whether the check is the *right* check.** A pin can be executed,
+  carry a negative control, cite a live line, and still assert the wrong
+  thing. That is what the reference-first and independent-recomposition
+  rules in [Wire Field Semantics](wire-field-semantics.md) are for.
+- **A negative control is author-chosen at both ends.** It proves the
+  pin bites on one break the author thought of — not on the break that
+  will happen. Mutation supplies an adversary who is not the author,
+  which is the other reason the audit is not optional.
+- **A control written to pass regardless** — verifying against a random
+  key, asserting `is_err()` on something unrelated. It satisfies the
+  registry gate; only the audit can see it.
+- **Whether a test asserts anything at all.** A body of `let _ = f();`
+  can be executed and coupled to its subject.
+- **Prose.** Issue comments, commit messages, reports. One line shape in a
+  commit message is now checked (#205, above); nothing a message *claims*
+  is, and that is the surface that matters.
+- **Scenario corpora.** A Periculum step that asserts nothing is the
+  same defect in another language; its analogue is the delivery bar
+  (Periculum #25).
+- **Firmware.** `leviculum-nrf` is excluded from the workspace
+  (`Cargo.toml:39`) and cross-compiles. All three stop there, and the
+  sx1262 incident lives on the far side.
+
+## Where this stands
+
+Codeberg is the source of truth for what is built. At the time of
+writing: C covers `docs/src/**`, the Rust sources of `leviculum-core`,
+`leviculum-lxmf`, `leviculum-lxmf-node` and `leviculum-std`, and (since
+2026-09-23) the gate scripts under `scripts/` and the `Justfile`, and its
+submodule check runs first in `just fast`; its bump path is unbuilt.
+Both halves of it repair since 2026-09-25: the bare class against the
+tree's own history, the identifier-anchored classes against the line map
+of a named base (section 7), and both only when run exactly once, after
+the last source edit of the pass (section 7a). Since 2026-10-06 both
+classes are anchored by the text of their cited line, and the history
+fixer repairs a named citation too when the anchor proves where it went
+(section 5); Codeberg #307 closed on that.
+
+Two shapes it refused to see until 2026-09-23, both found by reading
+rather than by a red gate. A **backwards line spec** (`a-b` with `a > b`)
+resolved like any other range, because the length check only looks at the
+larger endpoint — while `repaired()` declines to rewrite one, so the
+citation became unrepairable the moment its anchors moved and the drift
+report had nothing to offer. It is now refused where it is written. And a
+citation into the **`Justfile`** was existence-checked only: the corpus
+that could have named a recipe did not include shell scripts, and a
+substring search for a recipe name is not a definition check — the
+mention of `just standard` in a comment sat one line from the wrong cited
+line, inside `WINDOW`, while the recipe was 140 lines away. A Justfile
+citation that names a recipe (the ``just <recipe>`` spelling) now has to
+land on the recipe's header. Prose attributions in Rust doc
+comments are checked for decimal figures and for nothing else. Its
+commit-trailer step runs on every push to either repository, and checks
+one line shape and no claim. B emits manifests from every
+host gate that runs tests, and `just complete` in the `extensive` tier
+runs the whole workspace by construction, so no ordinary test is outside
+the union; the check that reads that union, and the staleness bound that
+ages manifests out, are unbuilt. Its wrapper terminates on its child
+rather than on the pipe, kills the child's process group and reports what
+it killed, and gives up at 1800 s with a named failure. The spawn-site
+rule above is built and audited: every long-lived spawn goes through
+`spawn_supervised`, the eleven bare spawns that remain are pinned per
+file in `scripts/supervised-spawn-counts.txt` with a reason each, and
+both halves run in `just fast`. What it does not reach is a process a
+supervised child starts for itself — a separate link, covered only by the
+wrapper's group kill — and any platform that is not Linux, where the
+helper compiles to the `Drop` path and says so. A is unbuilt.
+
+All three are subject to the rule they enforce. The standing canaries
+above are the demonstration made permanent, because a one-time one
+decays.
+
+## See also
+
+- [Evidence and Honesty](evidence-and-honesty.md) — the rule this page
+  mechanises, and the incidents behind it.
+- [Wire Field Semantics](wire-field-semantics.md) — what a pin must
+  assert, which is a different question from whether it can fail; and
+  the practice of checking the reference before auditing against it,
+  which Guarantee C mechanises.

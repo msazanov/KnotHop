@@ -1,0 +1,6 @@
+# L3 tunnel test image: the same archlinux:base the RNS cells use (so rns-iroh-node runs unchanged) plus the traffic tools.
+# iperf3 (BSD-3-Clause), iputils (BSD/GPL ping), aioquic (BSD-3-Clause): test tools only, never part of the product.
+FROM archlinux:base
+RUN pacman -Sy --noconfirm --needed iperf3 iputils python python-pip iproute2 iptables-nft procps-ng elfutils \
+ && pip install --break-system-packages --no-cache-dir aioquic cryptography \
+ && pacman -Scc --noconfirm >/dev/null 2>&1; true

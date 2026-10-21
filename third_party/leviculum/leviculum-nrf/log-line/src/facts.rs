@@ -1,0 +1,1070 @@
+//! The startup facts a board must be able to state about itself, and the
+//! sink each of them is written to.
+//!
+//! # Why routing is a property and not a call-site detail
+//!
+//! The firmware has two log sinks. `log_fmt` is gated on
+//! `RUNTIME_DRAIN_OPEN` and silently drops everything until a reader has
+//! attached to the debug port; `log_fmt_critical` bypasses that gate. The
+//! difference is invisible at a call site — the two spellings differ by one
+//! word — and it decides whether a line can ever be read on a board that
+//! booted before anyone was listening.
+//!
+//! Which is most boards. Measured at the bench on a reflashed T114, with a
+//! reader already waiting for the port to come back:
+//!
+//! ```text
+//! [INFO!] [STG] lora-init t=191
+//! [INFO!] [STG] main-loop t=1886
+//! [SX_REG] rxgain_before=0x94 rxgain_after=0x96 txmod=0x04 t=1921
+//! [LOG_GATE] opened, dropped 20 runtime lines pre-attach t=2581
+//! ```
+//!
+//! The radio task ran from `t=191` and the gate opened at `t=2581`: twenty
+//! lines emitted in between were dropped, and among them were the only two
+//! lines that say what the radio was set to and under what lawful duty-cycle
+//! cap it was transmitting. Neither is obtainable from a running board any
+//! other way — the applied configuration lives in the radio's registers and
+//! the enforced cap lives in the airtime tracker, and nothing reads either
+//! back out. For a *regulatory* limit that is the wrong property to have:
+//! the question "under what cap is this board transmitting?" has to be
+//! answerable at the bench, not reconstructable from the source.
+//!
+//! So the two are emitted here, through [`LineSink`], with their route
+//! stated as data. They are one-shot startup facts and not a stream: the
+//! cost is two lines per boot. Anything that repeats belongs on the gated
+//! sink, where it cannot lap the ring before a reader arrives.
+//!
+//! A third joins them on the same terms: [`tx_power_programmed`] states what
+//! the PA was actually programmed with, down to the `SetPaConfig` bytes. For
+//! as long as the driver hardcoded `SetTxParams` a board configured for 2 dBm
+//! said `txp=2` and radiated about 14, and nothing readable off a running
+//! board named the programmed power, so the sweep that would have caught it
+//! had nothing to verify a point against. Unconditional, like the cap line:
+//! "what is this board radiating" is not a question a silence can answer.
+//!
+//! The settings line carries the same answer in its own terms — `txp` is the
+//! programmed power and `txp_requested` the configured one — so the two lines
+//! cannot disagree about what the board is doing, and the shorter one is
+//! enough for the operator who only wants the number.
+//!
+//! The functions take a sink rather than calling the firmware's logger, so
+//! the routing is assertable on the host: `leviculum-nrf` cross-compiles to
+//! thumbv7em and runs no host tests, and reading the source to check which
+//! function a call site names proves nothing about what the board emits.
+
+use core::fmt::Arguments;
+
+/// Which of the firmware's two log sinks a line is written to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Bypasses the runtime drain gate: reaches the host even when the line
+    /// was emitted before anything attached to the debug port.
+    Critical,
+    /// Dropped while the runtime drain gate is closed.
+    Gated,
+}
+
+/// The firmware's debug log, as the facts below see it.
+///
+/// The firmware's implementation maps [`Route::Critical`] onto
+/// `log_fmt_critical` and [`Route::Gated`] onto `log_fmt`; a test's
+/// implementation records the route it was handed.
+pub trait LineSink {
+    /// Emit one line: the prefix, the body, and the route it goes out on.
+    fn line(&mut self, route: Route, prefix: &str, args: Arguments);
+}
+
+/// The radio settings the modem was actually programmed with.
+///
+/// Human-readable throughout — `bw_hz` and `cr_denom` rather than the
+/// SX1262 register codes — because the reader of this line is an operator
+/// answering "what is this board doing", not the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveRadioConfig {
+    pub freq_hz: u32,
+    pub sf: u8,
+    pub bw_hz: u32,
+    pub cr_denom: u8,
+    /// The transmit power the PA was **programmed** with: the byte
+    /// `SetTxParams` was given, not the one the configuration asked for.
+    pub txp_dbm: i8,
+    /// What the configuration asked for, which is the same number unless the
+    /// request was outside what the part can deliver.
+    pub txp_requested_dbm: i8,
+    pub csma: bool,
+    /// The host's transmit mute (`radio_silent`): the receiver keeps
+    /// running, every outgoing frame is dropped at the driver boundary.
+    /// Part of what the radio is set to, and the one part of it that can
+    /// make the board look like broken hardware.
+    pub silent: bool,
+    /// The mute's lease in seconds (Codeberg #410): how long this silence
+    /// may last before the board takes its own voice back. Zero when the
+    /// board is not mute.
+    pub lease_s: u16,
+    /// Seconds still to run on that lease at the moment the line is
+    /// written. Zero when the board is not mute.
+    pub lease_left_s: u16,
+}
+
+impl ActiveRadioConfig {
+    /// Whether the transmit power the operator asked for is the one the board
+    /// is running.
+    fn txp_honoured(&self) -> bool {
+        self.txp_dbm == self.txp_requested_dbm
+    }
+}
+
+/// `[LORA] active config: …` — what the radio is set to, emitted after
+/// every successful `configure_lora`.
+///
+/// Critical: it is emitted once at boot and once per runtime
+/// reconfiguration, and a board reconfigured in the field has to be able to
+/// say what it was reconfigured to.
+///
+/// `txp` is the **programmed** power, `txp_requested` the configured one, and
+/// `txp_honoured` states the comparison in a word that greps. The line used to
+/// carry the request alone, under the name the programmed value now has, and
+/// that is what let Codeberg #349 survive a whole corpus: 91 hardware
+/// scenarios ask for 2 dBm, the driver could reach nothing below 14, and the
+/// one line an operator reads said `txp=2`. A line that reports a
+/// substitution as the request is worse than no line at all — it answers the
+/// question wrongly rather than declining to answer it.
+///
+/// All three keys are unconditional, for the same reason the
+/// [`tx_power_programmed`] line is: a key that appears only in the
+/// interesting case cannot be grepped for across a corpus, because the reader
+/// would have to know in advance which runs to look at, which is precisely
+/// what they are trying to find out.
+///
+/// `silent` is on the line for the same reason and by the same argument
+/// (Codeberg #410): it is the difference between a board that transmits and
+/// one that does not, it is set by a host frame and not by anything the
+/// operator did at the bench, and a reader who has to infer it from the
+/// absence of `[LORA] TX` lines is reading a silence where a fact belongs.
+///
+/// `lease_s` and `lease_left_s` came with the deadline on that mute, and
+/// they are unconditional like the rest: the question a reader of a silent
+/// board has is not "is it silent" — the next key answers that — but "for
+/// how much longer", and a board that answers it only while it happens to
+/// be muted cannot be swept for across a corpus. On a board that is not
+/// mute both read `0`, which is the true answer: no silence, no deadline.
+pub fn active_radio_config<S: LineSink>(sink: &mut S, c: &ActiveRadioConfig) {
+    sink.line(
+        Route::Critical,
+        "[LORA] ",
+        format_args!(
+            "active config: freq={} sf={} bw={} cr={} txp={} txp_requested={} \
+             txp_honoured={} csma={} silent={} lease_s={} lease_left_s={}",
+            c.freq_hz,
+            c.sf,
+            c.bw_hz,
+            c.cr_denom,
+            c.txp_dbm,
+            c.txp_requested_dbm,
+            if c.txp_honoured() { "yes" } else { "no" },
+            c.csma,
+            c.silent,
+            c.lease_s,
+            c.lease_left_s
+        ),
+    );
+}
+
+/// One run of outgoing frames the host's transmit mute swallowed.
+///
+/// Counted rather than logged per packet for [`crate`]'s usual reason and
+/// `leviculum_media_state::DropRun`'s: every line also goes into the 2 KiB
+/// post-crash tail, and a muted board drops one frame per announce, so a
+/// line per packet would empty the tail of the boot and fault diagnostics
+/// it exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuteRun {
+    pub packets: u32,
+    pub bytes: u32,
+}
+
+/// `[LORA] LORA_TX_MUTED …` — the host's mute threw this run of frames
+/// away instead of transmitting them.
+///
+/// Codeberg #410: `radio_silent` is the one state of the transmit path
+/// that left no trace at all. The frame never reaches the acquisition
+/// jitter, the CAD, the CSMA decision or the airtime lock, each of which
+/// has its own line, so a muted board produced a capture in which packets
+/// entered the outgoing queue, were dequeued, and vanished. Seven hours of
+/// three mute LNodes were diagnosed from the *absence* of lines; this is
+/// the line whose presence answers it instead.
+///
+/// Emitted on the first frame of a run and at each decade after it, so the
+/// count is never more than a factor of ten below the truth while the
+/// number of lines stays logarithmic; the exact total is on
+/// [`lora_tx_unmuted`].
+///
+/// Gated, like `MEDIA_TX_DROP` which it is the sibling of: it describes
+/// running traffic, not the board's bring-up.
+pub fn lora_tx_muted<S: LineSink>(sink: &mut S, run: &MuteRun) {
+    sink.line(
+        Route::Gated,
+        "[LORA] ",
+        format_args!(
+            "LORA_TX_MUTED packets={} bytes={} reason=host-silent",
+            run.packets, run.bytes
+        ),
+    );
+}
+
+/// `[LORA] LORA_TX_UNMUTED …` — the mute is over and a frame was handed to
+/// the radio again. The only line carrying the run's untruncated totals.
+pub fn lora_tx_unmuted<S: LineSink>(sink: &mut S, run: &MuteRun) {
+    sink.line(
+        Route::Gated,
+        "[LORA] ",
+        format_args!(
+            "LORA_TX_UNMUTED packets={} bytes={}",
+            run.packets, run.bytes
+        ),
+    );
+}
+
+/// One host mute that ran out of time instead of being lifted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuteExpiry {
+    /// The lease that just ran out, in seconds — the host's value, or the
+    /// firmware default a host that sent none was given.
+    pub lease_s: u16,
+    /// Outgoing frames the silence swallowed over its whole life, exact.
+    pub dropped: u32,
+}
+
+/// `[LORA] LORA_MUTE_EXPIRED …` — the board took its own voice back
+/// because the host's silence reached its deadline.
+///
+/// Codeberg #410. `radio_silent` used to be a mute with no end: cleared by
+/// a reset, or by a later config saying otherwise, and by nothing else. A
+/// harness that promised to hand the bench back kept that promise only for
+/// as long as its own process lived, and on 2026-09-15 three LNodes stood
+/// mute for seven hours after a corpus that ended on an RNode-only cell.
+///
+/// This is the line that says the deadline did the handing back instead,
+/// and it is the one an operator greps for when a board starts talking
+/// again with nobody having touched it. Emitted exactly once per lease —
+/// `leviculum_mute_lease::MuteLease::expired_at` is edge-triggered for that
+/// reason — and the frames it names are the run's exact total, not the
+/// decade-truncated count [`lora_tx_muted`] carries.
+///
+/// Gated, like the two lines it closes out: it describes running traffic.
+/// The proof that the board can transmit again is not this line but the
+/// ordinary acquisition and TX lines that follow it.
+pub fn lora_mute_expired<S: LineSink>(sink: &mut S, expiry: &MuteExpiry) {
+    sink.line(
+        Route::Gated,
+        "[LORA] ",
+        format_args!(
+            "LORA_MUTE_EXPIRED lease_s={} dropped={}",
+            expiry.lease_s, expiry.dropped
+        ),
+    );
+}
+
+/// One outbound frame the regulatory airtime lock held until it was no longer
+/// worth its airtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleDrop {
+    /// How long the frame waited between being handed to the interface and
+    /// being thrown away, in milliseconds. The diagnostic value of the line:
+    /// a distribution of ages says whether the board is barely over the cap
+    /// or minutes behind it, which pass/fail counting cannot.
+    pub age_ms: u32,
+    /// The frame's payload length, so the airtime the drop reclaimed can be
+    /// worked out from the line alone.
+    pub bytes: u32,
+    /// Stale drops since boot, including this one. Carried on every printed
+    /// line so a rate-limited capture can still place the line in the run.
+    pub total: u32,
+}
+
+/// `[LORA] LORA_QUEUE_DROP reason=stale …` — a frame the airtime lock aged out
+/// instead of keying (Codeberg #433).
+///
+/// A duty-cycle lock does not thin traffic, it ages it: FIFO under a hold
+/// means the queue drains at the cap's rate with its order intact, so under
+/// sustained load the frames reaching the air are minutes old. Measured on the
+/// Pocket V2 on 2026-09-27 (#255): three relayed link requests keyed 145.6 s,
+/// 137.7 s and 144.0 s after they were handed over, against a relay link-table
+/// entry that lives 30 s. The interface now drops what it has held longer than
+/// `leviculum_queue_budget::HOLD_MAX_AGE_MS`, and this is the line that says it
+/// did.
+///
+/// Type-blind by construction: the body carries an age and a length and names
+/// no packet kind, because the interface reads neither.
+///
+/// Rate-limited through `leviculum_drop_budget`, like the core's `[DROP]`
+/// lines and for the same reason — a board that has fallen a backlog behind
+/// its cap purges that backlog in one sweep, and an unbounded line per frame
+/// would evict the `[STACK]`, `[TRANSPORT]` and panic lines the capture was
+/// taken for. What the limiter holds back is stated by
+/// [`lora_queue_drop_suppressed`], and the running total is on every line
+/// here anyway.
+///
+/// Gated, like the mute lines it sits beside: it describes running traffic,
+/// not the board's bring-up.
+pub fn lora_queue_drop_stale<S: LineSink>(sink: &mut S, drop: &StaleDrop) {
+    sink.line(
+        Route::Gated,
+        "[LORA] ",
+        format_args!(
+            "LORA_QUEUE_DROP reason=stale age_ms={} bytes={} total={}",
+            drop.age_ms, drop.bytes, drop.total
+        ),
+    );
+}
+
+/// `[LORA] LORA_QUEUE_DROP suppressed=… window_ms=…` — what one rate-limit
+/// window of [`lora_queue_drop_stale`] held back.
+///
+/// Emitted only for a window that refused something. Without it a purge and a
+/// trickle read identically on a capture, since both show
+/// `leviculum_drop_budget::LINES_PER_WINDOW` lines per second.
+pub fn lora_queue_drop_suppressed<S: LineSink>(sink: &mut S, suppressed: u32, window_ms: u32) {
+    sink.line(
+        Route::Gated,
+        "[LORA] ",
+        format_args!("LORA_QUEUE_DROP suppressed={suppressed} window_ms={window_ms}"),
+    );
+}
+
+/// Who chose a limit the airtime tracker is enforcing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitSource {
+    /// The host sent this value explicitly, and it wins verbatim — including
+    /// an explicit `0`, which means *unlimited* and not *unset*.
+    Host,
+    /// The firmware derived it from its own TX frequency because no explicit
+    /// value reached it.
+    Derived,
+    /// Taken verbatim from the active configuration, with no way to tell an
+    /// explicit host value from the compiled default.
+    ///
+    /// Only the short-term limit is ever this. The firmware derives no
+    /// short-term cap, and the radio-config wire format carries no presence
+    /// bit for `st_alock` the way it does for `lt_alock`, so a short frame
+    /// that omitted the field and a host that sent `0` arrive identical. The
+    /// *value* below is still the one loaded into the tracker; only its
+    /// authorship is unknown, and the line says so rather than guessing.
+    Config,
+}
+
+impl core::fmt::Display for LimitSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            LimitSource::Host => "host",
+            LimitSource::Derived => "derived",
+            LimitSource::Config => "config",
+        })
+    }
+}
+
+/// An `alock` u16 rendered the way a human reads a duty cycle.
+///
+/// The RNode `CMD_ST_ALOCK` / `CMD_LT_ALOCK` encoding is percent × 100, so
+/// `1000` is 10 % and `0` is *no limit at all*. Those two facts are why this
+/// exists: `lt=0` looks like the smallest possible cap and is the largest,
+/// and a reader who mistakes "unlimited" for "0.1 %" has made the one error
+/// on this line that has a legal consequence. Rendered with the raw number
+/// beside it, never instead of it, so the line stays machine-readable.
+struct Cap(u16);
+
+impl core::fmt::Display for Cap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == 0 {
+            f.write_str("unlimited")
+        } else {
+            // Integer division: no float formatter in the firmware's log path.
+            write!(f, "{}.{:02}%", self.0 / 100, self.0 % 100)
+        }
+    }
+}
+
+/// The airtime limits the tracker is actually enforcing, and where each came
+/// from.
+///
+/// Both limits are the RNode u16 encoding (percent × 100); `0` is unlimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AirtimeLimits {
+    /// Effective long-term limit loaded into the tracker — the host's value
+    /// or the frequency-derived lawful one, whichever won.
+    pub lt_alock: u16,
+    pub lt_source: LimitSource,
+    /// Short-term limit loaded into the tracker.
+    pub st_alock: u16,
+    pub st_source: LimitSource,
+    /// The TX frequency the lawful default is derived from.
+    pub freq_hz: u32,
+    /// The lawful long-term cap this frequency derives, stated whether or not
+    /// it is the one being enforced: with it on the line, an operator can see
+    /// that a host value is under, at, or above the lawful one without
+    /// looking a sub-band up in a table.
+    pub lawful_lt_alock: u16,
+}
+
+/// `[LORA_AIRTIME_LOCK] limits …` — the caps the board is transmitting under
+/// and who chose them, emitted at radio bring-up and on every reconfiguration.
+///
+/// Critical for the same reason as the settings above, and more sharply: this
+/// is the number a compliance question is about.
+///
+/// Unconditional, which is the whole point. It used to be emitted only when
+/// the firmware derived the cap itself, so an explicit host value produced no
+/// line at all and the cap in force had to be inferred from a silence — and
+/// an explicit `0` (unlimited: a legitimate bench setting, an unacceptable
+/// field one) was indistinguishable from a small derived cap from the outside.
+pub fn airtime_limits<S: LineSink>(sink: &mut S, l: &AirtimeLimits) {
+    sink.line(
+        Route::Critical,
+        "[LORA_AIRTIME_LOCK] ",
+        format_args!(
+            "limits lt={} lt_cap={} lt_src={} st={} st_cap={} st_src={} freq={} lawful={}",
+            l.lt_alock,
+            Cap(l.lt_alock),
+            l.lt_source,
+            l.st_alock,
+            Cap(l.st_alock),
+            l.st_source,
+            l.freq_hz,
+            l.lawful_lt_alock,
+        ),
+    );
+}
+
+/// Everything the transmit-power line states, as it was written to the chip.
+///
+/// Built from `sx126x::TxPowerProgram`, which the driver gets back from the
+/// call that did the writing — so every field here is a byte that went out on
+/// the SPI bus, not one the caller intended to send.
+pub struct TxPowerProgrammed {
+    /// The configured request, before any clamp.
+    pub requested_dbm: i8,
+    /// The first `SetTxParams` argument: what the chip was told to radiate.
+    pub programmed_dbm: i8,
+    /// The `SetPaConfig` argument block: PADutyCycle, HPMax, DeviceSel, PALut.
+    pub pa_config: [u8; 4],
+    /// The `SetTxParams` ramp byte.
+    pub ramp: u8,
+    /// The `REG_OCP` byte.
+    pub ocp: u8,
+    /// Whether the request had to be brought into the part's range.
+    pub clamped: bool,
+}
+
+/// `[SX_TX_POWER] requested_dbm=… tx_params_dbm=… pa=… ocp=… clamped=…` — the
+/// transmit power the radio is actually running, readable off a running board
+/// without inference.
+///
+/// The line this replaces (`[SX_PA_PROFILE]`) reported a *substitution*, and
+/// only when there was one. That was the right shape while the driver could
+/// only reach four powers; it is the wrong shape now that it reaches all 32,
+/// because the question at the rig is not "was I given something odd" but
+/// "what is this board radiating right now" — and a fact that is emitted only
+/// in the interesting case cannot answer that. So this one is unconditional,
+/// the same decision and for the same reason as `[LORA_AIRTIME_LOCK]` beside
+/// it: a cap in force had to be inferred from a silence, once.
+///
+/// Four things, none of them derivable from the others:
+///
+/// * `requested_dbm` — what the configuration asked for;
+/// * `tx_params_dbm` — the byte `SetTxParams` was given, i.e. the output;
+/// * `pa` — the four `SetPaConfig` bytes, so a board that somehow programmed
+///   a different PA row says so rather than being taken on trust;
+/// * `clamped` — whether the request was outside the part's range. Clamped and
+///   announced, never refused.
+///
+/// `ramp` and `ocp` ride along because they are the other two bytes of the
+/// same three-op sequence and cost nothing to state; `ocp` in particular is
+/// the one value that could make a board deliver less than `tx_params_dbm`
+/// says.
+///
+/// Critical, for the same reason as the two facts above: a board that boots
+/// before a reader attaches drops everything gated, and this is the fact a
+/// sweep has to confirm each point against before it measures it.
+pub fn tx_power_programmed<S: LineSink>(sink: &mut S, p: &TxPowerProgrammed) {
+    sink.line(
+        Route::Critical,
+        "[SX_TX_POWER] ",
+        format_args!(
+            "requested_dbm={} tx_params_dbm={} pa=0x{:02X},0x{:02X},0x{:02X},0x{:02X} \
+             ramp=0x{:02X} ocp=0x{:02X} clamped={}",
+            p.requested_dbm,
+            p.programmed_dbm,
+            p.pa_config[0],
+            p.pa_config[1],
+            p.pa_config[2],
+            p.pa_config[3],
+            p.ramp,
+            p.ocp,
+            if p.clamped { "yes" } else { "no" },
+        ),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::string::String;
+    use std::vec::Vec;
+
+    /// Records what the firmware's logger would have been handed. The line
+    /// is rendered through the real [`crate::format_line`], so the text
+    /// asserted below is the text that reaches the ring buffer.
+    #[derive(Default)]
+    struct Recorder {
+        lines: Vec<(Route, String)>,
+    }
+
+    impl LineSink for Recorder {
+        fn line(&mut self, route: Route, prefix: &str, args: Arguments) {
+            let mut buf = [0u8; 1024];
+            let bytes = crate::format_line(&mut buf, prefix, args, 191);
+            self.lines
+                .push((route, String::from_utf8_lossy(bytes).into_owned()));
+        }
+    }
+
+    fn eu_medium() -> ActiveRadioConfig {
+        ActiveRadioConfig {
+            freq_hz: 869_463_000,
+            sf: 8,
+            bw_hz: 125_000,
+            cr_denom: 5,
+            txp_dbm: 22,
+            txp_requested_dbm: 22,
+            csma: true,
+            silent: false,
+            lease_s: 0,
+            lease_left_s: 0,
+        }
+    }
+
+    #[test]
+    fn the_applied_configuration_goes_out_on_the_critical_sink() {
+        let mut sink = Recorder::default();
+        active_radio_config(&mut sink, &eu_medium());
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Critical,
+                String::from(
+                    "[LORA] active config: freq=869463000 sf=8 bw=125000 cr=5 txp=22 \
+                     txp_requested=22 txp_honoured=yes csma=true silent=false lease_s=0 lease_left_s=0 t=191\r\n"
+                )
+            )]
+        );
+    }
+
+    /// Codeberg #349: the line names the power the PA was programmed with,
+    /// and says in a word whether that is the power that was asked for.
+    #[test]
+    fn a_substituted_transmit_power_is_stated_on_the_configuration_line() {
+        let mut sink = Recorder::default();
+        active_radio_config(
+            &mut sink,
+            &ActiveRadioConfig {
+                txp_dbm: 14,
+                txp_requested_dbm: 2,
+                ..eu_medium()
+            },
+        );
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Critical,
+                String::from(
+                    "[LORA] active config: freq=869463000 sf=8 bw=125000 cr=5 txp=14 \
+                     txp_requested=2 txp_honoured=no csma=true silent=false lease_s=0 lease_left_s=0 t=191\r\n"
+                )
+            )]
+        );
+    }
+
+    /// The ordinary case still states all three, so a corpus can be grepped
+    /// for `txp_honoured=no` without knowing which runs to look at first.
+    #[test]
+    fn an_honoured_transmit_power_states_the_comparison_too() {
+        let mut sink = Recorder::default();
+        active_radio_config(&mut sink, &eu_medium());
+        assert!(
+            sink.lines[0]
+                .1
+                .contains("txp=22 txp_requested=22 txp_honoured=yes"),
+            "{}",
+            sink.lines[0].1
+        );
+    }
+
+    /// 869.463 MHz falls in ERC 70-03 h1.7, 10 % duty cycle; the
+    /// `CMD_LT_ALOCK` encoding of 10 % is 1000.
+    fn derived_eu_limits() -> AirtimeLimits {
+        AirtimeLimits {
+            lt_alock: 1000,
+            lt_source: LimitSource::Derived,
+            st_alock: 0,
+            st_source: LimitSource::Config,
+            freq_hz: 869_463_000,
+            lawful_lt_alock: 1000,
+        }
+    }
+
+    #[test]
+    fn a_derived_cap_names_the_frequency_it_came_from() {
+        let mut sink = Recorder::default();
+        airtime_limits(&mut sink, &derived_eu_limits());
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Critical,
+                String::from(
+                    "[LORA_AIRTIME_LOCK] limits lt=1000 lt_cap=10.00% lt_src=derived st=0 \
+                     st_cap=unlimited st_src=config freq=869463000 lawful=1000 t=191\r\n"
+                )
+            )]
+        );
+    }
+
+    /// The case that used to produce no line at all: the host sent an explicit
+    /// `lt_alock`, so the firmware derived nothing. Both limits are the host's,
+    /// and the lawful value for the frequency is stated beside them so the two
+    /// can be compared without a sub-band table — here 5 % against a lawful
+    /// 10 %, i.e. an operator who chose to stay under it.
+    #[test]
+    fn an_explicit_host_cap_is_stated_next_to_the_lawful_one() {
+        let mut sink = Recorder::default();
+        airtime_limits(
+            &mut sink,
+            &AirtimeLimits {
+                lt_alock: 500,
+                lt_source: LimitSource::Host,
+                st_alock: 1500,
+                st_source: LimitSource::Host,
+                freq_hz: 869_463_000,
+                lawful_lt_alock: 1000,
+            },
+        );
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Critical,
+                String::from(
+                    "[LORA_AIRTIME_LOCK] limits lt=500 lt_cap=5.00% lt_src=host st=1500 \
+                     st_cap=15.00% st_src=host freq=869463000 lawful=1000 t=191\r\n"
+                )
+            )]
+        );
+    }
+
+    /// The control. An explicit `0` is the dangerous value on this line: it
+    /// disables the cap, and it is the one number that looks like the
+    /// *smallest* cap while being the absence of one. A reader who cannot
+    /// tell it from a derived 0.1 % has a compliance error, not a cosmetic
+    /// one, so the two renderings are asserted against each other.
+    #[test]
+    fn an_explicit_zero_reads_as_unlimited_and_not_as_a_small_cap() {
+        let mut unlimited = Recorder::default();
+        airtime_limits(
+            &mut unlimited,
+            &AirtimeLimits {
+                lt_alock: 0,
+                lt_source: LimitSource::Host,
+                st_alock: 0,
+                st_source: LimitSource::Host,
+                freq_hz: 869_463_000,
+                lawful_lt_alock: 1000,
+            },
+        );
+
+        // 864 MHz derives ERC 70-03 h1.3's 0.1 % cap: the smallest one the
+        // table holds, and the one an unlimited board could be mistaken for.
+        let mut smallest = Recorder::default();
+        airtime_limits(
+            &mut smallest,
+            &AirtimeLimits {
+                lt_alock: 10,
+                lt_source: LimitSource::Derived,
+                st_alock: 0,
+                st_source: LimitSource::Config,
+                freq_hz: 864_000_000,
+                lawful_lt_alock: 10,
+            },
+        );
+
+        assert!(
+            unlimited.lines[0].1.contains("lt=0 lt_cap=unlimited"),
+            "got {:?}",
+            unlimited.lines[0].1
+        );
+        assert!(
+            smallest.lines[0].1.contains("lt=10 lt_cap=0.10%"),
+            "got {:?}",
+            smallest.lines[0].1
+        );
+        assert_ne!(unlimited.lines[0].1, smallest.lines[0].1);
+        // And the reason the two differ is stated, not left to the number:
+        // one is a choice, the other is a band.
+        assert!(unlimited.lines[0].1.contains("lt_src=host"));
+        assert!(smallest.lines[0].1.contains("lt_src=derived"));
+        // An operator who disabled a cap that exists can see that it exists.
+        assert!(unlimited.lines[0].1.contains("lawful=1000"));
+    }
+
+    /// A frequency the table does not cover derives nothing, and `lawful=0`
+    /// has to say so: "this band has no cap in our table" is a different
+    /// statement from "the operator switched the cap off", and only the
+    /// `lt_src` field separates them.
+    #[test]
+    fn an_out_of_band_frequency_states_that_it_derived_nothing() {
+        let mut sink = Recorder::default();
+        airtime_limits(
+            &mut sink,
+            &AirtimeLimits {
+                lt_alock: 0,
+                lt_source: LimitSource::Derived,
+                st_alock: 0,
+                st_source: LimitSource::Config,
+                freq_hz: 915_000_000,
+                lawful_lt_alock: 0,
+            },
+        );
+        assert_eq!(sink.lines[0].0, Route::Critical);
+        assert!(
+            sink.lines[0].1.contains(
+                "limits lt=0 lt_cap=unlimited lt_src=derived st=0 st_cap=unlimited \
+                 st_src=config freq=915000000 lawful=0"
+            ),
+            "got {:?}",
+            sink.lines[0].1
+        );
+    }
+
+    /// `grep AIRTIME` on a fresh boot answers the question with no inference
+    /// from silence: one line, whatever the origins are.
+    #[test]
+    fn every_origin_combination_emits_exactly_one_greppable_line() {
+        for (lt_source, st_source) in [
+            (LimitSource::Host, LimitSource::Host),
+            (LimitSource::Derived, LimitSource::Config),
+            (LimitSource::Host, LimitSource::Config),
+        ] {
+            let mut sink = Recorder::default();
+            airtime_limits(
+                &mut sink,
+                &AirtimeLimits {
+                    lt_source,
+                    st_source,
+                    ..derived_eu_limits()
+                },
+            );
+            assert_eq!(sink.lines.len(), 1, "{lt_source:?}/{st_source:?}");
+            assert!(sink.lines[0].1.contains("AIRTIME"));
+        }
+    }
+
+    /// The PA bytes below are `sx126x::PA_CONFIG_HIGH_POWER`, spelled out
+    /// because this crate does not depend on core.
+    fn programmed(requested_dbm: i8, programmed_dbm: i8, clamped: bool) -> TxPowerProgrammed {
+        TxPowerProgrammed {
+            requested_dbm,
+            programmed_dbm,
+            pa_config: [0x04, 0x07, 0x00, 0x01],
+            ramp: 0x04,
+            ocp: 0x38,
+            clamped,
+        }
+    }
+
+    /// The case the line exists for: 23 hardware scenarios configure 2 dBm,
+    /// and the only line that mentioned it said `txp=2` — the request. Now the
+    /// programmed byte is beside it, so the two can be read against each other
+    /// instead of one standing in for the other.
+    #[test]
+    fn the_line_states_the_request_the_programmed_byte_and_the_pa_config() {
+        let mut sink = Recorder::default();
+        tx_power_programmed(&mut sink, &programmed(2, 2, false));
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Critical,
+                String::from(
+                    "[SX_TX_POWER] requested_dbm=2 tx_params_dbm=2 pa=0x04,0x07,0x00,0x01 \
+                     ramp=0x04 ocp=0x38 clamped=no t=191\r\n"
+                )
+            )]
+        );
+    }
+
+    /// A clamp is named as one. The request stays on the line beside the
+    /// programmed value: "clamped" without both numbers would say that
+    /// something was changed without saying from what.
+    #[test]
+    fn a_clamped_request_keeps_both_numbers_and_says_it_was_clamped() {
+        let mut sink = Recorder::default();
+        tx_power_programmed(&mut sink, &programmed(37, 22, true));
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Critical,
+                String::from(
+                    "[SX_TX_POWER] requested_dbm=37 tx_params_dbm=22 pa=0x04,0x07,0x00,0x01 \
+                     ramp=0x04 ocp=0x38 clamped=yes t=191\r\n"
+                )
+            )]
+        );
+    }
+
+    /// **The control that the old line could not have.** A negative power is a
+    /// real configuration — `lnflash --radio-txpower` accepts -9 — and it has
+    /// to survive the formatting as a negative number rather than as a wrapped
+    /// byte. `247` on this line would be the u8 reinterpretation of -9.
+    #[test]
+    fn a_negative_power_is_printed_as_a_negative_number() {
+        let mut sink = Recorder::default();
+        tx_power_programmed(&mut sink, &programmed(-9, -9, false));
+        assert!(
+            sink.lines[0]
+                .1
+                .contains("requested_dbm=-9 tx_params_dbm=-9"),
+            "{}",
+            sink.lines[0].1
+        );
+        assert!(!sink.lines[0].1.contains("247"), "{}", sink.lines[0].1);
+    }
+
+    /// The line is unconditional: every power produces exactly one, including
+    /// the ones that need no clamp. The old line's silence in the ordinary
+    /// case is precisely what made "what is this board radiating" unanswerable
+    /// at the bench.
+    #[test]
+    fn every_power_produces_a_line() {
+        for dbm in -9i8..=22 {
+            let mut sink = Recorder::default();
+            tx_power_programmed(&mut sink, &programmed(dbm, dbm, false));
+            assert_eq!(sink.lines.len(), 1, "{dbm} dBm: {:?}", sink.lines);
+            assert_eq!(sink.lines[0].0, Route::Critical, "{dbm} dBm");
+        }
+    }
+
+    /// The reason these two are on the critical sink at all: a board that
+    /// boots before a reader attaches drops everything gated, and the two
+    /// facts an operator needs must survive that.
+    #[test]
+    fn a_pre_attach_boot_keeps_both_facts_and_drops_the_gated_ones() {
+        struct PreAttach {
+            kept: Vec<String>,
+            dropped: usize,
+        }
+        impl LineSink for PreAttach {
+            fn line(&mut self, route: Route, prefix: &str, args: Arguments) {
+                if route == Route::Gated {
+                    self.dropped += 1;
+                    return;
+                }
+                let mut buf = [0u8; 1024];
+                let bytes = crate::format_line(&mut buf, prefix, args, 191);
+                self.kept.push(String::from_utf8_lossy(bytes).into_owned());
+            }
+        }
+
+        let mut sink = PreAttach {
+            kept: Vec::new(),
+            dropped: 0,
+        };
+        // A routine runtime line, for contrast: it is gated and is lost.
+        sink.line(Route::Gated, "[LORA] ", format_args!("RX 41 bytes"));
+        active_radio_config(&mut sink, &eu_medium());
+        airtime_limits(&mut sink, &derived_eu_limits());
+
+        assert_eq!(sink.dropped, 1);
+        assert_eq!(sink.kept.len(), 2, "kept: {:?}", sink.kept);
+        assert!(sink.kept[0].starts_with("[LORA] active config: "));
+        assert!(sink.kept[1].starts_with("[LORA_AIRTIME_LOCK] limits "));
+    }
+    /// Codeberg #410: `radio_silent` stops every transmission at the driver
+    /// boundary while the receiver keeps running, and the one line an
+    /// operator reads to answer "what is this board set to" did not mention
+    /// it. On 2026-09-15 a corpus left all three rig LNodes muted for seven
+    /// hours; the preserved capture
+    /// (`schneckenschreck:/home/lew/rig-run/ble-drop/feld-t114.log`,
+    /// 02:44Z-09:40Z) contains 20 dequeues from the outgoing LoRa queue, no
+    /// transmission at all, and not one line mentioning a mute.
+    #[test]
+    fn a_muted_radio_says_so_on_the_configuration_line() {
+        let mut sink = Recorder::default();
+        active_radio_config(
+            &mut sink,
+            &ActiveRadioConfig {
+                silent: true,
+                lease_s: 900,
+                lease_left_s: 412,
+                ..eu_medium()
+            },
+        );
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Critical,
+                String::from(
+                    "[LORA] active config: freq=869463000 sf=8 bw=125000 cr=5 txp=22 \
+                     txp_requested=22 txp_honoured=yes csma=true silent=true lease_s=900 \
+                     lease_left_s=412 t=191\r\n"
+                )
+            )]
+        );
+    }
+
+    /// The deadline is on the line whether or not the board is mute, so
+    /// "how much longer" is a key that can be swept for rather than one
+    /// that appears only where somebody already knew to look. A board that
+    /// is transmitting says `lease_s=0 lease_left_s=0`, which is the true
+    /// answer and not a placeholder.
+    #[test]
+    fn an_unmuted_radio_still_carries_the_lease_keys() {
+        let mut sink = Recorder::default();
+        active_radio_config(&mut sink, &eu_medium());
+        assert!(
+            sink.lines[0]
+                .1
+                .contains("silent=false lease_s=0 lease_left_s=0"),
+            "{}",
+            sink.lines[0].1
+        );
+    }
+
+    /// The first packet a mute swallows says so, so a capture attached to a
+    /// board that has just been muted states it on that packet rather than
+    /// on the tenth.
+    #[test]
+    fn the_first_packet_a_mute_swallows_is_reported() {
+        let mut sink = Recorder::default();
+        lora_tx_muted(
+            &mut sink,
+            &MuteRun {
+                packets: 1,
+                bytes: 67,
+            },
+        );
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Gated,
+                String::from(
+                    "[LORA] LORA_TX_MUTED packets=1 bytes=67 reason=host-silent t=191\r\n"
+                )
+            )]
+        );
+    }
+
+    /// And the end of the run carries its untruncated totals, the one place
+    /// the exact count of what the mute cost is stated.
+    #[test]
+    fn the_end_of_a_mute_run_states_what_it_swallowed() {
+        let mut sink = Recorder::default();
+        lora_tx_unmuted(
+            &mut sink,
+            &MuteRun {
+                packets: 37,
+                bytes: 2479,
+            },
+        );
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Gated,
+                String::from("[LORA] LORA_TX_UNMUTED packets=37 bytes=2479 t=191\r\n")
+            )]
+        );
+    }
+
+    /// Codeberg #433: the frame the duty lock aged out. The body carries the
+    /// age, the length and the running total and names no packet kind — the
+    /// interface reads none, and a line that did would be the type-awareness
+    /// the isolation rule forbids.
+    #[test]
+    fn a_stale_frame_drop_states_its_age_its_size_and_the_running_total() {
+        let mut sink = Recorder::default();
+        lora_queue_drop_stale(
+            &mut sink,
+            &StaleDrop {
+                age_ms: 145_600,
+                bytes: 102,
+                total: 12,
+            },
+        );
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Gated,
+                String::from(
+                    "[LORA] LORA_QUEUE_DROP reason=stale age_ms=145600 bytes=102 total=12 t=191\r\n"
+                )
+            )]
+        );
+    }
+
+    /// And the window that held lines back says so, so a purge and a trickle
+    /// do not read the same.
+    #[test]
+    fn a_clipped_stale_drop_window_names_what_it_refused() {
+        let mut sink = Recorder::default();
+        lora_queue_drop_suppressed(&mut sink, 9, 1_000);
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Gated,
+                String::from("[LORA] LORA_QUEUE_DROP suppressed=9 window_ms=1000 t=191\r\n")
+            )]
+        );
+    }
+
+    /// Codeberg #410: the board took its own voice back. This is the line
+    /// an operator greps for when a board starts transmitting again with
+    /// nobody having touched it, and it carries the lease that ran out so
+    /// the reader can tell a host-set deadline from the firmware default.
+    #[test]
+    fn a_lease_that_runs_out_says_so_and_names_what_the_silence_cost() {
+        let mut sink = Recorder::default();
+        lora_mute_expired(
+            &mut sink,
+            &MuteExpiry {
+                lease_s: 900,
+                dropped: 37,
+            },
+        );
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Gated,
+                String::from("[LORA] LORA_MUTE_EXPIRED lease_s=900 dropped=37 t=191\r\n")
+            )]
+        );
+    }
+
+    /// A lease that expires with nothing to show for it still says so: the
+    /// board was mute, the deadline passed, and an idle board's silence
+    /// costing zero packets is a fact worth having in the capture rather
+    /// than a reason to say nothing.
+    #[test]
+    fn an_expiry_that_swallowed_nothing_is_still_reported() {
+        let mut sink = Recorder::default();
+        lora_mute_expired(
+            &mut sink,
+            &MuteExpiry {
+                lease_s: 6_300,
+                dropped: 0,
+            },
+        );
+        assert_eq!(
+            sink.lines,
+            [(
+                Route::Gated,
+                String::from("[LORA] LORA_MUTE_EXPIRED lease_s=6300 dropped=0 t=191\r\n")
+            )]
+        );
+    }
+}

@@ -1,0 +1,182 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Тесты Rust и deploy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # закреплённый SHA, v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/rawg-target/ci
+          key: rust-test-${{ runner.os }}-${{ hashFiles('bench/rns-iroh-node/Cargo.lock', 'docs/patches/*.patch') }}
+          restore-keys: rust-test-${{ runner.os }}-
+      - name: Настроить Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Получить закреплённый Leviculum и применить патчи
+        run: |
+          git clone https://codeberg.org/Lew_Palm/Leviculum "$RUNNER_TEMP/leviculum"
+          git -C "$RUNNER_TEMP/leviculum" checkout --detach cb814c8513fb59d991c96106f1dcdd5d070cb423
+          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-path-expiry-cache.patch"
+          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-per-link-cipher.patch"
+      - name: Тесты библиотеки Rust
+        working-directory: bench/rns-iroh-node
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/test
+        run: >-
+          cargo test --lib
+          --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ runner.temp }}/leviculum/leviculum-std"'
+      - name: Python-тесты
+        run: python3 -m pytest -q deploy/test_push.py
+      - name: Проверка Bash и ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          for script in deploy/*.sh; do bash -n "$script"; shellcheck -x "$script"; done
+
+  server-ubuntu-24:
+    name: rawgd (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # закреплённый SHA, v4
+        with:
+          path: ~/.cargo
+          key: server-24-${{ hashFiles('bench/rns-iroh-node/Cargo.lock', 'docs/patches/*.patch') }}
+          restore-keys: server-24-
+      - name: Системные зависимости
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev binutils
+      - name: Настроить Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Получить Leviculum и применить патчи
+        run: |
+          git clone https://codeberg.org/Lew_Palm/Leviculum "$RUNNER_TEMP/leviculum"
+          git -C "$RUNNER_TEMP/leviculum" checkout --detach cb814c8513fb59d991c96106f1dcdd5d070cb423
+          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-path-expiry-cache.patch"
+          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-per-link-cipher.patch"
+      - name: Собрать rawgd
+        working-directory: bench/rns-iroh-node
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/server-24
+        run: cargo build --release --bin rawgd --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ runner.temp }}/leviculum/leviculum-std"'
+      - name: Проверить glibc и сформировать SHA256SUMS
+        run: |
+          mkdir -p dist
+          install -m 0755 "$RUNNER_TEMP/cargo-target/server-24/release/rawgd" dist/rawgd
+          need=$(objdump -T dist/rawgd | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "rawgd requires up to $need"
+          (cd dist && sha256sum rawgd > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4
+        with:
+          name: rawgd-ubuntu-24.04
+          path: dist/
+          if-no-files-found: error
+
+  server-ubuntu-22:
+    name: rawgd-u2204 (glibc 2.35)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # закреплённый SHA, v4
+        with:
+          path: ~/.cargo
+          key: server-22-${{ hashFiles('bench/rns-iroh-node/Cargo.lock', 'docs/patches/*.patch') }}
+          restore-keys: server-22-
+      - name: Системные зависимости
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev binutils
+      - name: Настроить Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Получить Leviculum и применить патчи
+        run: |
+          git clone https://codeberg.org/Lew_Palm/Leviculum "$RUNNER_TEMP/leviculum"
+          git -C "$RUNNER_TEMP/leviculum" checkout --detach cb814c8513fb59d991c96106f1dcdd5d070cb423
+          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-path-expiry-cache.patch"
+          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-per-link-cipher.patch"
+      - name: Собрать rawgd-u2204
+        working-directory: bench/rns-iroh-node
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/server-22
+        run: cargo build --release --bin rawgd --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ runner.temp }}/leviculum/leviculum-std"'
+      - name: Проверить glibc 2.35 и сформировать SHA256SUMS
+        run: |
+          mkdir -p dist
+          install -m 0755 "$RUNNER_TEMP/cargo-target/server-22/release/rawgd" dist/rawgd-u2204
+          need=$(objdump -T dist/rawgd-u2204 | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "rawgd-u2204 requires up to $need"
+          if [ "${need#GLIBC_}" != "$need" ] && [ "$(printf '%s\n' 2.35 "${need#GLIBC_}" | sort -V | tail -1)" != 2.35 ]; then
+            echo "rawgd-u2204 requires newer than GLIBC_2.35" >&2; exit 1
+          fi
+          (cd dist && sha256sum rawgd-u2204 > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4
+        with:
+          name: rawgd-u2204-glibc-2.35
+          path: dist/
+          if-no-files-found: error
+
+  android-apk:
+    name: Android APK (debug signature)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # закреплённый SHA, v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # закреплённый SHA, v3
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # закреплённый SHA, v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/rawg-target/android-ci
+          key: android-${{ hashFiles('bench/android/native/Cargo.lock', 'bench/rns-iroh-node/Cargo.lock', 'docs/patches/*.patch') }}
+          restore-keys: android-
+      - name: Установить Android SDK и Rust target
+        run: |
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+          sdkmanager 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0' 'ndk;29.0.14206865'
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-linux-android
+      - name: Получить Leviculum и применить патчи
+        run: |
+          git clone https://codeberg.org/Lew_Palm/Leviculum "$RUNNER_TEMP/leviculum"
+          git -C "$RUNNER_TEMP/leviculum" checkout --detach cb814c8513fb59d991c96106f1dcdd5d070cb423
+          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-path-expiry-cache.patch"
+          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-per-link-cipher.patch"
+      - name: Собрать VPN APK с временной debug-подписью
+        working-directory: bench/android
+        env:
+          LEVICULUM_FORK: ${{ runner.temp }}/leviculum
+          OUT: ${{ runner.temp }}/apk-out
+          CARGO_TARGET_DIR: ${{ runner.temp }}/android-ci-target
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+          ./build.sh vpn
+      - name: Сформировать и проверить SHA256SUMS
+        run: |
+          mkdir -p artifacts
+          install -m 0644 "$RUNNER_TEMP/apk-out/rawgvpn.apk" artifacts/rawgvpn.apk
+          (cd artifacts && sha256sum rawgvpn.apk > SHA256SUMS)
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose artifacts/rawgvpn.apk
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4
+        with:
+          name: rawgvpn-apk-debug
+          path: artifacts/
+          if-no-files-found: error

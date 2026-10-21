@@ -1,0 +1,100 @@
+//! leviculum-std: Standard library extensions for reticulum
+//!
+//! This crate provides std-dependent functionality:
+//! - Network interfaces (TCP, UDP, Local/IPC)
+//! - Serial interfaces (KISS, RNode)
+//! - Configuration loading and persistence
+//! - File-based storage
+//! - Async runtime integration (tokio)
+//!
+//! Use leviculum-core for the no_std compatible core functionality,
+//! including the buffer system types (RawChannelReader, RawChannelWriter).
+
+#![warn(unreachable_pub)]
+
+pub mod api;
+pub(crate) mod autoconnect;
+pub(crate) mod clock;
+pub mod config;
+pub(crate) mod counter64;
+pub(crate) mod discovery;
+pub mod driver;
+pub mod error;
+/// `EVENT_CATALOG` completeness, checked against the tree.
+///
+/// A `#[cfg(test)]` module in `src/` and not an integration test under
+/// `tests/`, on purpose: the forge gate and `just fast` run
+/// `cargo test --workspace --lib`, so a check that lives in `tests/`
+/// would not run on the push path. A completeness check that five names
+/// already escaped needs to run where escapes happen.
+#[cfg(test)]
+mod event_catalog_completeness;
+pub mod event_log;
+pub mod file_identity_store;
+pub(crate) mod file_known_destinations_store;
+pub mod file_lxmf_store;
+pub(crate) mod file_packet_hash_store;
+pub mod file_peer_store;
+pub mod file_propagation_store;
+pub(crate) mod file_ratchet_store;
+/// Fuzzing-only entry points exposing crate-internal parsers to the detached
+/// cargo-fuzz harness. Compiled only under `--cfg fuzzing` (set by cargo-fuzz).
+#[cfg(fuzzing)]
+pub mod fuzz;
+/// The counting allocator shim that answers "how many bytes are live" by
+/// measurement rather than by the dump's model. Inert in a process that does
+/// not install it as the global allocator.
+pub mod heap_accounting;
+pub(crate) mod ini_config;
+pub mod interfaces;
+pub(crate) mod known_destinations;
+pub(crate) mod packet_hashlist;
+/// The process's own memory view for the SIGUSR1 census: allocator totals,
+/// the anonymous-mapping histogram and the gap arithmetic (Codeberg #437).
+pub mod proc_memory;
+pub mod process;
+pub mod remote_status;
+pub mod resource_policy;
+pub mod reticulum;
+pub(crate) mod rpc;
+pub mod socket_hook;
+pub(crate) mod storage;
+pub(crate) mod sync_ext;
+pub mod test_support;
+pub mod user;
+
+// Re-export commonly used core types for the high-level API
+pub use leviculum_core::node::{DeliveryError, EventClass, LinkStats, NodeEvent};
+pub use leviculum_core::transport::{InterfaceId, PathTableExport};
+pub use leviculum_core::{
+    AnnounceError, Destination, DestinationHash, DestinationType, Direction, Identity,
+    LinkCloseReason, LinkError, LinkId, PeerKeys, ProofStrategy, ReceivedAnnounce, SendError,
+    TransportStats,
+};
+
+/// Generate a new random identity using the system RNG.
+///
+/// Convenience wrapper around `Identity::generate(&mut OsRng)` for std apps.
+/// Embedded code should use `Identity::generate()` with a platform-specific RNG.
+pub fn generate_identity() -> Identity {
+    Identity::generate(&mut rand_core::OsRng)
+}
+
+pub use config::Config;
+pub use driver::{
+    Completion, CompletionError, EventReceiver, EventTap, FilteredEventTap,
+    InterfaceStatusSnapshot, LinkEstablishedFuture, LinkHandle, PacketSender,
+    RequestResponseFuture, ResourceSentFuture, ResourceSentInfo, ResponseInfo, ReticulumNode,
+    ReticulumNodeBuilder, TapEvent, DEFAULT_EVENT_TAP_CAPACITY, data_events_dropped,
+};
+pub use error::{Error, Result};
+pub use file_lxmf_store::FileLxmfStorage;
+pub use file_peer_store::FilePeerStore;
+pub use file_propagation_store::FilePropagationStore;
+pub use reticulum::Reticulum;
+/// Client for the shared-instance RPC socket (`rnstatus`/`rnpath` protocol).
+/// Used by `lnstest diag` to query a running `lnsd`/`rnsd`.
+pub use rpc::{
+    rpc_drop_path, rpc_query, rpc_query_hash_param, rpc_query_transport_tables,
+    TRANSPORT_TABLE_NAMES,
+};

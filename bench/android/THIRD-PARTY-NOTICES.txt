@@ -1,0 +1,2 @@
+ZXing Core 3.5.3 (com.google.zxing:core), Apache License 2.0, https://github.com/zxing/zxing
+Используется в приложении vpn для кодирования и разбора QR приглашения. Текст лицензии: LICENSE-ZXing.txt (в APK: assets/LICENSE-ZXing.txt).

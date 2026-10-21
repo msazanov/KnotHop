@@ -1,0 +1,161 @@
+# The firmware's host-test seam
+
+> **A decision lives in a host-testable crate. The nRF binary calls it.**
+
+`leviculum-nrf` builds for `thumbv7em-none-eabihf`, sits outside the root
+workspace with its own `.cargo` config, and runs no test of its own. Any
+statement about firmware behaviour that is written inside it is therefore
+provable only by flashing a board. This page says where the line between
+the two sides runs, why it is not a matter of taste, and which decisions
+are still on the wrong side of it.
+
+## Why the rule is about the bench
+
+The rig is one bench. It is shared between the conformance corpus, the
+land gates and every manual measurement, and a hardware run costs hours —
+so anything provable *only* there competes with everything else provable
+there. A host assertion costs a second and runs on every push.
+
+The pattern was found under time pressure rather than designed. Codeberg
+#402 stayed open for days over a board's announce cap registration that
+had in fact been correct since `594dd3f8`, because nothing could show it.
+What closed it was moving the step that carried the meaning
+(`AnnounceCapBitrate::sync_phy`) into `leviculum-core`, where a host test
+makes the same call the firmware makes. That is the pattern; this page is
+it stated as policy instead of as one lucky fix.
+
+## What counts as a decision
+
+A decision is anything whose wrongness is a behaviour, not a wiring
+fault: a cadence, a threshold, an ordering, a predicate, an arithmetic
+budget, a byte-exact line other tools grep. If a sentence about the code
+can be written as "under X it does Y", it is a decision, and that
+sentence belongs in a test.
+
+The far side — what legitimately stays in `leviculum-nrf/src` — is
+everything whose argument is a pin, a register, a SoftDevice syscall or
+an `embassy_time::Instant`: peripheral access, task spawning, the boot
+order, the I/O half of a driver.
+
+The seam between them is a value type. The crate holds the decision and
+the vocabulary it is expressed in; the firmware supplies the I/O and the
+clock and does what it is told. `leviculum-rx-arming` is the sharpest
+example already in the tree — it holds the order in which the receive
+path re-arms and hands a frame up, and `src/sx1262.rs` supplies a chip to
+drive (`stand_down_for_rx`, `leviculum-nrf/src/sx1262.rs:965`).
+
+## Where the seam runs today
+
+The `leviculum-nrf` workspace has 32 members besides the firmware crate,
+every one of them pure and host-testable: `screen`, `sd-policy`,
+`gnss-time`, `gnss-presence`, `gnss-init`, `telemetry-policy`, `ble-tx`,
+`announce-policy`, `queue-budget`, `log-line`, `tx-spacing`, `rx-arming`,
+`persist-ack`, `boot-trace`, `boot-count`, `channel-access`,
+`media-state`, `record-log`, `pn-store`, `store-spike`, `qspi-bitbang`,
+`battery-scale`, `settle-budget`, `drop-budget`, `heap-budget`,
+`node-name`, `sync-batch`, `upload-proof`, `mute-lease`, `qspi-selftest`,
+`qspi-boot`, `usb-policy` (`members`, `leviculum-nrf/Cargo.toml:14`). Before
+`heap-budget` and `node-name` joined them they carried **806 host assertions across 61 test targets** —
+measured 2026-09-25 by the host-triple lines of `lint-nrf`
+(`Justfile:75`). `mute-lease` is the
+newest and the rule's own case twice over: the deadline on a host's
+transmit mute (Codeberg #410) is a decision that would have been
+unassertable inside `src/lora.rs`, and the `LORA_MUTE_EXPIRED` line that
+announces it went into `log-line` beside the two mute lines it closes
+out, rather than being spelled at its one call site.
+
+`leviculum-core` is the other half of the seam and counts the same way: a
+decision that is not board-specific belongs there, where `lnsd` runs the
+identical code. `leviculum-announce-policy` is deliberately shared with
+the daemon for exactly that reason, so the cadence the desk measures on a
+board is the cadence the daemon runs.
+
+That number — how many firmware decisions can be asserted without a board
+— is the measure this page is judged by. It goes up when a decision
+moves, and it is the only thing that does.
+
+## The far side is not a choice
+
+Whether `leviculum-nrf` should gain a host test target of its own is
+settled by the compiler, not by preference. Both BSP features route
+through the `softdevice` aggregator, `lib.rs` refuses a build with no BSP
+selected, and the SoftDevice bindings do not compile for a host triple:
+
+```
+$ cd leviculum-nrf
+$ cargo check -p leviculum-nrf --features bsp-t114 \
+      --target x86_64-unknown-linux-gnu
+error: invalid register `r0`: unknown register
+...
+error: could not compile `nrf-softdevice-s140` (lib) due to 548 previous errors
+```
+
+(measured 2026-09-25). There is no feature combination that both links
+and builds for the host, so `#[test]` inside `leviculum-nrf` has nowhere
+to run. Consistently, `leviculum-nrf/src` contains zero `#[test]` and no
+`tests/` directory today.
+
+**So: "cannot move" is the definition of hardware-only.** A decision that
+has not been moved is not hardware-only, it is untested. The question to
+ask of any firmware behaviour is never "can the firmware crate test
+this?" — it cannot test anything — but "what is the value type that
+carries this decision, and what is left over once it is gone?"
+
+## How the rule is gated
+
+`lint-nrf` runs clippy and the tests of every workspace member except the
+firmware crate, on the host triple, as `--workspace --exclude
+leviculum-nrf`. It is spelled that way rather than as a list of `-p`
+flags so that adding a seam crate to `members` is the whole act of
+gating it. The list it replaced lived in three places, and its prose copy
+had already lost `leviculum-upload-proof` within a day of that crate
+landing. A positive control confirmed the failure mode is silent: a
+member carrying a deliberately red test failed the workspace form with
+exit 101 and passed the `-p` list with exit 0, because the list did not
+name it.
+
+New code follows the rule. Old code moves when it is touched anyway — a
+bug fix in a stranded decision is the moment to move it, not a reason to
+defer.
+
+## Still stranded
+
+The four areas that prompted this page are already seamed, and so is
+most of what the list below used to name; it is worth saying which,
+because the list below is what is actually left:
+
+| Decision | Crate | Since |
+|---|---|---|
+| Announce cadence and per-peer limit | `leviculum-announce-policy` | `787ce002`, 2026-09-09 |
+| LoRa channel access (jitter, CAD retry) | `leviculum-channel-access` | `11c532f0`, 2026-09-01 |
+| Receive re-arm / hand-off order | `leviculum-rx-arming` | `6d289255`, 2026-08-26 |
+| Media flags, running vs configured | `leviculum-media-state` | `8bbce725`, 2026-09-01 |
+| Heap budget: endpoint links, boot and live serve cap | `leviculum-heap-budget` | `03e99edf`, 2026-10-05 |
+| Node name, derived defaults and the BLE-pending flag | `leviculum-node-name` | `8128a0d2`, 2026-10-06 |
+| Front-end position: never both switch paths at once | `leviculum-rx-arming` (`front_end`) | `1a1ef641`, 2026-10-06 |
+| The 1200-baud touch predicate | `leviculum-usb-policy` | `604b5fae`, 2026-10-06 |
+| Control-envelope answer windows and the deferral bound they cover | `leviculum-usb-policy` | `604b5fae`, 2026-10-06 |
+| The duty-hold notice: one frame per hold edge, and the state behind a media report | `leviculum-usb-policy` (`DutyHoldNotice`) | leviculum#501, 2026-10-07 |
+
+The answer windows moved as constants, not as functions of the
+modulation. What the modulation moves is the delay they must cover, one
+maximum-size frame's airtime (728 ms at the SF8/125 kHz default, 4756 ms
+at SF10/62.5 kHz); the windows answer to the hosts' fixed waits (lnsd's
+2 s per attempt), so a slow profile is answered busy and acked on the
+retry rather than waited out. The crate asserts both halves, and the
+envelope-inside-lnsd relation is a build-time assert the firmware build
+inherits.
+
+What has no host assertion, in the order it is cheap to move:
+
+**1. The `[TRANSPORT]` ticker.** The re-arm deliberately drops missed
+periods so a busy loop does not then emit a burst of catch-up lines
+(`poll`, `leviculum-nrf/src/transport_stats.rs:106`), and the line is
+byte-exact because capture consumers grep it (`log`,
+`leviculum-nrf/src/transport_stats.rs:114`). `leviculum-log-line` already
+exists for the second half.
+
+See also: [Checks that are actually
+checks](checks-and-citations.md) for why a stated rule without a gate
+does not hold, and [Evidence and honesty in
+testing](evidence-and-honesty.md).

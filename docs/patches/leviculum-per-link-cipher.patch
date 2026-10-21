@@ -1,0 +1,533 @@
+diff --git a/leviculum-core/src/node/builder.rs b/leviculum-core/src/node/builder.rs
+index 57d97024..ddcc1ae2 100644
+--- a/leviculum-core/src/node/builder.rs
++++ b/leviculum-core/src/node/builder.rs
+@@ -42,6 +42,7 @@ pub struct NodeCoreBuilder {
+     proof_strategy: ProofStrategy,
+     proof_binding: ProofBinding,
+     link_cipher: crate::LinkCipher,
++    accept_cbc_links: bool,
+     transport_config: TransportConfig,
+     respond_to_probes: bool,
+     remote_management: bool,
+@@ -65,6 +66,7 @@ impl NodeCoreBuilder {
+             proof_strategy: ProofStrategy::None,
+             proof_binding: ProofBinding::default(),
+             link_cipher: crate::LinkCipher::default(),
++            accept_cbc_links: false,
+             transport_config: TransportConfig::default(),
+             respond_to_probes: false,
+             remote_management: false,
+@@ -118,6 +120,12 @@ impl NodeCoreBuilder {
+         self
+     }
+ 
++    /// Also accept inbound links that ask for standard CBC (see [`Node::set_accept_cbc_links`]).
++    pub fn accept_cbc_links(mut self, accept: bool) -> Self {
++        self.accept_cbc_links = accept;
++        self
++    }
++
+     /// Enable or disable transport mode (routing for other nodes)
+     pub fn enable_transport(mut self, enable: bool) -> Self {
+         self.transport_config.enable_transport = enable;
+@@ -316,6 +324,7 @@ impl NodeCoreBuilder {
+         node.set_proof_binding(self.proof_binding);
+         node.set_link_cipher(self.link_cipher)
+             .expect("fresh node has no links");
++        node.set_accept_cbc_links(self.accept_cbc_links);
+ 
+         if self.respond_to_probes {
+             node.enable_probe_responder();
+@@ -376,6 +385,7 @@ impl NodeCoreBuilder {
+         node.set_proof_binding(self.proof_binding);
+         node.set_link_cipher(self.link_cipher)
+             .expect("fresh node has no links");
++        node.set_accept_cbc_links(self.accept_cbc_links);
+ 
+         if self.respond_to_probes {
+             node.enable_probe_responder();
+diff --git a/leviculum-core/src/node/link_management.rs b/leviculum-core/src/node/link_management.rs
+index 1a4c1043..acf90800 100644
+--- a/leviculum-core/src/node/link_management.rs
++++ b/leviculum-core/src/node/link_management.rs
+@@ -141,7 +141,6 @@ fn cipher_proof_identifier(
+ 
+ pub(super) struct ReceiptTracker {
+     entries: Vec<ReceiptEntry>,
+-    cipher: crate::LinkCipher,
+ }
+ 
+ pub(super) struct ReceiptEntry {
+@@ -157,14 +156,9 @@ impl ReceiptTracker {
+     pub(super) fn new() -> Self {
+         Self {
+             entries: Vec::new(),
+-            cipher: crate::LinkCipher::default(),
+         }
+     }
+ 
+-    pub(super) fn set_cipher(&mut self, cipher: crate::LinkCipher) {
+-        self.cipher = cipher;
+-    }
+-
+     /// Estimated heap bytes of the tracker's entry spine (#388 census).
+     pub(super) fn heap_bytes(&self) -> usize {
+         crate::heap_census::vec_bytes(&self.entries)
+@@ -179,11 +173,12 @@ impl ReceiptTracker {
+         sequence: u16,
+         now_ms: u64,
+         binding: ProofBinding,
++        cipher: crate::LinkCipher,
+     ) {
+         self.entries
+             .retain(|e| !(e.link_id == link_id && e.sequence == Some(sequence)));
+ 
+-        let full_hash = cipher_proof_identifier(packet_data, binding, self.cipher);
++        let full_hash = cipher_proof_identifier(packet_data, binding, cipher);
+         let mut truncated_hash = [0u8; TRUNCATED_HASHBYTES];
+         truncated_hash.copy_from_slice(&full_hash[..TRUNCATED_HASHBYTES]);
+ 
+@@ -210,8 +205,9 @@ impl ReceiptTracker {
+         link_id: LinkId,
+         deadline_ms: u64,
+         binding: ProofBinding,
++        cipher: crate::LinkCipher,
+     ) -> [u8; 32] {
+-        let full_hash = cipher_proof_identifier(packet_data, binding, self.cipher);
++        let full_hash = cipher_proof_identifier(packet_data, binding, cipher);
+         let mut truncated_hash = [0u8; TRUNCATED_HASHBYTES];
+         truncated_hash.copy_from_slice(&full_hash[..TRUNCATED_HASHBYTES]);
+         self.entries.retain(|entry| entry.full_hash != full_hash);
+@@ -335,6 +331,27 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+         dest_hash: DestinationHash,
+         dest_signing_key: &[u8; 32],
+         first_hop_timeout_ms: Option<u64>,
++    ) -> Result<(LinkId, bool, crate::transport::TickOutput), LinkError> {
++        self.connect_with_cipher(dest_hash, dest_signing_key, first_hop_timeout_ms, self.link_cipher)
++    }
++
++    /// Whether a link request signalling `mode` is acceptable to this node as responder: its own cipher, or standard CBC when
++    /// [`Self::set_accept_cbc_links`] is on (links that cross stock Reticulum transports; those only carry CBC).
++    /// The initiator still rejects any mode other than the one it asked for, so this cannot be used to downgrade a link that asked for GCM.
++    pub(super) fn link_mode_allowed(&self, mode: u8) -> bool {
++        mode == self.link_cipher as u8 || (self.accept_cbc_links && mode == crate::LinkCipher::Cbc as u8)
++    }
++
++    /// [`Self::connect_with_first_hop_timeout`] with an explicit cipher for this link only.
++    ///
++    /// # Errors
++    /// As [`Self::connect`].
++    pub fn connect_with_cipher(
++        &mut self,
++        dest_hash: DestinationHash,
++        dest_signing_key: &[u8; 32],
++        first_hop_timeout_ms: Option<u64>,
++        cipher: crate::LinkCipher,
+     ) -> Result<(LinkId, bool, crate::transport::TickOutput), LinkError> {
+         if let Some(max) = self.transport_config().max_links {
+             if self.links.len() >= max {
+@@ -362,7 +379,7 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+ 
+         // Create new outgoing link
+         let mut link = Link::new_outgoing(dest_hash, &mut self.rng);
+-        link.set_cipher(self.link_cipher)?;
++        link.set_cipher(cipher)?;
+         link.set_keepalive_override(self.transport_config().link_keepalive_secs);
+         let packet = link.build_link_request_packet_with_transport(next_hop, hops, hw_mtu);
+         link.set_hops(hops);
+@@ -808,14 +825,13 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+             .map_err(|_| send::SendError::LinkFailed)?;
+ 
+         // Register receipt for channel delivery tracking (Python Channel.py:631)
+-        if let Some(seq) = self
++        if let Some((seq, cipher)) = self
+             .links
+             .get(link_id)
+-            .and_then(|l| l.channel())
+-            .map(|ch| ch.last_sent_sequence())
++            .and_then(|l| l.channel().map(|ch| (ch.last_sent_sequence(), l.cipher())))
+         {
+             self.receipt_tracker
+-                .register(&packet_bytes, *link_id, seq, now_ms, self.proof_binding);
++                .register(&packet_bytes, *link_id, seq, now_ms, self.proof_binding, cipher);
+         }
+ 
+         // Route via attached interface
+@@ -880,6 +896,7 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+             *link_id,
+             deadline_ms,
+             self.proof_binding,
++            link.cipher(),
+         );
+         self.route_link_packet(link_id, &packet_bytes);
+ 
+@@ -966,6 +983,7 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+             pacing_rejections: ch.map(|c| c.pacing_rejections()).unwrap_or(0),
+             iface_pacing_rejections: link.iface_pacing_rejections(),
+             attached_interface: link.attached_interface(),
++            cipher: link.cipher(),
+         })
+     }
+ 
+@@ -1069,7 +1087,7 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+             .get(64..67)
+             .map(|bytes| crate::link::decode_signaling_bytes(&bytes.try_into().unwrap()).1)
+             .unwrap_or(crate::constants::MODE_AES256_CBC);
+-        if requested_mode != self.link_cipher as u8 {
++        if !self.link_mode_allowed(requested_mode) {
+             crate::tracing::warn!("Dropped link request: cipher policy mismatch");
+             return;
+         }
+@@ -1097,7 +1115,7 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+ 
+         // Set attached interface from the receiving interface, and with it
+         // what that carrier charges one frame for the next.
+-        if link.cipher() != self.link_cipher {
++        if !self.link_mode_allowed(link.cipher() as u8) {
+             crate::tracing::warn!("Dropped link request: cipher policy mismatch");
+             return;
+         }
+@@ -1727,12 +1745,13 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+         let mut rx_ring_full = false;
+         let proof_packets: Vec<Vec<u8>> = {
+             let rtt_ms = link.rtt_ms();
++            let link_cipher = link.cipher();
+             let channel = link.ensure_channel(rtt_ms);
+             // Proofs bind to the token tag that `link.decrypt` just verified,
+             // not to a second SHA-256 pass over the payload: see
+             // `proof_identifier` for why that is not a weakening.
+             let full_packet_hash =
+-                cipher_proof_identifier(raw_packet, self.proof_binding, self.link_cipher);
++                cipher_proof_identifier(raw_packet, self.proof_binding, link_cipher);
+ 
+             let mut proofs = Vec::new();
+ 
+@@ -1956,7 +1975,7 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+                 plaintext.truncate(len);
+ 
+                 let full_packet_hash =
+-                    cipher_proof_identifier(raw_packet, self.proof_binding, self.link_cipher);
++                    cipher_proof_identifier(raw_packet, self.proof_binding, link.cipher());
+ 
+                 match link.proof_strategy() {
+                     ProofStrategy::All => {
+@@ -3949,12 +3968,18 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+ 
+                         if let Some(packet) = packet {
+                             // Register receipt for the re-encrypted packet
++                            let cipher = self
++                                .links
++                                .get(&link_id)
++                                .map(|l| l.cipher())
++                                .unwrap_or(self.link_cipher);
+                             self.receipt_tracker.register(
+                                 &packet,
+                                 link_id,
+                                 sequence,
+                                 now_ms,
+                                 self.proof_binding,
++                                cipher,
+                             );
+ 
+                             self.events.push(NodeEvent::ChannelRetransmit {
+@@ -4460,11 +4485,11 @@ mod receipt_tracker_tests {
+         let data_v1 = [0x00u8; 64];
+         let data_v2 = [0xFFu8; 64];
+ 
+-        tracker.register(&data_v1, link, 1, 1000, ProofBinding::PacketHash);
++        tracker.register(&data_v1, link, 1, 1000, ProofBinding::PacketHash, crate::LinkCipher::Cbc);
+         assert_eq!(tracker.len(), 1);
+ 
+         // Re-register same (link, seq) with different data
+-        tracker.register(&data_v2, link, 1, 2000, ProofBinding::PacketHash);
++        tracker.register(&data_v2, link, 1, 2000, ProofBinding::PacketHash, crate::LinkCipher::Cbc);
+         assert_eq!(tracker.len(), 1);
+ 
+         // Entry should have the new hashes
+@@ -4485,7 +4510,7 @@ mod receipt_tracker_tests {
+         let mut tracker = ReceiptTracker::new();
+         let link = make_link_id(0xBB);
+ 
+-        tracker.register(b"some_packet", link, 5, 1000, ProofBinding::PacketHash);
++        tracker.register(b"some_packet", link, 5, 1000, ProofBinding::PacketHash, crate::LinkCipher::Cbc);
+         assert_eq!(tracker.len(), 1);
+ 
+         let unknown = [0xFFu8; TRUNCATED_HASHBYTES];
+@@ -4499,9 +4524,9 @@ mod receipt_tracker_tests {
+         let link_a = make_link_id(0xAA);
+         let link_b = make_link_id(0xBB);
+ 
+-        tracker.register(b"a1", link_a, 1, 1000, ProofBinding::PacketHash);
+-        tracker.register(b"a2", link_a, 2, 1000, ProofBinding::PacketHash);
+-        tracker.register(b"b1", link_b, 1, 1000, ProofBinding::PacketHash);
++        tracker.register(b"a1", link_a, 1, 1000, ProofBinding::PacketHash, crate::LinkCipher::Cbc);
++        tracker.register(b"a2", link_a, 2, 1000, ProofBinding::PacketHash, crate::LinkCipher::Cbc);
++        tracker.register(b"b1", link_b, 1, 1000, ProofBinding::PacketHash, crate::LinkCipher::Cbc);
+         assert_eq!(tracker.count_for_link(&link_a), 2);
+         assert_eq!(tracker.count_for_link(&link_b), 1);
+ 
+@@ -4516,14 +4541,13 @@ mod receipt_tracker_tests {
+         let mut tracker = ReceiptTracker::new();
+         let link = make_link_id(0xCC);
+ 
+-        tracker.register(b"old_packet", link, 1, 1000, ProofBinding::PacketHash);
++        tracker.register(b"old_packet", link, 1, 1000, ProofBinding::PacketHash, crate::LinkCipher::Cbc);
+         tracker.register(
+             b"new_packet",
+             link,
+             2,
+             1000 + DATA_RECEIPT_TIMEOUT_MS,
+-            ProofBinding::PacketHash,
+-        );
++            ProofBinding::PacketHash, crate::LinkCipher::Cbc);
+ 
+         // Advance time so only the first has expired
+         let now = 1000 + DATA_RECEIPT_TIMEOUT_MS + 1;
+@@ -4543,7 +4567,7 @@ mod receipt_tracker_tests {
+         let link = make_link_id(0xDD);
+ 
+         // Register, confirm delivery, register again with same sequence
+-        tracker.register(b"msg_v1", link, 1, 1000, ProofBinding::PacketHash);
++        tracker.register(b"msg_v1", link, 1, 1000, ProofBinding::PacketHash, crate::LinkCipher::Cbc);
+         let hash1 = packet_hash(b"msg_v1");
+         let mut trunc1 = [0u8; TRUNCATED_HASHBYTES];
+         trunc1.copy_from_slice(&hash1[..TRUNCATED_HASHBYTES]);
+@@ -4553,7 +4577,7 @@ mod receipt_tracker_tests {
+         assert_eq!(tracker.len(), 0);
+ 
+         // Re-register same sequence (after wraparound or new message)
+-        tracker.register(b"msg_v2", link, 1, 2000, ProofBinding::PacketHash);
++        tracker.register(b"msg_v2", link, 1, 2000, ProofBinding::PacketHash, crate::LinkCipher::Cbc);
+         assert_eq!(tracker.len(), 1);
+ 
+         let hash2 = packet_hash(b"msg_v2");
+diff --git a/leviculum-core/src/node/mod.rs b/leviculum-core/src/node/mod.rs
+index 50c6d857..b79f77c7 100644
+--- a/leviculum-core/src/node/mod.rs
++++ b/leviculum-core/src/node/mod.rs
+@@ -321,6 +321,7 @@ pub struct LinkStats {
+     pub(crate) pacing_rejections: u64,
+     pub(crate) iface_pacing_rejections: u64,
+     pub(crate) attached_interface: Option<usize>,
++    pub(crate) cipher: crate::LinkCipher,
+ }
+ 
+ impl LinkStats {
+@@ -402,6 +403,11 @@ impl LinkStats {
+     pub fn attached_interface(&self) -> Option<usize> {
+         self.attached_interface
+     }
++
++    /// Cipher this link was established with. An application that only wants GCM links on some paths checks it here.
++    pub fn cipher(&self) -> crate::LinkCipher {
++        self.cipher
++    }
+ }
+ 
+ /// The unified Reticulum node, owns all protocol state
+@@ -456,6 +462,8 @@ pub struct NodeCore<R: CryptoRngCore, C: Clock, S: Storage> {
+     /// What data proofs are bound to; see [`crate::destination::ProofBinding`]
+     proof_binding: ProofBinding,
+     link_cipher: crate::LinkCipher,
++    /// Accept standard-CBC link requests besides `link_cipher` (default off).
++    accept_cbc_links: bool,
+     /// Pending events
+     events: Vec<NodeEvent>,
+     /// Probe destination hash (if respond_to_probes is enabled).
+@@ -607,6 +615,7 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+             default_proof_strategy: proof_strategy,
+             proof_binding: ProofBinding::default(),
+             link_cipher: crate::LinkCipher::default(),
++            accept_cbc_links: false,
+             events: Vec::new(),
+             probe_dest_hash: None,
+             remote_mgmt_dest_hash: None,
+@@ -2731,11 +2740,16 @@ impl<R: CryptoRngCore, C: Clock, S: Storage> NodeCore<R, C, S> {
+         self.proof_binding
+     }
+ 
++    /// As responder also accept links that ask for standard CBC (links that cross stock Reticulum transports can only be CBC).
++    /// Does not change the cipher this node asks for on its own links, and never lets an initiator's GCM request fall back to CBC.
++    pub fn set_accept_cbc_links(&mut self, accept: bool) {
++        self.accept_cbc_links = accept;
++    }
++
+     /// Explicit cipher policy, set before establishing links. No automatic downgrade.
+     pub fn set_link_cipher(&mut self, cipher: crate::LinkCipher) -> Result<(), crate::LinkError> {
+         if !self.links.is_empty() { return Err(crate::LinkError::InvalidState); }
+         self.link_cipher = cipher;
+-        self.receipt_tracker.set_cipher(cipher);
+         Ok(())
+     }
+ 
+@@ -5900,6 +5914,73 @@ mod tests {
+         }
+     }
+ 
++    /// Responder with `resp_cipher` (and optionally CBC accepted), initiator asking for `init_cipher` on this link only.
++    /// Returns the initiator/responder link ids if the link came up on the initiator, `None` if the request was dropped.
++    fn cipher_pair(
++        resp_cipher: crate::LinkCipher,
++        accept_cbc: bool,
++        init_cipher: crate::LinkCipher,
++    ) -> Option<(NodeCore<OsRng, MockClock, NoStorage>, NodeCore<OsRng, MockClock, NoStorage>, LinkId, LinkId)> {
++        use crate::transport::InterfaceId;
++        let resp_identity = Identity::generate(&mut OsRng);
++        let resp_signing_key = resp_identity.ed25519_verifying().to_bytes();
++        let mut responder = NodeCoreBuilder::new()
++            .link_cipher(resp_cipher)
++            .accept_cbc_links(accept_cbc)
++            .build(OsRng, MockClock::new(TEST_TIME_MS), NoStorage);
++        let mut resp_dest = Destination::new(Some(resp_identity), Direction::In, DestinationType::Single, "testapp", &["echo"]).unwrap();
++        resp_dest.set_accepts_links(true);
++        let dest_hash = *resp_dest.hash();
++        responder.register_destination(resp_dest);
++        // the initiator's node default is whatever; the cipher of this link is chosen per connect
++        let mut initiator = NodeCoreBuilder::new().build(OsRng, MockClock::new(TEST_TIME_MS), NoStorage);
++        let (init_id, _, output) = initiator.connect_with_cipher(dest_hash, &resp_signing_key, None, init_cipher).expect("connect");
++        let req = extract_broadcast_data(&output);
++        let resp_id = Link::calculate_link_id(&req);
++        let out = responder.handle_packet(InterfaceId(0), &req);
++        let proof = out.actions.iter().map(|a| match a {
++            crate::transport::Action::Broadcast { data, .. } | crate::transport::Action::SendPacket { data, .. } => data.clone(),
++        }).next()?;
++        let out = initiator.handle_packet(InterfaceId(0), &proof);
++        if !out.events.iter().any(|e| matches!(e, NodeEvent::LinkEstablished { .. })) {
++            return None;
++        }
++        let rtt = extract_broadcast_data(&out);
++        let _ = responder.handle_packet(InterfaceId(0), &rtt);
++        Some((initiator, responder, init_id, resp_id))
++    }
++
++    #[test]
++    fn test_cbc_request_needs_the_accept_flag_on_a_gcm_responder() {
++        use crate::LinkCipher::{Cbc, Gcm};
++        assert!(cipher_pair(Gcm, false, Cbc).is_none(), "GCM-only responder must drop a CBC request");
++        let (init, resp, i, r) = cipher_pair(Gcm, true, Cbc).expect("accepting responder answers a CBC request");
++        assert_eq!(init.link(&i).unwrap().cipher(), Cbc);
++        assert_eq!(resp.link(&r).unwrap().cipher(), Cbc, "the link keeps the cipher it asked for, it is not upgraded");
++    }
++
++    #[test]
++    fn test_gcm_request_is_never_answered_with_cbc_and_cbc_only_node_drops_gcm() {
++        use crate::LinkCipher::{Cbc, Gcm};
++        let (init, resp, i, r) = cipher_pair(Gcm, true, Gcm).expect("GCM link between GCM nodes");
++        assert_eq!(init.link(&i).unwrap().cipher(), Gcm);
++        assert_eq!(resp.link(&r).unwrap().cipher(), Gcm);
++        assert!(cipher_pair(Cbc, false, Gcm).is_none(), "a default (CBC) node must not take a GCM request");
++        assert!(cipher_pair(Cbc, true, Gcm).is_none(), "accepting CBC never widens to GCM");
++    }
++
++    #[test]
++    fn test_cbc_link_on_a_gcm_node_carries_channel_data_with_proofs() {
++        use crate::LinkCipher::{Cbc, Gcm};
++        use crate::transport::InterfaceId;
++        let (mut init, mut resp, i, _r) = cipher_pair(Gcm, true, Cbc).unwrap();
++        let out = init.send_on_link(&i, b"enroll").unwrap();
++        let wire = extract_broadcast_data(&out);
++        let delivered = resp.handle_packet(InterfaceId(0), &wire);
++        assert!(delivered.events.iter().any(|e| matches!(e, NodeEvent::MessageReceived { .. })), "CBC link on a GCM node delivers");
++        assert!(init.receipt_count_for_link(&i) <= 1);
++    }
++
+     fn establish_nodecore_link_pair() -> NodeCoreLinkPair {
+         use crate::transport::InterfaceId;
+ 
+diff --git a/leviculum-std/src/api/mod.rs b/leviculum-std/src/api/mod.rs
+index 1a23e877..d5fb0d9e 100644
+--- a/leviculum-std/src/api/mod.rs
++++ b/leviculum-std/src/api/mod.rs
+@@ -212,6 +212,12 @@ impl NodeBuilder {
+         self
+     }
+ 
++    /// Also accept inbound links that ask for standard CBC (links that cross stock Reticulum transports).
++    pub fn accept_cbc_links(mut self, accept: bool) -> Self {
++        self.inner = self.inner.accept_cbc_links(accept);
++        self
++    }
++
+     /// Load interface and node configuration from an INI config file, the same
+     /// format `rnsd`/`lnsd` use. This brings every interface type, including
+     /// RNode and serial, into the node, so a C app can adopt the user's
+@@ -517,6 +523,16 @@ impl Node {
+         self.inner.connect(dest_hash, signing_key).await
+     }
+ 
++    /// [`Self::connect_with_key`] with an explicit cipher for this link only (standard CBC for links that cross stock Reticulum transports).
++    pub async fn connect_with_key_cipher(
++        &self,
++        dest_hash: &DestinationHash,
++        signing_key: &[u8; 32],
++        cipher: LinkCipher,
++    ) -> Result<LinkHandle> {
++        self.inner.connect_with_cipher(dest_hash, signing_key, cipher).await
++    }
++
+     /// Obtain a writable handle to an already-established inbound link.
+     ///
+     /// Inbound links are auto-accepted and auto-proved by the stack (Python-RNS
+diff --git a/leviculum-std/src/driver/builder.rs b/leviculum-std/src/driver/builder.rs
+index e2261a96..44e4201a 100644
+--- a/leviculum-std/src/driver/builder.rs
++++ b/leviculum-std/src/driver/builder.rs
+@@ -234,6 +234,12 @@ impl ReticulumNodeBuilder {
+         self
+     }
+ 
++    /// Also accept inbound links that ask for standard CBC (links that cross stock Reticulum transports).
++    pub fn accept_cbc_links(mut self, accept: bool) -> Self {
++        self.core_builder = self.core_builder.accept_cbc_links(accept);
++        self
++    }
++
+     pub fn proof_strategy(mut self, strategy: ProofStrategy) -> Self {
+         self.core_builder = self.core_builder.proof_strategy(strategy);
+         self
+diff --git a/leviculum-std/src/driver/mod.rs b/leviculum-std/src/driver/mod.rs
+index 869bfa3c..7830aeb9 100644
+--- a/leviculum-std/src/driver/mod.rs
++++ b/leviculum-std/src/driver/mod.rs
+@@ -2771,17 +2771,35 @@ impl ReticulumNode {
+         &self,
+         dest_hash: &DestinationHash,
+         dest_signing_key: &[u8; 32],
++    ) -> Result<LinkHandle, Error> {
++        self.connect_inner(dest_hash, dest_signing_key, None).await
++    }
++
++    /// [`Self::connect`] with an explicit cipher for this link only.
++    pub async fn connect_with_cipher(
++        &self,
++        dest_hash: &DestinationHash,
++        dest_signing_key: &[u8; 32],
++        cipher: leviculum_core::LinkCipher,
++    ) -> Result<LinkHandle, Error> {
++        self.connect_inner(dest_hash, dest_signing_key, Some(cipher)).await
++    }
++
++    async fn connect_inner(
++        &self,
++        dest_hash: &DestinationHash,
++        dest_signing_key: &[u8; 32],
++        cipher: Option<leviculum_core::LinkCipher>,
+     ) -> Result<LinkHandle, Error> {
+         let first_hop_timeout_ms = self.shared_instance_first_hop_timeout_ms(dest_hash).await;
+         // Request link from NodeCore. A refusal by the configured link cap
+         // (`max_links`, #388) surfaces as `Error::Link(TableFull)`.
+         let (link_id, _was_routed, output) = {
+             let mut inner = self.inner.lock_recover();
+-            inner.connect_with_first_hop_timeout(
+-                *dest_hash,
+-                dest_signing_key,
+-                first_hop_timeout_ms,
+-            )?
++            match cipher {
++                Some(c) => inner.connect_with_cipher(*dest_hash, dest_signing_key, first_hop_timeout_ms, c)?,
++                None => inner.connect_with_first_hop_timeout(*dest_hash, dest_signing_key, first_hop_timeout_ms)?,
++            }
+         };
+         // Send output to event loop for dispatch (backpressure, waits if full)
+         self.action_dispatch_tx

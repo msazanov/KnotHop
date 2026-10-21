@@ -1,0 +1,15 @@
+[package]
+name = "iroh-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Local measurement tool: QUIC throughput, latency and path-switch continuity of iroh"
+
+[dependencies]
+# Pinned: Resilum uses =1.0.3; 1.3.0 is the version studied in the research notes.
+iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util", "sync", "net"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

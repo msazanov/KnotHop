@@ -1,0 +1,15 @@
+[package]
+name = "leviculum-drop-budget"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lew Palm"]
+license = "AGPL-3.0-or-later"
+description = "Pure rate-limit policy for the firmware's per-drop debug lines, host-testable"
+
+[dependencies]
+
+[dev-dependencies]
+# The budget is derived from the worst-case rendered [DROP] line; the
+# derivation test renders it through the crate that owns the shape instead
+# of estimating bytes. Test-only: the policy itself stays dependency-free.
+leviculum-log-line = { path = "../log-line" }

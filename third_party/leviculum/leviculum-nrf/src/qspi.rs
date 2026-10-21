@@ -1,0 +1,1191 @@
+//! The QSPI NOR flash two of our three boards turned out not to carry.
+//!
+//! **The T114 and the RAK4631 carry none, and one board does ask:** the
+//! SolarNode's `CONFIG.qspi_part` is [`P25Q16H`] and `bin/solarnode.rs`
+//! calls [`identify_at_boot`] once at boot. The two negatives came from
+//! an `EXTERNAL_FLASH_DEVICES` line in a vendor variant header, and on
+//! both vendors that line is a template default sitting under a comment
+//! that denies the part: Heltec commented the T114's QSPI pins out, RAK
+//! wrote "No onboard flash" over the RAK4631's and marked the pins
+//! "occupied by GPIO's". Three units — two T114s and the field Pocket —
+//! answer nothing to `05h`, `9Fh`, `90h` or the datasheet reset while
+//! every pin follows our drive. Both `CONFIG.qspi_part` are `None`, both
+//! firmwares print `[QSPI] NONE board=<b>` at boot instead of coming
+//! here, and the evidence with its URLs is in
+//! `leviculum-nrf/src/boards/t114.rs` and
+//! `leviculum-nrf/src/boards/rak4631.rs` (Codeberg #384).
+//!
+//! The SolarNode is a different claim and it is not a variant header's:
+//! Seeed's own schematic for the XIAO nRF52840 Plus module draws U7, an
+//! 8-pin NOR flash, on six named `P0.2x_QSPI_*` nets. What that
+//! schematic does NOT print is the part number or whether the footprint
+//! is populated, and the sheet for the plain (non-Plus) XIAO v1.1 draws
+//! the same U7 with the value **`DNP`** — do not populate. So the board
+//! file states the wiring from the schematic and the part number from
+//! the two Seeed variant headers, and the boot line is what settles
+//! whether anything answers. That is the whole point of asking:
+//! `boards/solarnode.rs` says what is expected, the board says what is
+//! there.
+//!
+//! Do not re-point the other two at this module on the strength of a
+//! variant header: `scripts/check-nrf-board-pins.sh` refuses that, and
+//! the day it is right, the check is the place to say so.
+//!
+//! What it drives, when something does: 2 MB of [`P25Q16H`] on the
+//! SolarNode, and 1 MB of [`IS25LP080D`] was what the Pocket was
+//! believed to carry. Codeberg #384 and
+//! `docs/src/concepts/propagation-node-on-a-board.md` ask what to put in
+//! such a part; this module is only the part that gets there — the
+//! peripheral, the part's identity, and the `embedded_storage` NorFlash
+//! surface the record log ([`leviculum_record_log`]) wants underneath it.
+//!
+//! # The storage trait shape
+//!
+//! There is nothing to wrap. `embassy_nrf::qspi::Qspi` already implements
+//! `ReadNorFlash`/`NorFlash` (and their async twins) with `ERASE_SIZE`
+//! 4096, `WRITE_SIZE` 4 and `READ_SIZE` 4, which is exactly the shape
+//! `flash.rs` already uses for the internal NVMC and the SoftDevice flash.
+//! So this module builds a `Qspi`, proves it is talking to the part we
+//! think it is, and hands it back. Anything that adds a layer here adds
+//! flash and a place for a bug.
+//!
+//! What it does *not* do is give the caller a device before it knows what
+//! is on the other end. [`identify_at_boot`] returns `None` on a JEDEC id
+//! that is not the board's part, and dropping the `Qspi` deactivates the
+//! peripheral: **a board with an unexpected part says so and writes
+//! nothing.** That is deliberate — the store's whole safety argument is
+//! about 4 KB sectors, a 0xFF erased state and program-once bits, and none
+//! of those are true of a part we have not identified.
+//!
+//! # Why a part carries its own bus speed
+//!
+//! `Speed::M32` on the ISSI part, because it allows 133 MHz and the
+//! nRF52840's own 32 MHz ceiling is what binds there: 16 MB/s, which the
+//! concept paper turns into a 0.07 s full-store scan — the number that
+//! makes an on-flash directory affordable and a RAM index unnecessary.
+//!
+//! The PUYA part is where that reasoning stopped being enough. Its `fC`
+//! is 104 MHz for `FAST_READ` (`0Bh`, one dummy byte, the opcode this
+//! driver uses on it) and every other command the probe issues (P25Q16H
+//! datasheet, Table 5-3 "AC parameters"), so the part allows 32 MHz. The
+//! SolarNode's bus does not read at it with margin: on 2026-10-04
+//! everything the self-test programmed read back clean at 8 MHz and wrong
+//! at 32 MHz in about 80 % of the bytes, 99.8 % of those differing from
+//! one read to the next, and the read sweep of 2026-10-05 found 32 MHz
+//! clean at one sampling delay only and 16 MHz clean at three (Codeberg
+//! #435, [`P25Q16H_BUS`]). The clock a board reads cleanly at is a property of
+//! the part, the board and the sampling delay together, which is why a
+//! part carries a whole [`BusTiming`] and why the P25Q16H's is measured.
+//!
+//! `Speed::M8` also exists for the other kind of part, the low-power one
+//! whose quad read tops out at 8 MHz in its default ultra-low-power mode
+//! (the MX25R1635F is the example, and the reason the conservative
+//! timings below are taken from its datasheet).
+//!
+//! # Quad enable
+//!
+//! Every part powers up in single-line SPI mode with the QE bit of its
+//! status register clear, and the `READ4IO`/`PP4IO` opcodes this driver
+//! configures by default do not work until it is set. **Where that bit
+//! lives is a property of the part, not of the bus**, which is why
+//! [`FlashPart`] carries a [`QuadEnable`] rather than this module
+//! knowing one recipe. Macronix and ISSI put it in bit 6 of the one
+//! status register ([`QuadEnable::StatusBit6`]); PUYA puts it in S9, bit
+//! 1 of status register 2, read with `35h` and written as the second
+//! byte of a two-byte `01h` (P25Q16H datasheet, "Status Register" and
+//! §10.5). Bit 6 of a PUYA status register is a block-protection bit, so
+//! the Macronix recipe applied to that part would not fail — it would
+//! write-protect it.
+//!
+//! [`QuadEnable::Untouched`] is therefore not a gap: it is the honest
+//! state for a part nothing reads yet. The probe then writes no
+//! non-volatile register at all and configures the single-line
+//! `FASTREAD`/`PP` opcodes, which work at the QE=0 every part leaves the
+//! factory in. It is what the SolarNode's [`P25Q16H`] uses.
+//!
+//! When QE is set, the write-enable the part needs first is supplied by
+//! the QSPI peripheral itself: every custom instruction it issues has
+//! `CINSTRCONF.WREN` set (`custom_instruction_start`,
+//! `embassy-nrf-0.9.0/src/qspi.rs`), and `WIPWAIT` makes it wait for the
+//! part to finish. One byte of data, so the Macronix configuration
+//! registers — which hold the ultra-low-power bit — keep their values.
+//!
+//! # Deep power down
+//!
+//! Both parts have a Deep Power Down state in which they answer nothing,
+//! drive nothing, and — this is the part that bites — survive a warm
+//! reset. Firmware that put the part to sleep once leaves it asleep for
+//! every boot after, and the symptom is a JEDEC read that succeeds and
+//! returns `00:00:00`: the peripheral clocked the opcode out, and nothing
+//! on the bus ever pulled MISO high. A wrong pin map looks the same from
+//! the log line, which is why the pins are gated separately
+//! (`scripts/check-nrf-board-pins.sh`) and why this boots with a release.
+//!
+//! So [`identify_at_boot`] sends Release from Deep Power Down (0xAB)
+//! before it asks anything, waits out the parts' recovery time, and reads
+//! JEDEC. A release sent to an awake part is a no-op, so it is
+//! unconditional rather than a flag. A first read that still comes back
+//! silent earns exactly one retry, because on the Macronix part it is the
+//! CS# pulse and not the opcode that does the releasing (rev. 1.6,
+//! §10-24) — so the first read may be the thing that woke it. Both
+//! answers go on the log line, `id=` and `id2=`, and one boot then says
+//! whether the part is asleep, awake, or not there at all.
+//!
+//! # The second opinion on `no-answer`
+//!
+//! `id=00:00:00 id2=00:00:00 state=no-answer` is where that sentence runs
+//! out. It says nobody drove MISO — it does not say why, and the two
+//! reasons lead to completely different work:
+//!
+//! | The hand-clocked read says | conclusion |
+//! |---|---|
+//! | the expected id | the part is there and the QSPI setup does not reach it. That is our bug, and it would be on the other board too. |
+//! | all zeros | nothing drives MISO under either driver. The part is absent or unpowered on this unit, and no code fixes that. |
+//! | something else | a third thing, and the bytes are the evidence for whatever it is. |
+//!
+//! So before it gives up, that path drops the peripheral, takes the same
+//! pins back as ordinary GPIOs, and asks again by hand at 250 kHz
+//! (`bitbang_second_opinion` below, shifter in
+//! [`leviculum_qspi_bitbang`]). Four extra `[QSPI]` lines, then `None`
+//! exactly as before. Everything it sends is a read or the datasheet reset
+//! pair; nothing it sends writes to the part, and the shifter has no
+//! opcode that could — not even `06h` WREN.
+//!
+//! **Only on that path.** A board whose part answers reaches `state=ok`
+//! without a single GPIO write from any of this, and its boot is not a
+//! cycle slower.
+//!
+//! # What the four lines say
+//!
+//! The first batch asked `9Fh` once and stopped, and `00:00:00` from that
+//! one question turned out to be a reading the part's own datasheet
+//! forbids taking at face value. Two sentences of Macronix MX25R1635F
+//! rev. 1.6 are why this path grew:
+//!
+//! - **§10-3**, "While Program/Erase operation is in progress, it will not
+//!   decode the RDID instruction." A busy part is mute to `9Fh`
+//!   *specifically*. `05h` answers in that state, and it is the question
+//!   we had never asked first.
+//! - **Pin 7 is HOLD# *or* RESET#** depending on the part's configuration.
+//!   If it is acting as RESET# and sits low, nothing answers whatever is
+//!   sent — and before our init that pin is an input with no pull, i.e.
+//!   floating.
+//!
+//! So the path now proves our own side first, then asks the part the
+//! questions it is allowed to answer. All four readings are pre-registered
+//! below, so a capture is read against a table written before the boot
+//! rather than interpreted after it.
+//!
+//! ## `[QSPI] PINS sck=<ok|stuck> cs=.. io0=.. io1=.. io2=.. io3=..`
+//!
+//! Each pin driven to both levels and read back through its own input
+//! buffer. `stuck` means the readback did not follow. This proves the MCU
+//! controls the lines before anything is concluded about what is on them;
+//! a `stuck` here makes every line after it uninterpretable.
+//!
+//! ## `[QSPI] MISO pullup=<0|1> pulldown=<0|1>`
+//!
+//! CS# high, so a part that is present has released IO1 (its SO). The line
+//! is then read once under the nRF's internal pull-up and once under its
+//! pull-down. **This line alone cannot say a part is absent**, and the
+//! first batch registered it as if it could:
+//!
+//! | pullup / pulldown | conclusion |
+//! |---|---|
+//! | 1 / 0 | the line follows our pull, which is what a deselected part is *supposed* to do: SO is high-impedance while CS# is high. A healthy board reads this, and so does an empty footprint. No conclusion. |
+//! | 0 / 0 | something holds it low while nothing should: a short, the header, or a part not releasing SO. |
+//! | 1 / 1 | something holds it high while nothing should. |
+//!
+//! So the two rows that mean something are the ones that contradict a
+//! released bus. `1 / 0` is the reading to ignore, and the evidence for
+//! an absent part has to come from the opcodes below, not from here.
+//!
+//! ## `[QSPI] BITBANG id=<hh:hh:hh> clk_khz=..`
+//!
+//! `9Fh` by hand, before the reset. Unchanged from the first batch, and
+//! the "before" half of the pair the line below completes.
+//!
+//! ## `[QSPI] PROBE rdsr=<hh> rdid=<hh:hh:hh> rems=<hh:hh> after_reset=1 wip=<0|1>`
+//!
+//! The datasheet's own wake-up sequence — `66h`/`99h` with WP# and HOLD#
+//! held high — and then the three read opcodes:
+//!
+//! | observed | conclusion |
+//! |---|---|
+//! | any of them non-zero and non-`ff` | the part is alive; the earlier silence was a state the reset cleared |
+//! | `rdsr` answers, `rdid` does not | the part is busy (WIP set, `wip=1`), §10-3 |
+//! | all `00` | nothing on the bus responds under any command |
+//! | all `ff` | the bus floats high; with `pulldown=0` above that is a contradiction worth its own line |
+//!
+//! One pass, one line each. No retries and no frequency ladder: this runs
+//! on a board that has already failed to answer, the caller returns `None`
+//! whatever comes back, and a ladder would produce more lines and no more
+//! information than the first.
+
+use embassy_nrf::qspi::{self, Config, Frequency, Qspi, ReadOpcode, WriteOpcode};
+use embassy_nrf::{bind_interrupts, peripherals, Peri};
+
+use embassy_nrf::gpio::{AnyPin, Flex, OutputDrive, Pull};
+
+bind_interrupts!(pub struct QspiIrqs {
+    QSPI => qspi::InterruptHandler<peripherals::QSPI>;
+});
+
+/// Read JEDEC ID (opcode 0x9F): manufacturer, memory type, capacity.
+const CMD_READ_JEDEC_ID: u8 = 0x9F;
+/// Read Status Register (opcode 0x05).
+const CMD_READ_STATUS: u8 = 0x05;
+/// Write Status Register (opcode 0x01).
+const CMD_WRITE_STATUS: u8 = 0x01;
+/// Quad Enable, bit 6 of the status register on both parts.
+const STATUS_QE: u8 = 0x40;
+/// Release from Deep Power Down (opcode 0xAB). `RES` in the Macronix
+/// datasheet, `RDPD` in the ISSI one; same opcode, same effect on a
+/// sleeping part.
+const CMD_RELEASE_DEEP_POWER_DOWN: u8 = 0xAB;
+
+/// Core cycles to wait for a part to come out of Deep Power Down.
+///
+/// 1 ms at the nRF52840's 64 MHz core, against datasheet recovery times of
+/// 35 us and 3 us:
+///
+/// - MX25R1635F: `tRDP`, "Recovery Time for Release from deep power down
+///   mode", 35 us max — Macronix datasheet rev. 1.6 (2018-12-12), Table 17
+///   "AC Characteristics".
+/// - IS25LP080D: `tRES1`, "Release deep power down", 3 us max. Taken from
+///   the IS25LP128 datasheet (ISSI rev. A, Table 9.5 AC characteristics),
+///   which is the same IS25LP family and command set; the 080D sheet
+///   itself was not reachable from these machines.
+///
+/// 28x the larger of the two is deliberate. This runs once per boot, so
+/// the margin costs nothing measurable, and a value trimmed to the
+/// datasheet would buy nothing.
+const RELEASE_WAIT_CYCLES: u32 = 64_000;
+
+/// The bus speeds we use, in a form a `const` board table can hold.
+///
+/// `embassy_nrf::qspi::Frequency` is neither `Copy` nor constructible out
+/// of a `&'static` struct, so the board table carries this and converts on
+/// the way in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Speed {
+    /// 8 MHz — the MX25R1635F's quad-read ceiling in ultra-low-power mode.
+    M8,
+    /// 16 MHz — the step between, and the SolarNode's P25Q16H's clock,
+    /// the fastest it reads clean at with margin ([`P25Q16H_BUS`]).
+    M16,
+    /// 32 MHz — the nRF52840 QSPI's own ceiling.
+    M32,
+}
+
+impl Speed {
+    fn frequency(self) -> Frequency {
+        match self {
+            Speed::M8 => Frequency::M8,
+            Speed::M16 => Frequency::M16,
+            Speed::M32 => Frequency::M32,
+        }
+    }
+
+    /// The bus clock in MHz, for the boot log line.
+    pub fn mhz(self) -> u32 {
+        match self {
+            Speed::M8 => 8,
+            Speed::M16 => 16,
+            Speed::M32 => 32,
+        }
+    }
+}
+
+/// The read timing a part is driven at: the clock and the input sampling
+/// delay, `IFTIMING.RXDELAY`.
+///
+/// RXDELAY counts 64 MHz periods (15.625 ns) from the SCK edge to the
+/// moment the peripheral samples its input (nRF52840 `IFTIMING` register,
+/// `nrf-pac` 0.2.0; `embassy_nrf::qspi::Config::rx_delay`, 0 to 7). The
+/// same count is a different fraction of a bit at every clock, so a clock
+/// without its delay is half a setting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BusTiming {
+    /// SCK.
+    pub speed: Speed,
+    /// `IFTIMING.RXDELAY`, 0..=7.
+    pub rx_delay: u8,
+}
+
+/// `embassy_nrf::qspi::Config::default()`'s RXDELAY: 2, 31.25 ns.
+pub const DEFAULT_RX_DELAY: u8 = 2;
+
+/// Where a part keeps its Quad Enable bit — or that the boot probe is to
+/// leave every status register alone.
+///
+/// Not a detail of the bus: bit 6 means different things to different
+/// vendors, so a single recipe is a write to whatever that vendor keeps
+/// there. On a PUYA part bit 6 of the status register is `BP4`, a
+/// block-protection bit, and the Macronix/ISSI recipe would not fail on
+/// it — it would write-protect the part, non-volatilely, on a boot that
+/// only meant to ask its name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QuadEnable {
+    /// Bit 6 of the one status register, `05h` to read and `01h` to
+    /// write. Macronix MX25R and ISSI IS25LP both keep it there.
+    StatusBit6,
+    /// Write no status register, and configure the single-line
+    /// `FASTREAD`/`PP` opcodes instead of the quad ones.
+    ///
+    /// For a part that is identified and nothing more. The probe then
+    /// costs it one `0xAB` and one `9Fh` and changes nothing that
+    /// survives the power cycle, and the device handed back is one whose
+    /// opcodes work at the QE=0 every part leaves the factory in —
+    /// rather than a handle that would read garbage on first use. The
+    /// day something stores records here is the day to name this part's
+    /// QE bit; until then the honest statement is that we have not
+    /// touched it.
+    Untouched,
+}
+
+/// The part a board is expected to carry.
+pub struct FlashPart {
+    /// Datasheet name, for the boot line.
+    pub name: &'static str,
+    /// The three bytes opcode 0x9F answers with.
+    pub jedec: [u8; 3],
+    /// Density in bytes. Also the bound `Qspi` enforces on every access.
+    pub capacity: u32,
+    /// Bus clock and sampling delay this part is driven at.
+    pub bus: BusTiming,
+    /// Where this part's Quad Enable bit is, or that the probe leaves
+    /// every status register alone. See [`QuadEnable`].
+    pub quad: QuadEnable,
+}
+
+/// ISSI IS25LP080D, 8 Mbit. No board in this tree carries it — the
+/// RAK4631's `EXTERNAL_FLASH_DEVICES` line that named it denies the part
+/// one comment above itself (`boards/rak4631.rs`, Codeberg #384). Kept as
+/// the worked example of a [`FlashPart`] for the add-on that brings one.
+pub const IS25LP080D: FlashPart = FlashPart {
+    name: "IS25LP080D",
+    jedec: [0x9D, 0x60, 0x14],
+    capacity: 1024 * 1024,
+    bus: BusTiming {
+        speed: Speed::M32,
+        rx_delay: DEFAULT_RX_DELAY,
+    },
+    quad: QuadEnable::StatusBit6,
+};
+
+/// The SolarNode's P25Q16H read timing, the one line a sweep result moves.
+///
+/// **16 MHz at RXDELAY 1, the middle of the only clean eye at least three
+/// RXDELAY steps wide** (`MIN_CLEAN_RUN` in `leviculum-qspi-selftest`).
+/// The self-test of 2026-10-05 (Codeberg #435,
+/// `/home/lew/rig-run/solarnode-qspi/qspi-selftest-20261004T230630Z.log`,
+/// build 8c52c797) read pattern B, programmed at 8 MHz, five times per
+/// chunk at every setting; mismatches in bytes of 2 097 152:
+///
+/// | SCK    | RXDELAY | bytes wrong | unstable  | stable    | reading                  |
+/// |--------|---------|-------------|-----------|-----------|--------------------------|
+/// | 8 MHz  | 2       | 0           | 0         | 0         | control                  |
+/// | 16 MHz | 0       | 0           | 0         | 0         | clean                    |
+/// | 16 MHz | 1       | 0           | 0         | 0         | clean, **chosen**        |
+/// | 16 MHz | 2       | 0           | 0         | 0         | clean                    |
+/// | 16 MHz | 3       | 1 969 638   | 1 956 751 | 12 887    | edge                     |
+/// | 16 MHz | 4, 5, 6 | 2 089 026   | 0         | 2 089 026 | stable wrong, one bit late |
+/// | 16 MHz | 7       | 2 090 781   | 1 977 264 | 113 517   | edge                     |
+/// | 32 MHz | 0       | 2 088 639   | 1 896 695 | 191 944   | edge                     |
+/// | 32 MHz | 1       | 0           | 0         | 0         | clean, one step wide     |
+/// | 32 MHz | 2       | 1 915 318   | 1 900 523 | 14 795    | edge (`embassy-nrf` default) |
+/// | 32 MHz | 3       | 2 089 026   | 0         | 2 089 026 | stable wrong, one bit late |
+/// | 32 MHz | 4, 5, 6 | about 2 09x xxx | mixed |           | wrong                    |
+///
+/// "One bit late": `lost1` = `gained1` = 20 979 770, the image shifted by
+/// one bit. RXDELAY 7 at 32 MHz is not in the capture (it closed after
+/// point 15). At 16 MHz the clean eye is three steps wide, 0 to 31 ns; at
+/// 32 MHz it is one step, 15.6 ns, with both neighbours wrong in nearly
+/// every byte, which temperature and supply can move it by. The default
+/// RXDELAY of 2 sits on the falling edge of that 32 MHz eye, the whole of
+/// #435: on 2026-10-04 reads at 32 MHz / 2 came back wrong in 1.64 M and
+/// 1.74 M bytes, at 8 MHz in none
+/// (`qspi-selftest-20261004T211914Z.log`), and the four read sets ahead
+/// of the 2026-10-05 sweep repeat that picture.
+///
+/// A full-part read takes about 1.05 s at 16 MHz, against 2.1 s at the
+/// 8 MHz this constant held from 8c52c797 until this sweep.
+pub const P25Q16H_BUS: BusTiming = BusTiming {
+    speed: Speed::M16,
+    rx_delay: 1,
+};
+
+/// PUYA P25Q16H, 16 Mbit, the part the Seeed XIAO nRF52840 module is
+/// believed to carry and the one the SolarNode asks for at boot
+/// (`boards/solarnode.rs`, Codeberg #384).
+///
+/// The JEDEC id is the datasheet's own "Table ID Definitions" for the
+/// `RDID` (9Fh) command — manufacturer `85` (PUYA), memory type `60`,
+/// memory density `15` — in `Flash_P25Q16H-UXH-IR_Datasheet.pdf`, the
+/// sheet Seeed links from the XIAO nRF52840 wiki page. `15` is the
+/// 16 Mbit code, so a board that answers `85:60:14` is carrying the
+/// 8 Mbit sibling and this probe will say `state=unexpected-part` rather
+/// than mount half a part.
+///
+/// Quad enable is [`QuadEnable::Untouched`]: nothing in this firmware
+/// writes this part's status registers, and its QE bit is S9 rather than
+/// bit 6 — see the module's "Quad enable" section for why that difference
+/// is not academic.
+pub const P25Q16H: FlashPart = FlashPart {
+    name: "P25Q16H",
+    jedec: [0x85, 0x60, 0x15],
+    capacity: 2 * 1024 * 1024,
+    bus: P25Q16H_BUS,
+    quad: QuadEnable::Untouched,
+};
+
+/// Bring the QSPI up, wake the part, identify it, and hand back a NorFlash
+/// device.
+///
+/// `None` means the part did not answer with the JEDEC id this board
+/// expects — `state=no-answer` if it said nothing at all even after the
+/// deep-power-down release, `state=unexpected-part` if it named itself and
+/// named something else. The `Qspi` is dropped on either path, which
+/// deactivates the peripheral and leaves the pins deconfigured, so nothing
+/// can write to a part whose geometry we do not know.
+///
+/// Emits one `[QSPI]` line either way, ungated like `SD_RAM_FLOOR`: a
+/// board that comes up with an unexpected part has to say so in a boot
+/// capture, before any host has attached to the debug port.
+///
+/// Async, and every command awaited rather than spun on, so the deadline
+/// in [`identify_and_mount_bounded`] can fire while a command is
+/// outstanding. `Qspi::new` still spins on the activation's READY
+/// (`embassy-nrf-0.9.0/src/qspi.rs`, `new`); no deadline in this
+/// executor reaches it.
+#[allow(clippy::too_many_arguments)]
+pub async fn identify_at_boot(
+    qspi: Peri<'static, peripherals::QSPI>,
+    sck: Peri<'static, AnyPin>,
+    csn: Peri<'static, AnyPin>,
+    io0: Peri<'static, AnyPin>,
+    io1: Peri<'static, AnyPin>,
+    io2: Peri<'static, AnyPin>,
+    io3: Peri<'static, AnyPin>,
+    part: &'static FlashPart,
+) -> Option<Qspi<'static>> {
+    // Second handles on the six pins, for the `no-answer` path alone.
+    //
+    // SAFETY: the only use is in `bitbang_second_opinion`, and the only
+    // caller of that is the branch below, which runs strictly AFTER the
+    // `Qspi` built from the originals has been dropped. The two drivers
+    // therefore never hold the bus at the same time. `AnyPin` is a byte,
+    // so the copies cost nothing on the path that never uses them —
+    // taking them here rather than inside the branch is only because
+    // `Qspi::new` consumes the originals.
+    let spare = unsafe {
+        [
+            sck.clone_unchecked(),
+            csn.clone_unchecked(),
+            io0.clone_unchecked(),
+            io1.clone_unchecked(),
+            io2.clone_unchecked(),
+            io3.clone_unchecked(),
+        ]
+    };
+
+    let mut config = Config::default();
+    config.frequency = part.bus.speed.frequency();
+    config.rx_delay = part.bus.rx_delay;
+    config.capacity = part.capacity;
+    if part.quad == QuadEnable::Untouched {
+        // Nothing sets QE on this part, so the default `READ4IO`/`PP4IO`
+        // would clock data on pins it is still using as WP# and HOLD#.
+        // Single-line opcodes are what a QE=0 part answers, and they are
+        // what makes the handle below honest rather than a trap for the
+        // first caller that reads through it.
+        config.read_opcode = ReadOpcode::FASTREAD;
+        config.write_opcode = WriteOpcode::PP;
+    }
+
+    // `Qspi::new` drives IO3 (the part's HOLD#/RESET#) high before it
+    // activates the interface, which is what a part that reads pin 7 as
+    // RESET# needs; every pin goes out high first (`config_pin!`,
+    // `embassy-nrf-0.9.0/src/qspi.rs`).
+    let mut flash = Qspi::new(qspi, QspiIrqs, sck, csn, io0, io1, io2, io3, config);
+
+    // Wake it before asking it anything. A part sleeping in Deep Power
+    // Down ignores every other command and rides through a warm reset, so
+    // without this a board that was ever put to sleep answers 00:00:00 for
+    // the rest of its life. Harmless on a part that is already awake,
+    // which is why it is in the boot path and not behind a flag.
+    if flash
+        .custom_instruction(CMD_RELEASE_DEEP_POWER_DOWN, &[], &mut [])
+        .await
+        .is_err()
+    {
+        log_part(part, None, None, false, "release-failed");
+        return None;
+    }
+    cortex_m::asm::delay(RELEASE_WAIT_CYCLES);
+
+    // Custom instructions run on the single-line SPI path regardless of
+    // the quad read/write opcodes configured above, so this works before
+    // QE is set.
+    let first = match read_jedec(&mut flash).await {
+        Some(id) => id,
+        None => {
+            log_part(part, None, None, false, "read-failed");
+            return None;
+        }
+    };
+
+    // A silent first answer earns exactly one more read, because on the
+    // Macronix part the release is the CS# pulse rather than the opcode
+    // ("returns to Stand-by mode if CS# pulses low for tCRDP", rev. 1.6
+    // §10-24) and the recovery time runs from that pulse. So the read
+    // above may be the thing that woke the part, and the read below is the
+    // first one it could have answered. Both go on the log line.
+    let second = if first == [0u8; 3] {
+        cortex_m::asm::delay(RELEASE_WAIT_CYCLES);
+        match read_jedec(&mut flash).await {
+            Some(id) => Some(id),
+            None => {
+                log_part(part, Some(first), None, false, "read-failed");
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+
+    let jedec = second.unwrap_or(first);
+    if jedec != part.jedec {
+        // Two silent reads after a release is not "some other part is
+        // fitted" — it is nothing on the bus driving MISO at all, which is
+        // a statement about the board rather than about the part number.
+        let silent = jedec == [0u8; 3];
+        let state = if silent {
+            "no-answer"
+        } else {
+            "unexpected-part"
+        };
+        log_part(part, Some(first), second, false, state);
+        if silent {
+            // The peripheral is out of answers; the pins are not. Drop it
+            // first — the bit-bang needs the QSPI off the pins, and
+            // `Drop` is what deactivates it and deconfigures them.
+            drop(flash);
+            bitbang_second_opinion(spare);
+        }
+        return None;
+    }
+
+    // The part named itself correctly. Whether anything is written to it
+    // now is the part's own business: `Untouched` is a part nothing reads
+    // yet, and a boot that only asked a name must not leave a
+    // non-volatile bit behind (see [`QuadEnable`]).
+    if part.quad == QuadEnable::StatusBit6 {
+        let mut status = [0u8; 1];
+        if flash
+            .custom_instruction(CMD_READ_STATUS, &[], &mut status)
+            .await
+            .is_err()
+        {
+            log_part(part, Some(first), second, false, "status-read-failed");
+            return None;
+        }
+        if status[0] & STATUS_QE == 0 {
+            let want = status[0] | STATUS_QE;
+            if flash
+                .custom_instruction(CMD_WRITE_STATUS, &[want], &mut [])
+                .await
+                .is_err()
+            {
+                log_part(part, Some(first), second, false, "quad-enable-failed");
+                return None;
+            }
+            // Read it back rather than assume: the quad opcodes this driver
+            // is configured with are silently wrong if QE did not take, and
+            // the symptom would be garbage data rather than an error.
+            let mut check = [0u8; 1];
+            if flash
+                .custom_instruction(CMD_READ_STATUS, &[], &mut check)
+                .await
+                .is_err()
+                || check[0] & STATUS_QE == 0
+            {
+                log_part(part, Some(first), second, false, "quad-enable-refused");
+                return None;
+            }
+        }
+    }
+
+    log_part(part, Some(first), second, true, "ok");
+    Some(flash)
+}
+
+/// Half a bit-bang clock period, in core cycles at the nRF52840's 64 MHz.
+///
+/// 128 cycles is 2 us, so a nominal 250 kHz — 32x under the slower
+/// candidate part's own single-line ceiling (the MX25R1635F's 8 MHz in
+/// ultra-low-power mode) and far under anything about the wiring that
+/// could plausibly be marginal. That is the point: this runs once, on a
+/// board that has already failed to answer, and a diagnostic that is
+/// itself near a timing limit proves nothing. `asm::delay` plus the GPIO
+/// writes make the real clock somewhat slower than the nominal figure,
+/// which only ever helps here.
+const BITBANG_HALF_PERIOD_CYCLES: u32 = 128;
+
+/// The nRF52840 core clock in kHz, for the nominal bit-bang frequency.
+const CORE_CLOCK_KHZ: u32 = 64_000;
+
+/// What goes on the `clk_khz=` field: nominal, from the half period above.
+const BITBANG_CLK_KHZ: u32 = CORE_CLOCK_KHZ / (2 * BITBANG_HALF_PERIOD_CYCLES);
+
+/// The four pins the hand-clocked read drives, as
+/// [`leviculum_qspi_bitbang::Bus`] wants them.
+///
+/// IO2 and IO3 are not here: they carry no edges, they are held high for
+/// the whole transfer by the caller, and giving the shifter the ability to
+/// move them would only be a way to get them wrong.
+struct GpioBus {
+    sck: Flex<'static>,
+    csn: Flex<'static>,
+    io0: Flex<'static>,
+    io1: Flex<'static>,
+}
+
+impl leviculum_qspi_bitbang::Bus for GpioBus {
+    fn set_sck(&mut self, high: bool) {
+        self.sck.set_level(high.into());
+    }
+
+    fn set_cs(&mut self, high: bool) {
+        self.csn.set_level(high.into());
+    }
+
+    fn set_io0(&mut self, high: bool) {
+        self.io0.set_level(high.into());
+    }
+
+    fn read_io1(&mut self) -> bool {
+        self.io1.is_high()
+    }
+
+    fn settle(&mut self) {
+        cortex_m::asm::delay(BITBANG_HALF_PERIOD_CYCLES);
+    }
+}
+
+/// Core cycles per microsecond at the nRF52840's 64 MHz core.
+const CYCLES_PER_US: u32 = 64;
+
+/// Settle between driving a pin and reading its own pad level back, stage
+/// 1a. 10 us against a GPIO that switches in nanoseconds — the margin is
+/// there so a line loaded by a long trace or a sleeping part's input
+/// capacitance is not read before it has arrived.
+const PIN_READBACK_CYCLES: u32 = 10 * CYCLES_PER_US;
+
+/// Settle after changing IO1's internal pull, stage 1b.
+///
+/// The nRF52840's internal pull is ~13 kOhm (nRF52840 PS v1.8, §6.9.3
+/// "Electrical specification", `R_PU`/`R_PD`), so against even a few
+/// hundred pF of bus capacitance the line is at its new level in a few
+/// microseconds. 100 us is two orders over that, and it runs twice, once
+/// per boot, on a board that has already failed.
+const PULL_SETTLE_CYCLES: u32 = 100 * CYCLES_PER_US;
+
+/// Settle after WP# and HOLD# are driven high, before anything is clocked.
+///
+/// 100 us. If pin 7 has been acting as RESET# and sitting low, this is the
+/// first moment the part has ever been out of reset, and `tREADY1` — the
+/// time from the rising edge to the part accepting an instruction — is
+/// 35 us max (MX25R1635F rev. 1.6, Table 17 "AC Characteristics").
+const HOLD_SETTLE_CYCLES: u32 = 100 * CYCLES_PER_US;
+
+/// Settle after the `66h`/`99h` pair, before the first read.
+///
+/// 50 us against the same 35 us `tREADY1`. Small margin, deliberately:
+/// anything the part does in this window it does on its own, and a long
+/// wait here would blur a reset that worked into one that did not.
+const RESET_RECOVERY_CYCLES: u32 = 50 * CYCLES_PER_US;
+
+/// Drive a pin to both levels and read each one back through the pin's own
+/// input buffer. `true` when the readback followed both times.
+///
+/// `set_as_input_output` rather than `set_as_output` because
+/// `set_as_output` writes `INPUT: Disconnect` into `PIN_CNF`
+/// (`set_as_output`, `embassy-nrf-0.9.0/src/gpio.rs:362`), and a
+/// disconnected input buffer reads zero forever — which would report every
+/// pin as `stuck` and prove nothing.
+///
+/// `OutputDrive::Standard` rather than the high drive the transfer uses:
+/// if a line is shorted, this is the moment it is found out, and the
+/// standard driver is the one that spends the least current finding out.
+///
+/// Leaves the pin disconnected, which is where `Qspi::drop` left five of
+/// the six; CS# is the exception and its caller restores it.
+fn pin_follows(pin: &mut Flex<'static>) -> bool {
+    pin.set_high();
+    pin.set_as_input_output(Pull::None, OutputDrive::Standard);
+    cortex_m::asm::delay(PIN_READBACK_CYCLES);
+    let high = pin.is_high();
+
+    pin.set_low();
+    cortex_m::asm::delay(PIN_READBACK_CYCLES);
+    let low = pin.is_low();
+
+    pin.set_as_disconnected();
+    high && low
+}
+
+/// The two words the `PINS` line is allowed to use.
+fn ok_or_stuck(followed: bool) -> &'static str {
+    if followed {
+        "ok"
+    } else {
+        "stuck"
+    }
+}
+
+/// Ask the pins directly, once, and say what they answered.
+///
+/// Only reached from the `state=no-answer` branch of [`identify_at_boot`],
+/// and only after the `Qspi` is dropped. Four `[QSPI]` lines — `PINS`,
+/// `MISO`, `BITBANG`, `PROBE` — and the table each is read by is in the
+/// module docs above, written before the boot rather than after it. One
+/// pass per line, no retry and no frequency ladder: the caller returns
+/// `None` either way, so a ladder of attempts would produce more lines and
+/// no more information than the first.
+///
+/// # The order, and why it is that order
+///
+/// Nothing may be concluded about the part until our own side is proven,
+/// so the pins come first (`PINS`) and what is on IO1 when nobody of ours
+/// drives it comes second (`MISO`). Only then is anything clocked.
+///
+/// CS# is tested first of the six and put straight back to driven-high, so
+/// the part is deselected for every other pin's test and cannot read a
+/// stray SCK edge as the start of a command. Nothing here ever asserts a
+/// write-enable, so even a fully mis-clocked byte cannot reach a state
+/// where the part would program or erase.
+///
+/// Stage 1a's IO3 test is also the first thing on this board that ever
+/// gives pin 7 a defined low and then a defined high. On a part where that
+/// pin is configured as RESET# rather than HOLD#, that *is* a hardware
+/// reset, and the `PROBE` line below is read after it — which is one more
+/// reason `after_reset=1` is on that line and not on `BITBANG`.
+///
+/// `BITBANG` is the cold `9Fh`, before the reset; `PROBE` is the same
+/// question plus `05h` and `90h` after it, which is what `after_reset=1`
+/// on that line means. The pair is the evidence for whether the reset
+/// changed anything, and neither line alone is.
+///
+/// # Two details of the wiring
+///
+/// - IO1 is read with a **pull-down** during the transfers. Without one,
+///   an undriven wire is a floating input and the bytes would be noise
+///   rather than evidence, so `00:00:00` has to be made to mean something:
+///   it means the wire never left the level the nRF's own internal pull
+///   put it at. A part that is present drives IO1 push-pull and wins
+///   against a pull of that order easily, so it cannot suppress a real
+///   answer — which also makes `ff:ff:ff` a genuine "something else" here
+///   and not the idle reading it would be under a pull-up. (Stage 1b reads
+///   it under both pulls on purpose; that is the one place the pull is the
+///   measurement rather than a floor under it.)
+/// - IO2 and IO3 are driven high from the end of stage 1b onwards. They
+///   are the part's WP# and pin 7, and pin 7 is HOLD# *or* RESET#: a part
+///   with HOLD# low suspends the transfer and answers nothing, and a part
+///   held in RESET# answers nothing at all. The QSPI peripheral was doing
+///   this implicitly through `CINSTRCONF.LIO2`/`LIO3`
+///   (`embassy-nrf-0.9.0/src/qspi.rs:290`); by hand it is explicit, and
+///   [`HOLD_SETTLE_CYCLES`] is the recovery time that follows raising them.
+///
+/// One ambiguity this does not resolve, and should not be read past: a
+/// part still in Deep Power Down answers nothing to `9Fh` here either,
+/// because the only opcode it would honour is `0xAB`. `identify_at_boot`
+/// already sent `0xAB` and pulsed CS# low three times before reaching this
+/// branch, so on any board where the QSPI reaches the part the part is
+/// awake — and on a board where it does not, the interesting rows of the
+/// tables are the ones where something *answers*, which no amount of sleep
+/// can fake.
+///
+/// # What it leaves behind
+///
+/// Exactly the pin states `Qspi::drop` left: SCK, IO0..IO3 disconnected
+/// (`Flex::drop` writes the same `PIN_CNF` that `gpio::deconfigure_pin`
+/// does), and CS# still an output driven high. That last one is not an
+/// oversight in either place — embassy leaves CSN driven on purpose, so a
+/// part in Deep Power Down does not read a floating CS# as a select and
+/// wake up on its own — so this path restores it rather than "cleaning it
+/// up" into a state its caller never had. A later `Qspi::new` on these
+/// pins therefore starts from the same place it would have without this
+/// function.
+fn bitbang_second_opinion(pins: [Peri<'static, AnyPin>; 6]) {
+    let [sck, csn, io0, io1, io2, io3] = pins;
+
+    let mut sck = Flex::new(sck);
+    let mut csn = Flex::new(csn);
+    let mut io0 = Flex::new(io0);
+    let mut io1 = Flex::new(io1);
+    let mut wp = Flex::new(io2);
+    let mut hold = Flex::new(io3);
+
+    // Stage 1a: does the MCU control these six lines at all? CS# first,
+    // and back to driven-high immediately, so every test after it runs
+    // with the part deselected.
+    let cs_ok = pin_follows(&mut csn);
+    csn.set_high();
+    csn.set_as_output(OutputDrive::HighDrive);
+
+    let sck_ok = pin_follows(&mut sck);
+    let io0_ok = pin_follows(&mut io0);
+    let io1_ok = pin_follows(&mut io1);
+    let io2_ok = pin_follows(&mut wp);
+    let io3_ok = pin_follows(&mut hold);
+
+    crate::log::log_fmt_critical(
+        "[QSPI] ",
+        format_args!(
+            "PINS sck={} cs={} io0={} io1={} io2={} io3={}",
+            ok_or_stuck(sck_ok),
+            ok_or_stuck(cs_ok),
+            ok_or_stuck(io0_ok),
+            ok_or_stuck(io1_ok),
+            ok_or_stuck(io2_ok),
+            ok_or_stuck(io3_ok),
+        ),
+    );
+
+    // Stage 1b: with CS# high a present part has released IO1, so whatever
+    // the line does under our two pulls, it does without us driving it.
+    // This is the line that separates "open connection" from "held".
+    io1.set_as_input(Pull::Up);
+    cortex_m::asm::delay(PULL_SETTLE_CYCLES);
+    let miso_pullup = io1.is_high();
+    io1.set_as_input(Pull::Down);
+    cortex_m::asm::delay(PULL_SETTLE_CYCLES);
+    let miso_pulldown = io1.is_high();
+
+    crate::log::log_fmt_critical(
+        "[QSPI] ",
+        format_args!(
+            "MISO pullup={} pulldown={}",
+            u8::from(miso_pullup),
+            u8::from(miso_pulldown)
+        ),
+    );
+
+    // WP# and pin 7 high for everything below, and held there until the
+    // pins are handed back. If pin 7 has been acting as RESET#, this is
+    // the edge that lets the part answer at all.
+    wp.set_high();
+    wp.set_as_output(OutputDrive::HighDrive);
+    hold.set_high();
+    hold.set_as_output(OutputDrive::HighDrive);
+    cortex_m::asm::delay(HOLD_SETTLE_CYCLES);
+
+    sck.set_low();
+    sck.set_as_output(OutputDrive::HighDrive);
+    io0.set_low();
+    io0.set_as_output(OutputDrive::HighDrive);
+    io1.set_as_input(Pull::Down);
+
+    let mut bus = GpioBus { sck, csn, io0, io1 };
+
+    // Cold, before the reset.
+    let id = leviculum_qspi_bitbang::read_jedec_id(&mut bus);
+    crate::log::log_fmt_critical(
+        "[QSPI] ",
+        format_args!(
+            "BITBANG id={} clk_khz={}",
+            JedecId(Some(id)),
+            BITBANG_CLK_KHZ
+        ),
+    );
+
+    // Stage 2: the datasheet's wake-up sequence, then the three questions
+    // a part in an unknown state is allowed to answer. `reset` clocks
+    // `66h` and `99h` adjacent with nothing between them, which is what
+    // makes the reset honoured rather than ignored.
+    leviculum_qspi_bitbang::reset(&mut bus);
+    cortex_m::asm::delay(RESET_RECOVERY_CYCLES);
+    let rdsr = leviculum_qspi_bitbang::read_status(&mut bus);
+    let rdid = leviculum_qspi_bitbang::read_jedec_id(&mut bus);
+    let rems = leviculum_qspi_bitbang::read_manufacturer_device_id(&mut bus);
+
+    crate::log::log_fmt_critical(
+        "[QSPI] ",
+        format_args!(
+            "PROBE rdsr={:02x} rdid={} rems={:02x}:{:02x} after_reset=1 wip={}",
+            rdsr,
+            JedecId(Some(rdid)),
+            rems[0],
+            rems[1],
+            u8::from(rdsr & leviculum_qspi_bitbang::STATUS_WIP != 0),
+        ),
+    );
+
+    let GpioBus { sck, csn, io0, io1 } = bus;
+    // Give the pins back. Dropping a `Flex` disconnects it, which is what
+    // `Qspi::drop` did to these five; CS# is the exception it deliberately
+    // left driven, so it is the one that persists.
+    drop(sck);
+    drop(io0);
+    drop(io1);
+    drop(wp);
+    drop(hold);
+    csn.persist();
+}
+
+/// One JEDEC id read (opcode 0x9F). `None` is a transaction the peripheral
+/// refused; three zero bytes are a transaction that worked and found
+/// nobody driving the bus.
+async fn read_jedec(flash: &mut Qspi<'static>) -> Option<[u8; 3]> {
+    let mut jedec = [0u8; 3];
+    flash
+        .custom_instruction(CMD_READ_JEDEC_ID, &[], &mut jedec)
+        .await
+        .ok()?;
+    Some(jedec)
+}
+
+/// A JEDEC id on the boot line: `c2:28:15`, or `none` for a read that was
+/// never made — the second read only happens when the first was silent,
+/// and a release that fails means neither did.
+struct JedecId(Option<[u8; 3]>);
+
+impl core::fmt::Display for JedecId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(id) => write!(f, "{:02x}:{:02x}:{:02x}", id[0], id[1], id[2]),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// The one boot line. Same shape as `SD_RAM_FLOOR`: every value that went
+/// into the verdict is on it, so the verdict is checkable from a capture.
+///
+/// `id` is the read after the deep-power-down release, `id2` the retry it
+/// earns by being silent. `id2=none` therefore means the first read was
+/// answered — the part was awake, or the release woke it — and anything
+/// else means the first read was not, so a capture says which of the two
+/// spoke without anyone having to know the sequence.
+fn log_part(
+    part: &FlashPart,
+    first: Option<[u8; 3]>,
+    second: Option<[u8; 3]>,
+    matched: bool,
+    state: &str,
+) {
+    crate::log::log_fmt_critical(
+        "[QSPI] ",
+        format_args!(
+            "JEDEC id={} id2={} expect={} part={} bytes={} clk={}MHz rxdelay={} match={} state={}",
+            JedecId(first),
+            JedecId(second),
+            JedecId(Some(part.jedec)),
+            part.name,
+            part.capacity,
+            part.bus.speed.mhz(),
+            part.bus.rx_delay,
+            u8::from(matched),
+            state,
+        ),
+    );
+}
+
+/// Bytes of the part read back and summarised by [`log_head`].
+const HEAD_PROBE_LEN: usize = 256;
+
+/// A 4-byte-aligned read buffer. The QSPI peripheral DMAs into it and
+/// asserts `ptr % 4 == 0` (`start_read`, `embassy-nrf-0.9.0/src/qspi.rs`).
+#[repr(align(4))]
+struct Aligned<const N: usize>([u8; N]);
+
+/// Read the first 256 bytes over the quad path and say what came back.
+///
+/// This is the only thing in part 1 that exercises the configured read
+/// opcode at the configured clock, so it is what a boot capture has to
+/// show before the bus is believed. `READ4IO` on a part whose QE bit the
+/// probe set, `FASTREAD` on a [`QuadEnable::Untouched`] one — which is
+/// why the opcode is chosen beside the part rather than here. It is also the honest answer to "is there already
+/// something on these boards' flash?", which matters before anything
+/// formats them: `nonff=0/256` is a blank part (or a bus that answers with
+/// pull-ups — the two look alike, which is why the JEDEC line above is the
+/// separate proof that a part is there at all), and anything else is data
+/// somebody wrote.
+pub fn log_head(flash: &mut Qspi<'static>) {
+    let mut buf = Aligned([0u8; HEAD_PROBE_LEN]);
+    if flash.blocking_read(0, &mut buf.0).is_err() {
+        crate::log::log_fmt_critical("[QSPI] ", format_args!("HEAD state=read-failed"));
+        return;
+    }
+    // FNV-1a over the window: a number a capture can be diffed on, not a
+    // cryptographic claim.
+    let mut digest: u32 = 0x811C_9DC5;
+    let mut nonff = 0u32;
+    for byte in buf.0.iter() {
+        digest = (digest ^ u32::from(*byte)).wrapping_mul(0x0100_0193);
+        if *byte != 0xFF {
+            nonff += 1;
+        }
+    }
+    crate::log::log_fmt_critical(
+        "[QSPI] ",
+        format_args!(
+            "HEAD fnv1a={digest:08x} nonff={nonff}/{HEAD_PROBE_LEN} b0={:02x}{:02x}{:02x}{:02x}",
+            buf.0[0], buf.0[1], buf.0[2], buf.0[3]
+        ),
+    );
+}
+
+/// Mount the record log over the whole part, read-only, and say what is
+/// there.
+///
+/// **Read-only on purpose.** These boards have carried other people's
+/// firmware, and part 1 of #384 has no business erasing whatever that left
+/// behind; `RecordLog::mount` returns `None` on a region it did not write
+/// rather than formatting it. Formatting is a decision for the batch that
+/// actually stores something.
+///
+/// Consumes the device: nothing in part 1 keeps the QSPI, and dropping it
+/// deactivates the peripheral (and, on the way out, works around
+/// nRF52840 anomaly 122) instead of holding the part out of its standby
+/// current for a store no one has mounted yet.
+pub async fn log_store(flash: Qspi<'static>, part: &FlashPart) {
+    use leviculum_record_log::{RecordLog, SECTOR_SIZE};
+
+    let sectors = part.capacity / SECTOR_SIZE;
+    match RecordLog::mount(flash, 0, part.capacity).await {
+        Ok(Some(mut log)) => {
+            let active = log.active_sector();
+            let seq = log.sequence();
+            match log.count().await {
+                Ok((live, purged)) => crate::log::log_fmt_critical(
+                    "[QSPI] ",
+                    format_args!(
+                        "STORE state=mounted sectors={sectors} active={active} seq={seq} \
+                         live={live} purged={purged}"
+                    ),
+                ),
+                Err(_) => crate::log::log_fmt_critical(
+                    "[QSPI] ",
+                    format_args!("STORE state=scan-failed sectors={sectors} active={active}"),
+                ),
+            }
+        }
+        Ok(None) => crate::log::log_fmt_critical(
+            "[QSPI] ",
+            format_args!("STORE state=unformatted sectors={sectors} note=this-batch-never-formats"),
+        ),
+        Err(_) => crate::log::log_fmt_critical(
+            "[QSPI] ",
+            format_args!("STORE state=mount-failed sectors={sectors}"),
+        ),
+    }
+}
+
+/// The QSPI peripheral's `TASKS_DEACTIVATE` (base 0x4002_9000, offset
+/// 0x010, `nrf-pac` `qspi::Qspi::tasks_deactivate`). Raw for the reason the
+/// self-test's registers are: `embassy-nrf` exports its PAC only under
+/// `unstable-pac`.
+const QSPI_TASKS_DEACTIVATE: *mut u32 = 0x4002_9010 as *mut u32;
+/// `INTENCLR`, offset 0x308.
+const QSPI_INTENCLR: *mut u32 = 0x4002_9308 as *mut u32;
+/// `ENABLE`, offset 0x500.
+const QSPI_ENABLE: *mut u32 = 0x4002_9500 as *mut u32;
+/// The register nRF52840 anomaly 122 has written after a deactivate, as
+/// `Qspi`'s own `Drop` does.
+const QSPI_ANOMALY_122: *mut u32 = 0x4002_9054 as *mut u32;
+/// `PSEL.SCK`, offset 0x524; `PSEL.IO0..IO3` follow at 0x530..0x53C.
+const QSPI_PSEL_SCK: *const u32 = 0x4002_9524 as *const u32;
+const QSPI_PSEL_IO: [*const u32; 4] = [
+    0x4002_9530 as *const u32,
+    0x4002_9534 as *const u32,
+    0x4002_9538 as *const u32,
+    0x4002_953C as *const u32,
+];
+/// `PSEL.CONNECT`: set means no pin is selected.
+const PSEL_DISCONNECTED: u32 = 1 << 31;
+
+/// Identify the part and mount its record log, giving both up together
+/// after [`leviculum_qspi_boot::BOOT_STEP_BUDGET_MS`].
+///
+/// On time this is [`identify_at_boot`] followed by [`log_store`], and the
+/// boot reads the same lines it always did. Past the deadline it prints
+/// `[QSPI] state=timeout after_ms=<n>`, releases the peripheral and the
+/// pins, and returns: the caller goes on to the radio exactly as it does
+/// after `state=no-answer`. No retry.
+///
+/// **The step is leaked, not dropped, on a timeout**, as the self-test's
+/// `guarded` does: every `Qspi` operation future carries an `OnDrop` that
+/// spins on the READY event (`embassy-nrf-0.9.0/src/qspi.rs`,
+/// `custom_instruction`, `read_raw`), and READY is exactly what a hung
+/// transfer never raises. A plain `with_timeout(.., step)` would fire, drop
+/// the step, and hang in that spin. Boxed, so the memory the transfer's
+/// DMA points into stays allocated for good; the `Qspi` inside therefore
+/// never runs its `Drop`, and `release_after_timeout` does that work
+/// instead. The leak is the size of the step future, once, on a board
+/// whose flash already failed.
+#[allow(clippy::too_many_arguments)]
+pub async fn identify_and_mount_bounded(
+    qspi: Peri<'static, peripherals::QSPI>,
+    sck: Peri<'static, AnyPin>,
+    csn: Peri<'static, AnyPin>,
+    io0: Peri<'static, AnyPin>,
+    io1: Peri<'static, AnyPin>,
+    io2: Peri<'static, AnyPin>,
+    io3: Peri<'static, AnyPin>,
+    part: &'static FlashPart,
+) {
+    use embassy_time::{with_timeout, Duration, Instant};
+    use leviculum_qspi_boot::{Timeout, BOOT_STEP_BUDGET_MS};
+
+    let start = Instant::now();
+    let mut step = alloc::boxed::Box::pin(async move {
+        if let Some(flash) = identify_at_boot(qspi, sck, csn, io0, io1, io2, io3, part).await {
+            log_store(flash, part).await;
+        }
+    });
+    let budget = Duration::from_millis(BOOT_STEP_BUDGET_MS.into());
+    if with_timeout(budget, step.as_mut()).await.is_err() {
+        core::mem::forget(step);
+        release_after_timeout();
+        let line = Timeout {
+            after_ms: start.elapsed().as_millis(),
+        };
+        crate::log::log_fmt_critical("[QSPI] ", format_args!("{line}"));
+    }
+}
+
+/// What `Qspi`'s `Drop` does, for a `Qspi` that was leaked mid-operation:
+/// stop the interrupt, deactivate (with the anomaly 122 write), disable,
+/// and disconnect SCK and IO0..IO3.
+///
+/// CSN stays what `Qspi::new` made it, a GPIO output driven high, for
+/// `Drop`'s own reason and one more: a part that stopped answering is best
+/// left deselected rather than with a floating chip select.
+fn release_after_timeout() {
+    // SAFETY: the registers are the QSPI's, which nothing else in the
+    // firmware drives; the only `Qspi` that did is leaked above and is never
+    // polled again. The pins stolen below are the ones that leaked `Qspi`
+    // selected, read back from its PSEL registers; no other driver holds
+    // them, because they were moved into it.
+    unsafe {
+        core::ptr::write_volatile(QSPI_INTENCLR, u32::MAX);
+        core::ptr::write_volatile(QSPI_TASKS_DEACTIVATE, 1);
+        core::ptr::write_volatile(QSPI_ANOMALY_122, 1);
+        core::ptr::write_volatile(QSPI_ENABLE, 0);
+        let sck = core::ptr::read_volatile(QSPI_PSEL_SCK);
+        for psel in core::iter::once(sck).chain(
+            QSPI_PSEL_IO
+                .iter()
+                .map(|reg| core::ptr::read_volatile(*reg)),
+        ) {
+            if psel & PSEL_DISCONNECTED == 0 {
+                // Bits 5:0 are port * 32 + pin, `AnyPin`'s own numbering;
+                // dropping the `Flex` disconnects the pin's input buffer.
+                drop(Flex::new(AnyPin::steal((psel & 0x3F) as u8)));
+            }
+        }
+    }
+}

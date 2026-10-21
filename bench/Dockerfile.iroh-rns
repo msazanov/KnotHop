@@ -1,0 +1,10 @@
+# Python RNS (версия зафиксирована) в образе с тем же glibc, что у хоста: туда монтируются нативно собранные бинарники iroh-bench.
+FROM archlinux:base
+ARG RNS_VERSION=1.5.7
+RUN pacman -Sy --noconfirm python python-pip iproute2 tcpdump iptables \
+ && python3 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir "rns==${RNS_VERSION}" cryptography \
+ && pacman -Scc --noconfirm >/dev/null
+ENV PATH=/opt/venv/bin:$PATH
+COPY rnsbench.py /usr/local/bin/rnsbench.py
+ENTRYPOINT ["python3", "/usr/local/bin/rnsbench.py"]

@@ -1,0 +1,2603 @@
+# Changelog
+
+All notable changes to this project will be documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Each release section opens with a `Toolchain:` line naming the pinned Rust
+version that built it, copied from `rust-toolchain.toml`. Raising that pin is
+a deliberate act at release time — published binaries and a measured embedded
+stack-frame margin are what it protects — and `just toolchain-status` says how
+far it has fallen behind current stable, as a report rather than a gate
+(Codeberg #304). Sections from 0.9.0 on carry the line; before the pin landed
+on 2026-08-18 the channel was `stable`, meaning whatever the building host had
+last installed, and there is no one version to name.
+
+## [Unreleased]
+
+Toolchain: Rust 1.97.1
+
+### Added
+
+- The nightly is built and published by `just nightly-publish` on the
+  machine that runs the tier-2 nightly, from the tree that night tested,
+  after a green night (leviculum#517, refs #260). The forge pipeline keeps
+  its test gate and its builds; its publish steps run only when started by
+  hand. `LEVICULUM_PUBLISH_DRY_RUN=1` builds everything and uploads nothing.
+
+- leviculum.network gets a landing page, a download page, a source page and
+  a board list (leviculum#498, refs #260), shipped in the lblogd package
+  under `/usr/share/lblogd/pages/` and served when `pages_dir` points there;
+  a link from one page to another now also reaches it on the NomadNet side.
+
+- The book is published (leviculum#503, refs #260). The nightly renders
+  `docs/` with a pinned mdbook and ships it as
+  `leviculum-docs-nightly.tar.gz` beside the packages;
+  `packaging/site/lev-unpack-docs` checks it and swaps it in under
+  https://leviculum.network/docs/, which the landing page's Documentation
+  link now points at.
+
+- A propagation node leaves half its airtime to forwarding (leviculum#494,
+  decided on #433). A board running the propagation role starts no sync
+  round, offer, transfer or active delivery of its own, and postpones
+  inbound offers with `ERROR_THROTTLED`, once the rolling hour has spent
+  half its lawful long-term airtime budget; what it relays for others is
+  unaffected, so the relay's own work no longer spends the budget its
+  forwarding needs (a transfer already under way finishes). The firmware logs `PN_YIELD reason=duty_share lt_ms= cap_ms=
+  share=` once when it starts yielding.
+
+- A relay that has spent its lawful airtime budget stops advertising routes
+  until the budget returns (leviculum#493, decided on #433). While a LoRa
+  interface's duty lock holds its TX gate, the node relays no announce and
+  no path response on that interface — a route it advertised there would
+  invite link setups it provably cannot carry — and the refusal is final
+  rather than queued, so no stale route keys when the hold ends. The node's
+  own announces are unaffected (the #402 announce cap governs them). The
+  hold visibly lifts the moment the rolling hour frees budget: the firmware
+  logs `[LORA] hold lifted lt_ms= held_for_ms= dropped_stale=` on the edge,
+  lnsd emits `DUTY_HOLD iface= state=held|lifted lt_ms=` event lines, and
+  suppressed relays carry `ANN_TX_SUPPRESSED … closed=duty_hold`. Python
+  precedent: an interface over its `announce_cap` relays no announce
+  (Transport.py:1252-1294).
+
+- A board driven by lnsd over its serial protocol now stops lnsd advertising
+  routes through it while its LoRa duty hold is in force (leviculum#501).
+  The LNode's USB control envelope gains `DUTY_HOLD` (0x8A, board to host,
+  `[state, lt_ms u32 BE]`): the firmware sends it on each edge of the hold
+  and right behind every media report, lnsd asks with a media query each
+  time the port attaches, mirrors it into the interface's `duty_hold`, logs
+  the `DUTY_HOLD iface= state=held|lifted lt_ms=` line its RNode path
+  already emits, and clears it with `cause=iface_down` when the port goes
+  away. USB protocol between our board and our host only; nothing changes
+  on the air.
+
+- An instrumented daemon package for memory censuses (Codeberg #437). The
+  nightly publishes `leviculum-nightly-arm64-heapacct.deb` beside the plain
+  packages: package `leviculum-heapacct`, version `<plain>+heapacct`, the
+  same six binaries with `lnsd` built under `--features heap-accounting`. It
+  conflicts with and replaces `leviculum`, and the plain package does the
+  same back, so `dpkg -i` of either swaps the other out. Its SIGUSR1
+  census subtracts the measured live heap from resident plus swap instead
+  of the modelled total, so what is left is allocator retention plus
+  stacks; a plain build prints `live n/a` in the same place. `lnsd
+  --version` names the build with `+heapacct`. Not for daily use: the
+  counting costs a few atomic operations per allocation.
+
+- Path choice can weigh what the link has shown, not only how many hops
+  (Codeberg #230). New opt-in `[reticulum]` key `path_choice =
+  hops_and_loss`: competing copies of one announce emission are ranked by
+  route cost, with the direct link priced at the bidirectional ETX its
+  announce re-hear ratio implies, so a clean two-hop route beats a direct
+  link that loses more than ~29 % of announces. The default, `hops`, is
+  today's rule, byte for byte; with it the transport keeps no evidence
+  table at all. Wire-invisible either way — only which next hop the path
+  table keeps changes. The decision table behind the rule is pinned as
+  `mvr_pathchoice_rule_table`: at 0 % loss the two settings are
+  indistinguishable, from 30 % direct-link loss up the evidence rule
+  delivers more probes and flaps less at every measured level, and the
+  Python-reference row matches the shipped rule exactly in that room.
+
+- A board can account for one named packet (Codeberg #421). The firmware's
+  `[DROP]` line now carries `ph=`, the same 16-hex journey correlator the
+  `PKT_RELAY` line and a peer's `lnsd` journey events already carry, so "did
+  the relay forward my report, and if not, which reason" is one grep for one
+  id across a board capture and the sender's log. The hash is taken only
+  where the deciding site already held one — the link-request, link-echo and
+  addressed-data drops — and the two paths that never hash (the HEADER_2
+  overheard gate, which stays SHA-256-free on its 99 %-volume path, and the
+  path-request refusals) say `ph=none` instead. The node-layer drop family —
+  a delivered packet that decrypted under no retained key, link data whose
+  owner restarted — raises the `[DROP]` event for the first time: it was the
+  one loss class with no board-visible line at all, despite being a message
+  lost at its last hop. The wider line re-derives the `[DROP]` rate limit
+  from the 8 KiB log ring: 2 lines per second instead of 3, pinned by a test
+  that renders the real worst-case line
+  (`leviculum-drop-budget::the_ring_derivation_still_holds`), with the
+  `suppressed=` window summary unchanged.
+
+- A board can be asked who may read its status remotely. A standalone LNode
+  now serves `rnstransport.remote.management` with the `/status` handler when
+  — and only when — it carries an allow-list of identity hashes, so
+  `rnstatus -R <board>` and `lnstatus -R <board>` address a board the way they
+  address a daemon, over whichever carrier reaches it. The list lives in a new
+  `"LMGA"` record on the telemetry flash page, is read at boot, and is written
+  by a new control-envelope frame (`MGMT_ALLOW`, 0x13, with `MGMT_ALLOW_QUERY`
+  0x14 to read it back and `MGMT_ALLOW_REPORT` 0x89 as the answer);
+  `lnflash --management-identity <hex>` (repeatable) and
+  `lnflash --clear-management` are the host side, plus a flash-time question
+  beside the radio one whose default answer is no (Codeberg #235, #238, #86).
+
+  Two properties are the point of the feature rather than details of it.
+  **The list is writable over USB and never over the air:** the envelope is
+  classified on the transport CDC read path and nowhere else, and the same
+  frame arriving from the LoRa or BLE interface is dropped in packet parsing,
+  which `leviculum-core/src/node/mvr_mgmt_allow_is_usb_only.rs` drives on a
+  real `NodeCore` instead of asserting by inspection. **An absent or empty
+  list registers nothing at all** — no destination, no handler, no announce.
+  That is a deliberate deviation from the daemon, which registers the handler
+  and consults an empty list per request the way Python does: a daemon sits on
+  a machine with an operator and a login, while a board is left on a mast, and
+  an unattended node announcing a management destination with nobody on the
+  list is advertising a door.
+
+  The answer is a report rather than an ack because two states honestly
+  differ: the management destination is created while the node is built, so a
+  list set now is served after the next reset — and an identity revoked now is
+  still being served until then, which is the sentence the operator who
+  revoked it most needs to read.
+
+- `lnstest selftest --messages N` sizes the ratchet exchange: how many
+  messages each direction sends under `--mode ratchet-basic` and
+  `--mode ratchet-enforced`, 10 by default, so an invocation without the flag
+  is unchanged. `--duration` and `--rate` size the link and single-packet
+  phases, which no ratchet mode runs, so until now a ratchet measurement was
+  fixed at 20 packets — too few for a delivery bar in the eighties to be
+  decided either way (Codeberg #429, #188).
+
+- A board can now account for a SINGLE named packet it was asked to relay,
+  not only for aggregate counts. `leviculum-nrf/Cargo.toml` pulls
+  leviculum-core with `default-features = false`, so the `tracing` feature is
+  off and every `debug!`/`trace!` in the core is a no-op on firmware
+  (`leviculum-core/src/lib.rs:83-100`): the journey events `PKT_FORWARD`,
+  `PKT_DROP` and `DEDUP_DROP` that make a relay decision legible on `lnsd` do
+  not exist on a board at all. The periodic `[TRANSPORT]` counter line says
+  how many packets were forwarded or dropped in the last 30 s and never
+  which, so a forward, a no-path drop, a dedup hit and a hop-ceiling drop all
+  looked like the same silence on the debug port. Chasing #344 needed a 5.5 h
+  receiver log, a millisecond capture of three debug ports at once and packet
+  length arithmetic to establish something the board could have said in one
+  line. The new `NodeEvent::RelayDecided` reports that decision per packet and
+  the boards render it as one `PKT_RELAY outcome=<o> ph=<hex16> dst=<hex8>
+  hops=<n> iface_out=<n|none>` line. `ph=` is the full 8-byte journey
+  correlator, byte-identical to the `ph=` a peer's `lnsd` prints, so a board
+  capture and a host log stitch on one id instead of on counter correlation.
+  Scope is the ADDRESSED relay path and only that: a packet whose transport
+  header names another node emits nothing, because on a shared medium a relay
+  hears every packet routed via its neighbours and one line per reception is
+  the 99 %-noise problem the counter-only overheard path exists to avoid — the
+  absence of a line is therefore itself a reading, and it is pinned as a test
+  rather than left as an intention
+  (`leviculum-core/src/node/mvr_embedded_same_iface_relay.rs`). Nothing is
+  hashed for the event: every call site already holds the hash it correlates
+  on. Measured cost: `NodeEvent` and `TransportEvent` both stay 232 bytes, so
+  no event anywhere grows; the t114 release image gains 1016 B of flash and
+  **0 B of `.bss`**, which is the budget that rules out compiling the real
+  `tracing` crate in (the T114's stack margin is ~13 KiB and every `.bss` byte
+  comes out of it); one line is 114 bytes on the debug CDC at its widest and
+  nothing at all when no reader is attached. Refs #346.
+
+- A board now says WHY it threw a packet away, at the moment it does, and not
+  only for the packets it was asked to relay. The line is `[DROP]
+  reason=<kebab> dst=<hex8> iface=<n> t=<ms>`, carrying the drop taxonomy's
+  own reason string — the same spelling a peer's `lnsd` prints on its
+  `PKT_DROP` — so a field capture names the drop instead of a reviewer
+  reconstructing it from three serial ports. It covers the receive-path drops
+  that reach no relay decision and were therefore reachable ONLY as a step in
+  a periodic counter: the overheard copies bound elsewhere
+  (`overheard-transport-id`, the commonest drop on a shared medium), the
+  relayed link request with no path onward (`no-path`), and the
+  same-interface link echo (`link-repeat-echo`) whose storm cost a rig day in
+  August. The core's new `NodeEvent::PacketDropped` is the complement of
+  `RelayDecided`, never a second copy: the two sets of call sites are
+  disjoint, so one dropped packet produces exactly one line, on one of the
+  two — pinned as a test rather than left as an intention
+  (`test_addressed_relay_drop_raises_no_packet_dropped`). There is
+  deliberately no `forwarded` counterpart; that count is already on the
+  periodic `[TRANSPORT] fwd=` field, and a line per successful relay is a line
+  nobody reads. Because the overheard path is the highest-volume event the
+  core raises, the board renders it through a rate limit of 3 lines per
+  second, then one `[DROP] suppressed=<n> window_ms=<w>` naming what the
+  window held back — derived in `leviculum-nrf/drop-budget` from the 8 KiB
+  `LOG_RING`, which on overflow does not lose drop lines but evicts the
+  `[STACK]`, `[TRANSPORT]` and panic lines the capture was taken for. Measured
+  cost: `NodeEvent` and `TransportEvent` both stay 232 bytes; `.bss` grows 28 B
+  on the t114 and the solarnode and 32 B on the rak4631 — the limiter's window
+  start, its two counters and the flag, which is what keeps this inside the
+  T114's ~13 KiB stack margin instead of compiling the real `tracing` crate
+  in — and `.text` grows 496 B, 656 B and 600 B respectively. Refs #346,
+  #344, #413.
+
+- A board that learns a path from an announce and passes it on to nobody now
+  says so. That outcome is not a drop — the announce arrived, was validated,
+  and the path is installed — so no counter moves and, until now, no line was
+  written anywhere: the single most informative thing about the failure, that
+  it happened at all, was invisible in every capture. A board is where it
+  bites, because a board registers no shared-instance local client, so
+  `handle_announce`'s local-client forward cannot run there and the announce
+  table is the only general route to its serial host. The new
+  `NodeEvent::AnnounceLearnedNotRelayed` fires at that point and the boards
+  render it as one `ANNOUNCE_LEARNED_NOT_RELAYED closed=<r> discovery=<w>
+  dest=<hex8>` line, carrying which term of the announce-table gate closed and
+  whether anyone had a discovery path request open for the destination.
+  Deliberately not a `PKT_DROP_SUMMARY` bucket, in the wording as well as the
+  taxonomy. Its trigger is narrow by measurement, not by assertion: it fires
+  only on a node that relays announces at all, a duplicate announce inside
+  the rate window never reaches it, and an announce that bought a rebroadcast
+  is silent (`leviculum-core/src/node/mvr_board_announce_uplink.rs`). One line
+  costs 106 bytes on the debug CDC at its widest, and nothing at all when no
+  reader is attached.
+
+- The firmware's `[LORA] RX` line carries the **context byte**, `ctx=0x<hh>`,
+  appended after `dst=` so every existing consumer of the line reads
+  unchanged. It is the only field that separates a relayed announce
+  (`ctx=0x00`) from a path response carrying the same announce (`ctx=0x0b`):
+  the two have the same `flags=0x51` and the same `dst=`, and only the second
+  is the one the announce table excludes by design. A capture could not tell
+  them apart before. The field offsets moved to
+  `leviculum_core::packet::peek_wire_class`, next to the layout they depend on
+  and host-tested there, because `leviculum-nrf` cross-compiles and runs no
+  host tests of its own.
+
+- The nightly decides what may be published. `rnsd_interop` — whether we still
+  interoperate with a Python-RNS peer — runs in neither forge pipeline and
+  cannot: it needs the `reference/Reticulum` submodule, and both pipelines
+  clone without submodules so that a plain clone builds (Codeberg #300). The
+  verdict is imported instead of re-derived: a green tier-2 nightly pushes
+  `refs/nightly/green/<YYYYMMDDTHHMMSSZ>` at the commit it tested, and
+  `scripts/publish-nightly.sh` refuses, before it touches the forge, any commit
+  those refs do not cover, naming which of three conditions failed — no
+  signal, not covered, or older than the 72-hour bound. The signer reads the
+  run's own test manifest rather than trusting the night's verdict, so a green
+  night cannot mean a suite that never ran, and
+  `LEVICULUM_PUBLISH_WITHOUT_NIGHTLY="<reason>"` lets a human publish anyway
+  with the reason recorded beside the build. `just nightly-green-selftest`
+  drives both halves against a fake remote and
+  `just check-publish-nightly-gate` asserts the five links between them are
+  still connected; both run in `just fast`. See
+  [CI Pipeline](docs/src/development-ci.md), "What may be published".
+
+- Published builds now record which compiler produced them. `rustc --version`
+  is asked once in `scripts/deb-stamp.sh` — the one step that runs in an image
+  with a Rust toolchain — and written forward as `.rustc-version`, the same
+  way the build id and the cargo target directory already are. From there it
+  reaches everything that ships: the Debian changelog inside every `.deb`
+  (`zcat /usr/share/doc/leviculum/changelog.gz`), the `VERSION` file in every
+  binary tarball, the rolling release body, and `[bundle] rustc` in the
+  lnflash bundle's `manifest.toml`, which `lnflash` prints in its opening
+  line. The toolchain pin is argued from published binaries and a measured
+  3264-byte embedded stack-frame margin, and codegen differences between
+  compiler versions move frame sizes — so "which compiler built this one"
+  is the first question a report of two boards behaving differently asks, and
+  until now it could only be answered by inferring a compiler from a git tag.
+  What is recorded is the compiler that ran, not the channel
+  `rust-toolchain.toml` asked for: a build outside rustup says so instead of
+  repeating the pin back. A bundle published before this carries no key and
+  still flashes, saying the compiler is unrecorded (Codeberg #305).
+
+- `just toolchain-status` says how far the pinned Rust toolchain has fallen
+  behind current stable: pinned version, newest stable release, and the
+  distance between them, on one line. Since the channel was pinned nothing
+  said when the bump was due, and a policy whose only home is a comment in
+  `rust-toolchain.toml` is what this project has decided not to rely on. It
+  is a report and never a refusal — a check that went red once stable moved
+  would go red on the Rust release train's schedule rather than on a change
+  of ours, and the cheapest way to clear it would be to bump the pin without
+  considering it, which is the drift the pin exists to prevent. Offline, no
+  rustup, no `stable` toolchain installed and a floating channel are printed
+  facts too, never errors, because the nightly status pastes this line and
+  cannot lose a run to a dead link (Codeberg #304).
+
+- `EVENT_CATALOG` now declares every structured event name the workspace
+  emits, and a test holds it that way. Forty-one names were emitted but
+  undeclared, among them `LINK_ENTRY_SET`, the five `TUNNEL_*` events, the
+  nine `RESOURCE_*` transfer events and eight Columba BLE events. That is
+  not a cosmetic gap: the event-log layer validates an event's SHAPE only for
+  a name it finds in the catalogue, so an undeclared event can lose a required
+  field forever without a single `EVENT_SCHEMA_VIOLATION`. The miauhaus soak
+  of 2026-09-18 (397 023 881 events) proved it on `LINK_ENTRY_SET` — 612 639
+  emissions, 252 669 of them with a broken `next_hop`, and what caught the
+  field was the field-VALUE check, which runs regardless of the catalogue,
+  never the schema check, which could not run at all. The new
+  `#[cfg(test)] mod event_catalog_completeness` in `leviculum-std` walks the
+  `tracing::*!(event = "...")` sites of every workspace member's `src/` and
+  fails on any name the catalogue is missing, so the next one is caught the
+  day its call site is written rather than after two months of public mesh.
+  It runs under `cargo test --workspace --lib`, which is what `just fast` and
+  the forge gate run.
+
+- `lnstatus -j --tables` now reports the size of **every** collection the
+  daemon's storage holds, not just the seven tables whose rows it dumps, under
+  a new `collections` key: one row per collection with `name`, `entries` and
+  `capacity` (`null` where the collection has no configured ceiling). Thirteen
+  collections had no counter in any RPC, among them the packet dedup cache,
+  which is the largest structure in the daemon and the only one that frees an
+  entire generation in one step — so a resident set that steps up and falls
+  back in 100 MB blocks could not be attributed to a structure at all. The
+  dedup cache is reported as its two generations separately rather than as a
+  sum, because the rotation is the event worth seeing and a sum is flat across
+  it. Counts are `len()` throughout, O(1), so the census costs nothing on a
+  status call. Reporting only: no ceiling was added or changed (Codeberg #174,
+  input for #421). A `Storage` implementation must now state its own inventory
+  (`Storage::collection_counts`), and a test in each storage module binds that
+  list to the struct's fields, so a collection added without a counter fails a
+  test instead of going unreported — which is how `known_dest_use` had been
+  missing from the diagnostic dump, now also fixed, along with the daemon-only
+  `known_dest_entries` map.
+- `Destination::set_default_app_data` / `clear_default_app_data`: app data an
+  application parks on a destination once, which every announce the stack
+  generates for it carries unless the caller passes explicit app data. The
+  path response a peer's path request triggers is generated exactly that way,
+  so a service that comes up and waits to be asked for can now answer with its
+  metadata without announcing first. Runtime-only, as in the reference: the
+  default is never written to persistent state.
+- `just fuzz` runs the eight cargo-fuzz targets over the untrusted-bytes
+  parsers, which nothing had run since they were written: no recipe, no CI
+  step, no schedule (Codeberg #290). The corpus and any crash input persist
+  under `~/.local/state/leviculum-fuzz`, outside the checkout, so a scheduled
+  run accumulates coverage instead of restarting from the seed corpus every
+  time. A crash exits 1 with the input kept, its hash and a hexdump; a run that
+  could not happen exits 2 and never looks clean. `just fuzz-selftest` holds
+  the runner to that on the push path.
+- lblogd serves the AGPL section 13 source offer on every page of both sides:
+  a footer naming the running version, the licence and a link to the source,
+  as plain text on the mesh where a NomadNet client cannot follow a web link.
+  It is on for every configuration and has no off switch — a reader of a
+  served page is a user interacting with AGPL software over a network, and an
+  offer an operator has to enable is one most operators never make, so lblogd
+  shipped a non-compliant site by default (Codeberg #294). The new `[source]
+  url` key exists for the one case the compiled-in default gets wrong: an
+  operator running a *modified* lblogd owes their readers their own tree, not
+  this repository. An empty value is refused at startup rather than served as
+  a footer that offers nothing. Visible to every existing deployment: pages
+  that had no footer now have one.
+- `SECURITY.md`: a private route for reporting a vulnerability, with the
+  contact, a 7-day acknowledgement window, 90-day coordinated disclosure,
+  and what is in scope. The repository had no such route, so a finder's
+  only options were a public issue or silence (Codeberg #289).
+
+- `just sweep`, which bounds this repository's two build directories without
+  paying for a full rebuild. Cargo adds and never removes: every changed
+  input writes a hash-suffixed artefact next to the old one, so a target
+  directory only grows, and the growth rate is the point rather than any one
+  build. Measured on the CI host on 2026-09-24, the `deps` directory under
+  `target/x86_64-unknown-linux-musl/debug` alone held 2705 files and 27 GB of
+  that tree's 36 GB; one working day of gate runs had taken the same tree to
+  137 GB on 2026-09-09 and filled the root volume until the dispatcher
+  refused work. A full volume does not announce itself as one: hardware runs
+  go red for want of space and look like the stack.
+
+  `cargo sweep --maxsize` drops the OLDEST artefacts until a directory fits
+  its cap, which keeps the ones the next build would reuse and is what
+  separates it from `cargo clean`. The recipe sweeps BOTH workspaces, the
+  host one at the root and the firmware one in `leviculum-nrf`, because a
+  sweep of the root leaves the firmware's 6.2 GB untouched. Where the
+  artefacts lie is asked rather than assumed, so a tree that moved them with
+  `CARGO_TARGET_DIR` — Tier 1 and the nightly do — is swept where they
+  actually are. The caps are parameters with measured defaults, not targets:
+  a directory already under its cap is left alone.
+
+  Deliberately untouched: the sccache directory. That cache is what makes
+  the rebuild after a sweep cheap, and it bounds itself through
+  `SCCACHE_CACHE_SIZE`. `scripts/install-ci.sh` installs cargo-sweep rather
+  than hinting at it, because a sweeper that is not installed turns every
+  hygiene job into a silent no-op, and `just sweep-selftest` holds what the
+  recipe promises — both workspaces, the budgets as given, and a refusal
+  naming the install line when the tool is absent — against a stub cargo, so
+  the assertion costs no build and removes no file. This is the on-demand
+  half of Codeberg #381; what bounds the trees unattended is not decided
+  here. Refs #381.
+
+### Changed
+
+- The path re-balance of #330 no longer deletes the route it was correcting. A
+  link-request proof that comes back over a different route than the one it was
+  sent on made the terminus write that route's length into the path entry while
+  the entry's next hop still named the relay — and `PathEntry::needs_relay()` is
+  `hops > 1 && next_hop.is_some()`, the sole switch that writes a transport
+  header. A 2-hop entry over a relay, re-balanced to 1 by a proof that crossed
+  the direct pair, therefore stopped addressing the relay at all: the relay was
+  still recorded, still the only way there, and forwarded nothing ever again.
+  Periculum pass 327 measured the cost in the emulated pathchoice cells
+  (2026-09-27): `lnsd` carried 7/8, 3/8, 4/8, 8/8, 8/8 transfers at
+  L = 0.3/0.5/0.7/0.9/1.0 where `rnsd` carried 8/8 on every relayed arm, with
+  ten of ten failed attempts having sent their request over the lossy pair.
+  `rebalance_path_hops` now refuses a count that would make `needs_relay()`
+  false while a next hop is named, leaves the entry untouched, tells its caller
+  which of the two happened, and reports the refusal as
+  `PATH_REBALANCE_HELD dst= from= refused= next_hop= iface=`. Everything else
+  #330 shipped is unchanged, including the adoption into the link entry and the
+  forwarded copy's frozen count. Python 1.5.2 has the same hole and does not
+  guard it — both adoption sites write `path_entry[IDX_PT_HOPS] = packet.hops`
+  without reading the next hop (`Transport.py:2634`, `:2707`) and
+  `Transport.outbound` inserts the transport header on
+  `path_entry[IDX_PT_HOPS] > 1` alone (`:1396`) — so this is our deviation, with
+  the wire, the peer semantics and the priority-1 argument written out in
+  `docs/src/architecture-hop-counting.md`. Codeberg #332, #330, #230,
+  periculum #58.
+
+### Changed
+
+- A link-request proof whose hop count disagrees with what our tables froze is
+  now believed about the route it travelled, not only tolerated. RNS 1.5.0 added
+  `ALLOW_LINK_PATH_REBALANCE` (`Transport.py:150` in the 1.5.0 tag) and with it
+  two adoption sites: a relay validates the proof's signature and then writes
+  `packet.hops` into the link entry and into the path entry for the link's
+  destination (`Transport.py:2540` onwards), and a link terminus does the same
+  for `link.expected_hops` (`Transport.py:2608` onwards). 1.3.5 — the version
+  `reference/Reticulum` is pinned to — had the bare equality check at
+  `Transport.py:2176` and `:2228` and dropped everything else, which is what our
+  #38 work reproduced. We now adopt at both sites: on a mismatch whose Ed25519
+  signature holds, the count the proof arrived with replaces the frozen one in
+  the link entry or on the `Link`, and the path entry's length follows. Only
+  `hops` moves; the interface, the next hop and the expiry stay what the announce
+  installed, and a proof whose signature does not hold adopts nothing (one
+  negative control per site). What we did NOT take from 1.5.0 is the honest wire:
+  the forwarded copy still carries the pre-adoption count, because a 1.3.5
+  initiator behind us froze its expectation from the announce WE rebroadcast and
+  rejects anything else (`Transport.py:2228`) — measured, not inferred, by
+  `lrproof_hop_undercount_interop_tests.rs`, which drives a real Python 1.3.5
+  initiator over the asymmetric topology and passes with the adoption in place.
+  The shared-medium relay arm also stays as it was, an echo drop, because there
+  the hop equality is the only loop breaker we have measured (the
+  `lora_3node_relay` storm of 2026-08-12). New diagnostic event
+  `PATH_REBALANCE dst= from= to=`. The reasoning, including the two things this
+  does not settle, is in `docs/src/architecture-hop-counting.md`. Codeberg #330.
+
+- The firmware no longer carries a floating-point number parser. Every
+  decimal field of every NMEA sentence went through `str::parse::<f32>()` or
+  `::<f64>()` inside `nmea0183` 0.6.0, and those two monomorphisations linked
+  `core::num::dec2flt` — 17 044 B of flash, of which the
+  `POWER_OF_FIVE_128` table alone is 10 416 B. That algorithm is correctly
+  rounded for the full 17 significant digits an IEEE double holds; an NMEA
+  field carries at most ten. The crate is now vendored under
+  `vendor/nmea0183` with its nine `str::parse` call sites replaced by an
+  integer parse
+  and one division (`vendor/nmea0183/src/fixed.rs`), which is bit-identical
+  to `str::parse` whenever the mantissa and the power of ten are both exactly
+  representable — true of every field shape a receiver emits, and asserted
+  against `str::parse` itself over a corpus of real sentences and over every
+  mantissa 0..=999 at every scale 0..=6 on both widths. Measured with
+  `leviculum-nrf/tools/flash-attribution.sh`: the t114 image falls from
+  623 032 B to 604 584 B and rak4631 from 628 776 B to 610 296 B, 18 448 B
+  and 18 480 B, and `just nrf-store-gap` now reports 124 876 B (121 KiB)
+  free below the propagation store region on t114, 119 160 B (116 KiB) on
+  rak4631. `dec2flt` no longer appears in either image at all.
+  The cost is carrying the fork, and it is small: 47 changed lines in four
+  inherited files, two more that `cargo fmt` rewrapped, and one new module.
+  Codeberg #386.
+
+- Every build claim `lnflash` makes about a flashed board now names where it
+  was read. A confirmation line said `the board reports git_sha=b9b4a9c3, not
+  de6e74ed` and nothing more, and the first question that raises — was that
+  line read on this board's own port at all? — was not answerable from the
+  tool's output: settling it on 2026-09-11 took two capture files, a hand
+  correlation, and stayed undecided. Each verdict now carries the mechanism
+  that decided it (the `[FW_BUILD]` banner the board emitted after the reset
+  the tool triggered; the control envelope carries no build query, so there
+  is one and the line says which), the path opened, the device node the open
+  was proved against, and how long after the port was flushed the line
+  arrived. The delay is the load-bearing number: a banner from a board that
+  has just booted arrives seconds in, so a sha delivered in the first
+  milliseconds after the flush was already in flight. A confirmation that
+  cannot decide is unchanged — it says the running build is unknown and names
+  no sha at all. Codeberg #378.
+
+- A board whose boot left its LoRa carrier down no longer acks a radio
+  configuration as if it were running it. Such a board has no LoRa task, so
+  the config goes to the flash page and nothing applies it before the next
+  reset — but the answer was the same `ACK` a board that programmed the
+  modem sends, and a host reading it as "the board is on this PHY" prices
+  every frame at a modulation nothing is keying. The envelope now answers
+  the confirmed page write with a refusal of its own, reason `0x08`
+  (`REFUSE_NOT_RUNNING`), the mirror of `0x06` (`REFUSE_PERSIST`): persist
+  is applied-but-not-durable, not-running is durable-but-not-applied, and
+  neither is a rejection. `lnflash` reads it and says the settings are
+  stored and come up at the next reset, rather than reporting a board that
+  took them as one that refused. The legacy magic frame keeps its `ACK`,
+  because ack-or-silence is its whole vocabulary and silence there reads as
+  "the frame never landed" to a sender whose next act is the reset that
+  applies the page; a legacy host that needs to know what the radio is
+  running asks `RADIO_QUERY`, which such a board refuses rather than
+  answering out of flash. Both dialects now decide this in one place
+  (`leviculum_core::envelope::radio_config_answer` and
+  `legacy_radio_config_acked`), so the pair cannot drift (Codeberg #363).
+
+- `lnstest selftest` sizes a single-packet drain window from the pacing the
+  sending interface applies, not from the frames' airtime alone. The RNode
+  interface holds each frame back until the modem can be finished with the
+  one before it, so a burst crosses the medium at that hold and not at the
+  bitrate. The window is now `frames x max(air, hold / 2) + (hold + air)`:
+  the hold is the frame's airtime plus twice the interface's reported band-1
+  jitter ceiling, which is the band-2 contention window a burst runs in
+  (`RNode_Firmware.ino:1603-1620`); the division is the two ends sending into
+  each other's holds; the last term is the tail deferral the final frame
+  waits out. The sizing line prints the formula and every term in it. On the
+  rig of 2026-09-23 the three ratchet cells delivered every frame on the air
+  and were still scored red, because the old window expired at 11.0 s on
+  bursts that completed in 11.8 to 12.0 s.
+
+- `lnstest selftest` stops counting at budget expiry instead of tearing its
+  clients down. The clients stay up for one hold plus one airtime, and what
+  arrives in that window is reported as `late=N` beside `outstanding=N`. The
+  delivery bar every verdict is computed from stays on what arrived inside
+  the budget, so a late frame neither flatters the bar nor reads as lost. The
+  old teardown let the far daemon decode a frame that was already on the air
+  and then drop it as "no path known", while the verdict printed no loss at
+  all.
+
+- `leviculum-core` has one msgpack decoder instead of four. It used to live
+  under `resource/`, with a second full copy of the readers in
+  `destination.rs` and a third and fourth copy of the map-length reader in
+  `discovery/mod.rs` and `discovery/registry.rs`. That is not a style
+  complaint: #267 was a bounds check spelled `*pos + len > data.len()` with
+  `len` a full `u32` off the wire, which wraps below `data.len()` on the
+  32-bit firmware target, so the guard passed and the slice behind it
+  panicked. Fixing it meant fixing it twice, and the second site was found
+  only because that batch happened to run an explicit audit for the shape --
+  the issue named one file and the reported panic was in one file, so a fix
+  confined to the reported site would have looked complete. The two copies
+  were also not reachable the same way, which makes "they are the same, so
+  one fix covers both" an assumption rather than a fact: the resource decoder
+  takes bytes off the wire, while the destination one parses the ratchet
+  store's outer map *before* the Ed25519 signature over it is verified. The
+  readers now sit in `crate::msgpack`, top-level rather than under
+  `resource/` because `destination`, `discovery` and `node` all decode
+  msgpack and a decoder under `resource/` made every one of them an
+  inversion. `leviculum-std/tests/msgpack_single_decoder.rs` keeps it that
+  way: it fails on a second definition of any primitive reader, and on any
+  hand-spelled `*pos + n`, so the next copy is caught the day it is written
+  (Codeberg #302).
+
+- `just --list` now describes each recipe in one sentence instead of showing
+  the tail of its comment block: `ci-gate` introduced itself as "day one it
+  would only teach people to skip the gate" and `fast` as "sources, proof
+  against the kernel". just keeps exactly ONE comment line per recipe -- its
+  parser walks back over a newline and a single `Item::Comment`, so a block is
+  not summarised, it is cut to whatever stands last, and a blank line above
+  the recipe suppresses the description altogether. Every listed recipe now
+  carries a `[doc('...')]` attribute, which takes precedence over the comment,
+  so the long explanations stay where they are and the list reads as a list.
+  `just check-just-docs` (in `just fast`, ~0.2 s) keeps the next recipe from
+  losing its description, and refuses one too long to sit in the list
+  (Codeberg #301).
+
+- `lnstatus -j --tables` answers with table SIZES and no rows. The rows are
+  asked for by name with the new `--table-rows` flag (`path_table`,
+  `reverse_table`, `link_table`, `announce_table`, `announce_cache`,
+  `tunnels`, `local_links`, or `all`), which requires `--tables`.
+
+  A status call was costing the daemon tens of megabytes. The answer was
+  built as a complete value tree before a byte was serialised — one dictionary
+  per row, with a string key per field, all live at once — so a node with
+  11 000 paths and 43 000 reverse entries paid 83 MB to describe tables that
+  serialise to about 7 MB. Polling such a node for two minutes moved its
+  resident set by 60 MB, and the hour spent explaining that sawtooth as a
+  defect in the node was spent on the measuring instrument instead.
+
+  Sizes cost a `len()` each, so the new default peaks at about 35 KB on that
+  same node, and the figure does not move with the size of the tables. The
+  per-collection census added in this release (`collections`) already answered
+  "how big" without materialising anything; `table_sizes` extends it to
+  `tunnels` and `local_links`, which live outside the storage and so could
+  previously only be sized by fetching their rows.
+
+  A table whose rows were not asked for is ABSENT from the response, not
+  present as an empty list: an empty list is how this key says "the table is
+  empty", and answering an unasked 43 000-row table with `[]` would be a lie
+  the reader cannot detect. `rows_for` names the tables whose rows the
+  response carries.
+
+  Anything reading the rows today must now ask for them: `lnstatus -j
+  --tables --table-rows all` reproduces the old output plus the two new keys.
+  The RPC verb is a Leviculum extension with no Python counterpart
+  (`rnstatus` has no `--tables`), so no reference client is affected
+  (Codeberg #028, #174).
+
+- Stamp generation is cancellable. `StampExecutor::generate`,
+  `CooperativeStamper::generate` and the `generate_with` helpers on
+  `DeliveryStampRequest` / `PropagationStampRequest` take a `StampCancel`
+  handle, and the search returns `StampError::Cancelled` within one yield
+  interval of it being fired.
+
+  Proof-of-work runs at a cost the *recipient* announces, and a cost of, say,
+  254 is inside the window the reference is willing to announce while being as
+  unfinishable as the 255 that was ruled out earlier. A tighter cost ceiling
+  cannot fix that without refusing costs a conforming peer may legitimately
+  use, so the work is made abandonable instead — as the reference does with
+  `LXStamper.cancel_work`. `lnmsg` fires the handle when a message is
+  cancelled: its mining thread is single-consumer, so an unfinishable grind
+  used to hold every stamp queued behind it for the rest of the run.
+
+  Breaking for anyone who implements `StampExecutor`: a call site with no
+  cancellation path passes a fresh `StampCancel::new()`.
+
+### Fixed
+
+- A board propagation node answers large offers without running out of heap
+  (leviculum#388). When a peer wanted messages, the board read every wanted
+  body, encoded them into one envelope and cut the transfer from it, all at
+  once: two 4 KB bodies needed 25 KB and a Python peer wanting ten needed
+  150 KB of a 16 KB role budget. The answer is now streamed out of the store
+  a part at a time, the board sends as many of the wanted messages as its
+  heap affords at that moment, and the rest stays queued for the next round.
+  The sync limit a board announces is derived from that budget and drops from
+  8 to 5 KB; client fetches keep their 8 KB bound.
+
+- A phone that keeps reconnecting no longer keeps a board from dialling other
+  boards (Codeberg #412). A board dials against the address sort only
+  after 30 s of strict scanning, and every link up and every teardown restarted
+  that clock, so a phone that reconnected every 20 s held the board in strict
+  mode for good: the replay of twenty such reconnects measured a longest strict
+  stretch of 19 s and never reached the fallback. Now only a NEW neighbour
+  restarts the clock, a peer the board has not linked since it last reached the
+  fallback, or a strict target; the phone's reconnects, displacements and
+  teardowns leave it running, and the same replay reaches the fallback at 30 s
+  and stays there. Separately, the churn cooldown that holds back rotating
+  addresses read a public address with a low OUI (a BlueZ host's `00:1A:7D`)
+  as rotating from its top bits; the scanner now reads the address type the
+  radio reports, and a public address is never held as rotating.
+
+- The `lxmf-node` test helper installs the same stderr `tracing` subscriber
+  `lnsd` does, so what `leviculum-core` and `leviculum-std` say underneath it
+  is observable at last (Codeberg #330). It installed none, which made every
+  `warn!`, `debug!` and `event=` line in the stack a no-op in this process:
+  a saved conformance run's helper log held 1602 stderr lines, all of them the
+  helper's own `[lxmf-node] …`, so the cells that assert our terminus adopted
+  a link-request proof's hop count could only assert the two core lines'
+  absence. The level comes from the daemon's own config file
+  (`[logging] loglevel`, as on `lnsd`), shifted by a new `-v`/`-q` count and
+  overridden by `RUST_LOG`, default info — so `warn!` is visible unasked, and
+  a periculum node reaches debug through the `loglevel = 5` its rendered
+  config already carries. Stdout is untouched: `EVENT` lines only, which is
+  what the driver parses.
+
+- An LNode now waits as long for the channel as an RNode does, and no
+  longer minutes longer (Codeberg #147). The firmware's carrier-sense
+  backoff counted its wait in a slot of its own making — a tenth of a
+  500-byte airtime, floored at 24 ms and with no ceiling at all — which is
+  5x the reference RNode firmware's slot at SF7 and 27x it at SF12/BW125,
+  where one slot came to 2.7 s. It multiplied into the doubling contention
+  window the gate draws in, so a board on a busy channel could owe over a
+  minute of backoff while its RNode neighbours owed under six seconds: a
+  node that yields the channel that much is not a neighbour the others can
+  interoperate with, and on a shared medium it starves rather than
+  colliding. The slot is now the reference's own — 12 symbol times clamped
+  to [24, 100] ms, 6 ms above 30 kbps — derived once in
+  `leviculum_core::rnode::csma_slot_ms` and pinned against a literal
+  transcription of the firmware's three lines over every PHY it admits.
+  The acquisition jitter already used that slot; the board no longer has
+  two slots that can disagree.
+
+- A node no longer holds the path answer it asked for itself (Codeberg
+  #428). On every interface that runs the announce ingress burst limiter —
+  which is every shared-medium interface, LoRa included — an announce for
+  an unknown destination arriving during a burst was queued until the
+  burst calmed. The exemption for a destination a path request is waiting
+  on covered only requests this node forwards on a neighbour's behalf, so
+  a node that issued its own path request and then received the answer
+  inside the burst window held that answer, and on a busy node the burst
+  need never calm. `lnpnd --status`, `rnprobe` and every `wait_for_path`
+  caller could time out against a reachable destination for that reason
+  alone. The reference exempts both tables at once (Transport.py:1701).
+  Ours now does too, for 15 s after the request went out — the point at
+  which the requester has given up and the announce is no longer anybody's
+  answer. An announce nobody here asked for is still held, unchanged.
+
+- `lnpnd --status` answers on a loaded shared instance (Codeberg #427). On
+  a transport node under sustained announce traffic the query timed out 7
+  of 8 times, at 5, 20 and 60 s alike, while the daemon worked fine the
+  whole time. Reproducing the load in a rig (path table driven to its
+  ceiling, a few thousand announces per minute) turned up two divergences
+  from the reference on one causal chain. First, a local client's path
+  request for a destination absent from the daemon's path table was
+  forwarded to network interfaces only, never to the other local clients —
+  and the daemon hosting the requested control destination is exactly such
+  a client, so once churn had evicted its control entry the request
+  black-holed (the reference forwards on every other interface,
+  Transport.py:3006-3013). Second, the client's own uplink to the shared
+  instance ran the announce ingress burst limiter, which the reference
+  disables on this interface unconditionally (LocalInterface.py:137-138):
+  a client born into a busy instance armed the limiter on the daemon's
+  announce fan-out and then held the very path-response announce it had
+  asked for, for as long as the traffic kept the burst armed — past any
+  budget. With both fixed the rig's query answers in ~0.5 s at the shipped
+  5 s budget under the same load; `lnpnd/tests/status_under_transport_load.rs`
+  pins the whole recovery end to end, and a transport unit test pins the
+  local-client forward on its own.
+
+- `lnpnd`'s remote-management verbs can say what happened to them
+  (Codeberg #427). The path and link stages shared one timeout line, the
+  field could not tell which stage died, and `-v`/`RUST_LOG` installed no
+  subscriber in client mode, so a timed-out query produced one line of
+  output and no way to ask for more. Each stage timeout now adds a stderr
+  line naming the stage, the destination hash actually being resolved (not
+  the propagation hash the status header prints), the measured wait
+  against the budget, and the instance name with the socket it resolves
+  to; stdout keeps the reference's exact `timed out, exiting now` line for
+  scripts. Client mode installs the same stderr subscriber the daemon path
+  has, at the config's loglevel shifted by `-v`/`-q` (the reference's
+  `_remote_init`, lxmd.py:877-878), `RUST_LOG` winning when set, and the
+  dial itself is logged with the resolved socket before it happens.
+
+- `lnsd` builds for a 32-bit router again (Codeberg #415). `leviculum-std`
+  held its interface byte counters, its event-log sink counters and the
+  driver's dropped-control counter in `std::sync::atomic::AtomicU64`, which
+  exists only where `target_has_atomic = "64"`. A user cross-compiling for a
+  MIPS router (`mips-unknown-linux-musl`, soft float) got three unresolved
+  imports out of this crate and had to patch it before the daemon would
+  build; `powerpc-unknown-linux-gnu` and the ARMv5 triples are in the same
+  position.
+
+  The counters now go through `Counter64`, which is an `AtomicU64` on every
+  target that has one and a mutex-guarded `u64` on the targets that do not.
+  The width does not move: narrowing to `AtomicUsize` is the fix that
+  suggests itself, and on a 32-bit target it wraps `rx_bytes`/`tx_bytes` at
+  4 GiB, so `rnstatus` totals restart on a router that has been up a week.
+  The cost is one uncontended lock per counted frame, and only on a target
+  that has no 64-bit atomic to begin with.
+
+  `just fast` now carries `no-atomic64-gate`, a `cargo check` of
+  `leviculum-std` for `arm-linux-androideabi` — 32-bit, no 64-bit atomic,
+  and no C dependency to cross-compile. The 32-bit gate added in #303 could
+  not have caught this: i686 is 32-bit and *has* a 64-bit atomic, so pointer
+  width and atomic width need separate targets. What the new gate does not
+  cover is `interfaces/ble/`, which is linux-only and not compiled there.
+
+- A board with an Android phone in the room now dials its neighbour boards
+  again (Codeberg #412). A board has one outgoing BLE link, and the scan
+  window elected the lowest-addressed eligible candidate. A phone's
+  resolvable private address has `01` in its top two bits while a board's
+  static random address has `11`, so a phone is numerically below every board
+  in the room, always: it was never eligible under the strict sort and always
+  first in the fallback class, and every few minutes it drew a new address
+  and won again. The corpus night of 2026-09-14/15 measured `feld-t114`
+  spending all seven outgoing links it made over two days on one phone and
+  none on a board.
+
+  The window now orders the fallback class by the address only where the
+  address is a key. A candidate whose address class says its owner redraws it
+  ranks behind every candidate whose does not, and those are ordered by which
+  advertiser the window heard first. In the host simulation with one phone in
+  the room, the share of the room's dials aimed at it falls from 42 % to 6 %
+  at ten boards and from 28 % to 0 % at twenty, the board-to-board links come
+  back to within 1 % of an empty room, and the boards left with no link to
+  any board fall from 28 and 48 per 1000 arrival orders to 2 and 0. A room of
+  boards alone is unchanged to the number, because it holds no address that
+  rotates.
+
+  It is a preference inside what the rule already permits, never an exclusion:
+  a board whose only eligible candidate is a phone dials the phone.
+
+- A board now proves a client's upload when it arrives, not when it has been
+  judged, so a phone on BLE can finally post mail to the propagation node on
+  a board (Codeberg #397). An upload rides a plain link packet and the
+  uploader holds a packet receipt worth `max(rtt * 6, 1 s)`; over BLE the
+  measured round trip of 295-484 ms makes that window 1.8-2.9 s wide. The
+  board proved only after the message's propagation stamp had been validated
+  and the record flushed, and that validation is the fixed 1000-round PN
+  workblock: 3655-3727 ms on an nRF52840. The receipt therefore always
+  expired first, LXMF tore the link down, the proof landed on a closed link,
+  and the client resent the same message every ~16 s while the board accepted
+  every copy (`PN_ACCEPT ... dup=1`). Lowering the announced stamp cost bought
+  nothing, because the cost sets the zero bits and not the rounds. Over LoRa a
+  seconds-wide window hid the same code.
+
+  The proof now leaves in the event arm that receives the packet, before the
+  upload is even decoded, and the stamp judgement follows on the work queue.
+  Python's propagation node validates before it proves
+  (`reference/LXMF/LXMF/LXMRouter.py:2233-2256`) and can afford to: its
+  workblock is about 20 ms on a desktop CPU. That ordering is not portable to
+  a core 185 times slower, so this is a deviation under the project's
+  deviation rule rather than parity — the wire is unchanged, and the
+  judgement a peer relies on still reaches it, because a refused stamp still
+  sends `ERROR_INVALID_STAMP` and tears the link down, which a Python client
+  turns into `LXMessage.REJECTED` whether or not its receipt already
+  concluded. What a refusal no longer shows up as is a missing proof, so
+  every refusing arm now logs `PN_REJECT reason=<word> via=<carrier>`, the
+  same fixed-word line `lnpnd` has always kept. The release point and the
+  window arithmetic live in the new host-testable `leviculum-upload-proof`,
+  whose tests carry the pre-fix ordering as a positive control.
+
+- An LNode whose calendar healed from the air now says so: `[TIME_SOURCE]`
+  reports `overheard` instead of the birth state (Codeberg #398). The line is
+  the only thing a board says about its clock, and the three sites that record
+  a time source — a GNSS fix, the host's `TYPE_WALL_TIME` envelope, the
+  propagation role's peer clock — are not the only sites that seat one.
+  `Transport::learn_emission_timebase` adopts an overheard announce's emission
+  stamp and raises the anchor to `TimeSource::Overheard` inside the core, with
+  nothing in the firmware called when it does, so the banner's copy kept the
+  boot value forever. A quiet-hour rig capture on 2026-09-14 read the same
+  word off two T114s announcing their delivery destination on the configured
+  1800 s cadence and off a RAK4631 withholding its announce for want of a
+  clock — the two states the line exists to tell apart. The main loop now
+  mirrors `node.time_source()` beside the interface state it already mirrors,
+  so an anchor seated anywhere in the core reaches the banner within one loop
+  pass and a source added later needs no fourth notification path.
+
+- The RAK4631 image no longer holds the accelerometer's interrupt line down
+  in the belief that it is a pulse-per-second input (Codeberg #394). The GNSS
+  task was handed `P0_17` as `pps` and held it as `Input::new(pin,
+  Pull::Down)` for the life of the task. The RAK19026 VC schematic
+  (RAKwireless, 11/26/2024) says P0.17 is something else entirely: sheet 4,
+  U7 `LIS3DH`, pin 11 `INT1`, through `R53` marked `0` and therefore fitted,
+  onto net `IO1` — and `WB_IO1 = 17` in RAK's own
+  `WisCore_RAK4631_Board/variant.h`. The receiver's real pulse output goes
+  nowhere: sheet 3, U6 `ZOE-M8Q-0`, pin C3 `TIMEPULSE`, net `1PPS`, through
+  `R39` marked `0/NC`, unfitted, and the pad behind that gap is `IO3`, which
+  is P0.21 rather than P0.17. `STANDBY_GPS` (`R44`) and `RESET_GPS` (`R45`)
+  are depopulated the same way, while both UART links are fitted, so on this
+  baseboard the ZOE-M8Q is a UART and nothing else. The pin came from a
+  Meshtastic `#define PIN_GPS_PPS (17)` whose own comment scopes it to the
+  RAK1910 plug-in card on a WisBlock Port A header, and our board file had
+  recorded the inference honestly — "verify with a capture" — from
+  2026-04-28 until now. Nothing captured it, because a pull-down on an idle
+  input looks exactly like a quiet pulse line. Consequences were a time
+  discipline that could never have measured anything and a pull parked on the
+  interrupt the movement flag in the open announce-cadence question needs, so
+  the board now passes `pps: None` and the `GnssPps` alias is gone rather
+  than corrected.
+
+- A UDP interface no longer signals a hardware MTU, so a link crossing one
+  settles on the base protocol MTU whichever stack sits on either end
+  (Codeberg #357). Python's `UDPInterface` sets `self.HW_MTU = 1064`
+  (`UDPInterface.py:74`) but leaves the base class's
+  `AUTOCONFIGURE_MTU = False` and `FIXED_MTU = False` (`Interface.py:93-94`)
+  alone, and every gate that puts an MTU on the wire reads the flags rather
+  than the value: the initiator's `Transport.next_hop_interface_hw_mtu`
+  returns `None` (`Transport.py:2682-2683`), a relay forwarding onto such a
+  next hop truncates the link request by `LINK_MTU_SIZE`
+  (`Transport.py:1599-1602`), and a receiver clamps against
+  `RNS.Reticulum.MTU` (`Transport.py:2101-2104`). All three land on 500;
+  1064 bounds the datagram the interface accepts off the wire and nothing
+  else. We adopted the class value as a signalled one, which is the same
+  shape as #355 inverted — there we read a constant the reference derives,
+  here we read one the reference never signals. The split it produced was
+  already written into our own interop suite: 500 on every UDP link with a
+  Python end on it, 1064 between two Rust ends, with a Rust relay putting a
+  1064-byte frame on a hop an all-Python mesh keeps at 500.
+
+  Two decision points behind it move with the interface, because a value
+  that is not signalled must not sneak back in from either side. A relay now
+  REMOVES the signalling bytes when the next hop signals no MTU instead of
+  passing the incoming value on — otherwise a link request that arrived over
+  TCP carried a 16384-byte MTU onto the UDP hop. Truncating is what the
+  reference does and it does not disturb the link identity, which both ends
+  derive from the request with the signalling bytes already removed
+  (`Link.py:341-347`). A responder reached over an interface that signals no
+  MTU now negotiates the base MTU rather than accepting the signalled value
+  unchecked. `InterfaceInfo::hw_mtu` accordingly means the MTU the interface
+  SIGNALS, and a UDP interface therefore reports nothing under the `mtu`
+  stats key, where Reticulum 1.5.x reports 1064 — a key that postdates our
+  pinned 1.3.5 reference and is read under `rnstatus` flags only.
+
+- A receiver of a resource no longer times out on parts that are still on the
+  air. Its part timeout was derived from the link RTT alone, and on a slow
+  half-duplex carrier the RTT is measured over a handshake whose frames
+  alternate direction and never queue behind one another, while the parts of
+  a window do: on `lora_window_ab_pythonlike` (SF7/BW62.5, 50 KB, night run
+  2026-09-23, commit 1599dc72, RSSI -39 dBm and no RF loss) a link
+  established at rtt 1173 ms bought a 2596 ms timeout for parts the sender's
+  own interface priced at 1866 to 2586 ms EACH. The last part of every window
+  timed out; under the `pythonlike` window policy each timeout stepped the
+  window down and pulled `window_max` after it, and at `window_min = 2` the
+  transfer locked — 261 part frames for 51 distinct parts, 39 B/s, killed at
+  49 of 109 parts.
+
+  The rule is now that a part timeout is never shorter than the time the
+  sender needs to put the requested window on the air. That time is an
+  interface fact, so the interface states it: `Interface::frame_turnaround_ms`
+  reports what one frame costs the frame behind it — zero for every medium
+  with no post-TX wait and, on an RNode, the MTU-sized `tx_hold` at the PHY
+  it programmed (airtime + DIFS + the widest contention draw it can price at
+  bring-up). The driver mirrors it into transport beside the next-slot
+  answer, a link records the figure of the interface it runs on, and
+  `IncomingResource::part_timeout_ms` floors the timeout at
+  `window x turnaround + one RTT`. It is a floor under both window policies:
+  neither loses the term it had, because the floor only ever raises. A link
+  across a relay prices its own first hop, which is the only one anything on
+  the wire lets it see.
+
+- A carrier-detect no longer ends a receive window that is holding a frame. The
+  CSMA path's `cad()` stood the receiver down unconditionally, so a board whose
+  own announce reached the channel-access gate while a frame was arriving ended
+  that reception mid-air and then read the frame it had just destroyed as a busy
+  channel: a propagation sync round lost its third offer frame that way in the
+  night run of 2026-09-23 and did not recover inside the round's 180 s deadline.
+  The site now takes the same wait the idle select takes, hands a frame it
+  catches up through the loop's own sink, and releases a bare carrier that shows
+  no header within the preamble-plus-header time, which is a tenth of the frame
+  bound and is what makes the wait affordable at up to eight CSMA retries per
+  packet. `[SX_RX_TEARDOWN]` and `[SX_RX_HARVEST]` carry `waited_ms=` and the
+  deferral line has a fourth outcome, `false_preamble` (#426).
+
+- A board running the propagation role no longer goes deaf while it validates
+  the mail it has just accepted. Every accepted upload and every synced message
+  walks the 1000-round propagation stamp workblock, which costs 3655 to 3727 ms
+  on an nRF52840, and the engine awaited the whole of it inside one pass of the
+  firmware's single main loop. For that span the loop is not in its `select`,
+  and the LoRa task's four-slot hand-off channel has a blocking producer, so a
+  receive window that comes down is never re-armed: the rig measured
+  `SX_RX_ARM site=ack dark_ms=10284` and later `dark_ms=17870` on a board
+  draining a ten-message sync batch, and a client's link request crossed the
+  air unheard in that window. The validator's cooperative yield does not cover
+  it, because the task that has to run is the main loop itself. The workblock
+  is now expanded 20 rounds at a time and parked between passes, so the loop is
+  away for 74.5 ms rather than 3.7 s and the receiver stays armed while a stamp
+  grinds. The new `leviculum-nrf/settle-budget` crate pins the bound, one
+  frame's airtime at the PHY the propagation cells run, and `PN_STAMP` now
+  carries `slices=` so a capture says the slicing ran (Codeberg #425).
+
+- `lnomad` now closes the link to a node it leaves. A browsing session reuses
+  one link per destination, but on every switch it only forgot the old one:
+  nothing in the crate ever called `close_link`, so the abandoned link stayed
+  established and kept exchanging keepalives for the life of the process, and
+  an ordinary walk across five nodes left five of them. On LoRa that airtime
+  is spent on a shared medium, and the peer is a foreign NomadNet node with no
+  way of knowing the browser has gone. The same leak came from the other two
+  ends of a link's life: turning identify off dropped the link it invalidated,
+  and quitting the browser stopped the node without closing what it held. Both
+  close now. The TUI aborts the in-flight fetch task on every navigation, so
+  link setup can be cancelled at any await it contains; the session therefore
+  records ownership of a link the moment the core link exists rather than once
+  setup succeeded, and a half-built link is never reused as though it were
+  established and identified (Codeberg #322).
+
+- A path request now crosses a board between two links of one BLE interface.
+  The exclusion a re-originated broadcast carries used to name the interface
+  the request arrived on, which is right for a shared medium, where every peer
+  on the segment already heard it, and wrong for BLE, where one interface
+  multiplexes several point-to-point links and the other links heard nothing.
+  A board between a host and a neighbour board therefore answered a path
+  request for a destination only the neighbour knew with silence, six retries
+  long, and a node that had just restarted could not recover its paths through
+  the board beside it. The broadcast now names the LINK it arrived on beside
+  the interface, and each interface decides what that means for itself: a
+  single-link carrier excludes itself exactly as before, a multi-link one
+  excludes the one link. Wire format and semantics are unchanged; a Python
+  peer sees the ordinary path request it would have seen from a per-peer
+  sub-interface (Codeberg #422).
+
+- A config file with a syntax error no longer starts a daemon that does
+  nothing. `[reticulum` with the bracket missing, and any other line that is
+  neither a section header nor a `key = value` pair, used to be skipped: the
+  file below it was read as nothing at all, `lnsd` came up on pure defaults,
+  logged `Node started with 0 interface(s)`, answered `systemctl is-active`
+  with `active`, and carried no traffic — a typo with no failure for anyone to
+  find. The reference decides this and refuses: the same file makes `rnsd`
+  1.3.5 log `Could not parse the configuration at <path>` and exit 255 without
+  starting (`RNS/Reticulum.py:330-333`, measured 2026-09-22), because
+  ConfigObj raises `Invalid line ... (matched as neither section nor
+  keyword)`. `lnsd` now refuses the same files, naming the line number and the
+  line, and the loader reports both the INI and the TOML verdict instead of
+  discarding the TOML one. Shapes ConfigObj accepts are unaffected, including
+  `[reticulum] # comment` (a header with a trailing comment, which the old
+  bracket test dropped on the floor) and `[reticulum = x` (a key, not a
+  header). A key that lands in no section, or in one `lnsd` does not read, is
+  still tolerated as Python tolerates it, but is now logged rather than
+  swallowed.
+
+- The citation guard now reads a reference table's signature as naming the
+  citation beside it, so the densest citation shape in the book is
+  drift-checked instead of existence-checked. A row like ``| `fn
+  has_path(&self, …) -> bool` — `driver/mod.rs:NNNN` |`` names its subject as
+  plainly as a citation can, but the name sits inside a signature several
+  words from the citation, and the two spellings the guard knew both required
+  adjacency — so every such row counted as bare and passed on the file merely
+  being long enough. Inside a table row a `fn NAME(` in a backticked span now
+  names the next citation on that row, and only the next one: a citation
+  between the two takes the signature for itself, which is what keeps the
+  pairing unambiguous without an adjacency rule. That moved 76 book citations
+  out of the bare class and immediately reported 41 of them as wrong. The
+  history anchor added for bare citations cannot reach this case — these
+  citing lines are older than the path they cite, so there is no blob to
+  anchor against and all of them counted as undecidable (Codeberg #307).
+
+- Every signature row in `docs/src/developer/rust-api-spec.md` points at the
+  item it names again. All 59 were wrong: a 17-row `ReticulumNode` method
+  table had aged past a thousand lines, and the `Identity`, `Destination`,
+  `NodeCore` and `Config` tables by 12 to 500. Each was re-derived from the
+  definition in the file its section names rather than shifted by the
+  distance the guard reported, because a citation that was already wrong and
+  gets moved to a new wrong number is harder to spot than one that is
+  obviously stale (Codeberg #307).
+
+- A destination's last `app_data` now survives a daemon restart, so the
+  propagation role can still recall what a neighbour said about itself after
+  one. `known_destinations` is written with the `app_data` the destination
+  announced, which is where Python's `Identity.recall_app_data` reads it from
+  (`RNS/Identity.py:162-172`, written by `remember` at validate time); ours
+  wrote `None` there for every destination learned at runtime and answered
+  the recall from the memory-only announce cache. The window that opened on
+  every start was a full announce interval wide — six hours at the reference
+  cadence — and inside it a node that syncs its store to us is read as "not a
+  node": we keep its mail and never sync back (Codeberg #420, the restart
+  half of #417). The file is the one an `rnsd` sharing the storage directory
+  reads and writes, so the recall now crosses both stacks. On a board nothing
+  changes: `EmbeddedStorage` persists nothing, and its recall bound stays
+  "while a path to that destination lives, and not across a reset".
+
+- Four structured-event call sites no longer pass a free-text message to the
+  tracing macro: `TUNNEL_PATH_ASSOCIATED`, `TUNNEL_REAPPEARED`,
+  `PATH_RESTORED` and `LOCK_DEPTH_OVERFLOW`. The prose rendered under a
+  `message` field whose spaces split the line for every token-based parser
+  (`jl`, `jldiff`, the periculum cells' awk); the miauhaus soak reported the
+  first of them as `EVENT_FIELD_VIOLATION event=TUNNEL_PATH_ASSOCIATED
+  field=message value_problem=whitespace`. The structured fields already
+  carried everything the sentences said, except on `LOCK_DEPTH_OVERFLOW`,
+  which now states it as `tripwire=inactive`. The same new completeness test
+  fails on any event site that passes a message argument, so the class is
+  closed rather than fixed one instance at a time.
+
+- `lnpnd` no longer stores a peer's whole inbound sync inside one core-processor
+  hook. Every accepted message is one durable store append — write, `fsync`,
+  rename, `fsync` the directory — and the hook that classified the batch stored
+  all of it while holding the core lock, so the node went silent for as long as
+  the disk took. In the public mesh on miauhaus (2026-09-21) a 105-message sync
+  produced `CORE_PROCESSOR_OVER_BUDGET hook="on_tick" elapsed_us=239016
+  budget_us=5000 events=0` in the tick right after it, one of 73 overruns in
+  the daemon's first 32 minutes; `lnsd` on the same host and the same traffic
+  reported none. The engine now queues validated payloads and stores one per
+  hook, asking the driver straight back for the rest, and a peer's batch is
+  resumable across hooks while still being reported as one round. The batch
+  costs the same wall-clock — the disk did not get faster — but the core lock is
+  released between messages, so the node keeps answering while it absorbs a
+  sync. Client uploads take the same queue, for the same reason. One append can
+  still exceed the budget on a slow disk (6.4 ms measured against a 5 ms
+  budget); what is gone is the multiplier. The numbers are measurable from the
+  tree (`append_cost`, `leviculum-std/src/file_propagation_store.rs`) and the
+  rule is written up in `docs/src/concepts/core-lock-budget.md` (Codeberg #384).
+
+- `lnpnd --status` asks for the path it is waiting for. `wait_for_path` used
+  to wait one whole retry interval before sending its first `PATH_REQUEST`,
+  and the client ships a 5 s budget with a 5 s retry interval — so the
+  deadline check fired on the very iteration the first request was due, and
+  the request never left the host. The client mints a fresh storage directory
+  per invocation, so there was no warm path table to fall back on either: a
+  healthy, announcing node answered `Getting lnpnd statistics timed out,
+  exiting now` after exactly 5 s of silence (field report 2026-09-20 14:51).
+  The first request now goes out immediately, which is what the reference's
+  client does (`lxmd.py:663-667` calls `request_path` before its first sleep);
+  the retry interval governs only the repeats, which remain ours. A path
+  already known still costs nothing. Measured on the reported topology — two
+  programs on one shared instance — the resolve now takes 100-101 ms against
+  the 5 s budget, so the default stays at 5 s: a larger one would only have
+  hidden the unsent request behind a longer fuse.
+
+  Two callers were sending their own `PATH_REQUEST` first to work around this
+  and no longer do, which removes a duplicate packet per query:
+  `fetch_remote_status` (`lnstatus -R`) and lnomad's page fetch. The first of
+  those also clamped its retry interval to `min(2 s, timeout)`, so
+  `lnstatus -w 2` or shorter put budget and interval back on equal footing and
+  lost every repeat; it now uses a fixed 2 s interval, which an interval
+  larger than the budget can no longer turn into "no request at all".
+
+- lnpnd tells a caller it refused their query instead of letting them time
+  out. Its three control paths (`--status`, `--sync`, `--break`) were
+  registered behind the core's `AllowList`, which drops a request from an
+  identity that is not allowed without a word — what
+  `RNS.Destination.ALLOW_LIST` does in the reference, and what makes the
+  reference's own `ERROR_NO_ACCESS` branch unreachable. The caller sat out its
+  whole timeout and printed `Getting lnpnd statistics timed out, exiting now`,
+  which claims nobody answered and sends the reader to the mesh, the instance
+  and the interfaces. The handler now decides and answers, with the
+  reference's own error value — so a Python client hears something it already
+  knows how to decode (exit 204) rather than silence. Nothing is newly
+  permitted: the handler checks the same list against the same remote identity
+  hash the core checked. Querying a node that does stay silent still exits
+  200, and the client now says on stderr what else that can mean.
+
+- A source build on an arm64 host no longer produces x86_64 binaries in
+  silence. `.cargo/config.toml` pins `x86_64-unknown-linux-musl` for every
+  host and cargo has no per-host conditional there, so a Raspberry Pi — one
+  of the more natural places to run a Reticulum node, and an architecture
+  the `.deb` packaging already ships — built successfully and then failed at
+  execution with a message that says nothing about architecture. The pin
+  stays, because dropping it would give up musl-static for every developer
+  build and moving it would only mirror the problem; instead the build now
+  warns when it is producing the pinned target on a host of another
+  architecture, naming the `CARGO_BUILD_TARGET` override to pass, and both
+  source-build documents carry that override (Codeberg #291).
+
+- The changelog's own version headings render as links again. A Keep a
+  Changelog heading is a reference link, so `## [0.8.1]` is only a link while
+  a matching definition exists at the foot of the file, and nothing about
+  writing the heading produces one. Eight headings had none — `Unreleased`
+  and the four newest releases among them — and showed the reader literal
+  bracket text at exactly the place a reader starts. `## [0.1.0]` also still
+  carried the placeholder date `2025-XX-XX`, which had shipped in every
+  release since; the real date is 2026-01-28. `just changelog-links` now
+  holds both lists to each other and refuses a date that is not a real one
+  (Codeberg #287).
+
+- An LXMF router no longer forgets everything it knows when its node's
+  timebase becomes real. A board without an RTC stamps from uptime seconds
+  until the first validated announce seats a real calendar, and the router
+  ages its stamp-cost cache and its delivered/processed ID windows on that
+  value — so the re-anchor, a step of about 1.7e9 seconds, expired every
+  entry in the next cleanup pass even though nothing had grown old.
+
+  The monotonic clock is what says how much time actually passed. The router
+  now keeps the `(emission_secs, now_ms)` pair of the last tick and shifts
+  every cached stamp by whatever the calendar advanced beyond the stopwatch,
+  so the ages those caches encode survive the step and real elapsed time
+  still expires entries. Ticket expiries are deliberately left alone: a
+  peer's `expires_unix` is an absolute instant it wrote from its own clock,
+  not an age measured here.
+
+  The window that was being lost is not cosmetic. A queued message whose
+  recipient stamp cost had just been forgotten goes out unstamped, and a peer
+  that demands a stamp drops it. The snapshot format is unchanged — the
+  anchor's monotonic half belongs to one process and is never persisted
+  (Codeberg #186).
+
+## [0.9.0] - 2026-09-18
+
+Toolchain: Rust 1.97.1
+
+### Added
+
+- `lnpath`, the path-query half of the client vocabulary: query a path to
+  a destination, wait for it, and drop one the daemon holds. Until now
+  every path step in every scenario borrowed Python's `rnpath`, including
+  scenarios with no Python node in them, and an install without Python RNS
+  had no way to ask where a destination was at all.
+
+  The `-w` window is the caller's number and nothing else. Periculum #20
+  is the counter-example this is measured against — `rnprobe` steps there
+  give up after roughly ten seconds whatever timeout was configured, which
+  turns an unrelated scenario red — so the end-to-end test asserts it
+  differentially: the same query run with `-w 2` and `-w 8` must differ in
+  elapsed time by about six seconds, which a hardcoded window cannot do.
+
+  `-d` drops the path from the **daemon's** table over the shared-instance
+  RPC, the way Python's `Reticulum.drop_path` does. Dropping the copy
+  inside the client would print the same success line and change nothing:
+  the client exits a moment later and the table that routes is the
+  daemon's. The second drop of the same path is what proves the
+  difference, and the test makes it.
+
+  The reference tool's other roles — the path and rate views, the
+  blackhole verbs, remote management of another instance — get no flag
+  here rather than a flag that means something subtly different;
+  `lnstatus --tables` already prints the path table. Man page, client-
+  tools table row and packaging ride along (Codeberg #173).
+
+- Every board now reports its physical link — rssi, snr and Reticulum's
+  own quality figure — in the telemetry it sends. The radio has measured
+  all three on every reception since the driver existed and logged them;
+  the Telemeter has carried them since the codec existed; nothing put the
+  two together, so a report said where a board was and not how well it was
+  hearing, which on a mesh is the more actionable of the two.
+
+  The reading is **the last frame received**, deliberately: a mean over a
+  window averages whichever neighbours happened to transmit and falls when
+  a distant node joins, which on a viewer reads as the near link
+  degrading. It is also what the references mean by the same words —
+  `RNS.Link.rssi`/`.snr` keep the last received packet's figures and
+  `RNodeInterface.r_stat_rssi` belongs to the frame the stat bytes came
+  with — so our number and a Python-RNS peer's are one quantity. `q` is
+  Reticulum's `Q_SNR_*` map rather than a scale of ours, computed from the
+  spreading factor the frame was actually demodulated at; a PHY with no
+  defined scale sends `q` as nil and the two measurements beside it
+  regardless.
+
+  A board that has heard nothing for longer than the fastest reporting
+  cadence sends no physical-link sensor at all. A stale rssi is the one
+  reading in the set that states the opposite of the truth — a board whose
+  antenna fell off would go on reporting the last good link it had — so
+  the rule and its bound live in `leviculum-telemetry-policy`, beside the
+  cadence and where a host test can drive them (Codeberg #236).
+
+- The SenseCAP Solar Node P1-Pro reports its pack voltage on the `[BAT]`
+  line like every other board, read through its own 1 MΩ/510 kΩ divider
+  rather than the T114's and sampled with the longer acquisition window
+  that divider's 338 kΩ of source resistance needs (Codeberg #233).
+
+- A node's BLE advertisement now carries the first four bytes of its
+  identity hash, so a board or `lnsd` recognises a peer it already holds
+  a link to before it dials it, and no longer spends its scarce outgoing
+  link on that peer under a new Bluetooth address. It reaches as far as
+  the record does: a peer that advertises no capability record, an
+  Android Columba among them, is dialled exactly as before
+  (Codeberg #412).
+
+- `lnflash` knows the SenseCAP Solar Node P1-Pro, so every control command
+  reaches it: `--watch`, `--announce`, `--set-time`, `--set-name`,
+  `--set-ble-tx-gap` and the `--radio-*` flags. The board runs our firmware
+  on the rig and answered none of them before, because no catalogue entry
+  claimed its USB ID (`1209:0003`). Flashing it by manifest stays refused and
+  is now refused by construction: a catalogue entry is split into a control
+  half and an optional flashing half, and this board has none — its
+  bootloader publishes `nRF52840-SeeedXiao-v1`, which is the XIAO module's
+  identifier and not this product's, so any DIY XIAO with a differently
+  wired radio answers to it. A bundle carrying an image for such a board
+  fails to load, `--board solarnode` is refused before the bus is read, and a
+  flash session that meets it on the bus names it, says why, and does not
+  reboot it. It is flashed with `just flash-solarnode` (Codeberg #233).
+
+- The C API serves a file and retires a handler. `lev_send_file_response`
+  sends a response Resource of the RAW bytes plus msgpack metadata, with no
+  `[request_id, response]` wrapper — the wire form a NomadNet `/file/`
+  download has, and the one of the three response calls whose name does not
+  say how it differs, so the doc comment says it instead. The requester reads
+  the bytes with `lev_event_data` and the `{"name": ...}` with
+  `lev_event_metadata` off one response event.
+  `lev_deregister_request_handler` takes a served path back down without
+  restarting the node, and answers which of the two things happened:
+  `LEV_OK` when it removed a handler, the new `LEV_ERR_NO_HANDLER` (-16) when
+  there was none. `lev_register_request_handler`'s doc no longer states that
+  there is no unregister.
+
+- `MessageState::Sending` is reported on `RouterEvent::MessageState` from
+  every path that enters it — direct, opportunistic and propagated — so a
+  message is observable while it is in flight instead of only when it is
+  answered. On the transition only.
+
+- lnmsg speaks to propagation nodes. `--via auto` (the new default)
+  tries the direct delivery link first and, when none comes up inside
+  the timeout, uploads the message to a propagation node instead — the
+  fallback Columba's `tryPropagationOnFail` and Sideband perform. `--via
+  direct` and `--via propagated` stay as explicit choices; the exit code
+  distinguishes handed on directly (0), held by a node for collection
+  (3), and neither (1), and the decision is logged as one structured
+  `LNMSG_VIA method=… reason=…` line. Node selection: `--pn <hash>`,
+  then the `propagation_node` key in lnmsg's own config
+  (`${LNMSG_HOME}/config`), then the most recently announced node heard
+  while attached; the client mines the propagation stamp at the node's
+  announced cost with elapsed-time progress on stderr above cost 10.
+  `lnmsg fetch` drains the mailbox with the genuine list/fetch/confirm
+  round and prints what is new, de-duplicated across runs against
+  messages already delivered directly (message ids persisted in
+  `${LNMSG_HOME}/seen`); `lnmsg address` prints the persistent LXMF
+  address without needing a daemon.
+
+- Peering logs a refresh, not only an addition. Every announce that
+  refreshes a peer already in the table emits `PN_PEER action=refresh
+  reason=announce`, on the boards and in `lnpnd` alike and with the
+  same field order in both. `action=add` is a once-per-peer-lifetime
+  line — the table is persisted and restored across reboots and
+  flashes — so until now nothing in the log said that a running node
+  still hears its peers.
+
+- lnpnd grows to lxmd's full scope (#384 part 4). Remote management:
+  the node registers lxmd's `lxmf.propagation.control` destination with
+  the `/pn/get/stats`, `/pn/peer/sync` and `/pn/peer/unpeer` request
+  paths behind the same identity allow list (`control_allowed`), and
+  answers with the reference's stats map — `lxmd --status --peers
+  --sync --break --remote` drives an lnpnd node, and lnpnd carries the
+  same client verbs with output in lxmd's shape, driving stock lxmd
+  nodes in return (both directions in the conformance corpus, the
+  payload encodings pinned byte-exact against `umsgpack` in
+  `VEC-PN-CONTROL`). The daemon's own mailbox: an LXMF delivery
+  destination on the node identity, announced with `display_name` and
+  `stamp_cost`, each received message written in the reference's
+  packed-container file format and handed to the `on_inbound` hook;
+  propagated uploads addressed to the node's own mailbox deliver
+  locally instead of rotting in the store, the reference's own
+  short-circuit. Configuration: an lxmd-format config directory
+  (`config`, `identity`, `allowed`, `ignored`, `storage/`) with lxmd's
+  sections and key names, flags as overrides, `--exampleconfig`, and
+  `auth_required` gating `/get`; the keys lnpnd accepts but does not
+  act on are named in lnpnd(1) with reasons. Packaging: lnpnd joins
+  the `.deb` builds with a hardened systemd unit, a dedicated service
+  user, `--service` file logging and a manual page. Propagation-stamp
+  validation moved off the core lock onto a single worker thread
+  (arrival order preserved — the proof still leaves only after the
+  store append), so a cost-13 default no longer spends ~10 ms of the
+  core mutex per accepted message; the validated sync-peer
+  association is captured when the resource concludes, so a peer
+  that tears its link down before the verdicts drain — stock lxmd
+  does — cannot orphan the inbound batch.
+
+- Propagation-node peering (#384 part 2): lnpnd now peers with other
+  propagation nodes — including stock Python `lxmd` at its default
+  peering cost — and syncs its store both ways. The protocol half lives
+  in `leviculum-lxmf::peering` (`no_std + alloc`, board-ready behind a
+  `PeerStore` trait): a capped peer table fed by propagation announces
+  (autopeer within the configured hop depth, static list, deterministic
+  first-heard-wins policy at the cap, 14-day unreachability cull), the
+  `/offer` wire codec and inbound gate (peering-key validation at our
+  announced cost, throttling, `from_static_only`), and one append-order
+  cursor per peer instead of the reference's per-message peer sets —
+  everything at or below the cursor has been offered and concluded, a
+  stale cursor is a bounded full re-offer. Outbound rounds mine the
+  peer's peering key once on a worker thread, persist it, offer within
+  a 6144-byte bound, and advance the cursor only on the concluded
+  resource. Messages accepted at cost 0 get true stamp values computed
+  whenever any peer filters offers by value. New lnpnd flags use lxmd's
+  key names: `--max-peers`, `--static-peers`, `--autopeer`,
+  `--autopeer-maxdepth`, `--remote-peering-cost-max`,
+  `--max-inbound-syncs`, `--from-static-only`. Structured events:
+  `PN_PEER`, `PN_OFFER`, `PN_SYNC`. Verified end-to-end in an all-Rust
+  two-node loopback (autopeer, key mine, offer, sync, re-offer answered
+  "want none") and by new periculum conformance cells against genuine
+  stock `lxmd` peers, including a mixed-stack relay chain in both
+  directions, key reuse at stock cost 18, the peer cap, and store
+  overflow during an inbound sync.
+
+- lnpnd, an LXMF propagation node daemon (#384): the store-and-forward
+  mailbox role on a running Reticulum shared instance. It announces
+  `lxmf.propagation`, accepts client uploads (proving each packet only
+  after the message is durably stored), answers `/get` with the
+  list/fetch/confirm rounds of the reference protocol, and evicts by the
+  reference's age-times-size weight. Stamp and peering costs default to 0
+  and are settable (`--stamp-cost`, `--peering-cost`); announced limits
+  default to the small honest values the propagation-node concept page
+  derives (4 kB per transfer, 32 kB per sync). Verified byte-for-byte
+  against the Python reference's own handlers and end-to-end against
+  genuine Python LXMF clients.
+
+- The propagation-node role and its store boundary in `leviculum-lxmf`
+  (#384): `PropagationNode` (announce, upload accept, mailbox drain,
+  eviction) over a `PropagationStore` trait whose verbs mirror the
+  boards' record log one-for-one, so the on-board node of a later part is
+  an adapter rather than a redesign. Host stores: in-memory, and a
+  file-backed one that fsyncs before the upload proof leaves — a power
+  cut during an upload reopens with every completed message and no
+  partial one.
+
+- The `lxmf-node` test helper speaks the propagation protocol (#384):
+  `pn_enable` runs lnpnd's engine, and `set_pn` / `send_propagated` /
+  `sync` drive the router's propagation client, mirroring the same verbs
+  in periculum's Python helper so one driver tests either stack's node.
+
+- LNode boards keep a message store on their internal flash (#384): 64 KiB
+  behind the firmware image, mounted at boot and formatted once, not yet
+  used for messages. `lnflash --store-storm <count>[,<bytes>]` appends
+  synthetic records to it, which is the instrument for measuring what the
+  store's page erases cost Bluetooth throughput and LoRa airtime.
+
+- A board says how often it restarted while nobody was watching (#380).
+  The breadcrumb record in retained RAM answers what the previous boot
+  was doing; it cannot answer how many boots there have been, because a
+  power loss takes retained RAM with it — and a power loss is the case
+  that matters. The 90 minute field walk that motivated this had a
+  Pocket V2 restart twice, and every boot of it read
+  `reset_reason=0x00000000` with `prev_magic=absent`; the restarts were
+  found afterwards by subtracting uptime stamps from a watch log, and on
+  the walk itself nobody could have known. All three boards now append
+  one 16-byte record per boot — boot number, raw `POWER.RESETREAS`, and
+  whether retained RAM survived — to a page of internal flash, and say
+  the count once at boot, ungated, beside `BOOT_TRACE`:
+  `BOOT_COUNT n=<n> reset_reason=0x<hex> retained=0|1 since_erase=<n>`.
+  `retained=0` with `reset_reason=0x00000000` is a power loss;
+  `retained=1` is a watchdog or a commanded reset.
+  Appended and never rewritten: a counter at a fixed address would cost
+  one page erase per boot and spend the page's rated 10 000 cycles in
+  10 000 boots, while 256 records to a page cost one erase per 256 boots
+  and 2 560 000 boots over the same budget. The write goes straight to
+  the NVMC before `Softdevice::enable`, because a board that boot-loops
+  on a sagging pack dies early and a record written later would be
+  missing from exactly those boots — and that is also why the record
+  cannot live in the record store (#384), which is driven through the
+  SoftDevice's flash API. The page is `memory.x`'s new `BOOT` region at
+  `0xD9000`, one page taken off the top of the application window and
+  directly below the store, on the same terms: it is inside the
+  bootloader's writable window, and what protects it is that our `.uf2`
+  carries no block for it. A foreign image can erase it, and the bytes
+  it leaves read as foreign rather than as a count. `boot_count::page()`
+  reads the address from the linker, so no Rust constant can disagree
+  with the map.
+
+- A board asks for a supervision timeout it can survive (#385). A link
+  a peripheral board holds is the one end that can do anything about
+  the parameters it was handed, and the two cases where those
+  parameters are bad or unknown are exactly the two where the board is
+  the peripheral: an lnsd central gives it BlueZ's 420 ms — nine
+  connection events at the 45 ms interval both stacks measured, and 36
+  link deaths in 16.2 hours on the bench — and a phone gives it
+  something nobody has measured yet. The board now compares the
+  timeout the link came up with against a 2000 ms floor and, only if
+  it falls short, asks the central for 4000 ms, the same value the
+  firmware's own central role already asks for. Conditional by design:
+  a central that negotiates something sane is left alone, because an
+  update request that fights a good value is a regression. Both the
+  decision and its outcome are logged as `BLE_CONN_PARAMS_REQ conn=<h>
+  timeout_ms=<n> result=sent|refused|skipped`, and because a central
+  may honour the request, ignore it, or answer with something else
+  entirely, a peripheral link re-reads its parameters at teardown and
+  repeats `BLE_CONN_PARAMS` marked `when=close`: a link that opened at
+  420 ms and closed at 4000 ms was granted what it asked for, one that
+  closed at 420 ms was not, and the request line alone says neither.
+  Board-to-board links are untouched — their central already asks for
+  4 s, so they only ever log `result=skipped`.
+
+- The boards say what their battery is doing (#380). Once at boot and
+  then every 30 s, both the Pocket V2 and the T114 log `BATTERY
+  mv=<n> min_mv=<n> max_mv=<n> pct=<n>|none cells=<n>S`. The pack is
+  sampled at 1 Hz and the line reports the extremes of the period as
+  well as the filtered value, so a sag under transmit load is visible
+  instead of averaged away. Before this the monitor fed the display and
+  said nothing else: a Pocket V2 that restarted twice during a 90
+  minute field walk on battery produced zero battery lines, so how
+  close the pack had been to the edge could not be asked afterwards.
+  This is a margin instrument, not a brownout detector — the sampler is
+  a second apart, the transient that resets a board is microseconds
+  wide, and the reset takes the log with it.
+
+- The T114 reads its own battery at all (#380). The monitor was typed
+  to the Pocket V2's ADC pin and had the Pocket's 1.73 divider baked
+  into its arithmetic; it now takes the pin, the divider multiplier and
+  the divider-enable pin from the board file, which was already
+  declaring all three. The T114's enable pin is held high only for the
+  duration of a sample, so its 490 kΩ divider does not sit across the
+  pack between them. The pack voltage also appears on the T114's status
+  panel, which used to render "(no feature)".
+
+- Every BLE link on a board says what it actually runs at (#385). At
+  the connection event, in both roles, the firmware logs
+  `BLE_CONN_PARAMS conn=<h> role=central|peripheral interval_ms=<n.nn>
+  latency=<n> timeout_ms=<n>` — the connection interval, slave latency
+  and supervision timeout the central chose, since neither stack
+  requests any of them. The supervision timeout is how long a
+  disturbance may last before the link dies, and until now the only way
+  to learn it was to read the peer's kernel: possible for a BlueZ
+  central on the bench (where a board and lnsd a metre apart lost their
+  link 36 times in 16.2 hours, every connection at a 45 ms interval
+  with a 420 ms supervision timeout), impossible for a phone. Both time
+  fields are converted from their two different raw scales (1.25 ms
+  steps for the interval, 10 ms for the timeout) so the line carries
+  milliseconds only. No parameter is requested or changed by this: it
+  is a measurement. lnsd has no counterpart, because BlueZ publishes
+  none of the three over D-Bus.
+
+- A board announces itself on a new BLE connection and on a timer, not
+  only before a telemetry report (#376). When a peer completes its
+  identity handshake the node announces its delivery destination to
+  that peer over that link alone, at most once per peer identity per 15
+  minutes; independently of telemetry it announces on every interface
+  every 30 minutes. Both are withheld while the board has no plausible
+  wall clock, because an announce stamped from uptime can never replace
+  a path at the receiver. A phone that connects between two reports now
+  sees the board at one hop straight away.
+
+- `lnflash --watch` records a board's debug log for field testing: it
+  opens the debug CDC with DTR and RTS raised, prefixes every line
+  with a wall-clock ISO-8601 timestamp, appends to `--out` flushed per
+  line, and reconnects with bounded backoff when the port vanishes
+  (reset, reflash, unplug), logging the gap as its own line. `lnflash
+  --summarize <file>` reads a watch file back and prints receptions
+  per class per hour (announce, data, path request) plus the last line
+  seen per class.
+
+- Every LoRa receive line says how strong the frame was, and what it
+  was (#364). lnsd's RNode RX line and its `LORA_RX` trace event carry
+  `rssi=`/`snr=` from the stat frames the RNode firmware indicates
+  before each data frame, paired the way Python's `RNodeInterface`
+  pairs them. The LNode firmware's `[LORA] RX` line adds `flags=` (the
+  packet's header flags byte) and `dst=` (first 8 hex of the
+  destination hash), so `lnflash --summarize` classifies announce,
+  data, path request and proof straight from a watch file.
+
+- An LNode now answers a Sideband telemetry request: an LXMF message
+  from the configured target carrying the `TELEMETRY_REQUEST` command
+  triggers an immediate report, rate-limited to one request-triggered
+  report per profile minimum interval. Requests from any other sender
+  are ignored and logged.
+
+- `lnstatus --identities` (`-N`) lists every identity the daemon has
+  learned from announces — identity hash, announced destination, name
+  (only for aspects the daemon registered itself), hops, via and last
+  seen — plus the `lxmf.delivery` and `rnstransport.probe` destinations
+  derived from each identity hash, ready to paste into `lnprobe`. Until
+  now that derivation had to be done by hand from `rnpath -t` output.
+  Served by a new additive `identities` RPC verb on the shared-instance
+  socket; a daemon without it (Python `rnsd`, older `lnsd`) closes the
+  connection and the tool reports the error.
+
+- `lnprobe`, a drop-in for Python's `rnprobe`: probes a destination
+  through a running `lnsd` **or** `rnsd` over the shared instance,
+  reporting round-trip time, hop count and packet loss from delivery
+  proofs — the same command line, output and exit codes as the
+  reference. The per-probe timeout asks the daemon for its first-hop
+  timeout like `rnprobe` does, so probes over slow media wait longer by
+  default.
+
+- A board says which hashes to probe: one `[IDENTITY]
+  identity=… probe=… lxmf=…` line on the boot-critical log path (both
+  BSPs), repeated in the periodic banner so a reader attached later
+  still sees it — and the same three hashes over a new control-envelope
+  identity query (frame `0x0E`), which `lnflash --set-name` prints in
+  its read-back, so no debug-port reader is needed.
+
+- lnsd joins the Columba BLE mesh: a new `BLEInterface` type
+  (`[[BLE Interface]]` config section) speaks the `ble-reticulum`
+  protocol v2.2 with the v0.3.0 capability record over BlueZ, in both
+  GATT roles at once — it advertises and serves the Columba GATT layout
+  under an `LN-<hex8>` name derived from the daemon identity like the
+  boards do, and it scans for and connects to peers under the same
+  connection-direction rule, so a PC participates in the same BLE mesh
+  as LNodes and phones. One interface is one broadcast domain across
+  all live BLE links; fragmentation and the connection decision reuse
+  the firmware's own host-tested code. Disabled unless configured.
+
+- A user can set a fixed position on an LNode — `lnflash --set-position
+  LAT,LON[,ALT]`, envelope frame `0x08` — which replaces the position
+  sensor in its telemetry reports until `--clear-position` returns it to
+  sensor reporting. Persisted beside the telemetry target, applied at
+  boot and at runtime, marked `possrc=fixed|gnss` in the report line,
+  and encoded in Sideband's own fixed-location shape (accuracy 0.01 m).
+
+- The gap the LoRa interface leaves between two packets on the air is
+  settable without a reflash — `lnflash --set-tx-spacing <MS>`, envelope
+  frame `0x06`. The default imposes nothing (#345).
+
+- The transmit power is settable without a reflash — `lnflash
+  --set-tx-power <DBM>`, which reads the board's current radio settings
+  back (envelope frame `0x07`) and returns them with only the power
+  changed. Persisted (#349).
+
+- A board states the transmit power it programmed, and whether the
+  request was clamped, on its critical log path (#349).
+
+- The firmware logs every arming of the receiver as `[SX_RX_ARM] site=
+  timeout_ms= dark_ms=`, so a capture says how long the radio was not
+  listening between two windows instead of leaving it to be inferred (#344).
+
+- Standing the receiver down logs `[SX_RX_TEARDOWN] site= preamble=
+  header= rxdone= armed_ms=` from every caller, `site=` naming the caller,
+  so a capture says whether a frame was already arriving when the window
+  came down (#276).
+
+- A receive window that is kept instead of re-armed logs `[SX_RX_ADOPT]
+  latched= preamble= header= rxdone= stood_ms=`, which counts the
+  receptions the previous firmware destroyed.
+
+- A transmit that waits for an arriving frame logs `[SX_TX_DEFER]
+  waited_ms= reason= outcome=`, so the airtime the wait costs and what it
+  bought are one ratio in the capture (#276).
+
+- The firmware receives at boosted SX1262 gain and applies the errata-15.4
+  IQ correction, and prints both registers before and after it writes them
+  (`[SX_REG]`, `[SX_REG_IQ]`), so the change is visible in a capture rather
+  than taken on trust (#258).
+
+- The nRF firmware prints its transport counters every 30 s as
+  `[TRANSPORT] fwd= rx= tx= nopath= dup= overheard= maxhops= paths=`, so
+  a board that does not relay a packet says which decision discarded it
+  (#344).
+
+- A transport-id mismatch names both ids it compared, and a packet
+  dropped that way for a destination this node serves locally is
+  reported per packet instead of only counted (#344).
+
+- The lnflash bundle carries the RAK4631 as well as the T114, so a
+  WisMesh Pocket V2 can be flashed and configured from the tarball
+  (#261).
+
+- `just nrf-shellcheck` runs shellcheck over the flash-runner scripts and
+  is part of `just fast` (#345).
+
+- The Pocket V2 reports its position and battery over LXMF: an
+  announced `lxmf.delivery` destination, a target set by address alone
+  (the node resolves the key over the air and says `awaiting-key` until
+  it has), tracker and station cadence profiles, and one immediate
+  report when a target becomes usable (#236).
+
+- Every published artifact now carries `THIRD-PARTY-NOTICES`, generated
+  from the lockfiles, so the MIT- and BSD-licensed crates linked into
+  the binaries travel with their required notices (#288).
+
+- The GNSS wake ends with an explicit UBX-CFG-ANT step: antenna supply
+  on, every automatic power-down path off, so the init no longer
+  depends on what the factory clear left behind (#324).
+
+- The GNSS heartbeat reports satellites in view and best C/N0 (`sv=`,
+  `cno=`) from GSV, so a receiver that hears the sky but never fixes is
+  distinguishable from a deaf antenna (#324).
+
+- The Pocket V2 wakes its GNSS module at boot with a minimal UBX init
+  (factory clear, cold start, full power), so a persisted module
+  configuration from earlier firmware cannot suppress acquisition (#324).
+
+- One framed control envelope on the LNode USB channel (type, length,
+  named refusals, capability report); radio config and reset migrated,
+  legacy magics stay accepted for a transition window (#238).
+
+- `lnflash --set-time` teaches a running LNode wall time over the
+  envelope; the banner then reports `[TIME_SOURCE] source=host` (#166).
+
+- The Pocket V2 firmware seeds its calendar from the GNSS receiver's RMC
+  UTC, and every LNode states its time source (`[TIME_SOURCE]` beside
+  `[FW_BUILD]`) (#166).
+
+- Single-destination decrypt misses are now counted (`single-decrypt-fail`
+  in `PKT_DROP_SUMMARY`) and journey-logged instead of dropped silently.
+
+- `Destination::with_explicit_hash`: a Single destination indexed by a
+  caller-supplied 16-byte hash; never announced, reachable by direct link
+  only (#254).
+
+- Driver completion futures (`connect_awaited`, `send_resource_awaited`,
+  `send_request_awaited`) and a bounded multi-consumer event tap, replacing
+  consumer poll loops (#253).
+
+- `lnmsg`, a new LXMF messenger: `lnmsg send <address>` queues one message
+  through a running `lnsd`/`rnsd` shared instance and says nothing. Exit 0
+  means queued, never delivered.
+
+### Changed
+
+- A board's announce cadence follows whether it moves, not a profile
+  chosen when it was flashed. A board that moves announces every five
+  minutes; one that does not falls back to one announce per hour, slow but
+  never silent. Movement resuming, or the first announce heard from a
+  destination this boot has not heard before, each buy one immediate
+  announce rather than a raised cadence. Movement has to be proven, not
+  measured once: the displacement must exceed the threshold across three
+  consecutive fixes, the accuracy gate must be satisfied, and the fast
+  state expires fifteen minutes after the last position confirming it, so
+  a fixed board whose receiver wanders costs airtime at worst and never
+  reachability. The board's own destination and the propagation role are
+  decided together, because a board whose own announce is withheld is
+  unreachable as a recipient while still usable as a mailbox.
+
+- A board's own announces may use at most a tenth of its lawful duty
+  budget. Locally originated announces bypass the transit announce cap by
+  design, matching the reference, so nothing governed them; the board now
+  stretches its configured interval until the announce set fits and writes
+  one `[ANNOUNCE_DUTY]` line naming the configured interval, the interval
+  actually used and the arithmetic that forced it. At a fast carrier this
+  changes nothing; at the slowest, five minutes becomes roughly half an
+  hour.
+
+- A shared-instance client's announce goes out at once, as the reference
+  does. The core held the first announce of every local-client destination
+  for 250 ms to batch a start-up burst; wire format and semantics were
+  untouched by it, but the deviation rule's third condition — a measurable
+  improvement of priority 1 — never had a measurement, and collision
+  avoidance belongs to the interface, which already spaces its own
+  transmissions. Measured against `rnsd` with the same client on both
+  stacks, 12 registrations each: median client-announce-to-on-air 1 ms for
+  `lnsd` against 699 ms for the reference, whose job loop is what it waits
+  on. A five-client simultaneous burst onto a half-duplex LoRa interface
+  still reaches the radio complete and 51 ms apart, which is the
+  interface's own spacing.
+
+- The T114 no longer drives six pins as a flash bus (#384). It fits no
+  QSPI part: Heltec's own board support package for HT-n5262 — the board
+  id our bootloader reports — has the QSPI pins commented out, the
+  sibling HT-n5262G variant gives two of them to the GPS reset and the
+  display backlight, all six nets are on the expansion header where a
+  user's own hardware sits, the two published pin maps disagree on
+  IO2/IO3, and on the rig every pin followed our drive while nothing
+  answered `9Fh`, `05h`, `90h` or a reset. The firmware now declares
+  `qspi_part: None` for the board, never configures those pins, and says
+  so once at boot instead of probing:
+  `[QSPI] NONE board=t114 reason=not-fitted-see-boards-t114-rs`. The
+  `[STG] qspi-init` stage marker is gone with the stage on that board.
+
+- Neither board probes a QSPI flash any more, because neither of them
+  carries one (#384): RAK's own board support package says "No onboard
+  flash" over the RAK4631's QSPI pins and marks them "occupied by
+  GPIO's", the `EXTERNAL_FLASH_DEVICES IS25LP080D` line under it being a
+  template default rather than a fitted part — the same artefact as
+  Heltec's, and the field Pocket answers `05h`, `9Fh`, `90h` and the
+  datasheet reset exactly as silently as both T114s. The Pocket now
+  declares `qspi_part: None` too, drops its aliases and its
+  `[STG] qspi-init` stage, and says
+  `[QSPI] NONE board=rak4631 reason=no-onboard-flash-see-boards-rak4631-rs`
+  once at boot.
+
+- A battery percentage that cannot be checked from far away is no longer
+  sent (#380). The cell count is decided from one reading at boot and
+  held for the boot, and every per-cell voltage after it is the pack
+  voltage divided by it — so a wrong count halves or doubles the
+  percentage, and the percentage carries neither a unit nor the count it
+  was divided by. Both boards now report a charge percentage only while
+  the measured pack voltage stays inside the band its classification
+  implies; outside it the `BATTERY` line reads `pct=none`, the telemetry
+  report carries no battery sensor at all, and the panel shows `--%`
+  beside the voltage. The state change is said once, on its own line,
+  `BATTERY_PCT reportable=0|1 pack_mv=<n> cells=<n>S band_lo_mv=<n>
+  band_hi_mv=<n>`, rather than once per sample. The band comes from the
+  OCV curve that already computes the percentage, so the guard and the
+  percentage cannot disagree about what a cell is: its ceiling is the
+  curve's 100 % point carried one step of its own top segment further
+  (4.33 V per cell), and its floor sits deliberately BELOW the curve's
+  floor, at the 2.5 V per cell protection cut-off — a pack between 2.5
+  and 3.0 V is nearly empty, which is a real state that must report 0 %
+  rather than go quiet exactly when the battery is about to give out.
+  The voltage itself is never withheld: it is a measurement, not a
+  derivation. Nor is the classification revised at runtime; this only
+  declines to build on it.
+
+- A second BLE connection from an identity a node already holds a link
+  to is decided by who opened it (#376, #382). An INCOMING duplicate
+  displaces the old link: a peer that opens a second connection has, by
+  its own one-link-per-identity rule, given up on the first, and it has
+  already built the replacement. An OUTGOING one — our own dial — is
+  refused unless the old link has delivered nothing at all, payload and
+  keepalives alike, for the link timeout (45 s); a node cannot recognise
+  its own peer before connecting, because an advertisement carries no
+  identity and phones rotate their address, so its fallback dial reaches
+  a peer it is already linked to. The two 2026-09-09 field failures were
+  the two directions: refusing an incoming duplicate cost a phone every
+  announce, displacing on an outgoing one cost it its working link every
+  ~95 seconds.
+
+  The intervening rule displaced any link that had received no frame
+  other than a keepalive for 30 seconds, and that fires on healthy
+  links: measured beside a Columba phone over 14.1 hours, the gaps
+  between received non-keepalive packets from a peer that was present
+  throughout had a median of 51 s, a 90th percentile of 182 s and a
+  maximum of 5590 s. Payload silence is what an idle phone looks like.
+  Keepalives are what a live peer sends regardless, so liveness is now
+  measured on every inbound frame, against the link timeout the
+  interfaces already expire links on — one clock instead of two, shared
+  by the firmware and lnsd. `BLE_LINK_DUP` says `action=refuse` or
+  `action=displace` with `origin=` and the old link's
+  `old_silence_ms`, on both stacks; `BLE_COUNTERS` carries `refused=`
+  and `displaced=`, and a refused address enters the dead-end table so
+  the scanner stops re-dialling it.
+
+- Every firmware debug line ends in `t=<uptime-ms>`, stamped on the board
+  when the line is formatted, so a capture measures the board and not the
+  USB drain loop (#344).
+
+- The firmware's outbound LoRa queue holds 64 packets or 6 KiB, whichever
+  binds first, instead of four packets; a refusal names which bound it hit
+  (#344).
+
+- The GNSS wake no longer forces a UBX-CFG-RST cold start on every boot,
+  so a reboot keeps the module's assistance data and refixes in seconds
+  instead of re-downloading the sky (#324).
+
+### Fixed
+
+- Installing the `lnpnd` package no longer puts a new node on the air.
+  `dpkg` used to start the unit as part of the installation, at a moment
+  when neither an identity nor a configuration could possibly be in
+  place: on the production host, 2026-09-17, the daemon minted an
+  identity of its own and announced that address on the public network
+  for 33 seconds. Worse than the announce is what it left behind — an
+  operator installing the package in order to take over an existing
+  node's identity now finds a foreign one already written, and missing
+  that costs every peer of the old node its address.
+
+  The unit is still enabled, so the node comes back after a reboot, but
+  only a start the operator issues themselves can reach the network
+  (cargo-deb's `systemd-units.start = false`, which is `dh_installsystemd
+  --no-start`). An upgrade over a running node still restarts it and
+  mints nothing.
+
+  The daemon keeps minting on a genuine first start — refusing would
+  strand the operator of a new node, since copying a file is deliberately
+  the only import path and there is no minting tool — but it can no
+  longer do so quietly: the mint logs `PN_IDENTITY_CREATED` with the
+  destination hash it just created, and it does that before the daemon
+  joins the shared instance, so no address can be announced without its
+  creation standing in the log.
+
+- The mvr proxies bind their listener before spawning the thread that
+  serves it: the scenario starts its client node the moment the helper
+  returns, and a connect that arrives before the new thread has been
+  scheduled is refused. A refused first connect is not retried at once —
+  the TCP interface waits a full `reconnect_interval`, 5 s — so the
+  client peered at 5 s instead of 50 ms and the scenario's initial path
+  install spent 4024 ms of its 5000 ms budget. That is a rotating
+  single-victim failure by construction: the race is only lost when
+  co-tenants delay the thread, so it never appeared in an isolated run
+  and did appear under `cargo test --workspace` (#221).
+
+- An AutoInterface joins the multicast group the config asks for: the
+  `multicast_address_type` key the reference has always read is read
+  here too, so an `lnsd` node added to a group of `rnsd` peers running
+  the permanent address type lands with them instead of alone in the
+  temporary group. The type is part of the group address, so the old
+  behaviour had no symptom to go on — the node discovered nobody,
+  nobody discovered it, and neither side logged anything. Unset still
+  means the temporary type, so no existing deployment changes group; a
+  value that is neither spelling is refused at startup rather than
+  quietly resolved to temporary the way Python resolves it (#282).
+
+- A board holds back the announces it relays instead of repeating every
+  one at once: its LoRa interface registers what a frame costs on the
+  carrier it is running, so the announce bandwidth cap engages in the
+  firmware too, and payload stops queueing behind other people's
+  announces on a slow PHY (#402).
+
+- An `lnsd` with an RNode interface holds back its transit announces
+  whether or not the config spells out a `bitrate`: the interface now
+  registers the announce-cap bitrate its live radio settings imply, which
+  is what a Python `RNodeInterface` on the same channel has always done
+  (#404).
+
+- SF5 and SF6 are refused with a reason instead of being configured and
+  then carrier-sensed against the SF7 threshold: no `cadDetPeak` for
+  either is published in anything this tree holds, and a wrong
+  detection threshold makes a node either transmit over a frame in the
+  air or back off on noise (#350).
+
+- A board's `[LORA] active config` line reports the transmit power it
+  programmed, not the one it was asked for: `txp` is the effective dBm,
+  beside `txp_requested` and a `txp_honoured=yes|no` that names a
+  substitution in a word (#349).
+
+- A board whose telemetry target is unreachable no longer announces at
+  the tick rate. The telemetry tick puts the delivery announce on the
+  air before the report exists, and the paths that give up after it —
+  no readings, no path, an interface that is offline, a send the core
+  refuses — booked nothing, so the attempt floor stayed where the last
+  successful report left it and the next 5 s tick spent another
+  announce. Measured at its worst as one announce every 6.7 s from a
+  single node against a 60 s policy, roughly 20 % channel occupancy.
+  Every one of those paths now books the airtime it spent
+  (`SendPolicy::note_airtime_spent`), and the tick asks
+  `SendPolicy::may_spend_airtime` at the spend itself. The report is
+  still owed and still goes out on the first tick past the floor; only
+  the retry rate changes. The `on_air()` branch that used to return in
+  silence now says `report withheld reason=no-on-air`.
+
+- A phone's rotated BLE address no longer strands it behind its own
+  dead link (#360, board side). When an identity we already hold a
+  link to handshakes on a new connection, the newer connection now
+  wins in both roles — the old link is torn down as
+  `BLE_LINK_REPLACED` and its queued packets move over — unless the
+  old link carried real payload within one keepalive interval
+  (`LINK_ACTIVE_DATA_MS`, 15 s), which still refuses the newcomer to
+  protect a transfer in flight. Before, an outgoing-origin duplicate
+  was refused unconditionally: the board dialled the rotated address,
+  learned the same identity, refused its own dial and kept the
+  abandoned link until the 45 s expiry, leaving the phone linkless
+  ~45 s of every ~90 s rotation cycle. The rule (`judge_duplicate`)
+  is shared by the firmware and lnsd, matches the reference driver's
+  accept-newer behaviour (`ble-reticulum` `BLEInterface.py`,
+  `_check_duplicate_identity`), and logs the consulted payload
+  recency as `old_data_silence_ms=` on every duplicate line.
+
+- Raw Link packet receipts are no longer failed at the literal
+  `max(rtt × 6, 5 ms)` deadline. The reference computes that formula but
+  only checks receipts once per second, so no Python receipt can fail
+  that early; enforcing it exactly meant that on a 1 ms-RTT TCP link an
+  upload to a Python propagation node was declared failed 6 ms after
+  sending — while the node was still validating the PoW stamp before
+  proving — and the LXMF layer then tore down the link the proof was
+  about to arrive on, every retry alike. The enforced deadline is now
+  floored at the reference's own check cadence
+  (`RAW_RECEIPT_TIMEOUT_FLOOR_MS`, 1 s); LoRa-scale RTTs are unaffected.
+
+- A battery reading can no longer be rescaled by a change nobody
+  notices (#380). The conversion divided by a full scale of 3600 mV,
+  which was true only because `ChannelConfig::single_ended` happens to
+  default to the internal 0.6 V reference and a gain of 1/6; nothing in
+  our code said so and nothing checked it, so an embassy release that
+  moved either default would have shifted every reading on every board
+  by a fixed factor and left all of them plausible. Both are now set
+  explicitly, and the full-scale millivolts are derived from the
+  configured gain rather than written down beside it, with host tests
+  pinning what that gain makes of each board's divider.
+
+- An implausible battery reading no longer classifies the pack as 2S
+  (#380). The classifier's doc promised a warning on an out-of-range
+  reading and the code had no way to give one. It mattered little at
+  the Pocket V2's 6.2 V range and a great deal at the T114's 14.7 V:
+  an unenabled divider or a floating input reads far above any pack,
+  was called 2S, and then halved every per-cell voltage for the rest of
+  the boot. Such a reading now falls back to 1S and says so.
+
+- `lnflash` confirms a flash against a build line the board emitted
+  *after* the reset the tool triggered, and no longer reports a good
+  flash as a failed one (#378). It used to read a 12 s window off a
+  bare `/dev/ttyACM` number and keep the last `[FW_BUILD]` in it, so a
+  line already in the port's input queue — filled before the question
+  was asked — could answer it: on 2026-09-09 a RAK4631 that was running
+  the new firmware was reported as `WrongBuild { saw: "ead0bce" }`,
+  the sha it had been running before the flash, and the run exited
+  non-zero. Now the bootloader must be gone from the bus (a board still
+  sitting in it never rebooted, which is `Absent`), the debug port is
+  resolved to its `by-id` path and the open proved against the board's
+  bus identity, the input queue is flushed, and only a complete line
+  arriving afterwards counts — a half-read `git_sha=daa8b8e` parses as
+  `daa8` and would be a failure manufactured out of a partial read. The
+  budget is three banner periods (15 s); the firmware emits one every
+  5 s, so a healthy board answers in the first. A confirmation that
+  cannot decide says the running build is unknown and names no sha at
+  all. The exit code now distinguishes the three: 0 confirmed, 1 the
+  flash failed (no board back, or a different build named, or nothing
+  written), 2 written but not read back.
+
+- `lnflash --watch` no longer stamps a torn first line as evidence:
+  the port's buffer can hold a partial line written before DTR was
+  raised, gluing two board lines at the tear. Bytes up to the first
+  newline after each (re)open are discarded and accounted on one
+  `[WATCH] discarded partial first line (<n> bytes)` line.
+
+- The `leviculum` .deb builds again: `lnprobe` was declared as a package
+  asset but missing from the build script's binary list, so `cargo deb`
+  aborted unable to resolve it. The binary now rides in the build, the
+  packaging check asserts it (with its manual page), and the nightly
+  binary tarballs carry it too.
+
+- The LNode LoRa transmit path runs channel access on every key-up
+  instead of only when a host set `csma_enabled`: a randomised, listened
+  pre-TX jitter (the RNode firmware's idle-channel CSMA draw, DIFS plus
+  0-13 slots) de-tiles senders whose transmissions share a trigger, and
+  CAD listen-before-talk with the bounded retry gate runs regardless of
+  the flag, whose backward-compat default of `false` had been switching
+  all collision avoidance off. The jitter and backoff randomness is now
+  seeded per board from the hardware RNG — the previous fixed seed made
+  co-booted boards draw identical backoffs. The flag is still parsed and
+  reported; the transmit path no longer obeys it.
+
+- A TCP interface signals the hardware MTU `rnsd` signals, 16384, instead
+  of the 262144 class constant. Python derives it from the interface
+  bitrate at interface post-init, so the class value never reaches the
+  wire; we read the constant. A Python client on an `lnsd` shared
+  instance therefore negotiated a 262144-byte link MTU across a TCP hop
+  where the same client gets 16384 from `rnsd`, and put frames on that
+  hop at 32x the size any Reticulum 1.5.x peer accepts on its own receive
+  path (#355).
+
+- `rnstatus -l` reads the same link-table line off `lnsd` as it does off
+  `rnsd`. The `link_count` and `active_link_count` RPC verbs answered with
+  the links the daemon terminates; upstream they report the transport link
+  table, i.e. the links it relays. An operator watching a relayed link saw
+  "0 entries in link table" against `lnsd` and "1 entry in link table
+  (1 active)" against `rnsd` for the same mesh state (#329).
+
+- An LNode no longer panics and resets when a phone connects over BLE. The
+  event buffer was left at its 128-byte default, and any peer negotiating a
+  large ATT MTU overflowed it on its first full-size write (#354).
+
+- An LNode transmits the power it was configured with. The requested
+  value never reached `SetTxParams`, so only four powers were reachable
+  and a configured 2 dBm went out at roughly 14 (#349).
+
+- The LNode radio is listening again before a received frame is handed to
+  the stack, instead of after it has been processed.
+
+- The LoRa loop keeps a receive window that already has the parameters it
+  wants instead of standing it down and arming an identical one, so a
+  frame arriving 20 ms behind another is no longer ended mid-air by the
+  loop's own next decision (#276).
+
+- A transmit that would end a receive window holding an arriving frame
+  waits for that frame first, bounded by one maximum-size frame's airtime
+  at the live modulation, and delivers it (#276).
+
+- A telemetry report whose dispatch was lost is retried no sooner than the
+  policy's own `min_interval_ms`, instead of on the next main-loop tick
+  (#344).
+
+- The applied radio settings and the lawful duty-cycle cap the firmware
+  derived from its frequency now survive a boot nobody was watching: both
+  are emitted on the log path that bypasses the debug port's runtime gate,
+  at bring-up and on every reconfiguration.
+
+- A board states the airtime limits it is enforcing and who chose each of
+  them on every boot, instead of only when it derived the cap itself — an
+  explicit host `0` used to switch the cap off silently.
+
+- A board says when it could not transmit at the power it was given,
+  naming the request and the power the PA was actually programmed with —
+  a request below 14 dBm rounds up, and the line reporting it used to be
+  dropped on a boot nobody was watching (#349).
+
+- The citation guard reads the `` (`ident`, `path:line`) `` spelling as
+  naming its subject, so 130 citations that were existence-checked are
+  drift-checked; 30 that had drifted are corrected.
+
+- A frame the firmware could not hand to an interface is no longer lost
+  in silence: `DispatchResult` is `#[must_use]`, every call site reports
+  what it lost, an action addressed to an unknown interface is counted
+  as `no-such-interface` instead of vanishing, and a full outbound queue
+  says so at the interface (#344).
+
+- A telemetry report the dispatch lost no longer counts as sent, so the
+  next tick reports again instead of the node going quiet for a whole
+  cadence interval (#344).
+
+### Removed
+
+- The host-side airtime gate on the RNode interface (#121). Duty-cycle
+  enforcement is the firmware's; the host no longer holds packets back
+  when it sees the firmware's lock in `CMD_STAT_CHTM`.
+
+## [0.8.1] - 2026-08-16
+
+### Added
+
+- `no_std` Telemeter codec in `leviculum-lxmf`: encode/decode of Sideband's
+  `FIELD_TELEMETRY` sensor map and `FIELD_TELEMETRY_STREAM` rows, with
+  golden vectors verified against Sideband and Columba (#237).
+- `lnflash`, a new LNode flashing tool: the full bootloader/SoftDevice
+  sequence with Nordic's S140 7.3.0 vendored (licence included), refusal
+  of an image that would soft-brick the board, `just lnflash-bundle` for
+  the distributable tarball.
+- `lnflash` sets the radio configuration at flash time: prompted values,
+  `--radio-*` flags, or a preset menu (`--radio-preset` eu868/us915/au915).
+- The LNode stores its radio settings in flash, so a host-set
+  configuration survives a reset instead of reverting to the compiled
+  default.
+- `lnstatus` shows a radio interface's last RSSI and SNR (#76).
+- `lnstatus -j --tables` exposes the transport's routing tables as
+  structured JSON (#174).
+- Per-link delivery telemetry — delivery rate, RTT, backpressure — as
+  read-only counters; `lev_link_stats` in the C API (#154, emoore).
+- The propagation-node HOST direction is public, so an external crate
+  can operate a propagation node instead of only being a client of one
+  (#201, emoore).
+- `lxmf-node`, a new crate running `leviculum-lxmf` as a shared-instance
+  client of `lnsd` or `rnsd`, speaking periculum's LXMF helper protocol
+  (#196).
+- `leviculum-std` runs a consumer `CoreProcessor` inside the driver's
+  tick, panic-contained and self-deadlock-reporting (#196, #198).
+- LXMF: `FileLxmfStorage` persists state to a directory,
+  `MessageState::AwaitingCollection` reports a mailboxed message,
+  `RouterEvent::PeerAnnounced` carries a peer's decoded display name,
+  error types implement `Error`, `StampExecutor::generate` is `Send`
+  (#203).
+- Auto-connected discovered peers inherit the bootstrap interface's
+  IFAC (#151).
+- T114: status screen on the board's optional ST7789 TFT, default-on.
+- The LNode honours a host-side reboot frame on its control channel.
+- A TCP server on port 0 reports its kernel-assigned address (#221).
+- lblogd: a file area so a post can carry pictures, Markdown tables
+  rendered as micron tables, per-day served-request counts.
+- lnomad: pictures drawn inline (Kitty/iTerm2/Sixel or half-blocks),
+  with a bounded in-memory cache (`--image-cache`).
+- `api::NodeBuilder` installs a `CoreProcessor` and re-exports
+  `TickOutput`, so the facade covers the processor seam (#222, PAzter1101).
+- The LNode debug port replays the panic count and stored post-mortem
+  block on demand.
+
+### Changed
+
+- BREAKING: an interface with no `txpower` asks for the board maximum
+  (22 dBm) instead of 0 dBm, capped by the lawful ERP limit for the
+  frequency (14 dBm on the EU 25 mW sub-bands, 10 dBm on 433 MHz); an
+  explicit `txpower` wins and is logged. A deliberate, documented
+  deviation from Python-Reticulum.
+- The `lnflash` EU default is the ReticulumNet consensus channel:
+  869.463 MHz, SF8, BW125, CR4/5, 22 dBm.
+- COMPAT: LXMF enforces Python's per-transfer limits in both directions:
+  over-limit sends are refused before any build, incoming delivery
+  Resources above 1 MB are refused by default; both configurable (#218).
+- A carrier touching one of the narrowband alarm bands between the EU
+  sub-bands is a config error; the derived airtime limit covers
+  433.05-434.79 MHz at 10 % duty cycle; a TX power the SX1262 cannot
+  set is rounded down and logged, not silently 14 dBm.
+- The LNode firmware's compiled profile transmits at 22 dBm, not 17.
+- Resource sends build off the node lock and inbound packets are
+  pre-hashed outside it (#29 stage 1, emoore); a resource build can be
+  handed to the caller, and superseded builds are refused (#196,
+  PAzter1101).
+- Announce verify and single-destination decrypt run off the node lock
+  (#29 stages 2-3; #243, emoore); the verified memo is discarded when
+  the IFAC strip rewrites the bytes, and ratchet enforcement is read
+  live at the consume site.
+
+### Fixed
+
+- `lnflash --set-time` and `--set-telemetry` run without a firmware
+  bundle on disk: the board catalogue is compiled into the binary and
+  only the flashing paths need images (#342).
+
+- The flash runner reads the firmware back off the board before it names
+  one, so the summary reports which board actually received the image
+  instead of whichever candidate its USB enumeration reached first
+  (#343).
+
+- The flash runner enumerates every attached bootloader volume and picks
+  the one whose `Board-ID` matches, instead of taking the first it finds,
+  so a board parked in its bootloader no longer blocks flashing every
+  other board; volumes it mounts are always unmounted again (#341).
+
+- The BLE interface waits for the SoftDevice notification queue to
+  drain instead of discarding the refusal, so a packet larger than one
+  fragment — every announce — reaches the peer; what still cannot be
+  sent is reported as `BLE_TX_DROP` (#264).
+
+- A relay forwards packets whose context byte it does not know instead
+  of dropping them at parse time; only local delivery abstains, counted
+  as `unknown-context` (#332).
+
+- Discovery announces are minted at stamp value 16, so RNS 1.5.0
+  listeners no longer discard them; the receive gate stays at 14 so
+  1.3.5 neighbours still decode (#328).
+
+- A transport relay forwards path-directed packets back onto the
+  receiving interface, so multi-hop over a single shared LoRa channel
+  delivers (A-B-C repeater).
+- Shared-medium relays no longer echo-storm a link: a link request is
+  transported only by its designated hop, link DATA repeats are
+  deduplicated, and same-interface echoes drop as `LinkRepeatEcho`
+  (#226, #227).
+- A local client no longer hears an echo of every link data packet it
+  sends through its relay (#226).
+- A relayed link's timeout is a rolling inactivity window: the
+  link-table entry refreshes on every repeat, so a held link survives
+  past 15 minutes (#226).
+- COMPAT: path handling matches the reference — a shared-instance
+  client's destination answers with a fresh path response (#171), a
+  never-announced local destination answers its first request (#169),
+  no response to the requesting next hop (#168), a targeted response
+  transmits once (#192), a pending rebroadcast survives serving a
+  response (#170), and re-originated path requests honour the
+  per-interface egress limit (#172).
+- COMPAT: announces carry wall-clock unix time (#155), the learned
+  timebase of a clockless node resists capture (#160), request
+  timestamps carry epoch seconds (#164), and `app_data` survives
+  re-announce paths.
+- COMPAT: LXMF timestamps — any msgpack number is accepted and the
+  payload hashed as received (#183), non-finite is refused at signing
+  (#184), wall time comes from the node's timebase (#182), microsecond
+  precision keeps back-to-back messages distinct (#217).
+- COMPAT: propagation length guards reject where Python's do (#201);
+  the resource advertisement `o` field carries the salted per-transfer
+  hash (#165); a dot in `app_name` or an aspect is rejected (#163).
+- One direct LXMF delivery cycle consumes one attempt, and a failed
+  outgoing Resource tears its link down before the retry (#179, nilu96).
+- A stamp cost outside Python's window is neither announced nor mined,
+  and an impossible cost fails instead of hanging the node (#181).
+- An accepted connection inherits its listener's `ingress_control`,
+  default-on like the reference (#189).
+- `lnstest selftest` sizes its delivery windows from the link's own
+  bitrate and asks the daemon that owns the radio (#190);
+  `interface_stats` reports the radio's on-air bitrate, TX jitter and
+  the daemon's listeners (#177, #190).
+- `UDPInterface` accepts a hostname in `forward_ip`, re-resolved at
+  runtime (#148).
+- A corrupt discovery record is warned about once, not per scan (#157).
+- The nRF firmware no longer builds `NodeCore` on the stack: the 94 KB
+  `main` frame that ate the T114's stack margin is gone, and a gate
+  fails any firmware frame above 16 KB.
+- lnomad sizes half-block pictures by half-block geometry and renders
+  table cells as the inline micron they are.
+- COMPAT: HKDF derives past the RFC 5869 block limit, as Python does
+  (#225, PAzter1101).
+- A channel send past the u16 envelope wire ceiling is refused instead
+  of panicking with the node lock held (#242, emoore).
+- The 1200-baud flash touch writes GPREGRET through SoftDevice
+  syscalls (#249), and the RNG never falls back to peripheral
+  registers while the SoftDevice runs (#250).
+- The repository checks out on Windows: no ':' in committed fixture
+  paths (#244/#245, emoore); the supervised-spawn probe builds off
+  Linux (#246, emoore).
+
+### Internal
+
+- Spawned test and bridge processes die with their parent
+  (`PR_SET_PDEATHSIG`), gate wrappers time out and report survivors,
+  the nightly tier runs the whole workspace by construction, test ports
+  come from one per-host counter, citation guards cover Rust source.
+
+## [0.8.0] - 2026-08-01
+
+### Added
+
+- LXMF client messaging stack: new `leviculum-lxmf` crate (no_std core,
+  std runtimes), opportunistic/direct/propagated delivery, stamps,
+  tickets, paper messages; locked against Python LXMF 1.1.0 (#138, nilu96).
+- Raw link packets (`send_packet_on_link`) and oversized link requests
+  carried as request Resources, both Python-canonical (#138).
+- Byte-channel interfaces over a caller-supplied duplex, including
+  RNode with runtime hot-plug (#141, PAzter1101).
+- Runtime add/remove of interfaces of every kind (#135, PAzter1101).
+- Outbound-socket hook on every TCP dial including the I2P SAM bridge,
+  fail-closed (#142, PAzter1101).
+- New interfaces Pipe, KISS, AX25KISS, RNodeMulti, I2P (#95-#99);
+  Backbone names, multiple AutoInterfaces, UDP multi-address (#89, #7, #4).
+- Per-interface propagation modes, announce rate limits, bitrate
+  weighting, ingress control, IFAC enforcement (#8, #90-#93, #104).
+- Interface auto-discovery with PoW-stamped, optionally encrypted
+  announces, Python-interoperable (#32, #106, #107).
+- Remote management: lnsd serves `rnstatus -R`; client `-R/-i/-w` (#86).
+- Tunnel synthesis and path restore on TCP connect/reconnect (#64).
+- Resources over 1 MiB send segmented like Python (#27).
+- Destination announces re-sent on a recovered interface (#132).
+- EU 868 lawful-by-default airtime cap in the LNode firmware (#55);
+  RNode TX gated during the firmware airtime lock (#121); radio stats (#25).
+- Config/CLI parity with rnsd (loglevel, ConfigObj quirks, instance
+  ports); lnsd `-s/--service` and `--exampleconfig`.
+- FFI: dropped event fields projected with accessors (interface id,
+  close reason, sizes, segments), stats-snapshot ids, delivery errors.
+
+### Changed
+
+- BREAKING: `lns` is renamed to `lnstest`; placeholder subcommands
+  removed, file transfer lives in `lncp`.
+- BREAKING: request handlers keyed by (destination, path); deregister
+  takes the destination, `RequestReceived` carries `destination_hash`.
+- BREAKING: `transport::DropReason` is `#[non_exhaustive]`.
+- Oversized single-segment responses fail closed (`ResourceTooLarge`);
+  response correlation is per-link like Python (#138).
+
+### Fixed
+
+- COMPAT: the six link-traffic contexts Python exempts from packet
+  dedup are exempt; idle Python-initiated links no longer die stale.
+- COMPAT: relays rewrite forwarded LRPROOF hops so strict Python
+  clients establish; shared-instance hop counting matches (#38, #119).
+- COMPAT: token unpadding matches Python; microReticulum peers decrypt.
+- COMPAT: `multicast_loopback` defaults true like Python (carrier flap fix).
+- SECURITY: msgpack recursion DoS via resource advertisements (#23).
+- Radio PHY matches the RNode firmware: airtime-scaled TX/CAD timeouts
+  (SF12 was undeliverable), derived preamble (#143), working RX-extend
+  guard (#144), preamble-charged airtime accounting (#149),
+  symbol-duration LDRO (#150; wire note: SF11/BW125 LDRO now off).
+- Links: healthy idle links survive (#123), inbound proofs count as
+  activity (#124), establishment jitter breaks lockstep (#129).
+- Expired paths re-originate discovery, with bounded retry (#117, #44).
+- Per-interface `announce_cap` now takes effect (was parsed and dropped).
+- A poisoned mutex no longer crashes the daemon; TCP reconnects back off.
+- Runtime-attached interfaces apply the configured IFAC.
+- An unverifiable delivery proof reports `InvalidProof`, not `LinkFailed`.
+
+### Internal
+
+- Wire-parser fuzz harness, Python-interop suite growth, periculum
+  test-framework extraction, lintian-clean debs, RUSTSEC bumps.
+
+## [0.7.0] - 2026-06-22
+
+### Added
+
+A comprehensive C API (`leviculum.h`) covering node lifecycle and
+config-file / shared-instance daemon setup, destinations, links
+(connect, send, receive, identify), datagrams and request/response,
+resource transfer, identity sign/verify/encrypt/decrypt with
+ratchets, delivery-proof strategies, read-only diagnostics, an event
+stream over an event fd, RNode and serial interfaces, and
+packaging/hex helpers. Ships with C examples and a large test suite
+(Codeberg #29). A new `leviculum-std::api` safe API module and
+driver builder back the binding.
+
+Configurable link keepalive interval on `TransportConfig`.
+
+Structured event-log observability: `ANN_TX` records announce
+rebroadcasts, and `PKT_DROP_SUMMARY` carries a complete drop-reason
+taxonomy (the total equals the sum of the reasons).
+
+Radio-config wire format gained a `radio_silent` flag (byte 15 of
+the payload, backward-compatible parse down to 13 bytes). When set,
+the T114 firmware drops outgoing LoRa packets at the driver
+boundary — the radio keeps listening but never transmits. The
+integration-test runner uses this to neutralize every T114 the
+scenario does not bind, so single-pair LoRa benchmarks stop
+seeing the idle T114's Reticulum announces as CSMA-busy. Bug #2
+CA-ON single-pair PDR distribution collapses from σ≈21 to σ≈4
+(mean 79 → 97 %, min 44 → 88 %).
+
+### Changed
+
+BREAKING: auto-accept is the only link model. The manual accept path
+(`NodeEvent::LinkRequest`, `accept_link`) was removed and replaced by
+`link_handle`. A destination can decline inbound links via
+`accepts_links = false` (`lev_destination_set_accepts_links`).
+
+The Debian package now installs `/etc/reticulum/` and
+`/etc/reticulum/storage/` with mode 2775 (group-writable + setgid).
+This makes the directory a true single source of truth shared by
+lnsd, the native `lns`/`lncp` clients, the Python tooling
+(`rnstatus`, `rncp`, `rnpath`, `rnprobe`, Sideband, Nomadnet, …)
+and — if the operator ever swaps daemons — Python's `rnsd`. Any
+user in the `leviculum` group can persist Reticulum state under
+the shared configdir, and Python's `RNS.Reticulum()` auto-detect
+of `/etc/reticulum` then completes without permission errors. No
+per-user configuration step is needed.
+
+### Fixed
+
+Announces above `PATHFINDER_MAX_HOPS` (hops > 128) are now gated,
+matching Python-RNS. Responder-initiated graceful close is now
+reliably delivered via the driver shutdown drain (Codeberg #77).
+In-flight resources are failed with `ResourceFailed` on link
+teardown instead of being silently dropped (Codeberg #78). The
+structured event log is now well-formed by construction (no more
+corrupt `LINK_ENTRY_SET` lines or field violations). Stale detection
+now works for links established at uptime second 0.
+
+RNode `flow_control = true` no longer deadlocks the send path. The
+I/O task previously waited for a `CMD_READY` from the firmware that
+only arrives after a TX, producing a chicken-and-egg stall (no TX
+ever fires, the send queue saturates and emits "send queue full,
+dropping oldest" until the upstream traffic source goes away).
+`interface_ready` is now `true` at io-task start, mirroring Python
+`RNodeInterface.py` after `validateRadioState()`.
+
+### Internal
+
+The event-log sink moved out of `test_support` into a production
+module. Added local `.deb` build recipes (`just build-deb*`).
+Integration-test runs are now hermetic across processes
+(process-unique docker names).
+
+## [0.6.3] - 2026-04-01
+
+### Fixed
+
+Fix: plain broadcast packets forwarded through shared instance — local clients can now send and receive unencrypted broadcasts via the daemon
+
+## [0.6.1] - 2026-03-21
+
+### Fixed
+
+Fix: resource transfer proof retry over LoRa — sender sends CacheRequest when proof is lost, receiver re-sends cached proof
+
+## [0.6.0] - 2026-03-20
+
+### Added
+
+Link requests are now retried up to three times on establishment timeout with exponential backoff (E34). When a link proof is lost, the responder re-sends the cached proof on receiving a duplicate link request. Three-node shared medium LoRa tests cover bidirectional transfer, contention, and relay scenarios. The LoRa test matrix now includes size sweep, frame loss, link-under-loss, bidirectional, and cross-implementation tests across all Rust and Python pairings. Proxy rules gained `max_size`, `min_size`, and `skip` filters for targeting specific packet types by size range.
+
+The `lncp` tool gained fetch mode (`-f`, `-F`, `-j`) with jail path restriction and identity-based authentication, physical layer rate display (`-P`), compression toggle (`-C`), and silent flag (`-S`). It works as a shared instance client connecting to a running daemon via Unix socket.
+
+Link request/response provides single-packet RPC over established links. Link identity verification proves ownership via Ed25519 signature. Resource transfers show real-time progress with speed and percentage.
+
+LoRa reliability improved through send queue priority (link traffic before announces), first-hop timeout accounting for airtime, RTT packet retry confirmed by inbound traffic, discovery path request retry, interface backpressure with retry queue, per-hop establishment timeout scaling, and reduced responder handshake timeout from 360s to 54s.
+
+The integration test framework gained Docker-based multi-node scenarios with TOML-defined topologies, dual-cluster tests up to 10 nodes, ratchet selftest modes with disk persistence, link failure simulation via iptables, negative assertions, and env-var radio overrides for LoRa profiles. RPC compatibility with Python CLI tools (`rnstatus`, `rnpath`, `rnprobe`) is complete. AutoInterface provides zero-config LAN discovery via IPv6 multicast.
+
+### Fixed
+
+Resource retransmit timing now matches Python with adaptive timeout factors, progressive backoff, and grace times. Receiver retransmit requests are rebuilt with only missing parts instead of re-requesting already-received data. The retransmit timeout resets correctly between retries. Shared-instance resource retransmissions are no longer blocked by packet dedup. Multi-segment resource receive handles dynamic buffer sizes, correct hashmap lengths, and proper metadata parsing. The `lncp` listener accepts incoming links. Resource API actions are dispatched immediately. RNode serial heartbeat prevents idle-correlated LoRa failures after prolonged silence. Channel SRTT is seeded to prevent retransmit storms.
+
+The selftest no longer overwrites the daemon's transport identity. Path requests are re-originated at each hop matching Python behavior. Hops are incremented on receipt so direct neighbors show as one hop. Cached announces are converted to the correct header format when forwarded to local clients. Path request responses reach local clients correctly. AutoInterface peer identity, source port, and discovery all work across machines. Announce replay protection allows better-hop paths through, and rate-limited announces still update the path table. Vendored Python RNS ingress_control inheritance is fixed.
+
+### Changed
+
+Jitter ceiling is now airtime-based with exponential backoff on announce collisions. The `WindowFull` error is renamed to `Busy` across all types. All Transport and NodeCore collections live behind the type-safe Storage trait. `MemoryStorage` is the production embedded implementation and `FileStorage` wraps it with persistence. Announce rebroadcast is immediate, removing per-hop latency. FileStorage packet cache uses HashSet with a 50k identity cap.
+
+## [0.5.19] - 2026-02-15
+
+### Fixed
+
+Pacing interval used handshake RTT instead of measured SRTT.
+
+## [0.5.18] - 2026-02-15
+
+### Changed
+
+Timeout computation uses current queue length instead of frozen send-time values. Smoothed RTT from proof round-trips uses RFC 6298 with Karn's algorithm. Maximum channel retries increased from five to eight, and the first retransmit skips pacing decrease.
+
+## [0.5.17] - 2026-02-14
+
+### Added
+
+Sender-side pacing with AIMD congestion control spaces sends evenly across the RTT instead of bursting until busy.
+
+## [0.5.16] - 2026-02-14
+
+### Fixed
+
+Retransmitted messages were permanently rejected when the proof was lost due to sequence wrap-around.
+
+## [0.5.15] - 2026-02-14
+
+### Fixed
+
+Channel retransmissions never triggered because duplicate Channel instances existed per link. Unified into one.
+
+## [0.5.14] - 2026-02-13
+
+### Fixed
+
+ConnectionStream silently dropped messages when busy. It now returns WouldBlock. The selftest closed links before messages were confirmed and counted Busy as permanent failure.
+
+## [0.5.13] - 2026-02-13
+
+### Fixed
+
+The peers display showed unknown hop counts and garbled app_data from Python msgpack formats.
+
+## [0.5.12] - 2026-02-12
+
+### Added
+
+PacketEndpoint handle provides fire-and-forget delivery to single-packet destinations.
+
+### Fixed
+
+Single-packet delivery through relays was broken. Packets are now converted from Type1 to Type2 format for relay paths.
+
+## [0.5.11] - 2026-02-12
+
+### Changed
+
+`Identity::encrypt()` returns Result instead of panicking on failure. Selective re-exports from leviculum-std replace the blanket `pub use leviculum_core::*`.
+
+## [0.5.10] - 2026-02-12
+
+### Changed
+
+ConnectionStream is send-only. Received data is delivered exclusively via NodeEvent.
+
+## [0.5.9] - 2026-02-12
+
+### Fixed
+
+Channel data proofs were not generated on the responder because the signing key was gated on proof strategy. On the initiator, the wrong signing key was consulted.
+
+## [0.5.8] - 2026-02-12
+
+### Added
+
+The `lns connect` command provides an interactive CLI for diagnostics, link management, and data exchange.
+
+### Fixed
+
+Links in Stale state now recover to Active on inbound traffic, matching Python.
+
+## [0.5.6] - 2026-02-11
+
+### Fixed
+
+MessageReceived events were silently dropped so channel data never reached ConnectionStream.
+
+## [0.5.5] - 2026-02-11
+
+### Fixed
+
+Link-addressed Data and proof packets were dropped on non-transport nodes. Channel mark_delivered was never called, breaking the proof delivery chain. ConnectionStream close did not send LINKCLOSE.
+
+## [0.5.4] - 2026-02-11
+
+### Fixed
+
+PathRequestReceived emitted an incorrect PathFound event with fabricated data.
+
+## [0.5.3] - 2026-02-11
+
+### Fixed
+
+Multi-hop link initiation from non-transport nodes used the wrong header format. LRPROOF delivery to local pending links was silently dropped.
+
+## [0.5.2] - 2026-02-11
+
+### Fixed
+
+Four hop off-by-one bugs in forwarding thresholds caused by Python/Rust hop semantics mismatch.
+
+## [0.5.1] - 2026-02-11
+
+### Fixed
+
+Multi-hop link forwarding through mixed relay chains failed due to premature header stripping and wrong transport_id.
+
+## [0.5.0] - 2026-02-11
+
+### Changed
+
+All NodeCore mutation methods return TickOutput for immediate action dispatch.
+
+## [0.4.4] - 2026-02-10
+
+### Added
+
+Per-destination announce rate limiting matches Python with violation, grace, and penalty phases.
+
+## [0.4.3] - 2026-02-10
+
+### Fixed
+
+Path rediscovery was dead code because the event handler was empty.
+
+## [0.4.2] - 2026-02-09
+
+### Added
+
+Expired links trigger path rediscovery with unresponsive state tracking.
+
+## [0.4.1] - 2026-02-08
+
+### Added
+
+`NodeCore::announce_destination()` broadcasts registered destinations.
+
+### Fixed
+
+Outbound packets were not cached for dedup so the node learned paths to itself via echo.
+
+## [0.4.0] - 2026-02-07
+
+### Added
+
+Embedded skeleton for the Heltec Mesh Node T114 (nRF52840 + SX1262). Channel-based InterfaceHandle and InterfaceRegistry with async event loop.
+
+## [0.3.1] - 2026-02-06
+
+### Fixed
+
+`send_on_connection()` dropped the first packet and `connect()` never sent the link request.
+
+## [0.3.0] - 2026-02-06
+
+### Changed
+
+Sans-I/O architecture introduced. `handle_packet()`, `handle_timeout()`, and the Action enum replace direct I/O. The driver owns all interfaces. The Context trait is removed in favor of direct `rng` and `now_ms` parameters.
+
+## [0.2.8] - 2026-02-04
+
+### Fixed
+
+Transport enable flag was not wired. Relay hop count, destination hash, proof routing, and announce replay all corrected.
+
+## [0.2.6] - 2026-02-03
+
+### Fixed
+
+Keepalive packets were encrypted instead of sent as plaintext, causing rejection by Python peers.
+
+## [0.2.5] - 2026-02-03
+
+### Added
+
+Link-level data proof system with PROVE_ALL, PROVE_APP, and PROVE_NONE strategies.
+
+### Changed
+
+DestinationHash and LinkId are now newtypes. Packet queues unified in LinkManager.
+
+## [0.2.3] - 2026-02-01
+
+### Added
+
+High-level Node API with NodeCore, NodeCoreBuilder, ReticulumNode, and ConnectionStream. Channel system, packet proofs, ratchets, IFAC, link keepalive, and graceful close.
+
+## [0.2.0] - 2026-01-30
+
+### Added
+
+Destination announce, link responder, LinkManager API, and event system.
+
+## [0.1.0] - 2026-01-28
+
+### Added
+
+Initial release with cryptography, identity, packets, announce, link state machine, HDLC framing, TCP interface, and transport layer. Full interoperability with Python rnsd.
+
+<!-- 0.6.1 and 0.6.3 were released without a tag, so their ranges name the
+     release commits instead. Every other end here is a tag. -->
+[Unreleased]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.9.0...master
+[0.9.0]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.8.1...v0.9.0
+[0.8.1]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.8.0...v0.8.1
+[0.8.0]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.7.0...v0.8.0
+[0.7.0]: https://codeberg.org/Lew_Palm/leviculum/compare/5d2685e91e8f471f3248296bd645e9349068ec50...v0.7.0
+[0.6.3]: https://codeberg.org/Lew_Palm/leviculum/compare/b6ca33844e607bff7147da0b36ff9112ba041550...5d2685e91e8f471f3248296bd645e9349068ec50
+[0.6.1]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.6.0...b6ca33844e607bff7147da0b36ff9112ba041550
+[0.6.0]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.19...v0.6.0
+[0.5.19]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.18...v0.5.19
+[0.5.18]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.17...v0.5.18
+[0.5.17]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.16...v0.5.17
+[0.5.16]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.15...v0.5.16
+[0.5.15]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.14...v0.5.15
+[0.5.14]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.13...v0.5.14
+[0.5.13]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.12...v0.5.13
+[0.5.12]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.11...v0.5.12
+[0.5.11]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.10...v0.5.11
+[0.5.10]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.9...v0.5.10
+[0.5.9]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.8...v0.5.9
+[0.5.8]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.6...v0.5.8
+[0.5.6]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.5...v0.5.6
+[0.5.5]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.4...v0.5.5
+[0.5.4]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.3...v0.5.4
+[0.5.3]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.2...v0.5.3
+[0.5.2]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.1...v0.5.2
+[0.5.1]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.5.0...v0.5.1
+[0.5.0]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.4.4...v0.5.0
+[0.4.4]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.4.3...v0.4.4
+[0.4.3]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.4.2...v0.4.3
+[0.4.2]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.4.1...v0.4.2
+[0.4.1]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.4.0...v0.4.1
+[0.4.0]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.3.1...v0.4.0
+[0.3.1]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.3.0...v0.3.1
+[0.3.0]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.2.8...v0.3.0
+[0.2.8]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.2.6...v0.2.8
+[0.2.6]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.2.5...v0.2.6
+[0.2.5]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.2.3...v0.2.5
+[0.2.3]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.2.0...v0.2.3
+[0.2.0]: https://codeberg.org/Lew_Palm/leviculum/compare/v0.1.0...v0.2.0
+[0.1.0]: https://codeberg.org/Lew_Palm/leviculum/src/tag/v0.1.0

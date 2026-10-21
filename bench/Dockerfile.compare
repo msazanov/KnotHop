@@ -1,0 +1,7 @@
+# Separate, unmodified benchmark executables; no product dependency change.
+# Xray MPL-2.0, AWG-go MIT, AWG-tools GPLv2. Product D4 remains open.
+FROM ghcr.io/xtls/xray-core@sha256:b697cda1588faca696ab7f7755dd1161f60862af3ff6026300e44cff6aedd558 AS xray
+FROM rawg-bench:awg31
+COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
+RUN apt-get update && apt-get install -y --no-install-recommends iptables && rm -rf /var/lib/apt/lists/*
+RUN xray version

@@ -1,0 +1,72 @@
+[Unit]
+Description=Leviculum Dev-Blog Server (NomadNet page node + clearnet web)
+Documentation=https://codeberg.org/Lew_Palm/leviculum
+After=network.target lnsd.service rnsd.service
+Wants=network.target
+
+# Deliberately After= without Requires=: lblogd needs *a* Reticulum shared
+# instance, and lnsd is only one way to have one — the Python rnsd serves
+# just as well, and the leviculum package is a Recommends, not a Depends.
+# Ordering when either is present, no hard coupling when neither is. An
+# After= naming a unit that is not installed is simply not applied, so
+# listing both costs nothing on a host that runs only one of them.
+
+# Give up after ten failed starts instead of retrying for ever; see
+# lnsd.service for why a `failed` unit beats a silent flap. The window is
+# fifteen minutes rather than lnsd's five because a failing start here is
+# not quick: lblogd re-dials the daemon socket for a minute before it
+# gives up (`DAEMON_WAIT` in lblogd/src/node.rs, and the Restart= comment
+# below), so one failed cycle is that minute plus RestartSec=10 — about
+# 70 s — and ten of them span about 700 s. Under the manager default
+# (DefaultStartLimitIntervalUSec=10s, DefaultStartLimitBurst=5) five such
+# cycles span some 350 s, so the limit never trips at all and the unit
+# flaps for the life of the machine against a daemon that is gone for
+# good. 900 s is the window ten cycles fit inside, which is what makes
+# the burst reachable.
+StartLimitIntervalSec=900
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=lblogd
+Group=lblogd
+ExecStart=/usr/bin/lblogd --config /etc/lblogd/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Ordering alone does not get lblogd a daemon: lnsd is Type=simple, so
+# systemd calls it started the moment it is exec'd, seconds before it binds
+# its IPC socket — and on a package install the two units are started in
+# separate transactions, which After= does not order at all. lblogd
+# therefore waits on the socket itself for up to a minute before giving up
+# (Codeberg #311). Restart= is the outer loop for the case that outlasts
+# that wait — a daemon down for an upgrade, or one that never comes back.
+Restart=on-failure
+RestartSec=10
+
+# The shipped config listens on 127.0.0.1:8080, which needs no privilege.
+# The capability is granted anyway because the *documented production*
+# config uses the defaults 0.0.0.0:80 and 0.0.0.0:443, and an operator who
+# edits the config should not additionally have to discover that the unit
+# needs editing too. Ambient capabilities are granted by systemd directly,
+# so this composes with NoNewPrivileges below.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening, mirroring lnsd.service. The data directory holds the node
+# identity and the ACME certificate cache and is the only writable path.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/lblogd
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

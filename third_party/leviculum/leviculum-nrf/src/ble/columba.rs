@@ -1,0 +1,2806 @@
+//! The Columba BLE protocol (v2.2, advertisement records v0.3.0).
+//!
+//! Everything on this side of the seam is what a Columba peer expects to
+//! see on the air and nothing else:
+//!
+//! - the GATT service and its three characteristics, under the
+//!   `37145b00-…` vendor UUID space,
+//! - the 16-byte identity handshake that opens a session,
+//! - the 1-byte keepalive that holds it open,
+//! - the advertisement: the service UUID a scanner filters on, the
+//!   `LN-<hex8>` name in the scan response, and the v0.3.0 capability
+//!   record,
+//! - and, in phase B of #255, the MAC-sorting rule that decides which of
+//!   two nodes initiates.
+//!
+//! What it is built on — SoftDevice bring-up, the packet channels, the
+//! per-connection drain table, the fragment pump — lives in
+//! [`super`] and [`super::notify`] and carries no Columba knowledge. See
+//! the [`super`] module docs for the seam and what still crosses it.
+
+use core::cell::{Cell, RefCell};
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use embassy_executor::Spawner;
+use embassy_futures::select::{select, select3, select4, Either, Either3, Either4};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::channel::Sender;
+use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Instant, Timer};
+use leviculum_ble_tx::{
+    addr_value, admit, connect_failure_condemns, dial_preference, identity_hint,
+    judge_supervision_timeout, manufacturer_data_with_hint, parse_peer_advertisement,
+    with_free_slots, AdvReport, CandidateTable, ChurnLedger, ChurnPolicy, ConnParams,
+    ConnParamsAsk, ConnParamsLine, ConnParamsReq, ConnParamsReqLine, ConnectDecision, DeadEnds,
+    DialLedger, Exclusion, GattBytes, LedgerPolicy, Ledgers, LinkPhase, LinkRole, LinkUp, Local,
+    Origin, OversizeFrom, OversizeLine, PeerAddr, PeerRegistry, PhaseEvent, PhaseNeighbours,
+    ScanMode, ScanPhase, TxGap, ADV_BYTES_USED, CAP_PERIPHERAL_ONLY, DEAD_END_SLOTS,
+    DEAD_END_TTL_MS, GATT_VALUE_MAX, IDENTITY_HINT_LEN, LEGACY_AD_CAPACITY, LINK_TIMEOUT_MS,
+    MANUFACTURER_DATA_HINT_LEN, PERIPH_SLOTS, PHASE_NEIGHBOUR_SLOTS, SCAN_WINDOW_COLLECT_MS,
+    WINDOW_CANDIDATES,
+};
+use leviculum_core::framing::ble::{
+    self as ble_framing, BleDefragmenter, DefragResult, FRAGMENT_HEADER_SIZE, KEEPALIVE_BYTE,
+    KEEPALIVE_INTERVAL_MS,
+};
+use nrf_softdevice::ble::advertisement_builder::{
+    AdvertisementDataType, Flag, LegacyAdvertisementBuilder, LegacyAdvertisementPayload,
+    ServiceList,
+};
+use nrf_softdevice::ble::gatt_server::{Server, WriteOp};
+use nrf_softdevice::ble::{
+    central, gatt_client, gatt_server, peripheral, Address, Connection, GattValue,
+};
+use nrf_softdevice::Softdevice;
+use static_cell::StaticCell;
+
+use super::notify::{notify_fragments, BLE_TX_DRAIN_UNROUTED, BLE_TX_DROPPED, BLE_TX_PACKETS};
+use super::{CarrierWaiter, BLE_INCOMING, HVN_DRAIN, MAX_LINKS};
+
+/// The value type of every characteristic a peer can write or notify:
+/// [`GattBytes`] under the `GattValue` trait, with a `from_gatt` that
+/// **cannot panic** (Codeberg #387).
+///
+/// The vendored impl this replaces — `GattValue for heapless::Vec<u8,
+/// N>` — is `unwrap!(Self::from_slice(data))` (nrf-softdevice
+/// gatt_traits.rs:97), and the field T114 panicked on exactly that
+/// line twice on 2026-09-12 with two phones connected: the macro's
+/// generated `on_write`/`on_hvx` feed `from_gatt` whatever the event
+/// buffer delivered, with no length gate between the air and the
+/// unwrap. Here an over-bound value is truncated and *marked* instead;
+/// the event handlers check [`GattBytes::oversize`] and drop the whole
+/// value with a `BLE_GATT_*_OVERSIZE` line, because a truncated
+/// Columba fragment completing a reassembly is worse than a lost one.
+///
+/// The width is [`GATT_VALUE_MAX`] (253): the exact size of a Columba
+/// fragment filling our granted ATT MTU of 256 (`leviculum-ble-tx`'s
+/// `gatt_bytes`, where the constants live and the arithmetic is
+/// const-asserted). The previous 251 — the link-layer DLE payload, a
+/// bound from the wrong layer — was 2 bytes short of a legitimate
+/// full-MTU fragment. The event buffer that feeds this type is sized
+/// by `nrf-softdevice/evt-max-size-*` in `Cargo.toml`, and
+/// nrf-softdevice still panics when an EVENT does not fit (#354):
+/// widening [`GATT_VALUE_MAX`] means rechecking that feature
+/// (253 + 18 bytes of event header = 271, inside 512).
+pub struct GattData(GattBytes<GATT_VALUE_MAX>);
+
+impl GattValue for GattData {
+    const MIN_SIZE: usize = 0;
+    const MAX_SIZE: usize = GATT_VALUE_MAX;
+
+    fn from_gatt(data: &[u8]) -> Self {
+        GattData(GattBytes::from_wire(data))
+    }
+
+    fn to_gatt(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl GattData {
+    /// Outbound construction: `None` if the value would not fit, so
+    /// nothing we hand the stack can ever be oversize on a peer.
+    fn new(data: &[u8]) -> Option<Self> {
+        GattBytes::new(data).map(GattData)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    fn wire_len(&self) -> usize {
+        self.0.wire_len()
+    }
+
+    fn oversize(&self) -> bool {
+        self.0.oversize()
+    }
+}
+
+#[nrf_softdevice::gatt_service(uuid = "37145b00-442d-4a94-917f-8f42c5da28e3")]
+pub struct ReticulumService {
+    #[characteristic(
+        uuid = "37145b00-442d-4a94-917f-8f42c5da28e5",
+        write,
+        write_without_response
+    )]
+    rx: GattData,
+
+    #[characteristic(uuid = "37145b00-442d-4a94-917f-8f42c5da28e4", read, notify)]
+    tx: GattData,
+
+    #[characteristic(uuid = "37145b00-442d-4a94-917f-8f42c5da28e6", read)]
+    identity: [u8; 16],
+}
+
+#[nrf_softdevice::gatt_server]
+pub struct ReticulumServer {
+    pub reticulum_service: ReticulumService,
+}
+
+/// [`ReticulumServer`] plus the one `Server` callback the
+/// `#[gatt_server]` macro does not generate.
+///
+/// The macro emits `on_write` only; every other callback keeps the
+/// trait's default, and the default for `on_notify_tx_complete` throws
+/// the event away. That event is exactly what tells us a connection's
+/// HVN queue has room again, so the impl is written by hand here and the
+/// write path is delegated unchanged.
+///
+/// This is seam leak (2) from the [`super`] docs: the routing it
+/// performs is protocol-neutral, but `Server` is implemented on a
+/// concrete GATT server, so each protocol owns the obligation to call
+/// it.
+pub struct NotifyAwareServer {
+    pub inner: ReticulumServer,
+}
+
+impl Server for NotifyAwareServer {
+    type Event = ReticulumServerEvent;
+
+    fn on_write(
+        &self,
+        conn: &Connection,
+        handle: u16,
+        op: WriteOp,
+        offset: usize,
+        data: &[u8],
+    ) -> Option<Self::Event> {
+        self.inner.on_write(conn, handle, op, offset, data)
+    }
+
+    /// One or more notifications left the SoftDevice's queue for `conn`.
+    ///
+    /// `count` says how many; the fragment pump waits on the edge rather
+    /// than on a credit count, so it is not forwarded — one edge is
+    /// enough to make it re-offer, and a full queue simply refuses again.
+    fn on_notify_tx_complete(&self, conn: &Connection, _count: u8) -> Option<Self::Event> {
+        let routed = match conn.handle() {
+            Some(handle) => HVN_DRAIN.drained(handle),
+            // The connection is already being torn down. There is no
+            // waiter this edge can honestly answer; waking one anyway is
+            // what the pre-phase-A global signal did.
+            None => false,
+        };
+        if !routed {
+            BLE_TX_DRAIN_UNROUTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        None
+    }
+}
+
+// Static advertising payload. 16-byte service UUID in little-endian.
+//
+// Same UUID as the GATT service: 37145b00-442d-4a94-917f-8f42c5da28e3,
+// reversed to LE: e3 28 da c5 42 8f 7f 91 94 4a 2d 44 00 5b 14 37
+const RETICULUM_SVC_UUID_LE: [u8; 16] = [
+    0xe3, 0x28, 0xda, 0xc5, 0x42, 0x8f, 0x7f, 0x91, 0x94, 0x4a, 0x2d, 0x44, 0x00, 0x5b, 0x14, 0x37,
+];
+
+/// The FIXED capability bits this node advertises AND feeds into its
+/// own side of the connection decision — one constant so the record on
+/// the air and the [`leviculum_ble_tx::should_initiate`] input cannot disagree.
+///
+/// Zero since phase B: [`super`]'s `gap_role_count` now grants one
+/// central role, we can initiate, so `PERIPHERAL_ONLY` (bit 0) is
+/// cleared in the same commit — the two are one fact stated twice, and
+/// they must not drift.
+///
+/// The advertised byte is this plus the live free-slot count
+/// ([`capability_record`], #375 item 3). The decision input stays the
+/// bare constant on purpose: [`leviculum_ble_tx::should_initiate`] reads bit 0 and
+/// nothing else, and a rule about who MAY dial must not acquire a
+/// second, time-varying input.
+const LOCAL_CAPS: u8 = 0;
+
+/// Peripheral link slots currently spent on a session.
+///
+/// Claimed by [`PeripheralSlot`] while a peripheral task serves a link,
+/// so [`free_peripheral_slots`] can put the remainder on the air (#375
+/// item 3). It is NOT a gate: how many links may exist is decided by
+/// the number of peripheral tasks and the SoftDevice's `conn_cfg`, as
+/// before, and nothing consults this counter to accept or refuse.
+static PERIPH_BUSY: AtomicU8 = AtomicU8::new(0);
+
+/// The record's slot count and the task pool are the same fact.
+const _: () = assert!(super::PERIPH_LINKS == PERIPH_SLOTS as usize);
+
+/// A peripheral slot held for the life of one session: claimed while
+/// the accepting task still holds [`ADV_LOCK`], released when the
+/// session ends. Claiming BEFORE the lock is dropped is what keeps the
+/// advertised count from ever over-stating — the next task builds its
+/// advertisement only after acquiring that lock, so it can never
+/// publish a slot this one has already taken.
+struct PeripheralSlot;
+
+impl PeripheralSlot {
+    fn claim() -> Self {
+        PERIPH_BUSY.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for PeripheralSlot {
+    fn drop(&mut self) {
+        PERIPH_BUSY.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Incoming link slots this board still has free, for the advertised
+/// capability record.
+fn free_peripheral_slots() -> u8 {
+    PERIPH_SLOTS.saturating_sub(PERIPH_BUSY.load(Ordering::Relaxed))
+}
+
+/// The v0.3.0 capability record this node advertises right now.
+///
+/// The record STAYS in the advertisement with the flag cleared, rather
+/// than being dropped: a peer that sees no manufacturer data at all
+/// cannot tell a central-capable v0.3.0 node from a pre-v0.3.0 node
+/// that never spoke the version, and would sort against the wrong rule
+/// (v0.3.0 §3.2; asserted host-side by [`leviculum_ble_tx::adv`]'s
+/// `clearing_the_flag_leaves_the_record_and_its_size_alone`). See
+/// [`leviculum_ble_tx::adv`] for the layout and the byte budget.
+///
+/// Since #375 item 3 the same byte carries [`free_peripheral_slots`] in
+/// bits 1-3, so a searching peer can prefer the emptiest board instead
+/// of picking blind and being refused. The record does not grow for
+/// that — the bits were spare — and the count is a hint only: what it
+/// is read for is the ORDER of eligible targets
+/// (`leviculum_ble_tx::window`), never for whether a link may be
+/// accepted.
+///
+/// Since #412 it also carries `hint`, the first four bytes of this
+/// board's identity hash, which grows the record from four bytes to
+/// eight and the whole advertisement to exactly
+/// [`LEGACY_AD_CAPACITY`]. That is what lets a scanning peer recognise
+/// us across an address rotation BEFORE it spends a dial on us. Also a
+/// hint only, and read for one thing: a peer already linked to us is
+/// not dialled again ([`PeerRegistry::hint_linked`]).
+///
+/// The hint is a parameter rather than a global: [`spawn`] is handed
+/// the identity and threads it to the tasks, so there is no second
+/// copy of it to go stale and no order in which this can be called
+/// before it is known.
+fn capability_record(hint: [u8; IDENTITY_HINT_LEN]) -> [u8; MANUFACTURER_DATA_HINT_LEN] {
+    manufacturer_data_with_hint(with_free_slots(LOCAL_CAPS, free_peripheral_slots()), &hint)
+}
+
+/// The advertising PDU as it stands at this instant: the two fixed AD
+/// structures and the live capability record.
+///
+/// Built per advertising start rather than once at boot, which is what
+/// makes the slot count on the air current without a single extra
+/// advertising restart: a peripheral task starts advertising exactly
+/// when the count it would publish has changed — it took over from a
+/// task that just accepted a link, or its own session just ended — and
+/// the SoftDevice is handed the fresh bytes in the same
+/// `sd_ble_gap_adv_set_configure` it was already about to perform. No
+/// running advertisement is ever stopped to rewrite it, so no
+/// advertising interval is dropped and nothing needs rate-limiting.
+fn advertisement_now(hint: [u8; IDENTITY_HINT_LEN]) -> LegacyAdvertisementPayload {
+    LegacyAdvertisementBuilder::new()
+        .flags(&[Flag::GeneralDiscovery, Flag::LE_Only])
+        .services_128(ServiceList::Complete, &[RETICULUM_SVC_UUID_LE])
+        .raw(
+            AdvertisementDataType::MANUFACTURER_SPECIFIC_DATA,
+            &capability_record(hint),
+        )
+        .build()
+}
+
+// The advertisement builder panics on overflow, on a board, at boot. The
+// budget is arithmetic over constants, so it is decided here instead.
+// Since #412 it is an equality, not an inequality: the identity hint
+// spent the last four bytes, so anything added to this builder fails
+// the build rather than the boot.
+const _: () = assert!(ADV_BYTES_USED <= LEGACY_AD_CAPACITY);
+const _: () = assert!(ADV_BYTES_USED == LEGACY_AD_CAPACITY);
+
+/// Register the GATT service and spawn the Columba tasks: one
+/// peripheral task per incoming link slot (#372) and the central half.
+/// Called by [`super::init`] once the SoftDevice is enabled. When the
+/// SoftDevice refuses the GATT registration, logs one
+/// `BLE_INIT_FAIL code=<n>` line and spawns nothing: the board comes up
+/// without BLE instead of panicking into a post-mortem.
+///
+/// Takes the SoftDevice by unique reference and hands back a shared one:
+/// registering a service is the only step that needs exclusive access
+/// (`ReticulumServer::new` adds attributes to the SoftDevice's table),
+/// and everything after it — the SoC-event task, the flash writes in
+/// [`crate::radio_store`] — shares the handle.
+///
+/// The advertising and scan-response payloads are built here, once, for
+/// all peripheral tasks: nrf-softdevice's `advertise_connectable` wants
+/// `&'static` slices, and the name in the scan response is the boot
+/// name — the operator's (#235) if one is set, `LN-<hex8>` from the
+/// identity hash otherwise (#255), the same value
+/// `crate::ble::set_gap_device_name` writes into the GAP attribute so
+/// the two BLE surfaces cannot disagree, truncated visibly on a
+/// codepoint boundary to `DEVICE_NAME_LEN`. It rides in the SCAN
+/// RESPONSE, a second 31-byte PDU, so it does not compete with the
+/// advertisement's budget. Built once into `StaticCell`s the SoftDevice
+/// holds `&'static`s to for the life of the advertising loops: that is
+/// why a name set at runtime reaches BLE only at the next boot, and why
+/// the control frame's report says so rather than implying otherwise.
+pub fn spawn(
+    spawner: &Spawner,
+    sd: &'static mut Softdevice,
+    identity_hash: [u8; 16],
+) -> &'static Softdevice {
+    // A GATT table the SoftDevice refuses to register is a boot-time
+    // condition, not a crash: log the SoftDevice's error code and come up
+    // without BLE — no Columba task spawns, exactly like the profile's
+    // `ble=off` path in [`super::init`] — rather than panic a board whose
+    // LoRa carrier and PN role still work. Critical sink: this fires
+    // before the host's DTR-assert has opened the runtime drain, like the
+    // ADV line below.
+    static SERVER: StaticCell<NotifyAwareServer> = StaticCell::new();
+    let server = match ReticulumServer::new(sd) {
+        Ok(inner) => SERVER.init(NotifyAwareServer { inner }),
+        Err(gatt_server::RegisterError::Raw(code)) => {
+            crate::log::log_fmt_critical(
+                "[BLE ] ",
+                format_args!("BLE_INIT_FAIL code={}", u32::from(code)),
+            );
+            return sd;
+        }
+    };
+    let sd: &'static Softdevice = sd;
+
+    // Publish the identity characteristic value so a connecting peer can
+    // read it before exchanging frames over rx/tx.
+    let _ = server.inner.reticulum_service.identity_set(&identity_hash);
+
+    // The duplicate rule's tie-break input (#360 round 2): Columba's
+    // `preferredBleRole` breaks an MTU tie on `localIdentity <
+    // peerIdentity`, so the registry needs OUR identity to compute the
+    // peer's arbitration. Set before any task spawns — a link that
+    // judged against a zeroed identity would lose every tie-break and
+    // disagree with the phone about the survivor.
+    LIVE_PEERS.lock(|peers| peers.borrow_mut().set_local_identity(identity_hash));
+
+    static SCAN_DATA: StaticCell<LegacyAdvertisementPayload> = StaticCell::new();
+    // The advertisement itself is built per advertising start, by
+    // [`advertisement_now`], because its capability record carries a
+    // live slot count. This one is the boot witness for the line below:
+    // it measures the same builder on the same AD structures, so the
+    // byte budget is still reported from bytes and not from arithmetic.
+    // The four bytes that go on the air and that a peer compares a
+    // live link's identity against (#412), derived once here from the
+    // same hash the Identity characteristic above publishes.
+    let hint = identity_hint(&identity_hash);
+    let adv = advertisement_now(hint);
+    let name = crate::name::boot_gap_name();
+    let scan: &'static LegacyAdvertisementPayload = SCAN_DATA.init(
+        LegacyAdvertisementBuilder::new()
+            .full_name(name.as_str())
+            .build(),
+    );
+
+    // The measured bytes, not the computed ones: if the builder ever
+    // disagrees with `ADV_BYTES_USED`, the capture says so. Critical
+    // path: this fires once, at boot, before the host's DTR-assert has
+    // opened the runtime drain — the gated `log_fmt` silently dropped
+    // it and the #372 rig proof could not observe its own checkpoint.
+    crate::log::log_fmt_critical(
+        "[BLE ] ",
+        format_args!(
+            "ADV adv_bytes={} scan_bytes={} cap={} peripheral_only={} periph_links={} \
+             free_slots={} hint={:02x}{:02x}{:02x}{:02x}",
+            adv.as_ref().len(),
+            scan.as_ref().len(),
+            LEGACY_AD_CAPACITY,
+            u8::from(capability_record(hint)[3] & CAP_PERIPHERAL_ONLY != 0),
+            super::PERIPH_LINKS,
+            free_peripheral_slots(),
+            hint[0],
+            hint[1],
+            hint[2],
+            hint[3],
+        ),
+    );
+
+    for index in 0..super::PERIPH_LINKS {
+        spawner.must_spawn(peripheral_task(sd, server, scan, index, hint));
+    }
+    // Phase B (#255): the central half — scan, decide, initiate. Both
+    // halves of the protocol spawn here, behind the one entry point the
+    // neutral module calls.
+    spawner.must_spawn(central_task(sd, identity_hash));
+    sd
+}
+
+/// Serializes the advertise phase across the peripheral tasks: the
+/// SoftDevice runs ONE advertising set (`adv_set_count: 1`), so exactly
+/// one free task may hold `advertise_connectable` at a time. On a
+/// connect the winner releases the lock and serves its session; the
+/// next free task takes over the advertisement, which is what keeps the
+/// board connectable while any slot is free (#372). With every slot in
+/// a session nobody holds the lock and nothing advertises — a full
+/// board is honestly silent rather than accepting a connection it
+/// would immediately have to refuse.
+static ADV_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
+
+/// One incoming-link slot: advertise (serialized on [`ADV_LOCK`]),
+/// accept, serve the session, repeat. `index` is the task's identity in
+/// the logs and its carrier-wake latch; the session itself is keyed by
+/// its drain slot, as every session is.
+#[embassy_executor::task(pool_size = super::PERIPH_LINKS)]
+async fn peripheral_task(
+    sd: &'static Softdevice,
+    server: &'static NotifyAwareServer,
+    scan: &'static LegacyAdvertisementPayload,
+    index: usize,
+    hint: [u8; IDENTITY_HINT_LEN],
+) {
+    let incoming_tx = BLE_INCOMING.sender();
+
+    loop {
+        // The runtime carrier gate: a profile switched to `ble=off`
+        // holds the task here, so nothing is on the air — no
+        // advertisement, no acceptable connection. Off→on (the carrier
+        // came up at boot, it was only gated) falls through and resumes
+        // advertising. Logged only when it actually gates, once per
+        // gated period, not once per connection.
+        if !crate::media::ble_active() {
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!("BLE_CARRIER_GATE role=peripheral adv={index} state=off"),
+            );
+            super::carrier_on(CarrierWaiter::Peripheral(index)).await;
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!("BLE_CARRIER_GATE role=peripheral adv={index} state=on"),
+            );
+        }
+        // Held for the whole session below, claimed under ADV_LOCK: see
+        // [`PeripheralSlot`] for why the claim may not wait until after
+        // the lock is released.
+        let mut held_slot: Option<PeripheralSlot> = None;
+        let conn = {
+            let _adv_turn = ADV_LOCK.lock().await;
+            // The carrier can flip off while this task waits for the
+            // lock; back to the gate rather than advertising a
+            // switched-off carrier onto the air.
+            if !crate::media::ble_active() {
+                continue;
+            }
+            let config = peripheral::Config::default();
+            // Built here, not at boot: the capability record carries
+            // this board's free-slot count, which is current exactly
+            // now (#375 item 3). The identity hint (#412) in the same
+            // record is fixed for the life of the board and simply
+            // rides along. The payload lives across the await below,
+            // which is what the SoftDevice's pointer into it requires.
+            let adv = advertisement_now(hint);
+            let advertisement = peripheral::ConnectableAdvertisement::ScannableUndirected {
+                adv_data: adv.as_ref(),
+                scan_data: scan.as_ref(),
+            };
+            match select(
+                peripheral::advertise_connectable(sd, advertisement, &config),
+                super::carrier_off(CarrierWaiter::Peripheral(index)),
+            )
+            .await
+            {
+                Either::First(Ok(conn)) => {
+                    held_slot = Some(PeripheralSlot::claim());
+                    Some(conn)
+                }
+                Either::First(Err(_)) => None,
+                // Carrier switched off while advertising: dropping the
+                // advertise future is what stops the advertisement (the
+                // SoftDevice cancels it on drop). The gate above then
+                // holds the loop.
+                Either::Second(()) => continue,
+            }
+            // The lock drops here: a session must not hold the
+            // advertisement hostage, and a failed advertise must not
+            // spin-hold it through its backoff.
+        };
+        match conn {
+            Some(conn) => {
+                // Gate-free, `[INFO] ` prefix kept: a central can dial in
+                // before the debug port re-enumerates (#446, ~2.9 s on a
+                // T114 after a reset), and a gated line there is dropped,
+                // not delayed — the reset census then waits 120 s for
+                // evidence of a link that is up and carrying traffic.
+                // Same treatment as the identity banner (#234); the
+                // bracket below and both conn-params helpers follow.
+                crate::log::log_fmt_critical("[INFO] ", format_args!("BLE: connected"));
+                // Read once, before the session: the handle is gone by
+                // the time the link ends (`on_disconnected` clears it,
+                // unlike the parameters), and the close line has to
+                // carry the same `conn=` as the open one or it cannot
+                // be matched to the request it is evidence about.
+                let handle = conn.handle().unwrap_or(u16::MAX);
+                log_conn_params(&conn, handle, LinkRole::Peripheral, LinkPhase::Open);
+                ask_for_a_survivable_timeout(&conn, handle);
+                gatt_events(&conn, server, &incoming_tx).await;
+                // The ATT MTU the peer and we settled on, reported here
+                // rather than at connect because the Exchange MTU Request
+                // arrives after the connection event. `on_disconnected` does
+                // not clear it and we still hold the `Connection`, so the
+                // negotiated value is still readable. This is the only place
+                // `conn_gatt.att_mtu` becomes observable from outside the
+                // board — without it, "is our conn_cfg in force?" can only be
+                // answered by reading crate source.
+                crate::log::log_fmt_critical(
+                    "[INFO] ",
+                    format_args!("BLE: disconnected att_mtu={}", conn.att_mtu()),
+                );
+                // And the parameters the link ACTUALLY ran on when it
+                // ended, re-read for the same reason and from the same
+                // still-live state (#385): a link that opened at 420 ms
+                // and closes at 4000 ms says the update request was
+                // honoured, one that closes at 420 ms says it was not,
+                // and neither is knowable from the request alone —
+                // a central may honour it, ignore it, or answer with
+                // something else entirely, all without telling us.
+                log_conn_params(&conn, handle, LinkRole::Peripheral, LinkPhase::Close);
+            }
+            None => {
+                Timer::after_millis(1000).await;
+            }
+        }
+        // The slot is free again. The next advertisement this board
+        // starts states the higher count; a task already advertising
+        // keeps the older, LOWER one until it resolves, which
+        // understates our capacity for a while and never overstates it.
+        drop(held_slot);
+    }
+}
+
+/// Say what a link actually runs at (#385).
+///
+/// Except for the peripheral's supervision-timeout request
+/// ([`ask_for_a_survivable_timeout`]), neither stack asks for
+/// connection parameters, so these are the central's choice inherited
+/// whole — and the supervision timeout among them is precisely how
+/// long a disturbance may last before the link dies. On the bench the
+/// values could be read out of the central's kernel because the
+/// central was BlueZ; against a phone the board is the only side that
+/// can be asked, and before this line it was never asked.
+///
+/// A central link says this once, next to the successful dial. A
+/// peripheral link says it twice — [`LinkPhase::Open`] next to
+/// `BLE: connected`, [`LinkPhase::Close`] at teardown next to the
+/// `att_mtu` line — because on that side the parameters can still
+/// change under us, and the closing pair is the only evidence of what
+/// the central did with the request.
+fn log_conn_params(conn: &Connection, handle: u16, role: LinkRole, phase: LinkPhase) {
+    // Critical, not gated: this is the one line per link the reset
+    // census greps for (`reset_loop.rs::LINK_NEEDLE`), emitted at the
+    // connected event — which on a freshly reset peripheral can precede
+    // DTR-assert (#446). At most two of these per link lifecycle, so
+    // the ring cannot be lapped by them.
+    crate::log::log_fmt_critical(
+        "[BLE ] ",
+        format_args!(
+            "{}",
+            ConnParamsLine {
+                conn: handle,
+                role,
+                params: live_conn_params(conn),
+                phase,
+            }
+        ),
+    );
+}
+
+/// The parameters this connection is running on right now, in the
+/// units [`ConnParams`] speaks.
+///
+/// `max_conn_interval` is the interval and not half of a range: the
+/// SoftDevice sets both bounds to the actual interval in every event
+/// it reports parameters in (S140 bindings, `ble_gap_conn_params_t`
+/// doc comment), and `Connection::conn_params` returns what those
+/// events stored.
+///
+/// It returns what they stored MOST RECENTLY, which is what makes the
+/// close reading worth taking: the SoftDevice keeps the struct current —
+/// it overwrites the stored copy on every `BLE_GAP_EVT_CONN_PARAM_UPDATE`
+/// (`nrf-softdevice/src/ble/gap.rs`), which is exactly the event a
+/// central's answer to our update request arrives in, and it does not
+/// clear it on disconnect. So the same call reads the negotiated set at
+/// connect and the accepted set at teardown.
+fn live_conn_params(conn: &Connection) -> ConnParams {
+    let raw = conn.conn_params();
+    ConnParams {
+        interval_units: raw.max_conn_interval,
+        latency: raw.slave_latency,
+        timeout_units: raw.conn_sup_timeout,
+    }
+}
+
+/// Ask the central for a supervision timeout this link can survive —
+/// but only if the one it came up with is too short (#385).
+///
+/// The peripheral is the only end with a lever here: the host cannot
+/// set connection parameters through the API lnsd uses, and a phone
+/// picks whatever it picks. `judge_supervision_timeout` holds the rule
+/// and the numbers, with the argument for both in its module comment;
+/// this function is the driver that performs its verdict and says what
+/// happened either way.
+///
+/// Conditional by design. A central that already negotiates something
+/// sane is left alone, because an update request that fights a good
+/// value is a regression, and what Columba chooses has never been
+/// measured. A refused request is not retried: on a peripheral this is
+/// an L2CAP connection parameter update request, and a central that
+/// says no means it.
+///
+/// `result=sent` claims only that the request left the board. Whether
+/// it was honoured is stated by the `when=close` line at teardown, and
+/// nowhere else.
+fn ask_for_a_survivable_timeout(conn: &Connection, handle: u16) {
+    let (timeout_ms, result) = match judge_supervision_timeout(live_conn_params(conn)) {
+        ConnParamsAsk::Keep { timeout_ms } => (timeout_ms, ConnParamsReq::Skipped),
+        ConnParamsAsk::Ask(ask) => {
+            let requested = nrf_softdevice::raw::ble_gap_conn_params_t {
+                // Both bounds at the interval the link already runs at:
+                // the ask is about the timeout alone, and a request
+                // that also moved the interval could be refused over a
+                // field we have no complaint about.
+                min_conn_interval: ask.interval_units,
+                max_conn_interval: ask.interval_units,
+                slave_latency: ask.latency,
+                conn_sup_timeout: ask.timeout_units,
+            };
+            let result = match conn.set_conn_params(requested) {
+                Ok(()) => ConnParamsReq::Sent,
+                Err(_) => ConnParamsReq::Refused,
+            };
+            (ask.timeout_ms(), result)
+        }
+    };
+    // Gate-free like its `BLE_CONN_PARAMS` companion (#446): the
+    // verdict is made at the connected event, once per peripheral link.
+    crate::log::log_fmt_critical(
+        "[BLE ] ",
+        format_args!(
+            "{}",
+            ConnParamsReqLine {
+                conn: handle,
+                timeout_ms,
+                result,
+            }
+        ),
+    );
+}
+
+/// Run one inbound frame through a link's defragmenter, and say so when
+/// that cost a partial packet (#373): a new START over an unfinished
+/// head, a `total` that contradicts the reassembly in progress, or the
+/// hard reset after a garbage frame each discard one whole in-progress
+/// Reticulum packet — and before this line the discard was invisible on
+/// every surface. `lost=` is what this frame cost, `total=` the
+/// defragmenter's running count for the link, so one line states the
+/// incident and the history.
+fn process_logged(
+    d: &mut BleDefragmenter,
+    data: &[u8],
+    now_ms: u64,
+    slot_index: usize,
+) -> DefragResult {
+    let before = d.abandoned_count();
+    let result = d.process(data, now_ms);
+    if matches!(result, DefragResult::Error) {
+        // Hard reset: a garbage frame amid a reassembly must not leave a
+        // stale head for the next packet's tail to complete (#255), and
+        // the head it discards is a loss this link must report.
+        d.abandon();
+    }
+    let after = d.abandoned_count();
+    if after != before {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!(
+                "BLE_RX_ABANDON slot={} lost={} total={}",
+                slot_index,
+                after.saturating_sub(before),
+                after,
+            ),
+        );
+    }
+    // #388 census: this chokepoint sees every fragment of both roles,
+    // so it is the one place the session-local defragmenter's holding
+    // can be mirrored where the census walker reads it.
+    super::defrag_held_set(slot_index, d.held_bytes());
+    result
+}
+
+/// Hold the next packet back until this connection's inter-packet gap
+/// (#376) has elapsed: the compiled 100 ms default
+/// ([`leviculum_ble_tx::DEFAULT_TX_GAP_MS`], the measured desk value),
+/// or the `--set-ble-tx-gap` override (0 disables). Both pumps — the
+/// peripheral notify path and the central write path — call this before
+/// a packet's first fragment and [`TxGap::packet_done`] after its last,
+/// so the gap is packet-to-packet on one connection handle, exactly as
+/// specified. Keepalives bypass it on both sides: the gap is specified
+/// between packets, and a keepalive that slid the window would change
+/// the quantity being paced. Every actual wait logs `BLE_TX_GAP` — the
+/// desk signature of a paced link.
+async fn serve_tx_gap(gap: &TxGap, conn_handle: u16) {
+    let wait_ms = gap.wait_ms(Instant::now().as_millis(), super::tx_gap_ms());
+    if wait_ms > 0 {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!("BLE_TX_GAP conn={} waited_ms={}", conn_handle, wait_ms),
+        );
+        Timer::after(Duration::from_millis(wait_ms)).await;
+    }
+}
+
+/// Per-connection event-loop. Inbound writes drive `gatt_server::run`'s
+/// closure (Columba defrag + handshake state); outbound BLE_OUTGOING and
+/// keepalive timer feed `gatt_server::notify_value`. The two halves run
+/// concurrently via `embassy_futures::select`.
+async fn gatt_events(
+    conn: &Connection,
+    server: &NotifyAwareServer,
+    incoming_tx: &Sender<
+        'static,
+        CriticalSectionRawMutex,
+        (Option<[u8; 16]>, alloc::vec::Vec<u8>),
+        4,
+    >,
+) {
+    // This connection's drain edge. Claimed for the lifetime of the
+    // connection and released below, so a reconnect (or a second link,
+    // since phase B) never inherits another link's pending edge. The
+    // slot index doubles as the link's identity: it selects the
+    // per-link outbound queue the fan-out feeds and the [`LIVE_PEERS`]
+    // entry the handshake fills.
+    let Some(conn_handle) = conn.handle() else {
+        crate::warn!("BLE: connection without a handle, dropping it");
+        return;
+    };
+    let Some((slot_index, drain)) = HVN_DRAIN.claim_indexed(conn_handle) else {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!(
+                "BLE_DRAIN_TABLE_FULL conn={} slots={}",
+                conn_handle,
+                HVN_DRAIN.capacity()
+            ),
+        );
+        return;
+    };
+    // The connection event, before any identity: the peer's address
+    // enters the registry (pre-dial exclusion) and, when it is a new
+    // fixed address, the fallback clock restarts (#375 §0 — resetting
+    // only at identity left a 3 s gap the rig's fallback fired straight
+    // into; #504 — a known or rotating address does not).
+    let peer = peer_addr(&conn.peer_address());
+    let peer_value = peer.value;
+    conn_link_up(slot_index, peer);
+
+    // Per-connection state. `Cell` lets the closure inside
+    // `gatt_server::run` mutate handshake_done while the outbound branch
+    // reads it. Single-task context (the executor polls one future at a
+    // time), so no Mutex is needed.
+    let defrag: Cell<BleDefragmenter> = Cell::new(BleDefragmenter::new());
+    let handshake_done: Cell<bool> = Cell::new(false);
+    let last_keepalive: Cell<Instant> = Cell::new(Instant::now());
+    // The drain hold (#376): nothing is notified — packets or
+    // keepalives — until the peer has BOTH written the TX CCCD and
+    // handshaked, whichever lands later. The 11:31:18 field T114 sent
+    // its first notify before the central had subscribed and the
+    // SoftDevice refused it with sd_error 13313
+    // (BLE_ERROR_GATTS_SYS_ATTR_MISSING); the packet died. Policy
+    // host-tested in [`leviculum_ble_tx::hold`]; the latch wakes the
+    // outbound arm when readiness changes.
+    let tx_hold: Cell<leviculum_ble_tx::TxHold> = Cell::new(leviculum_ble_tx::TxHold::new());
+    let tx_ready: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+    // The identity this link's peer presented in the handshake, for
+    // tagging inbound packets with their ingress link (Codeberg #365).
+    // `None` until the handshake lands.
+    let link_peer: Cell<Option<[u8; 16]>> = Cell::new(None);
+
+    // This link's private outbound queue (fed by the fan-out; see
+    // super::LINK_OUT). Drain packets left over from the slot's
+    // previous tenancy before serving this connection.
+    let outgoing_rx = super::link_out(slot_index).receiver();
+    while outgoing_rx.try_receive().is_ok() {}
+    // #388 census: the queue is empty, whatever the previous tenancy
+    // left uncounted or over-counted.
+    super::session_held_reset(slot_index);
+
+    let tx_handle = server.inner.reticulum_service.tx_value_handle;
+
+    let inbound = gatt_server::run(conn, server, |evt| {
+        let ReticulumServerEvent::ReticulumService(service_evt) = evt;
+        match service_evt {
+            ReticulumServiceEvent::RxWrite(data) => {
+                // A write past the characteristic bound (#387): dropped
+                // whole, never truncated into the defragmenter — a cut
+                // fragment completing a reassembly is worse than a lost
+                // one. Before #387 this input was a panic in the
+                // vendored `from_gatt` (gatt_traits.rs:97).
+                if data.oversize() {
+                    BLE_GATT_OVERSIZE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    crate::log::log_fmt(
+                        "[BLE ] ",
+                        format_args!(
+                            "{}",
+                            OversizeLine {
+                                from: OversizeFrom::Write,
+                                conn: conn_handle,
+                                len: data.wire_len(),
+                                max: GATT_VALUE_MAX,
+                            }
+                        ),
+                    );
+                    return;
+                }
+                let data = data.as_slice();
+                if !handshake_done.get() && data.len() == 16 {
+                    // Identity handshake — peer's first write is its 16-byte identity.
+                    crate::log::log_fmt(
+                        "[BLE ] ",
+                        format_args!(
+                            "peer id: {:02x}{:02x}{:02x}{:02x}",
+                            data[0], data[1], data[2], data[3]
+                        ),
+                    );
+                    let mut peer_id = [0u8; 16];
+                    peer_id.copy_from_slice(data);
+                    if !peer_link_up(
+                        slot_index,
+                        conn_handle,
+                        peer,
+                        peer_id,
+                        Origin::Incoming,
+                        conn.att_mtu(),
+                    ) {
+                        // Refused (#360 round 2): this identity's
+                        // existing link is alive and the peer's own
+                        // arbitration keeps it. Nothing was
+                        // registered, so the teardown below reports
+                        // nothing; dropping the connection here ends
+                        // `gatt_server::run` and takes this session
+                        // with it. The address is backed off too — the
+                        // scanner must not turn round and dial the peer
+                        // whose duplicate we just sent away. The
+                        // identity is condemned too (#412 part 3): the
+                        // address dies at the peer's next rotation and
+                        // the identity does not, and a peer producing
+                        // duplicates is one our own fallback dial will
+                        // buy a refusal from as well. The connection
+                        // was the peer's to pay for, not ours — what
+                        // the ledger takes from it is not the cost but
+                        // the evidence that this identity already
+                        // holds a live link with us.
+                        note_dead_end(peer_value, "dup_refused");
+                        note_dial_outcome(&peer_id, None, "dup_refused_incoming");
+                        let _ = conn.disconnect();
+                        return;
+                    }
+                    link_peer.set(Some(peer_id));
+                    handshake_done.set(true);
+                    last_keepalive.set(Instant::now());
+                    let mut hold = tx_hold.get();
+                    hold.note_handshake();
+                    tx_hold.set(hold);
+                    if hold.ready() {
+                        tx_ready.signal(());
+                    }
+                } else if data.len() < FRAGMENT_HEADER_SIZE {
+                    // Single-byte keepalive (0x00): nothing to
+                    // defragment, but the peer is demonstrably there,
+                    // which is what the expiry's liveness clock
+                    // measures (#382). A quiet phone sends nothing
+                    // else for minutes. Liveness only — the duplicate
+                    // rule reads the payload clock (#360), which a
+                    // keepalive must not feed.
+                    note_heard(slot_index);
+                } else {
+                    // Real payload: liveness AND the active-use
+                    // evidence the duplicate rule consults (#360).
+                    note_data(slot_index);
+                    let now = Instant::now().as_millis();
+                    let mut d = defrag.replace(BleDefragmenter::new());
+                    let result = process_logged(&mut d, data, now, slot_index);
+                    let frags = d.last_completed_fragments();
+                    defrag.set(d);
+                    match result {
+                        DefragResult::Complete(packet) => {
+                            // conn= tells the phone's link from the
+                            // neighbour board's; frags= shows how the
+                            // peer fragmented (#376).
+                            crate::info!(
+                                "BLE: RX {}B conn={} frags={}",
+                                packet.len(),
+                                conn_handle,
+                                frags
+                            );
+                            // try_send: if the consumer is slow and the 4-deep
+                            // channel is full, drop the packet rather than block
+                            // here (we're in a sync closure, can't await).
+                            let bytes = packet.capacity();
+                            let len = packet.len();
+                            if incoming_tx.try_send((link_peer.get(), packet)).is_ok() {
+                                // #388 census: BLE_INCOMING custody; the
+                                // main loop subtracts on receive.
+                                super::incoming_held_add(bytes);
+                                // #235: the packet, not the allocation —
+                                // the reference counts payload bytes.
+                                crate::iface_bytes::note_rx(crate::iface_bytes::BLE, len);
+                            }
+                        }
+                        DefragResult::NeedMore | DefragResult::Error => {}
+                    }
+                }
+            }
+            // The peer wrote the TX CCCD — the subscription half of the
+            // drain hold (#376). An unsubscribe re-arms the hold.
+            ReticulumServiceEvent::TxCccdWrite { notifications } => {
+                let mut hold = tx_hold.get();
+                hold.note_subscription(notifications);
+                tx_hold.set(hold);
+                if hold.ready() {
+                    tx_ready.signal(());
+                }
+            }
+        }
+    });
+
+    let outbound = async {
+        // This connection's inter-packet gap state (#376); dies with the
+        // link, so a reconnect starts unpaced.
+        let mut tx_gap = TxGap::new();
+        loop {
+            // Keepalives only once the link is ready (#376): before the
+            // CCCD subscription a keepalive notify fails with the same
+            // sd_error 13313 the first packet did. Readiness implies the
+            // handshake, which is what armed this deadline before.
+            let keepalive_deadline = if tx_hold.get().ready() {
+                Timer::at(last_keepalive.get() + Duration::from_millis(KEEPALIVE_INTERVAL_MS))
+            } else {
+                Timer::at(Instant::MAX)
+            };
+
+            match select3(outgoing_rx.receive(), keepalive_deadline, tx_ready.wait()).await {
+                Either3::First(packet) => {
+                    // #388 census: this packet stays in the slot's
+                    // custody until its last fragment is out (or the
+                    // teardown reset catches a death mid-pump).
+                    let held_bytes = packet.capacity();
+                    if !tx_hold.get().ready() {
+                        // Held, not dropped (#376): the packet waits here
+                        // until the subscription (or the handshake, if
+                        // later) lands; the link's queue holds the rest.
+                        let mut hold = tx_hold.get();
+                        if hold.note_held() {
+                            crate::log::log_fmt(
+                                "[BLE ] ",
+                                format_args!(
+                                    "BLE_TX_HELD conn={} reason=not-subscribed",
+                                    conn_handle
+                                ),
+                            );
+                        }
+                        tx_hold.set(hold);
+                        while !tx_hold.get().ready() {
+                            tx_ready.wait().await;
+                        }
+                    }
+                    serve_tx_gap(&tx_gap, conn_handle).await;
+                    let fragments = ble_framing::fragment_packet(&packet, ble_framing::DEFAULT_MTU);
+                    notify_fragments(
+                        conn,
+                        drain,
+                        tx_handle,
+                        fragments.len(),
+                        |index| &fragments[index],
+                        "packet",
+                        packet.len(),
+                    )
+                    .await;
+                    tx_gap.packet_done(Instant::now().as_millis());
+                    super::session_held_sub(slot_index, held_bytes);
+                }
+                Either3::Second(()) => {
+                    let kv = [KEEPALIVE_BYTE];
+                    notify_fragments(conn, drain, tx_handle, 1, |_| &kv, "keepalive", kv.len())
+                        .await;
+                    last_keepalive.set(Instant::now());
+                }
+                // Readiness changed: recompute the keepalive deadline.
+                Either3::Third(()) => {}
+            }
+        }
+    };
+
+    // The third arm is the runtime carrier switch (`--set-media
+    // ble=off`): the link is disconnected exactly as if the peer had
+    // walked out of range — the teardown below reports the loss through
+    // the same `peer_link_down`, so the core's cull is identical. The
+    // fourth is [`link_over`]: a displacement (#376), where the
+    // displacer already logged and moved the queue and the teardown
+    // below is churn because the new link is already registered — or
+    // the expiry (#382), where nothing was heard for LINK_TIMEOUT_MS
+    // and the teardown IS the peer loss.
+    match select4(
+        inbound,
+        outbound,
+        super::carrier_off(CarrierWaiter::Session(slot_index)),
+        link_over(slot_index, conn_handle),
+    )
+    .await
+    {
+        Either4::Third(()) => {
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!("BLE_CARRIER_DROP role=peripheral slot={}", slot_index),
+            );
+            // Already-disconnected is fine; the teardown is the same.
+            let _ = conn.disconnect();
+        }
+        Either4::Fourth(end) => {
+            // An expiry is the peer's own departure (#417): it went
+            // silent on a link it held with us until the registry's
+            // bound swept it — the rotation's signature. The
+            // displacement is fed by the displacer instead
+            // ([`displace_old_link`]), once per event.
+            if matches!(end, LinkEnd::Expired(_)) {
+                if let Some(peer_id) = link_peer.get() {
+                    note_peer_leave(&peer_id, peer, "expiry_peripheral");
+                }
+            }
+            log_link_end("peripheral", slot_index, conn_handle, end);
+            let _ = conn.disconnect();
+        }
+        Either4::First(_) | Either4::Second(_) => {}
+    }
+
+    // Registry entry first, then the slot: a slot that reads free while
+    // the identity still reads linked would refuse a legitimate
+    // reconnect in the central task's duplicate check.
+    peer_link_down(slot_index);
+    conn_link_down(slot_index);
+    super::defrag_held_set(slot_index, 0);
+    super::session_held_reset(slot_index);
+    HVN_DRAIN.release(conn_handle);
+}
+
+// --- The central half (#255 phase B): scan, decide, initiate ---
+
+/// The 16-byte identities of currently linked peers, indexed by the
+/// link's drain-slot (the same index that selects its outbound queue).
+///
+/// v2.2 keys everything durable by identity precisely because BLE
+/// addresses rotate (§"Why Not Use MAC Addresses as Keys?"). The
+/// scanner cannot apply that lesson pre-connect — an advertisement
+/// carries no identity — so a peer we already hold a link to can rotate
+/// its address and reappear as a seemingly new device. This registry is
+/// the post-connect closure of that hole: when an identity we already
+/// hold connects again — read from the Identity characteristic on the
+/// central path, presented in the handshake on the peripheral one — the
+/// registry decides which of the two connections the pair keeps
+/// ([`leviculum_ble_tx::judge_duplicate`], #360 round 2).
+///
+/// Since #360 round 2 the decision is the one BOTH sides compute: an
+/// old link silent past [`leviculum_ble_tx::LINK_ABANDONED_MS`] — any
+/// frame, keepalives included — was abandoned by its peer and loses to
+/// the newcomer (`rule=abandoned`); an old link alive is arbitrated by
+/// Columba's own `preferredBleRole`
+/// ([`leviculum_ble_tx::preferred_ble_role`]), evaluated from the
+/// PEER's perspective, and we keep the connection the peer keeps
+/// (`rule=columba_mtu` / `columba_identity`). The 2026-09-12 21:41
+/// field T114 is why round 1's payload-recency rule had to go: the
+/// phone held a LIVE central link (keepalive 7.3 s old), the board
+/// displaced it because its last payload was 15 185 ms old, the
+/// phone's own arbitration kept it (fresh connection still at the MTU
+/// floor in its ledger), and each side then closed the link the other
+/// had kept — 45 s of dead air per cycle, from the opposite direction
+/// of the morning failure round 1 fixed. The losing link is
+/// disconnected BY US at the decision, whichever role, never left to
+/// the expiry. A dead link is still cleared by the expiry
+/// ([`link_silent`] at [`leviculum_ble_tx::LINK_TIMEOUT_MS`], the
+/// sweep lnsd runs over its rows), which removes it whether or not
+/// anything dials it. Every line carries `origin=` (the role map the
+/// arbitration is computed over), `rule=`, both usable MTUs as
+/// compared, the old link's `old_silence_ms` (the abandonment test's
+/// input) and `old_data_silence_ms` (round 1's input, reported for
+/// comparison, no longer consulted).
+///
+/// The first/last-link rules live host-tested in
+/// [`leviculum_ble_tx::registry`]; this is the one firmware instance,
+/// behind the critical-section mutex the host crate cannot need.
+static LIVE_PEERS: BlockingMutex<CriticalSectionRawMutex, RefCell<PeerRegistry<MAX_LINKS>>> =
+    BlockingMutex::new(RefCell::new(PeerRegistry::new()));
+
+/// Links displaced by a newer connection of the same identity (#376,
+/// #382), for the `BLE_COUNTERS` line's `displaced=` field.
+pub(crate) static BLE_LINKS_DISPLACED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Connections refused because the identity behind them already holds a
+/// LIVE link (#376), for the `BLE_COUNTERS` line's `refused=` field.
+/// On a board sitting beside a Columba phone this is the counter that
+/// should climb while `displaced=` stays put.
+pub(crate) static BLE_LINKS_REFUSED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Inbound GATT values dropped for exceeding [`GATT_VALUE_MAX`] (#387)
+/// — writes and notifications together — for the `BLE_COUNTERS` line's
+/// `oversize=` field. Each drop also names itself as a
+/// `BLE_GATT_WRITE_OVERSIZE` / `BLE_GATT_NOTIFY_OVERSIZE` line; this is
+/// the running total that makes the drops quotable from a capture.
+/// Before #387 this exact input was not a counter but a panic
+/// (nrf-softdevice gatt_traits.rs:97), twice on the field T114.
+pub(crate) static BLE_GATT_OVERSIZE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Per-slot displacement latches (#376): [`peer_link_up`] signals the
+/// OLD link's slot when a newer connection of the same identity takes
+/// over, and the session holding that slot tears itself down through
+/// [`displaced`]. The payload is the connection handle the displacer
+/// read out of the drain table, so a wake aimed at a previous tenancy
+/// of the slot can never kill an innocent successor. One latch per
+/// drain slot, like the session half of `CARRIER_WAKES`.
+static DISPLACE_WAKES: [Signal<CriticalSectionRawMutex, u16>; MAX_LINKS] =
+    [const { Signal::new() }; MAX_LINKS];
+
+/// Resolve when this session's link has been displaced by a newer
+/// connection of the same identity (#376). A latched wake for a
+/// different handle is a stale leftover from a previous tenancy:
+/// consumed and ignored.
+async fn displaced(slot_index: usize, conn_handle: u16) {
+    let wake = &DISPLACE_WAKES[slot_index];
+    loop {
+        if wake.wait().await == conn_handle {
+            return;
+        }
+    }
+}
+
+/// Resolve when this session's link has delivered NOTHING — no packet
+/// fragment, no keepalive — for [`LINK_TIMEOUT_MS`], returning that
+/// silence: the board's link expiry (#382).
+///
+/// The board has no sweep task, so the expiry is an arm of the session
+/// it ends, reading the same liveness clock [`note_heard`] feeds and
+/// making the same comparison lnsd's `LinkTable::expire` makes over its
+/// rows. It has to exist for its own sake: a replacement (#360) clears
+/// a dead link only when its identity happens to connect or be dialled
+/// again, and until #382 that was the ONLY thing that ever removed a
+/// link which had stopped answering. A SoftDevice
+/// supervision timeout does not cover this: it ends a link whose
+/// CONTROLLER has stopped acknowledging (4 s in the central role,
+/// `ConnectConfig::default`; the peer's choice in the peripheral one),
+/// while what expires here is a link whose radio is fine and whose
+/// Columba peer has gone away.
+///
+/// It sleeps exactly to the earliest instant the link could be over,
+/// so a healthy link costs one wake per [`LINK_TIMEOUT_MS`] and a
+/// keepalive-fed one never fires at all. A slot whose identity is not
+/// registered yet — a peripheral connection between the connect event
+/// and the handshake — has no clock to read and is re-checked one
+/// keepalive interval later; the previous tenant's clock is never
+/// mistaken for this link's.
+async fn link_silent(slot_index: usize) -> u64 {
+    loop {
+        let now_ms = Instant::now().as_millis();
+        match LIVE_PEERS.lock(|peers| peers.borrow().silence_ms(slot_index, now_ms)) {
+            Some(silence_ms) if silence_ms >= LINK_TIMEOUT_MS => return silence_ms,
+            Some(silence_ms) => Timer::after_millis(LINK_TIMEOUT_MS - silence_ms).await,
+            None => Timer::after_millis(KEEPALIVE_INTERVAL_MS).await,
+        }
+    }
+}
+
+/// Why the fourth arm of both session selects ended the link: the peer
+/// built a replacement, or the link stopped delivering anything at all.
+/// Both end in a disconnect; they differ in what the capture is owed.
+enum LinkEnd {
+    /// A newer connection of this identity took the peer over (#376);
+    /// the displacer has already logged the decision.
+    Displaced,
+    /// Nothing was heard on this link for [`LINK_TIMEOUT_MS`] — the
+    /// silence, in ms, so a capture can tell an expiry from a range
+    /// loss and see how far past the bound it ran.
+    Expired(u64),
+}
+
+/// One line for an expiry, none for a displacement — that one is
+/// already on the wire as `BLE_LINK_REPLACED`, logged by
+/// the displacer with the evidence it decided on. `silence_ms=` is the
+/// expiry's evidence, in the same spelling the duplicate lines'
+/// `old_silence_ms=` uses, so one grep reads both.
+fn log_link_end(role: &str, slot_index: usize, conn_handle: u16, end: LinkEnd) {
+    if let LinkEnd::Expired(silence_ms) = end {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!(
+                "BLE_LINK_EXPIRE role={} slot={} conn={} silence_ms={}",
+                role, slot_index, conn_handle, silence_ms
+            ),
+        );
+    }
+}
+
+/// The fourth arm of both session selects: the two ways a link ends
+/// without either side's carrier going away.
+async fn link_over(slot_index: usize, conn_handle: u16) -> LinkEnd {
+    match select(displaced(slot_index, conn_handle), link_silent(slot_index)).await {
+        Either::First(()) => LinkEnd::Displaced,
+        Either::Second(silence_ms) => LinkEnd::Expired(silence_ms),
+    }
+}
+
+/// Register a slot's peer and, when this is the identity's FIRST link,
+/// report the arrival to the main loop so the transport learns about
+/// the peer behind the new link (Codeberg #365) — the mirror
+/// of [`peer_link_down`]'s last-link rule.
+///
+/// A second link from an identity we already hold is decided so that
+/// both sides keep the same connection (#360 round 2, see
+/// [`LIVE_PEERS`]): `false` means REFUSED — the existing link is alive
+/// and the peer's arbitration keeps it, and the caller must drop the
+/// connection it just made, address included ([`note_dead_end`]).
+/// `true` means the link is registered, either plainly or after
+/// replacing the old one. `att_mtu` is this connection's ATT MTU as
+/// currently negotiated (`conn.att_mtu()`): recorded with the link as
+/// the old-side input of future duplicate decisions, and — on the
+/// incoming path — the peer's own view of the connection it just
+/// arbitrated for. Either way the decision is logged —
+/// `BLE_LINK_DUP … action=refuse` or `BLE_LINK_REPLACED` — carrying
+/// `origin=`, `rule=`, both usable MTUs, the old link's
+/// `old_silence_ms` and the reported `old_data_silence_ms`, so a
+/// capture shows which branch fired and on what evidence.
+///
+/// A displacement registers the new link BEFORE the old one is
+/// signalled, which is what makes the old teardown's `link_down` a
+/// churn edge rather than a `Lost`/`Up` flap. A refusal never touches
+/// the registry at all, so the refused slot's teardown is silent too.
+fn peer_link_up(
+    slot_index: usize,
+    conn_handle: u16,
+    peer: PeerAddr,
+    peer_id: [u8; 16],
+    origin: Origin,
+    att_mtu: u16,
+) -> bool {
+    let peer_value = peer.value;
+    let now_ms = Instant::now().as_millis();
+    let up = LIVE_PEERS.lock(|peers| {
+        peers
+            .borrow_mut()
+            .link_up(slot_index, peer_id, origin, att_mtu, now_ms)
+    });
+    match up {
+        LinkUp::Refused {
+            old_slot,
+            rule,
+            old_silence_ms,
+            old_data_silence_ms,
+            old_usable_mtu,
+            new_usable_mtu,
+        } => {
+            BLE_LINKS_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // A refusal brought no link up; the reset rule leaves the
+            // strict clock alone for it (`PhaseEvent::resets_strict`).
+            note_phase_event(PhaseEvent::LinkRefused);
+            let old_conn = HVN_DRAIN
+                .handle_at(old_slot)
+                .unwrap_or(leviculum_ble_tx::NO_CONN_HANDLE);
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!(
+                    "BLE_LINK_DUP peer={:02x}{:02x}{:02x}{:02x} addr={:012x} action=refuse rule={} origin={} old_conn={} new_conn={} old_mtu={} new_mtu={} old_silence_ms={} old_data_silence_ms={}",
+                    peer_id[0], peer_id[1], peer_id[2], peer_id[3],
+                    peer_value, rule.as_str(), origin_str(origin), old_conn, conn_handle,
+                    old_usable_mtu, new_usable_mtu, old_silence_ms,
+                    leviculum_ble_tx::DataSilence(old_data_silence_ms),
+                ),
+            );
+            return false;
+        }
+        LinkUp::Displaced {
+            old_slot,
+            rule,
+            old_silence_ms,
+            old_data_silence_ms,
+            old_usable_mtu,
+            new_usable_mtu,
+        } => {
+            displace_old_link(DisplacedOld {
+                old_slot,
+                new_slot: slot_index,
+                new_conn: conn_handle,
+                peer,
+                peer_id,
+                origin,
+                rule,
+                old_silence_ms,
+                old_data_silence_ms,
+                old_usable_mtu,
+                new_usable_mtu,
+            });
+            // A displacement is a peer we hold a link to, reconnecting:
+            // never a new neighbour, so the fallback clock runs on
+            // (#504). Until then it restarted the clock, and a rotating
+            // phone that reconnected inside the bound kept the board in
+            // strict mode for good: `issue_412_a_rotating_peer_that_
+            // keeps_reconnecting_no_longer_holds_off_the_fallback` in
+            // leviculum_ble_tx::admission. The identity is recorded all
+            // the same, so its next plain link in this phase is known.
+            let _ = meet_link(&peer_id);
+            note_phase_event(PhaseEvent::LinkDisplaced);
+        }
+        LinkUp::Accepted { first } => {
+            if first {
+                super::report_peer_event(super::PeerEvent::Up(peer_id));
+            }
+            // A NEW neighbour's link in either role restarts the
+            // fallback clock (#375, narrowed by #504): the strict rule
+            // gets its full bound to place the newcomer before the
+            // scanner may dial against the sort. An identity already
+            // linked in this phase restarts nothing.
+            note_phase_event(PhaseEvent::LinkAccepted(meet_link(&peer_id)));
+        }
+    }
+    true
+}
+
+/// A slot's peer delivered a KEEPALIVE — the liveness clock the expiry
+/// reads (#382) and, since #360 round 2, the duplicate rule's
+/// abandonment test. Called on both session loops exactly where lnsd's
+/// `link_frame` sets `last_heard_ms`: a keepalive proves the peer is
+/// there at all, which is what a quiet phone has to be judged on.
+/// Costs one critical section and one `u64` store per frame.
+fn note_heard(slot_index: usize) {
+    let now_ms = Instant::now().as_millis();
+    LIVE_PEERS.lock(|peers| peers.borrow_mut().note_heard(slot_index, now_ms));
+}
+
+/// A slot's peer delivered real PAYLOAD — a fragment frame — which
+/// feeds the expiry's liveness clock AND the payload clock every
+/// duplicate decision REPORTS — round 1 of #360 consulted it, round 2
+/// does not (`old_data_silence_ms`). Called per inbound FRAME, before
+/// reassembly: a packet that never finishes reassembling still proves
+/// the link delivers.
+fn note_data(slot_index: usize) {
+    let now_ms = Instant::now().as_millis();
+    LIVE_PEERS.lock(|peers| peers.borrow_mut().note_data(slot_index, now_ms));
+}
+
+/// The stable token `BLE_LINK_DUP origin=` carries, matching lnsd's.
+fn origin_str(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Incoming => "incoming",
+        Origin::Outgoing => "outgoing",
+    }
+}
+
+/// Everything [`displace_old_link`] needs: the two slots, the peer, and
+/// the evidence the [`leviculum_ble_tx::judge_duplicate`] branch that
+/// fired decided on. One struct rather than nine positional arguments,
+/// so a caller cannot silently swap `old_usable_mtu` for
+/// `new_usable_mtu` — the two numbers whose ORDER is the whole
+/// arbitration (#360 round 2).
+struct DisplacedOld {
+    /// The slot of the link being torn down.
+    old_slot: usize,
+    /// The slot the newcomer just registered on.
+    new_slot: usize,
+    /// The newcomer's connection handle, for the log line.
+    new_conn: u16,
+    /// The newcomer's address with its type, which the churn arming
+    /// reads (#506).
+    peer: PeerAddr,
+    peer_id: [u8; 16],
+    /// Who opened the NEWCOMER — the role map the arbitration was
+    /// computed over, reported as `origin=`.
+    origin: Origin,
+    /// Which branch decided it, reported as `rule=`.
+    rule: leviculum_ble_tx::DupRule,
+    /// The old link's any-frame silence: the abandonment test's input.
+    old_silence_ms: u64,
+    /// The old link's payload silence — round 1's input, reported for
+    /// comparison, consulted by nothing.
+    old_data_silence_ms: Option<u64>,
+    /// The usable MTUs as the arbitration compared them, in the PEER's
+    /// ledger (a fresh connection reads the floor there).
+    old_usable_mtu: u16,
+    new_usable_mtu: u16,
+}
+
+/// Tear down the OLD link of an identity whose newer connection just
+/// registered (#376, replacement rule #360 round 2). The teardown is
+/// OURS and immediate — the losing link is never left to the 45 s
+/// expiry, whichever role holds it — because the peer's own cancel
+/// does not drop the ACL (field 2026-09-12 21:41:48.146: Columba's
+/// "Connection cancelled" left our link up for 45 s collecting
+/// `Rejecting pre-identity write` refusals). The old slot's queued
+/// packets move to the new
+/// link's queue first — the replacement says the peer no longer reads
+/// the old connection, so anything left there would die with it; a
+/// packet the old pump already pulled out of the queue is the one loss
+/// this cannot prevent. Runs synchronously between the registry check
+/// and the wake (no await point), so the old session — which clears its
+/// registry entry before releasing its drain slot — cannot vanish in
+/// between: the latched wake always reaches the tenancy it names.
+fn displace_old_link(displaced: DisplacedOld) {
+    let DisplacedOld {
+        old_slot,
+        new_slot,
+        new_conn,
+        peer,
+        peer_id,
+        origin,
+        rule,
+        old_silence_ms,
+        old_data_silence_ms,
+        old_usable_mtu,
+        new_usable_mtu,
+    } = displaced;
+    let peer_value = peer.value;
+    let old_conn = HVN_DRAIN
+        .handle_at(old_slot)
+        .unwrap_or(leviculum_ble_tx::NO_CONN_HANDLE);
+    let old_queue = super::link_out(old_slot);
+    let new_queue = super::link_out(new_slot);
+    let mut moved = 0usize;
+    let mut dropped = 0usize;
+    while let Ok(packet) = old_queue.try_receive() {
+        let bytes = packet.capacity();
+        if new_queue.try_send(packet).is_ok() {
+            // #388 census: custody follows the packet to the new slot.
+            super::session_held_moved(old_slot, new_slot, bytes);
+            moved += 1;
+        } else {
+            super::session_held_sub(old_slot, bytes);
+            dropped += 1;
+        }
+    }
+    BLE_LINKS_DISPLACED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // A replacement is a departure too (#417): the identity left the
+    // address the old link was made on, even though it came straight
+    // back. Fed here, by the displacer, so both roles' displacements
+    // are one site and the displaced session's own teardown stays
+    // silent about it.
+    note_peer_leave(&peer_id, peer, "replaced");
+    crate::log::log_fmt(
+        "[BLE ] ",
+        format_args!(
+            "BLE_LINK_REPLACED peer={:02x}{:02x}{:02x}{:02x} addr={:012x} rule={} origin={} old_conn={} new_conn={} old_mtu={} new_mtu={} old_silence_ms={} old_data_silence_ms={} moved={} dropped={}",
+            peer_id[0], peer_id[1], peer_id[2], peer_id[3],
+            peer_value, rule.as_str(), origin_str(origin), old_conn, new_conn,
+            old_usable_mtu, new_usable_mtu, old_silence_ms,
+            leviculum_ble_tx::DataSilence(old_data_silence_ms), moved, dropped,
+        ),
+    );
+    DISPLACE_WAKES[old_slot].signal(old_conn);
+}
+
+/// Clear a slot's registry entry and, when that took the peer's LAST
+/// link, report the loss to the main loop so the transport culls the
+/// paths via that peer (Codeberg #365). A same-identity link on another
+/// slot (the displacement hand-over window) means the peer is still
+/// reachable: registry churn, not a loss, so no report.
+fn peer_link_down(slot_index: usize) {
+    let lost = LIVE_PEERS.lock(|peers| peers.borrow_mut().link_down(slot_index));
+    if let Some(identity) = lost {
+        super::report_peer_event(super::PeerEvent::Lost(identity));
+    }
+}
+
+/// Register a connection's address at the connection event, in either
+/// role — before any identity is known — and restart the strict phase
+/// when the address is a NEW fixed one: the rig showed the fallback
+/// firing in the 3 s gap between `BLE: connected` and the identity
+/// handshake (#375 §0), because the clock used to reset only at
+/// identity. A rotating address cannot say who connected, so it waits
+/// for the identity (#504).
+fn conn_link_up(slot_index: usize, addr: PeerAddr) {
+    LIVE_PEERS.lock(|peers| peers.borrow_mut().conn_up(slot_index, addr.value));
+    let neighbour = PHASE_NEIGHBOURS.lock(|seen| seen.borrow_mut().meet_conn(addr));
+    note_phase_event(PhaseEvent::ConnUp(neighbour));
+}
+
+/// Clear a connection's address at teardown. A departure is not a new
+/// neighbour, so the strict phase runs on (#504; until then it
+/// restarted here, and a phone's every reconnect bought another bound).
+fn conn_link_down(slot_index: usize) {
+    LIVE_PEERS.lock(|peers| peers.borrow_mut().conn_down(slot_index));
+    note_phase_event(PhaseEvent::ConnDown);
+}
+
+/// A connection's peer address with the type the SoftDevice reported,
+/// so a public address is never taken for a rotating one (#504).
+fn peer_addr(addr: &Address) -> PeerAddr {
+    PeerAddr::from_raw(&addr.bytes(), addr.as_raw().addr_type())
+}
+
+/// Record that `identity` linked in the current phase and say whether
+/// it is new to it ([`PhaseNeighbours::meet_link`]).
+fn meet_link(identity: &[u8; 16]) -> leviculum_ble_tx::Neighbour {
+    PHASE_NEIGHBOURS.lock(|seen| seen.borrow_mut().meet_link(identity))
+}
+
+// The scanner's two exclusions by link, filters three and four of
+// `leviculum_ble_tx::admit` since #496, read under the `LIVE_PEERS`
+// lock in `find_peer_to_initiate`:
+//
+// - BY ADDRESS (`PeerRegistry::addr_linked`). Core Spec Vol 6 Part B
+//   §4.5 permits one connection per address pair — the initiator shall
+//   not dial an advertiser it is connected to, and the advertiser shall
+//   ignore such a CONNECT_IND — so a dial here can only time out (5 s on
+//   the air, the rig's `BLE_CENTRAL_FAIL … err=Timeout` loop) and the
+//   scanner excludes the address before dialling.
+// - BY IDENTITY HINT (#412, `PeerRegistry::hint_linked`), the same
+//   exclusion one level up, where a rotated address cannot hide. Without
+//   it a linked peer that draws a new address looks like a new device,
+//   wins the fallback class by its low address and takes the board's ONE
+//   central slot, and the duplicate is only found after the connect, the
+//   discovery and the identity read. It reaches exactly as far as the
+//   record does, which is our own two stacks: the corpus night's 7-of-7
+//   was an Android Columba, and Columba at 6674ae87 advertises the
+//   service UUID alone — no manufacturer record, so no hint, so that
+//   phone is dialled exactly as it was. What no longer lets it take the
+//   slot every time is the window's fallback order, which stopped
+//   ranking by an address its owner redraws (`leviculum_ble_tx::window`,
+//   #412). A HINT, and used in one direction only: to skip a dial. `None`
+//   — an advertiser that carried no hint — is never a match, so a
+//   pre-#412 board and a phone behave exactly as they did. Nothing
+//   durable is keyed on it; admission is still the 16-byte identity
+//   handshake.
+
+/// The number of distinct live peer identities on the BLE interface
+/// (Codeberg #365) — what the main loop mirrors into the core as the
+/// interface's peer count, next to the `is_online` mirror. Counted from
+/// the post-handshake registry, not the drain table: a link that has
+/// not presented an identity yet is not a peer the transport can ask
+/// anything of.
+pub(crate) fn live_peer_count() -> usize {
+    LIVE_PEERS.lock(|peers| peers.borrow().peer_count())
+}
+
+/// Map the core's link statement onto link slots — the fan-out's one
+/// question to the registry. The rules and their peer-gone decisions
+/// are host-tested in [`leviculum_ble_tx::plan_fanout`]; this is the
+/// lock around the firmware's single registry instance.
+pub(crate) fn plan_fanout(aim: leviculum_ble_tx::TxAim) -> leviculum_ble_tx::TxFanout {
+    LIVE_PEERS.lock(|peers| leviculum_ble_tx::plan_fanout(&peers.borrow(), aim))
+}
+
+/// The Columba service from the client side — the same three
+/// characteristics as [`ReticulumService`], with the directions
+/// mirrored (v2.2 §GATT Service Structure: we write the peer's RX, the
+/// peer notifies us on its TX, its Identity is read once at connect).
+#[nrf_softdevice::gatt_client(uuid = "37145b00-442d-4a94-917f-8f42c5da28e3")]
+pub struct ReticulumClient {
+    #[characteristic(uuid = "37145b00-442d-4a94-917f-8f42c5da28e5", write)]
+    rx: GattData,
+
+    #[characteristic(uuid = "37145b00-442d-4a94-917f-8f42c5da28e4", read, notify)]
+    tx: GattData,
+
+    #[characteristic(uuid = "37145b00-442d-4a94-917f-8f42c5da28e6", read)]
+    identity: [u8; 16],
+}
+
+/// Discovery-scan cadence, in 625 µs units: a 30 ms listen every
+/// 100 ms. Passive — the decision needs only the advertising PDU
+/// (service UUID + capability record), so scan requests would spend
+/// airtime to learn a name we do not use (v2.2 §Discovery Phase:
+/// matching is by service UUID, never by name). The radio is shared
+/// with our own advertising and up to four live connections; 30 %
+/// leaves the SoftDevice scheduler room for all of them.
+const SCAN_INTERVAL_625US: u32 = 160;
+const SCAN_WINDOW_625US: u32 = 48;
+
+/// Bound on one connect attempt, in 10 ms units (5 s). The peer
+/// advertised moments ago; if it does not answer a CONNECT_IND within
+/// seconds it is gone or busy, and the scanner should look again.
+const CONNECT_TIMEOUT_10MS: u16 = 500;
+
+/// Pause after a session ended or an attempt failed, before the next
+/// scan pass. Keeps a refusing/vanishing peer from being hammered.
+const CENTRAL_RETRY_BACKOFF_MS: u64 = 5_000;
+
+// The fallback bound itself, `SCAN_FALLBACK_AFTER_MS` (30 s), lives in
+// `leviculum_ble_tx::window` since #375 part 2 — lnsd runs the same
+// clock, and a shared constant cannot drift. The firmware-side
+// arithmetic behind it still holds: one failed strict attempt costs up
+// to [`CONNECT_TIMEOUT_10MS`] (5 s) plus [`CENTRAL_RETRY_BACKOFF_MS`]
+// (5 s), so 30 s spans several complete search-connect-backoff cycles
+// at the 30 %-duty passive scan cadence
+// ([`SCAN_INTERVAL_625US`]/[`SCAN_WINDOW_625US`]).
+
+/// The strict-phase clock behind
+/// [`leviculum_ble_tx::SCAN_FALLBACK_AFTER_MS`], the board's one
+/// [`ScanPhase`] (the rule is host-tested in
+/// [`leviculum_ble_tx::admission`] since #496): when the current strict
+/// phase began and whether the switch to fallback was already logged for
+/// this phase. Reset by [`note_phase_event`] for every [`PhaseEvent`]
+/// the reset rule names — a NEW neighbour's link or fixed-address
+/// connection ([`PHASE_NEIGHBOURS`], #504), or the strict rule
+/// producing a target — and otherwise it
+/// runs whenever the central task is scanning, live links
+/// notwithstanding (the eager spec, #375 part 3). Live links no longer
+/// suspend it: the doomed dial that motivated the quiet spec is
+/// excluded by address before it can leave the scanner
+/// ([`PeerRegistry::addr_linked`], Core Spec Vol 6 Part B §4.5), a failed
+/// fallback dial is backed off by [`DeadEnds`], and the quiet
+/// suspension itself measurably cost merges —
+/// `ble-tx/tests/graph_formation.rs` puts it at 28 and 78 all-linked
+/// splits per 1000 arrival orders at 10 and 20 boards against eager's
+/// zero.
+///
+/// A blocking mutex over a `Cell`, like [`LIVE_PEERS`]: written from
+/// the peripheral tasks (via [`peer_link_up`]) and read from the
+/// central task's scan callback, and the milliseconds are 64-bit, which
+/// the target has no atomic for.
+static FALLBACK_CLOCK: BlockingMutex<CriticalSectionRawMutex, Cell<ScanPhase>> =
+    BlockingMutex::new(Cell::new(ScanPhase::new()));
+
+/// Who linked in the current phase, the "seen before" input of the
+/// reset rule (#504): identities, and fixed addresses at the connection
+/// event before the identity is known. [`PHASE_NEIGHBOUR_SLOTS`] keys
+/// (12: one per link slot plus the eight a dead-end table holds), the
+/// oldest overwritten when full; an evicted peer that comes back reads
+/// as new and buys one early reset. Cleared by [`scan_mode_now`] when
+/// the phase reaches fallback, so a peer restarts the clock at most
+/// once per phase however often it reconnects. A `RefCell` under a
+/// blocking mutex, like [`LIVE_PEERS`], written from both roles.
+static PHASE_NEIGHBOURS: BlockingMutex<
+    CriticalSectionRawMutex,
+    RefCell<PhaseNeighbours<PHASE_NEIGHBOUR_SLOTS>>,
+> = BlockingMutex::new(RefCell::new(PhaseNeighbours::new()));
+const _: () = assert!(PHASE_NEIGHBOUR_SLOTS == MAX_LINKS + DEAD_END_SLOTS);
+
+/// Hand one [`PhaseEvent`] to the fallback clock, which restarts the
+/// strict phase iff [`PhaseEvent::resets_strict`] says so: a new
+/// neighbour linked in either role, or the strict rule found a
+/// permitted peer — either way the strict sort has work to do, so the
+/// clock starts over.
+fn note_phase_event(event: PhaseEvent) {
+    let now_ms = Instant::now().as_millis();
+    FALLBACK_CLOCK.lock(|clock| {
+        let mut phase = clock.get();
+        phase.note(event, now_ms);
+        clock.set(phase);
+    });
+}
+
+/// The [`ScanMode`] the current strict phase has reached, logging the
+/// strict-to-fallback switch once per phase (`BLE_SCAN_FALLBACK`).
+///
+/// Sampled per advertising report rather than per scan pass: a strict
+/// pass that never finds a target never *ends* — `central::scan` runs
+/// until its callback accepts a peer — so "the next pass" would never
+/// come for exactly the stranded board the fallback exists for. The
+/// timing stays an input to [`leviculum_ble_tx::should_initiate`]; the rule itself never
+/// measures it.
+///
+/// Under the eager spec a linked board reaches fallback too — on a
+/// two-node rig the surviving scanner sits in fallback with its only
+/// neighbour's address excluded, so no candidate ever opens a window
+/// and nothing is dialled. `BLE_SCAN_FALLBACK` is still logged once
+/// per phase, not once per pass: the `announced` flag only clears at
+/// [`note_phase_event`], and a board in that state has no connection
+/// events to reset it.
+fn scan_mode_now() -> ScanMode {
+    // One lock for the read-check-mark sequence: a reset racing in
+    // between two separate locks would be overwritten with the stale
+    // phase. The log line itself stays outside the critical section.
+    let now_ms = Instant::now().as_millis();
+    let poll = FALLBACK_CLOCK.lock(|clock| {
+        let mut phase = clock.get();
+        let poll = phase.poll(now_ms);
+        clock.set(phase);
+        poll
+    });
+    if let Some(elapsed_ms) = poll.announce_ms {
+        // The phase reached fallback: a new phase starts with nobody
+        // seen, so each peer may restart the clock once more (#504).
+        PHASE_NEIGHBOURS.lock(|seen| seen.borrow_mut().clear());
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!("BLE_SCAN_FALLBACK after_ms={elapsed_ms}"),
+        );
+    }
+    poll.mode
+}
+
+// The dead-end table's TTL and size, `DEAD_END_TTL_MS` (120 s) and
+// `DEAD_END_SLOTS` (8), and the table itself, `DeadEnds`, live in
+// `leviculum_ble_tx::admission` since #496, with the clock a parameter.
+// The size is `2 * MAX_LINKS` by derivation; this keeps the two equal.
+const _: () = assert!(DEAD_END_SLOTS == 2 * MAX_LINKS);
+
+/// The one dead-end table, shared by both roles (#376). It used to be a
+/// local of [`central_task`], which only the dialler could write; a
+/// duplicate refusal happens in EITHER role — the phone may dial us
+/// just as readily as we dial it — and the address to back off is the
+/// same address the scanner would otherwise re-offer within seconds.
+/// A blocking mutex over a `RefCell`, like [`LIVE_PEERS`], because the
+/// scan callback reads it from the central task while a peripheral
+/// session writes it.
+static DEAD_ENDS: BlockingMutex<CriticalSectionRawMutex, RefCell<DeadEnds>> =
+    BlockingMutex::new(RefCell::new(DeadEnds::new()));
+
+/// Condemn an address for [`DEAD_END_TTL_MS`] and say why on one line.
+///
+/// After a duplicate refusal (`reason=dup_refused`) this is what stops
+/// the board re-dialling the same rotated address every scan pass: the
+/// refusal itself is cheap, but it costs a connect, a discovery and an
+/// identity read each time. The peer's NEXT rotation is dialled once
+/// more — the identity behind an advertisement is unknowable before
+/// connecting, so that residual dial is inherent — and bounded by this
+/// TTL against the rotation interval.
+fn note_dead_end(addr: u64, reason: &str) {
+    let now_ms = Instant::now().as_millis();
+    DEAD_ENDS.lock(|table| table.borrow_mut().note(addr, now_ms));
+    crate::log::log_fmt(
+        "[BLE ] ",
+        format_args!(
+            "BLE_DIAL_DEAD_END addr={addr:012x} reason={reason} ttl_s={}",
+            DEAD_END_TTL_MS / 1_000
+        ),
+    );
+}
+
+/// What the board remembers about the dials it has already paid for
+/// (#412 part 2), keyed by IDENTITY where [`DEAD_ENDS`] is keyed by
+/// address.
+///
+/// The two are not alternatives and neither replaces the other. The
+/// address table stops the board re-dialling ONE address for
+/// [`DEAD_END_TTL_MS`]; a Columba was seen under five addresses in four
+/// minutes, so for exactly the peer #412 is about every entry is a
+/// first offence forever. This table survives the rotation, and what it
+/// decides is not a candidate but a CLASS: while a run of wasted dials
+/// to one identity stands, the board spends no FALLBACK dial at all and
+/// leaves its one outgoing slot free rather than buying another refusal
+/// with it. A strict verdict is never held — the address sort is #375's
+/// guarantee and this table has no business in it.
+///
+/// The rule itself is [`leviculum_ble_tx::DialLedger`], measured on
+/// `ble-tx/tests/graph_formation.rs`; this is only its board-global
+/// instance. A `Cell`, not a `RefCell`, because [`DialLedger`] is
+/// `Copy` and the whole table is 8 × 28 bytes; locked like
+/// [`FALLBACK_CLOCK`], because a peripheral session writes it while the
+/// central task's scan callback reads it.
+static DIAL_LEDGER: BlockingMutex<CriticalSectionRawMutex, Cell<DialLedger>> =
+    BlockingMutex::new(Cell::new(DialLedger::new()));
+
+/// The policy [`DIAL_LEDGER`] runs, and the A/B switch for it.
+///
+/// [`LedgerPolicy::MEASURED`] is the default and the one every table in
+/// `graph_formation` is measured at. The `ble-dial-ledger-off` feature
+/// compiles [`LedgerPolicy::OFF`] in instead, which records nothing and
+/// holds nothing — bit-identical to a board with no ledger, not merely
+/// equal in aggregate — so the rig can run the same image twice and
+/// attribute a difference to this feature and nothing else.
+#[cfg(not(feature = "ble-dial-ledger-off"))]
+const LEDGER_POLICY: LedgerPolicy = LedgerPolicy::MEASURED;
+#[cfg(feature = "ble-dial-ledger-off")]
+const LEDGER_POLICY: LedgerPolicy = LedgerPolicy::OFF;
+
+/// The `held_until_ms` of the last pause a suppressed dial was logged
+/// for, so the `BLE_DIAL_LEDGER held` line is emitted once per PAUSE and
+/// not once per advertising report.
+///
+/// The rate limit is keyed by the deadline rather than by a timer,
+/// because the thing being reported is the pause itself: a board with
+/// nothing but fallback candidates re-enters the scan callback several
+/// times a second and would otherwise flood the debug CDC exactly as
+/// the `[DROP]` storm #346 budgets against. Keying by the deadline also
+/// means a RE-armed pause (a new deadline) gets its own line, which is
+/// the event a capture needs to see.
+static HELD_LOGGED_FOR: BlockingMutex<CriticalSectionRawMutex, Cell<Option<u64>>> =
+    BlockingMutex::new(Cell::new(None));
+
+/// Record one dial outcome against the identity the dial reached, and
+/// say on one line when it armed the pause.
+///
+/// `session_ms` is `None` for a dial refused post-connect — no session
+/// existed — and `Some(ms)` for one whose link has ended. A link still
+/// standing has no outcome and must not be recorded.
+///
+/// Only the ARMING is logged, not every note: a wasted dial already
+/// leaves its own line (`BLE_LINK_DUP … action=refuse`,
+/// `BLE_CENTRAL_DOWN`), and the one thing those lines cannot say is
+/// that the run has now closed the fallback class.
+fn note_dial_outcome(peer_id: &[u8; 16], session_ms: Option<u64>, reason: &str) {
+    let now_ms = Instant::now().as_millis();
+    let noted = DIAL_LEDGER.lock(|cell| {
+        let mut ledger = cell.get();
+        let noted = ledger.note(LEDGER_POLICY, peer_id, session_ms, now_ms);
+        cell.set(ledger);
+        noted
+    });
+    if noted.armed {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!(
+                "BLE_DIAL_LEDGER armed identity={:02x}{:02x}{:02x}{:02x} run={} reason={} \
+                 session_ms={} pause_ms={}",
+                peer_id[0],
+                peer_id[1],
+                peer_id[2],
+                peer_id[3],
+                noted.run,
+                reason,
+                SessionLen(session_ms),
+                LEDGER_POLICY.pause_ms,
+            ),
+        );
+    }
+}
+
+/// Say that a FALLBACK dial is held right now, once per pause (see
+/// [`HELD_LOGGED_FOR`]). Called from the scan callback when
+/// [`admit`] named the dial ledger ([`Exclusion::LedgerHeld`]) as the
+/// filter that decided.
+fn log_dial_held(until_ms: u64, now_ms: u64) {
+    let fresh = HELD_LOGGED_FOR.lock(|cell| {
+        if cell.get() == Some(until_ms) {
+            return false;
+        }
+        cell.set(Some(until_ms));
+        true
+    });
+    if fresh {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!(
+                "BLE_DIAL_LEDGER held run={} until_ms={} now_ms={}",
+                LEDGER_POLICY.wasted_run, until_ms, now_ms
+            ),
+        );
+    }
+}
+
+/// What the board remembers about the peers that keep LEAVING (#417),
+/// keyed by IDENTITY like [`DIAL_LEDGER`] and fed by the opposite
+/// outcome: sessions the dial ledger rightly calls useful — the phone
+/// stays linked until its next rotation — whose identity then departs,
+/// again and again. A run of departures inside one window closes the
+/// ROTATING half of the fallback class for a cooldown: strict verdicts
+/// and fixed-addressed fallback candidates stay dialable, which is the
+/// scope the #417 design table chose (holding the whole class forfeits
+/// the board-to-board links the penalty wins back; `graph_formation`).
+///
+/// The rule is [`leviculum_ble_tx::ChurnLedger`]; this is its
+/// board-global instance, locked like [`DIAL_LEDGER`] and for the same
+/// reason: both session roles write it (a departure is a departure
+/// whoever paid for the dial) while the central task's scan callback
+/// reads it.
+static CHURN_LEDGER: BlockingMutex<CriticalSectionRawMutex, Cell<ChurnLedger>> =
+    BlockingMutex::new(Cell::new(ChurnLedger::new()));
+
+/// The policy [`CHURN_LEDGER`] runs, and the A/B switch for it — the
+/// same shape as [`LEDGER_POLICY`]'s: the `ble-churn-penalty-off`
+/// feature compiles [`ChurnPolicy::OFF`] in instead, which records
+/// nothing and holds nothing.
+#[cfg(not(feature = "ble-churn-penalty-off"))]
+const CHURN_POLICY: ChurnPolicy = ChurnPolicy::MEASURED;
+#[cfg(feature = "ble-churn-penalty-off")]
+const CHURN_POLICY: ChurnPolicy = ChurnPolicy::OFF;
+
+/// The `held_until_ms` of the last cooldown a suppressed dial was
+/// logged for — [`HELD_LOGGED_FOR`]'s twin, one line per cooldown
+/// rather than one per advertising report, and a re-armed cooldown (a
+/// new deadline) gets its own line.
+static CHURN_HELD_LOGGED_FOR: BlockingMutex<CriticalSectionRawMutex, Cell<Option<u64>>> =
+    BlockingMutex::new(Cell::new(None));
+
+/// Record one DEPARTURE of a rotating-addressed peer (#417): the
+/// identity behind `peer` ended a session by its own leaving —
+/// silence until the expiry swept the link, or a replacement by its
+/// next connection. A fixed-addressed session's end is not recorded
+/// (the class filter is `ChurnLedger::note_departure`, called from here
+/// alone, and reads the address type, #506): a flaky board must never
+/// arm a cooldown that every phone in the room then pays for.
+///
+/// Only the ARMING is logged — the departure itself already has its
+/// line (`BLE_LINK_EXPIRE`, `BLE_LINK_REPLACED`), and the one thing
+/// those lines cannot say is that the run has now closed the class.
+fn note_peer_leave(peer_id: &[u8; 16], peer: PeerAddr, reason: &str) {
+    let now_ms = Instant::now().as_millis();
+    // The class by the address type the link was made with (#506): the
+    // top bits alone armed a cooldown for #504's public address.
+    let noted = CHURN_LEDGER.lock(|cell| {
+        let mut ledger = cell.get();
+        let noted = ledger.note_departure(CHURN_POLICY, peer, peer_id, now_ms);
+        cell.set(ledger);
+        noted
+    });
+    let Some(noted) = noted else {
+        return;
+    };
+    if noted.armed {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!(
+                "BLE_CHURN_LEDGER armed identity={:02x}{:02x}{:02x}{:02x} run={} reason={} \
+                 window_ms={} cooldown_ms={}",
+                peer_id[0],
+                peer_id[1],
+                peer_id[2],
+                peer_id[3],
+                noted.run,
+                reason,
+                CHURN_POLICY.window_ms,
+                CHURN_POLICY.cooldown_ms,
+            ),
+        );
+    }
+}
+
+/// Say that a FALLBACK dial to a ROTATING-addressed candidate is held
+/// right now (#417), once per cooldown. Called from the scan callback
+/// when [`admit`] named the churn ledger ([`Exclusion::ChurnHeld`]) as
+/// the filter that decided.
+fn log_churn_held(until_ms: u64, now_ms: u64) {
+    let fresh = CHURN_HELD_LOGGED_FOR.lock(|cell| {
+        if cell.get() == Some(until_ms) {
+            return false;
+        }
+        cell.set(Some(until_ms));
+        true
+    });
+    if fresh {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!(
+                "BLE_CHURN_LEDGER held run={} until_ms={} now_ms={}",
+                CHURN_POLICY.leave_run, until_ms, now_ms
+            ),
+        );
+    }
+}
+
+/// A dial outcome's session length as the `BLE_DIAL_LEDGER` line prints
+/// it: the milliseconds, or `refused` when there was no session at all.
+///
+/// Its own token rather than a zero, for the same reason [`FreeSlots`]
+/// has one: a zero-length session and a refusal are different outcomes
+/// — the threshold judges the first and cannot judge the second — and a
+/// capture must not have to guess which one a `0` meant.
+struct SessionLen(Option<u64>);
+
+impl core::fmt::Display for SessionLen {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(ms) => write!(f, "{ms}"),
+            None => f.write_str("refused"),
+        }
+    }
+}
+
+/// A peer's advertised free-slot count as the `BLE_SCAN_DECISION` line
+/// prints it: the number, or `unknown` when the peer said nothing.
+///
+/// Its own token rather than a sentinel number, because every number
+/// in that position is also a real answer and a capture must not have
+/// to know which one means "no answer".
+struct FreeSlots(Option<u8>);
+
+impl core::fmt::Display for FreeSlots {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(free) => write!(f, "{free}"),
+            None => f.write_str("unknown"),
+        }
+    }
+}
+
+/// A peer's advertised identity hint as the `BLE_SCAN_DECISION` line
+/// prints it (#412): the four bytes in hex, or `unknown` when the peer
+/// carried none.
+///
+/// Its own token rather than `00000000`, for the same reason
+/// [`FreeSlots`] has one: silence and a real answer must not print the
+/// same, or a capture cannot tell why a dial was or was not skipped.
+struct IdentityHint(Option<[u8; IDENTITY_HINT_LEN]>);
+
+impl core::fmt::Display for IdentityHint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(h) => write!(f, "{:02x}{:02x}{:02x}{:02x}", h[0], h[1], h[2], h[3]),
+            None => f.write_str("unknown"),
+        }
+    }
+}
+
+/// Scan until one advertisement wins an initiate decision, keep
+/// collecting further eligible advertisers for one bounded window
+/// ([`SCAN_WINDOW_COLLECT_MS`]), then return the best candidate — the
+/// peer that cannot dial us first (#412 part 1), then the rest of what
+/// the rule permitted, then fallback verdicts; the emptiest advertiser
+/// first inside each, ties broken by the lowest address except among
+/// peers that redraw theirs (#412) — plus the rule that permitted it (the caller resets the fallback
+/// clock on a strict verdict, #375) and the window's `seen` count for
+/// the `BLE_SCAN_WINDOW` log line.
+///
+/// Dialling the FIRST eligible advertiser instead is what enabled the
+/// saturated-cycle lock (`graph_formation.rs`: 48/1000 disconnected
+/// orders at 20 boards; the window's choice gives 0). The choice
+/// itself lives in [`CandidateTable`], the same pure structure the
+/// simulation and lnsd use, so the three cannot drift.
+///
+/// Every connectable PDU carrying the Reticulum service UUID gets a
+/// [`leviculum_ble_tx::should_initiate`] verdict from the v2.2 sort + v0.3.0 override
+/// (the rule lives host-tested in [`leviculum_ble_tx::peer`]), under
+/// the [`ScanMode`] the fallback clock has reached at that report; the
+/// verdict is logged once per (address, rule) change rather than per
+/// PDU, because a waiting peer re-advertises several times a second.
+async fn find_peer_to_initiate(
+    sd: &'static Softdevice,
+    own_addr_value: u64,
+) -> Result<Option<(Address, ConnectDecision, usize)>, central::ScanError> {
+    let config = central::ScanConfig {
+        active: false,
+        extended: false,
+        interval: SCAN_INTERVAL_625US,
+        window: SCAN_WINDOW_625US,
+        ..central::ScanConfig::default()
+    };
+    let window: RefCell<CandidateTable<Address, WINDOW_CANDIDATES>> =
+        RefCell::new(CandidateTable::new());
+    let last_logged: Cell<Option<(u64, ConnectDecision)>> = Cell::new(None);
+    // One advertising report's whole pipeline — parse, decide, log,
+    // filter, collect — shared verbatim by both scan phases below;
+    // `true` iff the report put a candidate into the window.
+    let consider = |report: &nrf_softdevice::raw::ble_gap_evt_adv_report_t| -> bool {
+        // Only PDUs we could act on: connectable advertising, not scan
+        // responses (passive scanning yields none, but the filter makes
+        // the assumption explicit rather than inherited).
+        if report.type_.connectable() == 0 || report.type_.scan_response() != 0 {
+            return false;
+        }
+        // SAFETY: the SoftDevice hands us this report synchronously;
+        // p_data/len describe its advertising-data buffer, valid for
+        // the duration of the callback.
+        let data =
+            unsafe { core::slice::from_raw_parts(report.data.p_data, report.data.len as usize) };
+        let parsed = parse_peer_advertisement(data, &RETICULUM_SVC_UUID_LE);
+        if !parsed.offers_service {
+            return false;
+        }
+        let peer = Address::from_raw(report.peer_addr);
+        // The address type travels with the address (#496): the report
+        // carries it, and filter six reads it (#504), so a public
+        // address is never held as a rotating one.
+        let adv = AdvReport {
+            addr: PeerAddr::from_raw(&peer.bytes(), report.peer_addr.addr_type()),
+            caps: parsed.caps,
+            identity_hint: parsed.identity_hint,
+        };
+        let peer_value = adv.addr.value;
+        let mode = scan_mode_now();
+        let now_ms = Instant::now().as_millis();
+        // The verdict and the six filters, host-tested in
+        // `leviculum_ble_tx::admission`; this is the locks around the
+        // board's single instances. The ledgers are `Copy` and are read
+        // out first, so the nested section holds two tables, not four.
+        let dial = DIAL_LEDGER.lock(Cell::get);
+        let churn = CHURN_LEDGER.lock(Cell::get);
+        let admission = LIVE_PEERS.lock(|peers| {
+            DEAD_ENDS.lock(|dead| {
+                admit(
+                    Local {
+                        caps: LOCAL_CAPS,
+                        addr: own_addr_value,
+                    },
+                    &adv,
+                    mode,
+                    &peers.borrow(),
+                    &dead.borrow(),
+                    Ledgers {
+                        dial: &dial,
+                        churn: &churn,
+                    },
+                    now_ms,
+                )
+            })
+        });
+        let decision = admission.decision;
+        let free_slots = parsed.free_slots();
+        if last_logged.get() != Some((peer_value, decision)) {
+            last_logged.set(Some((peer_value, decision)));
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!(
+                    // caps only means something when caps_record=1;
+                    // caps_record=0 is a v2.2 peer with no readable
+                    // v0.3.0 record — distinct from an explicit
+                    // dual-role record advertising caps=0x00.
+                    //
+                    // free_slots is the DECODED count (#375 item 3), so
+                    // a capture shows what the choice below saw and not
+                    // just the raw byte. `unknown` is its own token, not
+                    // a zero: a peer that said nothing about its slots
+                    // is ranked as if it had them all free, and reading
+                    // that as "0 free" in a capture would invert the
+                    // conclusion drawn from it.
+                    // hint is the DECODED identity hint (#412), the
+                    // same four bytes every other line prints as
+                    // `peer=`, so a capture can read "this dial was
+                    // skipped because we already hold that peer"
+                    // straight off. `unknown` is its own token for the
+                    // same reason free_slots has one: a peer that said
+                    // nothing about who it is is not a peer named
+                    // 00000000.
+                    //
+                    // pref is the window's FIRST ordering term (#412
+                    // part 1), a pure function of this one
+                    // advertisement, so it can be printed here rather
+                    // than only at the window's close: `cannot_dial_us`
+                    // is the peer whose record says it can never
+                    // initiate, and a capture showing one of those
+                    // losing a window to a `permitted` peer is the
+                    // preference NOT firing. `rule=` next to it stays
+                    // the verdict that made the peer eligible at all —
+                    // the two answer different questions and a capture
+                    // needs both.
+                    "BLE_SCAN_DECISION addr={:012x} caps_record={} caps={:#04x} free_slots={} \
+                     hint={} rule={} pref={} initiate={}",
+                    peer_value,
+                    u8::from(parsed.caps.is_some()),
+                    parsed.caps.unwrap_or(0),
+                    FreeSlots(free_slots),
+                    IdentityHint(parsed.identity_hint),
+                    decision.as_str(),
+                    dial_preference(decision, free_slots).as_str(),
+                    u8::from(decision.initiate()),
+                ),
+            );
+        }
+        // The six filters, in `admit`'s order: the verdict, the dead
+        // ends, the §4.5 exclusion by address (a dial to an address we
+        // already hold a connection with can only time out, see
+        // `PeerRegistry::addr_linked`), the same exclusion by IDENTITY hint
+        // (#412: the peer that rotated its address is the one the
+        // address filter structurally cannot see, and on a board with
+        // one central slot that dial is the whole outgoing capacity),
+        // the dial ledger (#412 part 2: not a property of this
+        // candidate but of what the board's last dials bought, so it
+        // only ever closes the FALLBACK class), and the churn ledger
+        // (#417, one class narrower: only the fallback candidates whose
+        // ADDRESS ROTATES, so a board re-linking to a board through a
+        // fallback dial never pays it — `graph_formation` measures why).
+        // A window that holds nothing but held fallback verdicts opens
+        // no candidate and the outgoing slot stays free, which is the
+        // whole point: in the solo window there is no better peer to
+        // send it to. The two ledger filters say so once per hold.
+        match admission.outcome {
+            Ok(()) => {}
+            Err(Exclusion::LedgerHeld { until_ms }) => {
+                log_dial_held(until_ms, now_ms);
+                return false;
+            }
+            Err(Exclusion::ChurnHeld { until_ms }) => {
+                log_churn_held(until_ms, now_ms);
+                return false;
+            }
+            Err(
+                Exclusion::NotInitiate
+                | Exclusion::DeadEnd
+                | Exclusion::AddrLinked
+                | Exclusion::HintLinked,
+            ) => return false,
+        }
+        window
+            .borrow_mut()
+            // The report's type ranks a public address with the fixed
+            // ones (#506; the guess put #504's behind every board).
+            .offer(
+                peer_value,
+                Some(adv.addr.addr_type),
+                decision,
+                free_slots,
+                peer,
+            )
+    };
+    // Phase 1: scan until the first eligible candidate opens the
+    // window. A strict pass that never finds one never ends — that is
+    // the searching state the fallback clock measures.
+    central::scan(sd, &config, |report| consider(report).then_some(())).await?;
+    // Phase 2: keep scanning for the window bound, collecting into the
+    // table; the callback accepts nothing, so this scan can only end
+    // in an error — the timer closing the window is the normal path.
+    let collect = central::scan(sd, &config, |report| {
+        consider(report);
+        None::<()>
+    });
+    match select(collect, Timer::after_millis(SCAN_WINDOW_COLLECT_MS)).await {
+        Either::First(Err(err)) => return Err(err),
+        Either::First(Ok(())) | Either::Second(()) => {}
+    }
+    let window = window.into_inner();
+    let seen = window.seen();
+    Ok(window
+        .into_best()
+        .map(|(_, decision, peer)| (peer, decision, seen)))
+}
+
+/// One central link, connect to teardown. Returns after logging why it
+/// ended; the caller paces the next attempt. `decision` is the verdict
+/// that permitted the dial: a FALLBACK target that does not even
+/// connect goes into the dead-end table (#375 §0 — before that entry
+/// existed, the 5 s retry backoff re-dialled the same dead address
+/// every ~20 s forever), while a failed strict dial keeps only the
+/// short backoff, because the sort will keep electing that peer and a
+/// two-minute hole toward it would cost real links.
+async fn central_link(
+    sd: &'static Softdevice,
+    own_identity: &[u8; 16],
+    peer: Address,
+    decision: ConnectDecision,
+) {
+    // The address with the type the SoftDevice reports for it, which
+    // the churn arming reads when this link ends (#506).
+    let typed_peer = peer_addr(&peer);
+    let peer_value = typed_peer.value;
+    let whitelist = [&peer];
+    let config = central::ConnectConfig {
+        scan_config: central::ScanConfig {
+            whitelist: Some(&whitelist),
+            active: false,
+            extended: false,
+            interval: SCAN_INTERVAL_625US,
+            window: SCAN_WINDOW_625US,
+            timeout: CONNECT_TIMEOUT_10MS,
+            ..central::ScanConfig::default()
+        },
+        ..central::ConnectConfig::default()
+    };
+    let conn = match central::connect(sd, &config).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!("BLE_CENTRAL_FAIL addr={peer_value:012x} stage=connect err={err:?}"),
+            );
+            if connect_failure_condemns(decision) {
+                note_dead_end(peer_value, "fallback_connect");
+            }
+            return;
+        }
+    };
+    log_conn_params(
+        &conn,
+        conn.handle().unwrap_or(u16::MAX),
+        LinkRole::Central,
+        LinkPhase::Open,
+    );
+
+    // v2.2 §Connection Phase, in the spec's order: service discovery
+    // (3), read the Identity characteristic (4) — with the checks the
+    // registry exists for — then subscribe (5) and handshake (6).
+    let client: ReticulumClient = match gatt_client::discover(&conn).await {
+        Ok(client) => client,
+        Err(err) => {
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!("BLE_CENTRAL_FAIL addr={peer_value:012x} stage=discover err={err:?}"),
+            );
+            let _ = conn.disconnect();
+            return;
+        }
+    };
+    let peer_id = match client.identity_read().await {
+        Ok(id) => id,
+        Err(err) => {
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!("BLE_CENTRAL_FAIL addr={peer_value:012x} stage=identity err={err:?}"),
+            );
+            let _ = conn.disconnect();
+            return;
+        }
+    };
+    // Null-hypothesis check first: an unexpected identity may be us
+    // from a different angle. The scanner never sees our own PDUs, but
+    // a peer could mirror our identity back through a bug, and "linked
+    // to myself" must be a loud log line, not a quiet link.
+    if peer_id == *own_identity {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!("BLE_LINK_SELF addr={peer_value:012x} action=disconnect"),
+        );
+        note_dead_end(peer_value, "self_link");
+        let _ = conn.disconnect();
+        return;
+    }
+    // An identity we already hold is decided by [`peer_link_up`] below,
+    // once the slot exists: this dial wins only over a link the peer
+    // has abandoned, or one the peer's own arbitration gives up; a live
+    // link the peer still keeps refuses the dial, BEFORE we handshake,
+    // so the peer never even sees a duplicate (#360 round 2). A link
+    // that has really stopped answering entirely is still the expiry's
+    // business ([`link_silent`]).
+
+    // From here the link is real: register it exactly as the peripheral
+    // side does — a drain-table claim (whose index is the link identity
+    // for the fan-out) plus the identity registry entry. The claimed
+    // drain slot never signals on this link (a GATT client sends
+    // write-commands, not notifications, so no HVN edges arise), but
+    // holding it is what makes "claimed slot" mean "live link".
+    let Some(conn_handle) = conn.handle() else {
+        crate::warn!("BLE: central connection without a handle, dropping it");
+        return;
+    };
+    let Some((slot_index, _drain)) = HVN_DRAIN.claim_indexed(conn_handle) else {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!(
+                "BLE_DRAIN_TABLE_FULL conn={} slots={}",
+                conn_handle,
+                HVN_DRAIN.capacity()
+            ),
+        );
+        let _ = conn.disconnect();
+        return;
+    };
+    // This link's outbound queue; stale packets are the previous
+    // tenant's, drained BEFORE the registry entry so a displacement's
+    // moved packets (#376) land in a clean queue instead of being
+    // thrown away with the leftovers.
+    let outgoing_rx = super::link_out(slot_index).receiver();
+    while outgoing_rx.try_receive().is_ok() {}
+    // #388 census: queue drained, custody starts at zero.
+    super::session_held_reset(slot_index);
+    conn_link_up(slot_index, typed_peer);
+    if !peer_link_up(
+        slot_index,
+        conn_handle,
+        typed_peer,
+        peer_id,
+        Origin::Outgoing,
+        conn.att_mtu(),
+    ) {
+        // Refused (#376): this identity's existing link keeps the
+        // peer. Nothing was registered, so the teardown is
+        // silent — release what this dial did claim and back the
+        // address off, or the scanner re-offers it within seconds.
+        // This is the outcome the ledger was built for (#412 part 2):
+        // a connect, a discovery and an identity read paid in full to
+        // be told the identity was already live. Wasted at every
+        // threshold, because there is no session to measure.
+        note_dead_end(peer_value, "dup_refused");
+        note_dial_outcome(&peer_id, None, "dup_refused_outgoing");
+        let _ = conn.disconnect();
+        conn_link_down(slot_index);
+        HVN_DRAIN.release(conn_handle);
+        return;
+    }
+
+    // The session clock the ledger judges this dial by. Started where
+    // the link becomes real — the registry accepted it — rather than at
+    // `central::connect`, because the connect, the discovery and the
+    // identity read are the dial's PRICE and what the ledger measures
+    // is what the dial BOUGHT.
+    let session_from = Instant::now();
+
+    run_central_session(
+        &conn,
+        &client,
+        own_identity,
+        peer_id,
+        slot_index,
+        conn_handle,
+        typed_peer,
+    )
+    .await;
+
+    // This dial's outcome, against the identity it turned out to have
+    // (#412 part 2). Only the CENTRAL teardown feeds the ledger: an
+    // incoming session is a dial the peer paid for, and its length says
+    // nothing about the price of ours. A session that reached
+    // `useful_session_ms` clears the identity's run — the table
+    // remembers a run of waste, never a total.
+    let session_ms = session_from.elapsed().as_millis();
+    note_dial_outcome(&peer_id, Some(session_ms), "session_end");
+
+    crate::log::log_fmt(
+        "[BLE ] ",
+        format_args!(
+            "BLE_CENTRAL_DOWN peer={:02x}{:02x}{:02x}{:02x} slot={} session_ms={}",
+            peer_id[0], peer_id[1], peer_id[2], peer_id[3], slot_index, session_ms
+        ),
+    );
+    peer_link_down(slot_index);
+    conn_link_down(slot_index);
+    super::defrag_held_set(slot_index, 0);
+    super::session_held_reset(slot_index);
+    HVN_DRAIN.release(conn_handle);
+}
+
+/// Subscribe, handshake, then pump both directions until either side
+/// ends the link. The mirror of [`gatt_events`], with the roles
+/// swapped: inbound is the peer's TX notifications, outbound writes the
+/// peer's RX characteristic.
+async fn run_central_session(
+    conn: &Connection,
+    client: &ReticulumClient,
+    own_identity: &[u8; 16],
+    peer_id: [u8; 16],
+    slot_index: usize,
+    conn_handle: u16,
+    peer: PeerAddr,
+) {
+    let peer_value = peer.value;
+    // Subscribe to the peer's TX before announcing ourselves, so
+    // nothing the peer sends in response to the handshake can fall into
+    // an unsubscribed gap (v2.2 §Connection Phase steps 5 and 6).
+    if let Err(err) = client.tx_cccd_write(true).await {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!("BLE_CENTRAL_FAIL addr={peer_value:012x} stage=subscribe err={err:?}"),
+        );
+        let _ = conn.disconnect();
+        return;
+    }
+    // The identity handshake: our 16-byte identity hash as the first
+    // write, which is how the peripheral — who never scans — learns who
+    // connected (v2.2 §Identity Handshake Protocol). Written WITH
+    // response: the confirmation is the one signal the session may
+    // start.
+    let Some(handshake) = GattData::new(own_identity) else {
+        // Unreachable (16 <= GATT_VALUE_MAX), but a truncated handshake
+        // must not go on the air as a valid-looking write.
+        return;
+    };
+    if let Err(err) = client.rx_write(&handshake).await {
+        crate::log::log_fmt(
+            "[BLE ] ",
+            format_args!("BLE_CENTRAL_FAIL addr={peer_value:012x} stage=handshake err={err:?}"),
+        );
+        let _ = conn.disconnect();
+        return;
+    }
+    crate::log::log_fmt(
+        "[BLE ] ",
+        format_args!(
+            "BLE_CENTRAL_UP peer={:02x}{:02x}{:02x}{:02x} slot={} att_mtu={}",
+            peer_id[0],
+            peer_id[1],
+            peer_id[2],
+            peer_id[3],
+            slot_index,
+            conn.att_mtu(),
+        ),
+    );
+
+    let incoming_tx = BLE_INCOMING.sender();
+    let defrag: Cell<BleDefragmenter> = Cell::new(BleDefragmenter::new());
+    let last_keepalive: Cell<Instant> = Cell::new(Instant::now());
+
+    // This link's outbound queue. Already drained of the previous
+    // tenant's leftovers by [`central_link`], before the registry
+    // entry — see there (#376).
+    let outgoing_rx = super::link_out(slot_index).receiver();
+
+    // Inbound: the peer's TX notifications. We read the peer's identity
+    // from its characteristic, so a 16-byte first frame is NOT a
+    // handshake here — per v2.2 §Identity Handshake ("only 16-byte
+    // packets without an existing identity are treated as handshakes")
+    // everything that is not a keepalive is fragment traffic.
+    let inbound = gatt_client::run(conn, client, |event| {
+        let ReticulumClientEvent::TxNotification(data) = event;
+        // Same defect class as the server side's oversize write
+        // (#387): the generated `on_hvx` feeds `from_gatt` whatever
+        // the peer notified, and the vendored conversion panicked on
+        // anything past the bound. Dropped whole, logged, counted.
+        if data.oversize() {
+            BLE_GATT_OVERSIZE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!(
+                    "{}",
+                    OversizeLine {
+                        from: OversizeFrom::Notify,
+                        conn: conn_handle,
+                        len: data.wire_len(),
+                        max: GATT_VALUE_MAX,
+                    }
+                ),
+            );
+            return;
+        }
+        let data = data.as_slice();
+        if data.len() < FRAGMENT_HEADER_SIZE {
+            // The peer's 1-byte keepalive: nothing to defragment, but
+            // it is evidence the peer is still there, which is what the
+            // expiry reads (#382). Liveness only — the duplicate rule
+            // reads the payload clock (#360).
+            note_heard(slot_index);
+            return;
+        }
+        // Real payload: liveness AND the active-use evidence the
+        // duplicate rule consults (#360).
+        note_data(slot_index);
+        let now = Instant::now().as_millis();
+        let mut d = defrag.replace(BleDefragmenter::new());
+        let result = process_logged(&mut d, data, now, slot_index);
+        let frags = d.last_completed_fragments();
+        defrag.set(d);
+        match result {
+            DefragResult::Complete(packet) => {
+                // conn= and frags= as on the peripheral side (#376):
+                // whether a Columba peer that showed "MTU 20 bytes"
+                // really sends 20-byte pieces although our central
+                // negotiated a large att_mtu is exactly this number.
+                crate::info!(
+                    "BLE: RX {}B conn={} frags={}",
+                    packet.len(),
+                    conn_handle,
+                    frags
+                );
+                let bytes = packet.capacity();
+                let len = packet.len();
+                if incoming_tx.try_send((Some(peer_id), packet)).is_ok() {
+                    // #388 census, as on the peripheral side.
+                    super::incoming_held_add(bytes);
+                    crate::iface_bytes::note_rx(crate::iface_bytes::BLE, len);
+                }
+            }
+            DefragResult::NeedMore | DefragResult::Error => {}
+        }
+    });
+
+    // Outbound: fragments as write-without-response. Queue-full
+    // flow control lives in `gatt_client::write_without_response`
+    // itself — it re-offers after BLE_GATTC_EVT_WRITE_CMD_TX_COMPLETE —
+    // so unlike the notify path no drain machinery is needed; every
+    // remaining error is fatal for the link.
+    let outbound = async {
+        // This connection's inter-packet gap state (#376); dies with the
+        // link, so a reconnect starts unpaced.
+        let mut tx_gap = TxGap::new();
+        loop {
+            let keepalive_deadline =
+                Timer::at(last_keepalive.get() + Duration::from_millis(KEEPALIVE_INTERVAL_MS));
+            match select(outgoing_rx.receive(), keepalive_deadline).await {
+                Either::First(packet) => {
+                    // #388 census, as on the peripheral pump.
+                    let held_bytes = packet.capacity();
+                    serve_tx_gap(&tx_gap, conn.handle().unwrap_or(u16::MAX)).await;
+                    let fragments = ble_framing::fragment_packet(&packet, ble_framing::DEFAULT_MTU);
+                    let mut sent = 0usize;
+                    let mut torn = false;
+                    for (index, fragment) in fragments.iter().enumerate() {
+                        let Some(value) = GattData::new(fragment.as_slice()) else {
+                            // Unreachable: DEFAULT_MTU fragments are
+                            // narrower than the characteristic's
+                            // GATT_VALUE_MAX.
+                            // Reported all the same — this used to be a
+                            // bare `return`, i.e. exactly the silent
+                            // mid-packet loss #373 hunts.
+                            let dropped = BLE_TX_DROPPED
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                                + 1;
+                            crate::log::log_fmt(
+                                "[BLE ] ",
+                                format_args!(
+                                    "BLE_TX_DROP kind=packet len={} frag={} of={} sent={} reason=oversize code=0 conn={} dropped={}",
+                                    packet.len(),
+                                    index,
+                                    fragments.len(),
+                                    sent,
+                                    conn.handle().unwrap_or(u16::MAX),
+                                    dropped,
+                                ),
+                            );
+                            torn = true;
+                            break;
+                        };
+                        if let Err(err) = client.rx_write_without_response(&value).await {
+                            let dropped = BLE_TX_DROPPED
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                                + 1;
+                            crate::log::log_fmt(
+                                "[BLE ] ",
+                                format_args!(
+                                    "BLE_TX_DROP kind=packet len={} frag={} of={} sent={} reason=write_cmd code=0 dropped={} err={:?}",
+                                    packet.len(),
+                                    index,
+                                    fragments.len(),
+                                    sent,
+                                    dropped,
+                                    err,
+                                ),
+                            );
+                            torn = true;
+                            break;
+                        }
+                        sent += 1;
+                    }
+                    tx_gap.packet_done(Instant::now().as_millis());
+                    super::session_held_sub(slot_index, held_bytes);
+                    // One BLE_TX_PKT per multi-fragment packet, success
+                    // and failure alike (#373) — same line, same host
+                    // test as the notify path's.
+                    if fragments.len() > 1 {
+                        crate::log::log_fmt(
+                            "[BLE ] ",
+                            format_args!(
+                                "{}",
+                                leviculum_ble_tx::TxPktLine {
+                                    conn: conn.handle().unwrap_or(u16::MAX),
+                                    len: packet.len(),
+                                    frags: fragments.len(),
+                                    sent,
+                                }
+                            ),
+                        );
+                    }
+                    if torn {
+                        // A torn head poisons the peer's reassembler
+                        // exactly as on the notify path (see
+                        // super::notify): the only in-band reset is
+                        // dropping the link. After a write error the
+                        // link is dead anyway; make it official.
+                        let _ = conn.disconnect();
+                        return;
+                    }
+                    BLE_TX_PACKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                Either::Second(()) => {
+                    // Unreachable `else` (1 <= GATT_VALUE_MAX); ending
+                    // the session is the harmless reading of it.
+                    let Some(kv) = GattData::new(&[KEEPALIVE_BYTE]) else {
+                        return;
+                    };
+                    if client.rx_write_without_response(&kv).await.is_err() {
+                        return;
+                    }
+                    last_keepalive.set(Instant::now());
+                }
+            }
+        }
+    };
+
+    // Third arm: the runtime carrier switch, as on the peripheral side —
+    // disconnect, and let [`central_link`]'s teardown report the loss
+    // through the same `peer_link_down` that range loss takes. Fourth:
+    // [`link_over`], the displacement (#376) and the expiry (#382), the
+    // same two on this side of the connection as on the other.
+    match select4(
+        inbound,
+        outbound,
+        super::carrier_off(CarrierWaiter::Session(slot_index)),
+        link_over(slot_index, conn_handle),
+    )
+    .await
+    {
+        Either4::Third(()) => {
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!("BLE_CARRIER_DROP role=central slot={}", slot_index),
+            );
+            let _ = conn.disconnect();
+        }
+        Either4::Fourth(end) => {
+            // The same departure on this side of the connection (#417):
+            // the dial ledger judges what this dial BOUGHT, the churn
+            // ledger what the peer then DID with it.
+            if matches!(end, LinkEnd::Expired(_)) {
+                note_peer_leave(&peer_id, peer, "expiry_central");
+            }
+            log_link_end("central", slot_index, conn_handle, end);
+            let _ = conn.disconnect();
+        }
+        Either4::First(_) | Either4::Second(_) => {}
+    }
+}
+
+/// The scanner/initiator task: the peripheral task's counterpart, one
+/// central link at a time (Ausbaustufe 1 — `central_role_count` is 1,
+/// and the task's sequential scan→connect→session loop is what holds
+/// that structurally).
+#[embassy_executor::task]
+async fn central_task(sd: &'static Softdevice, identity_hash: [u8; 16]) {
+    // Our own current address, as the sort compares it. Static random,
+    // set by the SoftDevice at enable; it does not rotate, so reading
+    // it once is reading it right.
+    let own = nrf_softdevice::ble::get_address(sd);
+    let own_addr_value = addr_value(&own.bytes());
+    crate::log::log_fmt(
+        "[BLE ] ",
+        format_args!("BLE_CENTRAL_ADDR addr={own_addr_value:012x} caps={LOCAL_CAPS:#04x}"),
+    );
+
+    loop {
+        // The runtime carrier gate, as at the top of the peripheral
+        // loop: `ble=off` holds the task here, so a switched-off
+        // carrier neither scans nor initiates; off→on falls through
+        // and resumes scanning.
+        if !crate::media::ble_active() {
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!("BLE_CARRIER_GATE role=central state=off"),
+            );
+            super::carrier_on(CarrierWaiter::Central).await;
+            crate::log::log_fmt(
+                "[BLE ] ",
+                format_args!("BLE_CARRIER_GATE role=central state=on"),
+            );
+        }
+        match select(
+            find_peer_to_initiate(sd, own_addr_value),
+            super::carrier_off(CarrierWaiter::Central),
+        )
+        .await
+        {
+            Either::First(Ok(Some((peer, decision, seen)))) => {
+                // A strict verdict is a permitted peer: the strict rule
+                // works here, so the fallback clock restarts (#375). A
+                // fallback verdict must NOT restart it — if this dial
+                // fails, the board is still stranded and the next pass
+                // must stay in fallback rather than wait out the bound
+                // again.
+                note_phase_event(if decision == ConnectDecision::InitiateFallback {
+                    PhaseEvent::FallbackTarget
+                } else {
+                    PhaseEvent::StrictTarget
+                });
+                // Once per window that ends in a dial: how many
+                // eligible advertisers the window held and which one
+                // the shared choice elected, under which rule.
+                crate::log::log_fmt(
+                    "[BLE ] ",
+                    format_args!(
+                        "BLE_SCAN_WINDOW seen={} chosen={:012x} rule={}",
+                        seen,
+                        addr_value(&peer.bytes()),
+                        decision.as_str(),
+                    ),
+                );
+                crate::log::log_fmt(
+                    "[BLE ] ",
+                    format_args!(
+                        "BLE_CENTRAL_CONNECT addr={:012x}",
+                        addr_value(&peer.bytes())
+                    ),
+                );
+                central_link(sd, &identity_hash, peer, decision).await;
+            }
+            // Unreachable in practice — a window only closes after its
+            // first candidate — but an empty one is a plain rescan,
+            // never a panic.
+            Either::First(Ok(None)) => continue,
+            Either::First(Err(err)) => {
+                crate::warn!("BLE: scan pass failed err={:?}", err);
+            }
+            // Carrier switched off mid-scan: dropping the scan future
+            // stops the scan. Straight back to the gate, no backoff —
+            // there is nothing to pace against while off.
+            Either::Second(()) => continue,
+        }
+        Timer::after_millis(CENTRAL_RETRY_BACKOFF_MS).await;
+    }
+}

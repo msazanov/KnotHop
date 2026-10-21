@@ -1,0 +1,3321 @@
+//! The propagation-node role on the board (Codeberg #384, part 3).
+//!
+//! The board twin of `lnpnd`'s engine: the same protocol crates —
+//! [`leviculum_lxmf::PropagationNode`] for accept/`/get`,
+//! [`leviculum_lxmf::peering`] for the peer table and sync decisions —
+//! over the record-log adapters of `leviculum-pn-store` instead of files,
+//! driven from the binaries' main loop instead of a driver tick.
+//!
+//! # How it rides the main loop
+//!
+//! Three entry points, all called from the loop that owns the node:
+//!
+//! * [`Engine::on_events`](crate::pn::Engine::on_events) — synchronous.
+//!   Reads one dispatch's
+//!   [`NodeEvent`](leviculum_core::node::NodeEvent)s, updates peer/link
+//!   state, and **queues** everything
+//!   that needs flash or stamp work as a `Work` item. Nothing here
+//!   validates a stamp or touches the async flash.
+//! * [`Engine::settle`](crate::pn::Engine::settle) — asynchronous, and the
+//!   only place the engine
+//!   awaits. Runs the due periodic jobs (announce, maintenance, sync
+//!   scheduling, stats), processes **at most one** queued work item —
+//!   and, when that item is gated by a propagation stamp, at most one
+//!   `GRIND_SLICE_ROUNDS`-round SLICE of its workblock, which is what
+//!   bounds how long the main loop is away from its channels — and
+//!   flushes the store adapters' queued writes through
+//!   [`crate::record_store::pn_execute`], one channel round trip per op.
+//!   The wire action a write gates (the `/get` response, a sync round's
+//!   conclusion) is sent only after its flush reported durable: "persist
+//!   before you prove" holds at this boundary. The client upload's packet
+//!   proof is NOT one of those actions and never was one — see §"What
+//!   those seconds cost on a fast carrier" below.
+//! * [`Engine::next_deadline_ms`](crate::pn::Engine::next_deadline_ms) — what
+//!   the loop folds into its sleep,
+//!   so queued work resumes promptly without the loop polling.
+//!
+//! # Stamp validation on this core
+//!
+//! At the default announced cost of 13, every accepted upload and every
+//! synced message walks the 1000-round PN workblock — about 41 000
+//! SHA-256 compressions, 2.62 MB hashed (concept page §2) — through the
+//! streaming validator. The engine validates **one message at a time**,
+//! a slice of its workblock per settle pass, and reports every finished
+//! validation as `PN_STAMP ms=<n> slices=<n>`. An inbound sync batch is
+//! therefore drained incrementally — between slices the main loop
+//! returns to its channels — and while one is draining, new `/offer`s
+//! are answered `ERROR_THROTTLED` exactly as the reference throttles
+//! during sequential validation
+//! (`reference/LXMF/LXMF/LXMRouter.py:2273`).
+//!
+//! That drain outlives the link it arrived on, and has to. The sender is
+//! finished the moment its resource is proven — it moves the ids to
+//! handled and tears the link down in the same block
+//! (`reference/LXMF/LXMF/LXMPeer.py:499-503`), which is what
+//! `Engine::conclude_round` does too — while the batch here still has
+//! about 3.7 s of workblock per message ahead of it. The messages are
+//! resident and decoded by then, so the close decides nothing about
+//! them: the rule is [`leviculum_sync_batch::SyncBatch::after_close`],
+//! and only the link's own bookkeeping goes with the link.
+//!
+//! ## Why a slice and not a yield (leviculum#425)
+//!
+//! Until 2026-09-24 a settle pass awaited the WHOLE workblock. The
+//! validator yields cooperatively every 64 rounds, which on a host is
+//! enough — the runtime's other tasks run — and on this board is not,
+//! because the task that has to run is this one. The LoRa task hands
+//! received frames up through a four-slot channel whose send BLOCKS
+//! (`crate::lora`), and nothing but this loop's own `select` drains it;
+//! a loop that is away for 3.7 s therefore leaves the LoRa task parked
+//! in the hand-off with no receive window standing. The 2026-09-23 night
+//! run measured it: `SX_RX_ARM site=ack dark_ms=10284`, later
+//! `dark_ms=17870`, on a board validating ten synced stamps back to
+//! back, and one client link request on the air that it never received
+//! — the role's core promise broken by the role's own work.
+//!
+//! So the workblock is parked between passes
+//! ([`leviculum_lxmf::WorkblockStream`]) instead of being awaited
+//! through. The slice is sized against one frame's airtime at the PHY
+//! the propagation cells run, in `leviculum-settle-budget`, which is
+//! also where the before and after numbers are pinned.
+//!
+//! That measurement is in: **3655-3667 ms**, four samples, one board,
+//! `ble_pn_board_upload` on 2026-09-16 (firmware `5349cecd`). The cost
+//! does not follow the announced stamp cost — the workblock is a fixed
+//! 1000 rounds (`leviculum_lxmf::constants::WORKBLOCK_EXPAND_ROUNDS_PN`)
+//! and only `min_accepted_cost() == 0` without value computation skips
+//! the walk entirely (see `Engine::validate` below). Peering stamps are
+//! unaffected: their workblock is 25 rounds, forty times cheaper, which
+//! is why board-to-board sync completes where a client upload does not.
+//!
+//! ## What those seconds cost on a fast carrier (leviculum#397)
+//!
+//! A client upload arrives as a plain link packet, and the uploader
+//! holds a packet receipt whose deadline is `max(rtt * 6, 5 ms)` —
+//! Python `reference/Reticulum/RNS/Packet.py:431`, ours
+//! `leviculum_core::constants::TRAFFIC_TIMEOUT_FACTOR` over
+//! `RAW_RECEIPT_TIMEOUT_FLOOR_MS`. Until 2026-09-25 we proved only after
+//! the record was durable — the reference's own ordering
+//! (`reference/LXMF/LXMF/LXMRouter.py:2233-2256`) — which put the whole
+//! validation inside that window. Below an RTT of roughly 610 ms the
+//! window is shorter than the walk and the proof is always late: the
+//! uploader's receipt fails, LXMF tears the link down
+//! (`reference/LXMF/LXMF/LXMessage.py:616-620`), our proof lands on a
+//! closed link, and the client retries the same message every ~16 s
+//! while we accept every copy (`PN_ACCEPT ... dup=1`). Over LoRa the
+//! window is seconds wide and nothing shows; over BLE (measured RTT
+//! 295-484 ms, so a 1.8-2.9 s window) no upload from a host ever
+//! concluded.
+//!
+//! The reference can afford that ordering because its workblock is about
+//! 20 ms on a desktop CPU (measured 2026-09-25 against
+//! `reference/LXMF/LXMF/LXStamper.py:49-60`), two orders of magnitude
+//! inside the narrowest window a link ever has. This core is 185 times
+//! slower, so the ordering that is free there is fatal here.
+//!
+//! So the proof now leaves at receipt, in `on_event`'s
+//! `LinkDataReceived` arm, and the judgement follows on the work queue.
+//! That is a DEVIATION, taken under the CLAUDE.md rule and not by
+//! parity: the wire is unchanged (the same link proof for the same
+//! packet hash, earlier), the semantics a peer relies on are unchanged
+//! (a packet proof is what `RNS.Link.receive` itself issues under
+//! `PROVE_ALL` before any application sees the payload —
+//! `reference/Reticulum/RNS/Link.py:999-1006` — and a refused stamp
+//! still sends `ERROR_INVALID_STAMP` and tears the link down, which a
+//! Python client turns into `LXMessage.REJECTED` whether or not its
+//! receipt already concluded,
+//! `reference/LXMF/LXMF/LXMRouter.py:2667-2677`), and Priority 1 moves
+//! from zero BLE client deliveries to one round trip. The arithmetic and
+//! the release point live in `leviculum-upload-proof`, whose tests carry
+//! the old ordering as a positive control.
+//!
+//! What a refusal no longer shows as is a missing proof, so every
+//! refusing arm now logs `PN_REJECT reason=<word> via=<carrier>` — the
+//! same fixed-word line `lnpnd` keeps — and the accepted arm still
+//! reports its flush as `PN_ACCEPT ... durable=`.
+//!
+//! # Heap budget (#388)
+//!
+//! The boot line `HEAP_BUDGET links=<max> ble_links=<m> per_link=<b>
+//! ble_session=<b> role=<b> reserve=<b> total=<b>` (emitted by
+//! [`crate::heap_census::log_budget_and_assert`], asserted against
+//! [`crate::HEAP_SIZE`]) sums the worst case every owner of the 96 KiB
+//! heap may reach at once:
+//!
+//! ```text
+//! total = node_box                            (size_of the boxed NodeCore,
+//!                                              30 984 B: EmbeddedStorage's
+//!                                              inline tables + core state)
+//!       + links · per_link                    links = max_endpoint_links
+//!         per_link = size_of::<Link>()        one boxed Reticulum link (2 600 B)
+//!                  + link-table node share      (the map value is a Box)
+//!       + ble_links · ble_session             ble_links = ble::MAX_LINKS (4)
+//!                                             SESSION_BUDGET_BYTES: queue
+//!                                             full + pump + defrag, only a
+//!                                             link on a GATT connection has
+//!                                             one — a LoRa link costs
+//!                                             per_link alone
+//!       + role                                ROLE_BUDGET_BYTES:
+//!           SYNC_SLICE_BYTES (8 000)            one sync: an inbound batch
+//!                                               or one streamed answer
+//!         + 2 · BOARD_TRANSFER_LIMIT_KB·1000    two phones' queued uploads
+//!         + 5120                                peer table incl. 64 B keys
+//!                                               per peer (#388 pass 3),
+//!                                               offer plan, maps, duplicate
+//!                                               cache, flush queues
+//!         + (0)                                 SERVE_PEAK_BYTES, the
+//!                                               outbound serve transient —
+//!                                               48 922 B at the announced
+//!                                               cap and UNFUNDED, see the
+//!                                               arithmetic at the constant
+//!       + reserve                             fragmentation reserve
+//!                                             + the shared BLE channels
+//!                                             + one incoming resource at
+//!                                               MAX_INCOMING_RESOURCE_BYTES
+//! ```
+//!
+//! `links` is DERIVED, not chosen
+//! ([`crate::heap_census::max_endpoint_links`]): the fixed terms are
+//! subtracted from the heap and the remainder divided by `per_link`.
+//! With today's numbers — node box 31 040, role 21 120, reserve 18 848,
+//! sessions 4 · 3 948 = 15 792, per_link 2 696 — the remainder is
+//! 11 504 B and the division yields **4** (leaving 720 B of slack): the heap affords exactly the
+//! BLE-session count, no extra LoRa-backed links until a fixed term
+//! shrinks. The same number is handed to `NodeCoreBuilder::max_links`,
+//! so the budget's `links=` is an enforced cap, not a claim: the fifth
+//! concurrent link — the allocation that used to die at 340 bytes in
+//! the field — is refused (`LINK_REFUSED`, the initiator retries after
+//! its establishment timeout) instead of taking every existing link
+//! down with the heap.
+//!
+//! Every term is a named constant next to the state it bounds; the
+//! census's `pn_batch=`/`pn_work=`/`ble_s<n>=` lines are the running
+//! actuals these terms must dominate. Growing any capacity means
+//! re-running this sum — the boot assertion makes forgetting that a
+//! panic at the desk instead of an allocation failure in the field.
+//!
+//! # The clock (instruction item 6)
+//!
+//! The role needs a calendar three times over: the announce timebase
+//! (field 1, what peers order updates by), age-based expiry/eviction,
+//! and the peer table's own liveness stamps. A board without a GNSS fix
+//! takes its seed from any of: the host's `--set-time` (#238, already
+//! wired), a connected phone — the timestamp of the first upload
+//! envelope it sends us — or a peer's announce timebase; both of the
+//! latter seed through the transport's sanity window as
+//! [`TimeSource::Overheard`](leviculum_core::transport::TimeSource::Overheard),
+//! logged as `TIME_SEED source=overheard`.
+//! What degrades when none of them ever arrives: expiry ages are
+//! uptime-relative (harmless within one boot), peer `last_heard` starts
+//! near zero (the 14-day cull simply never fires), and the announce is
+//! withheld — deliberately, because an announce stamped from an unseeded
+//! clock poisons exactly the path tables a propagation node exists to be
+//! found through, and the first contact on any carrier delivers a seed
+//! that ends the condition.
+
+extern crate alloc;
+
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::vec::Vec;
+
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+
+use leviculum_core::envelope::{PnConfigWire, PN_COST_KEEP};
+use leviculum_core::identity::Identity;
+use leviculum_core::node::{NodeCore, NodeEvent};
+use leviculum_core::pn_config_store::StoredPnConfig;
+use leviculum_core::resource::ResourceStrategy;
+use leviculum_core::traits::{Clock, Storage};
+use leviculum_core::transport::{TickOutput, TimeSource};
+use leviculum_core::{
+    Destination, DestinationHash, DestinationType, Direction, LinkId, ProofStrategy, RequestError,
+};
+use leviculum_lxmf::constants::{
+    STAMP_SIZE, WORKBLOCK_EXPAND_ROUNDS_PEERING, WORKBLOCK_EXPAND_ROUNDS_PN,
+};
+use leviculum_lxmf::node::APP_NAME;
+use leviculum_lxmf::peering::{
+    answer_offer, build_offer, offer_budget_for_mdu, offer_reply, peering_key_material,
+    plan_sync_batch, DeclineReason, DropReason, InboundGate, OfferPlan, OfferReply, OfferResponse,
+    PeerChange, PeerOffer, PeerRecord, PeerStore, PeerSyncEnvelope, PeerTable, PeeringConfig,
+    SyncPhase, SyncSource, WantedIds, OFFER_PROBE_BUDGET, OFFER_REQUEST_PATH,
+    SYNC_BACKOFF_STEP_SECS, SYNC_INTERVAL_SECS,
+};
+use leviculum_lxmf::propagation::{
+    MessageListResponse, PeerError, PropagationNodeAnnounce, TransientId,
+};
+use leviculum_lxmf::propagation_client::PROPAGATION_ASPECT;
+use leviculum_lxmf::propagation_store::StoredMessage;
+use leviculum_lxmf::{
+    CooperativeStamper, Eviction, EvictionReason, GetOutcome, PropagationNode,
+    PropagationNodeConfig, PropagationStore, StampCancel, UploadOutcome, WorkblockStream,
+    MESSAGE_GET_PATH,
+};
+use leviculum_pn_store::{FlushOp, PnPeerStore, PnStore, Region};
+use leviculum_queue_budget::{OwnShare, OwnVerdict, OWN_TRAFFIC_SHARE_PERMILLE};
+use leviculum_record_log::SECTOR_SIZE;
+use leviculum_sync_batch::AfterClose;
+use leviculum_upload_proof::UploadProofs;
+use rand_core::CryptoRngCore;
+
+// ---------------------------------------------------------------------------
+// Persisted configuration (instruction item 5)
+// ---------------------------------------------------------------------------
+
+/// The costs this boot runs (read once at boot) and the costs a reboot
+/// would come up with (updated by [`apply_config`]). Two pairs, same
+/// running-versus-configured split the media profile keeps, because a
+/// `--stamp-cost` mid-run must not silently change what the role already
+/// announced.
+static RUNNING_STAMP: AtomicU8 = AtomicU8::new(0);
+static RUNNING_PEERING: AtomicU8 = AtomicU8::new(0);
+static CONFIGURED_STAMP: AtomicU8 = AtomicU8::new(0);
+static CONFIGURED_PEERING: AtomicU8 = AtomicU8::new(0);
+
+/// Store fill for the display, updated by the engine's stats pass:
+/// live message records in the region.
+static STORE_FILL: AtomicU32 = AtomicU32::new(0);
+
+/// Live message records, as last counted — the display's `S` field.
+pub fn store_fill() -> u32 {
+    STORE_FILL.load(Ordering::Relaxed)
+}
+
+/// Whether a binary constructed the engine this boot.
+static ROLE_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The display's store-fill field: `Some(live records)` while the role
+/// runs, `None` on a boot without it, so the line keeps its historical
+/// shape there.
+pub fn fill_indicator() -> Option<u16> {
+    if ROLE_ACTIVE.load(Ordering::Relaxed) {
+        Some(store_fill().min(u16::MAX as u32) as u16)
+    } else {
+        None
+    }
+}
+
+/// Read the persisted costs (or the Lead's defaults), seed the
+/// running/configured state, and log the boot `PN_CONFIG` line. Call once
+/// at boot, before [`Engine::new`].
+pub fn load_config_at_boot(page: u32) -> StoredPnConfig {
+    let (config, src) = match crate::telemetry::load_pn_config(page) {
+        Some(config) => (config, "flash"),
+        None => (StoredPnConfig::DEFAULT, "default"),
+    };
+    RUNNING_STAMP.store(config.stamp_cost, Ordering::Relaxed);
+    RUNNING_PEERING.store(config.peering_cost, Ordering::Relaxed);
+    CONFIGURED_STAMP.store(config.stamp_cost, Ordering::Relaxed);
+    CONFIGURED_PEERING.store(config.peering_cost, Ordering::Relaxed);
+    crate::log::log_fmt_critical(
+        "PN_CONFIG ",
+        format_args!(
+            "stamp_cost={} peering_cost={} src={}",
+            config.stamp_cost, config.peering_cost, src
+        ),
+    );
+    config
+}
+
+/// Merge one control frame over the configured costs and persist.
+/// Runs on the serial task ([`crate::usb`]); takes effect at the next
+/// boot, which the caller's answer states.
+pub fn apply_config(wire: PnConfigWire) -> crate::telemetry::PendingSave {
+    let merged = StoredPnConfig {
+        stamp_cost: if wire.stamp_cost == PN_COST_KEEP {
+            CONFIGURED_STAMP.load(Ordering::Relaxed)
+        } else {
+            wire.stamp_cost
+        },
+        peering_cost: if wire.peering_cost == PN_COST_KEEP {
+            CONFIGURED_PEERING.load(Ordering::Relaxed)
+        } else {
+            wire.peering_cost
+        },
+    };
+    CONFIGURED_STAMP.store(merged.stamp_cost, Ordering::Relaxed);
+    CONFIGURED_PEERING.store(merged.peering_cost, Ordering::Relaxed);
+    crate::log::log_fmt_critical(
+        "PN_CONFIG ",
+        format_args!(
+            "stamp_cost={} peering_cost={} src=host effective=next-boot",
+            merged.stamp_cost, merged.peering_cost
+        ),
+    );
+    crate::telemetry::request_save_pn_config(merged)
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// The role's first announce after boot and its cadence both moved to
+// `leviculum_announce_policy::AnnounceCadence` (#401): the propagation
+// half and the board's own destination are decided together, because a
+// board whose own announce is withheld is unreachable as a recipient
+// while still usable as a mailbox. The boot delay is still the
+// reference's own (`NODE_ANNOUNCE_DELAY`,
+// `reference/LXMF/LXMF/LXMRouter.py:41`), and the cadence a moving board
+// runs is still the 300 s this role argued from the concept page's drain
+// numbers — a 10-minute hilltop stop still moves a >=30-message delta.
+// What changed is that a board which is NOT moving falls back to the
+// hourly floor instead of paying 300 s forever, and that a slow carrier
+// can stretch either.
+use leviculum_announce_policy::{AnnounceSlot, Decision};
+
+/// How long the role holds its announce when its store did not mount.
+const ANNOUNCE_STORE_RETRY_MS: u64 = 60_000;
+
+/// Store maintenance cadence (`JOB_STORE_INTERVAL × PROCESSING_INTERVAL`,
+/// `reference/LXMF/LXMF/LXMRouter.py:871-900`).
+const MAINTENANCE_SECS: u64 = 480;
+
+/// `PN_STATS` cadence (instruction item 3).
+const STATS_SECS: u64 = 300;
+
+/// Outbound sync round watchdog, as on the host (`lnpnd/src/peering.rs`).
+const OUTBOUND_DEADLINE_MS: u64 = 180_000;
+
+/// `/offer` request timeout, as on the host.
+const OFFER_REQUEST_TIMEOUT_MS: u64 = 60_000;
+
+// The board peer-table cap. Its derivation is a const assertion in the
+// heap budget crate now, beside the census model's figure for a full table
+// (`leviculum_heap_budget::BOARD_MAX_PEERS`). Re-measure on both bins when
+// the role has run on hardware; the number to compare is the `[HEAP]`
+// watermark with a full table.
+use leviculum_heap_budget::BOARD_MAX_PEERS;
+
+/// Highest remote peering cost this board will mine a key for. The
+/// reference accepts up to 26 (`MAX_PEERING_COST`,
+/// `reference/LXMF/LXMF/LXMRouter.py:51`); at §2's orientation figures
+/// cost 26 is 45-134 *minutes* of this board's single core, one-off per
+/// peer but still the whole radio's CPU for the duration. 18 — the
+/// reference's default announcement — is 10-32 s. Declining a costlier
+/// peer is local policy the reference itself exercises at its own bound;
+/// no wire byte differs.
+const BOARD_REMOTE_PEERING_COST_MAX: u8 = 18;
+
+// The announced limits, the serve SDU and reserve, the serve peak and the
+// role's slice are terms of the boot heap budget (#388), defined with that
+// arithmetic where a host test reaches them.
+pub use leviculum_heap_budget::{
+    BOARD_SYNC_LIMIT_KB, BOARD_TRANSFER_LIMIT_KB, ROLE_BUDGET_BYTES, SERVE_PEAK_BYTES,
+    SERVE_RESERVE_BYTES, SERVE_RESOURCE_SDU,
+};
+
+/// The transient peaks of the role's operations, the model's figures at the
+/// inputs this board actually saw (#388, order 510): the largest per
+/// operation since boot, printed as `[HEAP_PEAK]` beside the census's
+/// steady state terms (`crate::heap_census::log`). Computed, not measured:
+/// `LlffHeap` has no per-allocation hook, and the arithmetic is what the
+/// host tests pin against the real code (`leviculum-nrf/heap-budget`).
+///
+/// Fed to the census rather than to `debug_assert!`s: the field runs
+/// release builds, where an assertion is not there to see, and a debug
+/// build asserting against the budget would panic on shapes the host tests
+/// already show overdraw. A line in the log names the operation and its
+/// size next to `largest=`, which is what the next post-mortem needs.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EnginePeaks {
+    /// [`leviculum_heap_budget::offer_response_peak`].
+    pub offer_response: usize,
+    /// [`leviculum_heap_budget::inbound_resource_peak`].
+    pub inbound_resource: usize,
+    /// [`leviculum_heap_budget::upload_peak`], accepted uploads.
+    pub upload: usize,
+    /// [`leviculum_heap_budget::store_tail_peak`].
+    pub store_tail: usize,
+}
+
+/// Boot-time spine reservations (#388 step 3), allocated once in
+/// [`Engine::new`] and reused: `VecDeque`/`Vec` never shrink, so the
+/// event path re-enters these blocks instead of growing fresh ones into
+/// an already-fragmented heap. Payload bytes ride IN the items and are
+/// bounded by the announced limits above. Eight work slots: two phones'
+/// uploads plus `/get` and `/offer` rounds in flight never reached five
+/// on the field captures; growth past the reserve still works, it just
+/// pays one reallocation.
+const WORK_SLOTS: usize = 8;
+
+/// Reserve for [`Engine::too_large`], same allocate-once reasoning.
+const TOO_LARGE_SLOTS: usize = 8;
+
+/// Active-delivery retry budget per stored message (instruction item 4).
+const ACTIVE_ATTEMPTS: u8 = 3;
+
+/// Gap between consecutive active-delivery sends: one in flight, and the
+/// next only after the loop has been back to its channels.
+const ACTIVE_GAP_MS: u64 = 1_000;
+
+/// How soon the loop should call back while work is queued.
+const WORK_POLL_MS: u64 = 25;
+
+/// Workblock rounds one settle pass expands before it parks the stream and
+/// gives the main loop back.
+///
+/// The whole 1000-round propagation workblock costs 3655-3727 ms on this core
+/// (`PN_STAMP ms=`), and for every one of those milliseconds the loop is not
+/// in its `select`, so nothing drains the LoRa task's four-slot hand-off and
+/// the receiver goes dark behind it (`SX_RX_ARM site=ack dark_ms=10284`,
+/// 2026-09-23). Twenty rounds is 74.5 ms of that, which with the loop's own
+/// turn leaves the board away for less than the 166 ms a link request spends
+/// on the air at the PHY the propagation cells run — the sizing is
+/// `leviculum_settle_budget::slice_rounds_for`, and the crate's tests are
+/// where both numbers are pinned. Read from there rather than restated, so a
+/// slice that stops fitting the budget makes that crate red instead of making
+/// this line quietly wrong.
+const GRIND_SLICE_ROUNDS: usize = leviculum_settle_budget::GRIND_SLICE_ROUNDS as usize;
+
+/// How soon the loop should call back while a stamp grind is parked: now.
+///
+/// [`WORK_POLL_MS`] would add 25 ms of sleep to each of the fifty slices a
+/// workblock takes, turning a 3.7 s validation into a 5 s one for no gain —
+/// the loop is CPU-bound here, not waiting for anything. Zero means the timer
+/// arm is already due when the `select` is entered, so every arm is polled
+/// once (the hand-off among them) and the loop comes straight back.
+const GRIND_POLL_MS: u64 = 0;
+
+/// The `lxmf.propagation` destination hash a remote identity owns — who a
+/// link's peer IS in the peer table. The same derivation the peer's own
+/// announce carries, so a remote recognised over a link and a remote heard
+/// on the air are one entry (`LXMRouter.py:2352`).
+fn propagation_hash_of(identity: &Identity) -> [u8; 16] {
+    let name_hash = Destination::compute_name_hash(APP_NAME, &[PROPAGATION_ASPECT]);
+    *Destination::compute_destination_hash(&name_hash, identity.hash()).as_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// Region plumbing
+// ---------------------------------------------------------------------------
+
+/// The store region as the synchronous scan sees it: a memory-mapped
+/// byte view.
+///
+/// SAFETY of the view: the region is internal flash, memory-mapped and
+/// always readable; the only writer is the record-store task through the
+/// SoftDevice. A scan concurrent with an in-flight append sees the
+/// record's commit word still erased and stops before it; a scan
+/// concurrent with a page erase sees a header whose CRC fails and skips
+/// the page (`leviculum_pn_store::scan` docs). CPU reads of flash stall
+/// while the NVMC is busy and then return the settled bytes — the nRF52
+/// has no torn word reads.
+#[derive(Clone, Copy)]
+pub struct FlashRegion {
+    base: u32,
+    len: u32,
+}
+
+impl FlashRegion {
+    fn store_region() -> Self {
+        let (base, len) = crate::record_store::region();
+        Self { base, len }
+    }
+}
+
+impl Region for FlashRegion {
+    fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
+        // SAFETY: see the type docs.
+        f(unsafe { core::slice::from_raw_parts(self.base as *const u8, self.len as usize) })
+    }
+}
+
+/// `0x`-free lowercase hex of a byte slice, allocation-free.
+struct Hex<'a>(&'a [u8]);
+
+impl core::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Queued work
+// ---------------------------------------------------------------------------
+
+/// One deferred job: everything that needs the async flash or the stamp
+/// validator, queued by [`Engine::on_events`] and drained one per
+/// [`Engine::settle`].
+enum Work {
+    /// A client upload envelope awaiting its stamp judgement, from a raw
+    /// link packet or a single-message resource.
+    ///
+    /// No proof travels here. A packet upload is proven at receipt (#397,
+    /// `on_event`'s `LinkDataReceived` arm) and a resource upload is
+    /// acknowledged by the resource protocol, so by the time an item reaches
+    /// this queue the wire has already answered the sender.
+    Upload {
+        link_id: LinkId,
+        data: Vec<u8>,
+        via: &'static str,
+    },
+    /// A `/get` request awaiting its (possibly purging) answer.
+    Get {
+        link_id: LinkId,
+        request_id: [u8; 16],
+        data: Vec<u8>,
+    },
+    /// An `/offer` request awaiting peering-key validation.
+    Offer {
+        link_id: LinkId,
+        request_id: [u8; 16],
+        data: Vec<u8>,
+    },
+}
+
+/// An inbound sync resource from a validated peer — any message count —
+/// being drained one message per settle pass (module docs, §stamp
+/// validation).
+///
+/// The queue and its counters live in [`leviculum_sync_batch`], together with
+/// the one decision that is not bookkeeping: what a `LinkClosed` for
+/// `link_id` means for messages already resident here.
+struct SyncBatch {
+    link_id: LinkId,
+    remote: [u8; 16],
+    drain: leviculum_sync_batch::SyncBatch<Vec<u8>>,
+}
+
+/// One outbound sync round in flight, as on the host.
+struct OutboundSync {
+    peer: [u8; 16],
+    link_id: LinkId,
+    plan: OfferPlan,
+    request_id: Option<[u8; 16]>,
+    sending: Option<(usize, u64)>,
+    deadline_ms: u64,
+}
+
+/// One packet-sized stored message being actively delivered (item 4).
+struct ActiveDelivery {
+    transient_id: TransientId,
+    destination: [u8; 16],
+    packet_hash: [u8; 16],
+    attempts_left: u8,
+}
+
+/// A mined peering key coming back from [`miner_task`].
+struct MineResult {
+    peer: [u8; 16],
+    key: [u8; 32],
+    value: u16,
+}
+
+struct MineJob {
+    peer: [u8; 16],
+    material: [u8; 32],
+    cost: u8,
+}
+
+static MINE_REQ: embassy_sync::channel::Channel<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    MineJob,
+    1,
+> = embassy_sync::channel::Channel::new();
+static MINE_RES: embassy_sync::channel::Channel<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    MineResult,
+    1,
+> = embassy_sync::channel::Channel::new();
+
+/// The peering-key miner: the board's stand-in for the host's worker
+/// thread (`generate_peering_key` runs off the sync thread in the
+/// reference too, `reference/LXMF/LXMF/LXMPeer.py:285-286`). Cooperative
+/// — the stamper yields every 64 trials — so the node keeps meshing
+/// while a key grinds; at the capped cost 18 that is 10-32 s of
+/// background arithmetic, once per peer, persisted.
+#[embassy_executor::task]
+pub async fn miner_task() {
+    loop {
+        let job = MINE_REQ.receive().await;
+        let started = embassy_time::Instant::now();
+        let mut stamper = CooperativeStamper::cooperative(crate::rng::RawHwRng::new());
+        // No cancellation handle: the board mines one key per peer from its
+        // own table and has no way to withdraw the intent while it runs
+        // (Codeberg #185). The cost is capped at 18 here, so this grind is
+        // bounded by the cap rather than by the handle.
+        let never = StampCancel::new();
+        let Ok(key) = stamper
+            .generate(
+                &job.material,
+                job.cost,
+                WORKBLOCK_EXPAND_ROUNDS_PEERING,
+                &never,
+            )
+            .await
+        else {
+            // Only cost 255 is refused, and the table never admits it.
+            continue;
+        };
+        let value = stamper
+            .measure_stamp(&job.material, &key, WORKBLOCK_EXPAND_ROUNDS_PEERING)
+            .await;
+        crate::log::log_fmt(
+            "PN_KEY ",
+            format_args!(
+                "mined peer={} cost={} value={} ms={}",
+                Hex(&job.peer[..8]),
+                job.cost,
+                value,
+                started.elapsed().as_millis()
+            ),
+        );
+        MINE_RES
+            .send(MineResult {
+                peer: job.peer,
+                key,
+                value,
+            })
+            .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The engine
+// ---------------------------------------------------------------------------
+
+/// The engine's slice of the heap census (#388): estimated bytes per
+/// part of the role's runtime state, from [`Engine::heap_census`]. The
+/// message store itself is flash; what shows up here is only RAM the
+/// role pins while working.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EngineHeapCensus {
+    /// Live peers in the table.
+    pub peer_count: usize,
+    /// Peer table node structure.
+    pub peers: usize,
+    /// Queued work items (uploads, /get, /offer) with their payloads.
+    pub work: usize,
+    /// The inbound sync batch draining one message per settle pass.
+    pub batch: usize,
+    /// The outbound sync round's offer plan.
+    pub outbound: usize,
+    /// Per-link bookkeeping: pending proofs, validated links, inbound
+    /// transfers, the too-large list.
+    pub link_maps: usize,
+    /// The role's own state ([`PropagationNode::heap_bytes`]): the
+    /// processed-id duplicate cache and the announced name.
+    pub role: usize,
+    /// Unflushed writes queued at both store adapters.
+    pub flush: usize,
+}
+
+impl EngineHeapCensus {
+    /// Sum of every accounted field.
+    pub fn total(&self) -> usize {
+        self.peers
+            + self.work
+            + self.batch
+            + self.outbound
+            + self.link_maps
+            + self.role
+            + self.flush
+    }
+}
+
+/// A stamp validation parked between settle passes.
+///
+/// The engine holds at most one, and holds it only across the passes one
+/// message's workblock takes. What it costs the heap is the SHA-256 state and
+/// the two 32-byte arrays below — never a workblock, which the streaming
+/// expansion does not materialise, and never two, which is why a parked grind
+/// does not widen the `[HEAP]` line's peak.
+struct Grind {
+    /// The stamp material: the message's transient id. Kept so a resumed
+    /// slice does not re-decode the upload it came out of.
+    material: TransientId,
+    stamp: [u8; STAMP_SIZE],
+    stream: WorkblockStream,
+    started: embassy_time::Instant,
+    /// Settle passes this grind has taken, reported as `slices=` so a capture
+    /// says whether the slicing ran at all.
+    slices: u32,
+}
+
+/// What one slice of [`Engine::validate_step`] leaves the caller with.
+enum ValidateStep {
+    /// The workblock is not expanded yet. The caller must put its work item
+    /// back untouched and return to the loop; the next pass resumes here.
+    Parked,
+    /// The stamp's value, or `None` for a stamp that does not clear the
+    /// announced cost or an upload that would not decode.
+    Done(Option<u16>),
+}
+
+pub struct Engine {
+    role: PropagationNode<PnStore<FlashRegion>>,
+    peers: PeerTable,
+    peer_store: PnPeerStore<FlashRegion>,
+    gate: InboundGate,
+    dest_hash: DestinationHash,
+    identity: Identity,
+    identity_hash: [u8; 16],
+    /// Proof hashes owed per link, and the rule for when they are released
+    /// ([`leviculum_upload_proof`], #397).
+    proofs: UploadProofs<LinkId>,
+    work: VecDeque<Work>,
+    sync_batch: Option<SyncBatch>,
+    outbound: Option<OutboundSync>,
+    /// Inbound links whose `/offer` key validated
+    /// (`validated_peer_links`, `reference/LXMF/LXMF/LXMRouter.py:2316`).
+    validated_links: BTreeMap<LinkId, [u8; 16]>,
+    inbound_transfers: Vec<LinkId>,
+    mining_peer: Option<[u8; 16]>,
+    last_synced: Option<[u8; 16]>,
+    next_sync_at_ms: u64,
+    next_maintenance_at_ms: u64,
+    next_stats_at_ms: u64,
+    announce_withheld_logged: bool,
+    active: Option<ActiveDelivery>,
+    next_active_at_ms: u64,
+    /// Records active delivery skipped as too large for one packet —
+    /// left for `/get`, never retried actively.
+    too_large: Vec<TransientId>,
+    /// The own-traffic share (leviculum#494): one tracker for every site
+    /// where the engine originates traffic, so a yield is stated once per
+    /// edge however many sites meet it ([`Engine::own_traffic_go`]).
+    own_share: OwnShare,
+    /// The stamp validation parked between settle passes, if one is. At most
+    /// one: the engine validates one message at a time either way, and the
+    /// slicing changed how long one takes, not how many run.
+    grind: Option<Grind>,
+    /// The largest modelled transient per operation since boot.
+    peaks: EnginePeaks,
+    /// What the BOOT plan funds one fetch to serve
+    /// ([`crate::heap_census::budget_serve_cap`] of this node's own box)
+    /// — the floor the serve-time reading is taken against, kept here so
+    /// the generic `NodeCore` size is measured once, at construction.
+    serve_boot_cap: usize,
+}
+
+impl Engine {
+    /// Register the `lxmf.propagation` destination and its two request
+    /// handlers on the node, and build the engine over the store region.
+    ///
+    /// `None` only if the node's identity cannot be re-derived, the same
+    /// failure mode the delivery destination has.
+    pub fn new<R, C, S>(node: &mut NodeCore<R, C, S>, config: StoredPnConfig) -> Option<Self>
+    where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let identity_bytes = node.identity().private_key_bytes().ok()?;
+        let identity = Identity::from_private_key_bytes(&identity_bytes).ok()?;
+        let identity_hash = *identity.hash();
+        let mut destination = Destination::new(
+            Some(identity.clone()),
+            Direction::In,
+            DestinationType::Single,
+            APP_NAME,
+            &[PROPAGATION_ASPECT],
+        )
+        .ok()?;
+        destination.set_accepts_links(true);
+        // The application proves, not the stack — the same `PROVE_APP`
+        // the reference's propagation destination would need to prove a
+        // client upload at all. Since #397 it proves at receipt, in
+        // `on_event`'s `LinkDataReceived` arm, so the strategy buys the
+        // ORDER (proof, then queue) rather than a delay.
+        destination.set_proof_strategy(ProofStrategy::App);
+        let dest_hash = *destination.hash();
+        node.register_destination(destination);
+        node.register_request_handler(
+            dest_hash,
+            MESSAGE_GET_PATH,
+            leviculum_core::RequestPolicy::AllowAll,
+        );
+        node.register_request_handler(
+            dest_hash,
+            OFFER_REQUEST_PATH,
+            leviculum_core::RequestPolicy::AllowAll,
+        );
+
+        let region = FlashRegion::store_region();
+        let pages = region.len / SECTOR_SIZE;
+        let store = PnStore::new(region, pages);
+        let name = crate::name::mesh_name(&identity_hash);
+        let serve_boot_cap =
+            crate::heap_census::budget_serve_cap(core::mem::size_of::<NodeCore<R, C, S>>());
+        let role_config = PropagationNodeConfig {
+            stamp_cost: config.stamp_cost,
+            peering_cost: config.peering_cost,
+            name: Some(name.as_bytes().to_vec()),
+            transfer_limit_kb: BOARD_TRANSFER_LIMIT_KB,
+            // The announced sync appetite must fit both the resource cap
+            // and the heap budget (#388); derived from what the board can
+            // afford to answer (order 511) — see BOARD_SYNC_LIMIT_KB.
+            sync_limit_kb: BOARD_SYNC_LIMIT_KB,
+            // The fetch is bounded apart from the announcement, so the
+            // smaller derived limit does not shrink what a client gets.
+            serve_limit_bytes: Some(leviculum_heap_budget::BOARD_SERVE_LIMIT_BYTES),
+            // What one fetch may SERVE, from the same boot arithmetic
+            // the `HEAP_BUDGET serve_cap=` line prints — the node box is
+            // this generic's own size, so the printed number and the
+            // enforced one are one expression. Below the announced sync
+            // limit whenever the plan funds less than it announces,
+            // which is today, on every board. It is the FLOOR: every
+            // `/get` re-reads it against the heap the board has at that
+            // moment (`SERVE_CAP`, `answer_get_work`).
+            serve_cap_bytes: Some(serve_boot_cap),
+            ..PropagationNodeConfig::default()
+        };
+        let mut role = PropagationNode::new(store, role_config);
+
+        let peer_store = PnPeerStore::new(region);
+        let mut peers = PeerTable::new(PeeringConfig {
+            max_peers: BOARD_MAX_PEERS,
+            peering_cost: config.peering_cost,
+            remote_peering_cost_max: BOARD_REMOTE_PEERING_COST_MAX,
+            ..PeeringConfig::default()
+        });
+        if let Ok(records) = peer_store.load_all() {
+            peers.restore(records);
+        }
+        role.set_compute_stamp_value(peers.max_peer_min_cost() > 0);
+
+        ROLE_ACTIVE.store(true, Ordering::Relaxed);
+        crate::log::log_fmt_critical(
+            "PN ",
+            format_args!(
+                "role dst={} peers={} store_pages={}",
+                Hex(dest_hash.as_bytes()),
+                peers.len(),
+                pages
+            ),
+        );
+
+        Some(Self {
+            role,
+            peers,
+            peer_store,
+            gate: InboundGate::default(),
+            dest_hash,
+            identity,
+            identity_hash,
+            proofs: UploadProofs::new(),
+            // #388 step 3: spines at their working size from boot,
+            // reused for the engine's lifetime (see WORK_SLOTS).
+            work: VecDeque::with_capacity(WORK_SLOTS),
+            sync_batch: None,
+            outbound: None,
+            validated_links: BTreeMap::new(),
+            inbound_transfers: Vec::with_capacity(crate::ble::MAX_LINKS),
+            mining_peer: None,
+            last_synced: None,
+            next_sync_at_ms: 0,
+            next_maintenance_at_ms: 0,
+            next_stats_at_ms: 0,
+            announce_withheld_logged: false,
+            active: None,
+            next_active_at_ms: 0,
+            too_large: Vec::with_capacity(TOO_LARGE_SLOTS),
+            own_share: OwnShare::new(),
+            grind: None,
+            peaks: EnginePeaks::default(),
+            serve_boot_cap,
+        })
+    }
+
+    /// The propagation destination hash, for boot banners.
+    pub fn destination_hash(&self) -> &DestinationHash {
+        &self.dest_hash
+    }
+
+    /// One engine-level heap census (#388): estimated bytes per part of
+    /// the role's runtime state, walked at the owners — the model is
+    /// [`leviculum_core::heap_census`]'s.
+    pub fn heap_census(&self) -> EngineHeapCensus {
+        use leviculum_core::heap_census as hc;
+        let mut work = self.work.capacity() * core::mem::size_of::<Work>();
+        for item in &self.work {
+            work += match item {
+                Work::Upload { data, .. } | Work::Get { data, .. } | Work::Offer { data, .. } => {
+                    data.capacity()
+                }
+            };
+        }
+        let batch = self.sync_batch.as_ref().map_or(0, |batch| {
+            hc::vec_deque_bytes(batch.drain.messages())
+                + batch
+                    .drain
+                    .messages()
+                    .iter()
+                    .map(|message| message.capacity())
+                    .sum::<usize>()
+        });
+        let outbound = self
+            .outbound
+            .as_ref()
+            .map_or(0, |sync| hc::vec_bytes(&sync.plan.ids));
+        let link_maps = hc::btree_map_bytes(self.proofs.map())
+            + self
+                .proofs
+                .map()
+                .values()
+                .map(hc::vec_deque_bytes)
+                .sum::<usize>()
+            + hc::btree_map_bytes(&self.validated_links)
+            + hc::vec_bytes(&self.inbound_transfers)
+            + hc::vec_bytes(&self.too_large);
+        EngineHeapCensus {
+            peer_count: self.peers.len(),
+            peers: self.peers.heap_bytes(),
+            work,
+            batch,
+            outbound,
+            link_maps,
+            role: self.role.heap_bytes(),
+            flush: self.role.store().queued_heap_bytes() + self.peer_store.queued_heap_bytes(),
+        }
+    }
+
+    /// The largest modelled transient per operation since boot (#388).
+    pub fn heap_peaks(&self) -> EnginePeaks {
+        self.peaks
+    }
+
+    /// When the loop should call [`Engine::settle`] again.
+    pub fn next_deadline_ms(&self, now_ms: u64) -> u64 {
+        if self.grind.is_some() {
+            // A parked stamp grind is the one thing the loop owes itself
+            // immediately: it is CPU-bound, waiting on nothing, and the fifty
+            // slices a workblock takes must not each buy a `WORK_POLL_MS`
+            // sleep. Due now means the `select` polls every arm once — the
+            // LoRa hand-off among them — and returns here.
+            return now_ms.saturating_add(GRIND_POLL_MS);
+        }
+        if !self.work.is_empty()
+            || self.sync_batch.is_some()
+            || self.role.store().pending_ops() > 0
+            || self.peer_store.pending_ops() > 0
+        {
+            return now_ms.saturating_add(WORK_POLL_MS);
+        }
+        let mut due = now_ms.saturating_add(crate::announce::with_cadence(|cadence| {
+            cadence.wait_ms(AnnounceSlot::Propagation, now_ms)
+        }));
+        due = due.min(self.next_maintenance_at_ms.max(now_ms + 1));
+        due = due.min(self.next_stats_at_ms.max(now_ms + 1));
+        due = due.min(self.next_sync_at_ms.max(now_ms + 1));
+        if let Some(sync) = &self.outbound {
+            due = due.min(sync.deadline_ms);
+        }
+        due.max(now_ms + 1)
+    }
+
+    fn seed_clock<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        unix_secs: u64,
+        from: &'static str,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        if node.has_plausible_wall_clock() || unix_secs == 0 {
+            return;
+        }
+        // The birth-era estimate, read before the jump: every liveness
+        // stamp at or below it was taken on the old calendar. Reading that
+        // boundary off the node instead of off a fixed date is what keeps
+        // the refresh below working now that the birth anchor is the build
+        // timestamp rather than uptime seconds (Codeberg #247).
+        let before = node.emission_secs();
+        if node.set_wall_time_unix_secs(unix_secs, TimeSource::Overheard) {
+            crate::set_time_source(TimeSource::Overheard);
+            crate::log::log_fmt_critical(
+                "[INFO!] ",
+                format_args!("[TIME_SEED] source=overheard via={from} unix={unix_secs}"),
+            );
+            // Both epoch guards take the same boundary: peer liveness
+            // stamps here, stored-message timestamps in the role.
+            self.role.note_calendar_jump(before);
+            self.on_clock_seeded(before, node.emission_secs());
+        }
+    }
+
+    /// The calendar just jumped from the birth anchor to real time:
+    /// refresh every liveness stamp taken before the jump so the 14-day
+    /// unreachability cull does not read the jump as fourteen days of
+    /// silence. "Heard this boot" is the honest reading of those stamps.
+    ///
+    /// `before` is the estimate the old calendar gave at the moment of the
+    /// jump, so `last_heard <= before` is exactly "stamped on the old
+    /// calendar" — no fixed date can say that any more, because the birth
+    /// anchor is itself a plausible-looking value (Codeberg #247).
+    fn on_clock_seeded(&mut self, before: u64, now: u64) {
+        if now <= before {
+            return;
+        }
+        let mut refreshed: Vec<[u8; 16]> = Vec::new();
+        for peer in self.peers.iter_mut() {
+            if peer.last_heard <= before {
+                peer.last_heard = now;
+                refreshed.push(peer.destination_hash);
+            }
+        }
+        for destination in refreshed {
+            self.persist_peer(&destination);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Event ingestion (synchronous)
+    // -----------------------------------------------------------------
+
+    /// Digest one dispatch's events. Cheap and synchronous; anything that
+    /// needs flash or the validator lands in the work queue.
+    pub fn on_events<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        events: &[NodeEvent],
+    ) -> TickOutput
+    where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let mut out = TickOutput::default();
+        for event in events {
+            self.on_event(node, event, &mut out);
+        }
+        out
+    }
+
+    fn on_event<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        event: &NodeEvent,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        match event {
+            NodeEvent::AnnounceReceived { announce, .. }
+                if announce.name_hash()
+                    == &Destination::compute_name_hash(APP_NAME, &[PROPAGATION_ASPECT])
+                    && announce.destination_hash() != &self.dest_hash =>
+            {
+                let destination = *announce.destination_hash().as_bytes();
+                self.on_pn_announce(
+                    node,
+                    destination,
+                    announce.app_data(),
+                    announce.is_path_response(),
+                );
+            }
+            NodeEvent::AnnounceReceived { announce, .. } => {
+                self.trigger_active(node, announce.destination_hash().as_bytes(), out);
+            }
+            NodeEvent::PathFound {
+                destination_hash, ..
+            } => {
+                self.trigger_active(node, destination_hash.as_bytes(), out);
+            }
+            NodeEvent::LinkEstablished {
+                link_id,
+                is_initiator: false,
+                destination_hash,
+                ..
+            } if destination_hash == &self.dest_hash => {
+                // Resources gated by the application, as the reference
+                // gates them (`propagation_link_established`,
+                // `reference/LXMF/LXMF/LXMRouter.py:2188-2193`).
+                let _ = node.set_resource_strategy(link_id, ResourceStrategy::AcceptApp);
+            }
+            NodeEvent::LinkEstablished {
+                link_id,
+                is_initiator: true,
+                ..
+            } => {
+                self.on_sync_link_up(node, link_id, out);
+            }
+            NodeEvent::ResponseReceived {
+                link_id,
+                request_id,
+                response_data,
+                ..
+            } => {
+                self.on_offer_response(node, link_id, request_id, response_data, out);
+            }
+            NodeEvent::RequestTimedOut {
+                link_id,
+                request_id,
+            } => {
+                let matches = self
+                    .outbound
+                    .as_ref()
+                    .is_some_and(|s| s.link_id == *link_id && s.request_id == Some(*request_id));
+                if matches {
+                    self.finish_round("offer_timeout", 0, 0);
+                    out.merge(node.close_link(link_id));
+                }
+            }
+            NodeEvent::LinkProofRequested {
+                link_id,
+                packet_hash,
+            } if self.owns_link(node, link_id) => {
+                self.proofs.requested(*link_id, *packet_hash);
+            }
+            NodeEvent::LinkDataReceived { link_id, data } if self.owns_link(node, link_id) => {
+                // #397: the proof says the bytes arrived and decrypted, and
+                // the moment they did is the only moment the uploader is
+                // still listening — its receipt is `max(rtt * 6, 1 s)` wide
+                // and one stamp workblock is 3.7 s. So it goes out here,
+                // before the upload is even decoded, and the judgement
+                // follows on the queue. `leviculum_upload_proof` is where
+                // that ordering is asserted and priced.
+                if let Some(packet_hash) = self.proofs.on_receipt(link_id) {
+                    if let Ok(send) = node.send_data_proof(link_id, &packet_hash) {
+                        out.merge(send);
+                    }
+                }
+                self.work.push_back(Work::Upload {
+                    link_id: *link_id,
+                    data: data.clone(),
+                    via: "packet",
+                });
+            }
+            NodeEvent::ResourceAdvertised {
+                link_id, data_size, ..
+            } if self.owns_link(node, link_id) => {
+                // Refused before it moves when above the announced
+                // per-sync limit (`reference/LXMF/LXMF/LXMRouter.py:2220-2224`).
+                let accept = self.role.accepts_resource_of(*data_size);
+                let verdict = if accept {
+                    if self.validated_links.contains_key(link_id) {
+                        self.inbound_transfers.push(*link_id);
+                    }
+                    node.accept_resource(link_id)
+                } else {
+                    node.reject_resource(link_id)
+                };
+                if let Ok(send) = verdict {
+                    out.merge(send);
+                }
+            }
+            NodeEvent::ResourceCompleted {
+                link_id,
+                data,
+                is_sender: false,
+                ..
+            } if self.owns_link(node, link_id) => {
+                self.on_inbound_resource(node, link_id, data, out);
+            }
+            NodeEvent::ResourceCompleted {
+                link_id,
+                is_sender: true,
+                segment_index,
+                total_segments,
+                ..
+            } if segment_index == total_segments => {
+                self.on_resource_sent(node, link_id, true, out);
+            }
+            NodeEvent::ResourceFailed {
+                link_id,
+                is_sender: true,
+                ..
+            } => {
+                self.on_resource_sent(node, link_id, false, out);
+            }
+            NodeEvent::RequestReceived {
+                link_id,
+                destination_hash,
+                request_id,
+                path,
+                data,
+                ..
+            } if destination_hash == &self.dest_hash && path == MESSAGE_GET_PATH => {
+                self.work.push_back(Work::Get {
+                    link_id: *link_id,
+                    request_id: *request_id,
+                    data: data.clone(),
+                });
+            }
+            NodeEvent::RequestReceived {
+                link_id,
+                destination_hash,
+                request_id,
+                path,
+                data,
+                ..
+            } if destination_hash == &self.dest_hash && path == OFFER_REQUEST_PATH => {
+                self.work.push_back(Work::Offer {
+                    link_id: *link_id,
+                    request_id: *request_id,
+                    data: data.clone(),
+                });
+            }
+            NodeEvent::LinkClosed { link_id, .. } => {
+                self.proofs.forget(link_id);
+                self.validated_links.remove(link_id);
+                self.inbound_transfers.retain(|held| held != link_id);
+                // Two cases for a close that lands on the batch's own link,
+                // told apart by whether anything is still resident
+                // (`leviculum_sync_batch::SyncBatch::after_close`):
+                //
+                // * `KeepDraining` — the messages are HERE, whole and
+                //   decoded, and only their stamps are still owed. This
+                //   sender is finished, not gone: it proved its resource and
+                //   tore the link down in the same breath, as the reference
+                //   does (`reference/LXMF/LXMF/LXMPeer.py:499-503`). The
+                //   grind runs on to the end of the batch and the round is
+                //   concluded by `perform_sync_step` like any other. Until
+                //   eb9b8b7a this arm concluded here instead, which dropped
+                //   the whole unjudged tail — 6 of 7 messages on the rig
+                //   (`lora_pn_board_offer_past_the_link`, 2026-09-24).
+                // * `Conclude` — nothing left to judge. Logging the round
+                //   here rather than waiting for a settle pass keeps a spent
+                //   batch from standing in the way of the next `/offer`.
+                //
+                // A link that dies while the resource is still IN FLIGHT
+                // never reaches either: the batch is built from the decoded
+                // envelope once the transfer concluded, so there is no batch
+                // yet and `sync_batch` is `None`.
+                let after_close = self
+                    .sync_batch
+                    .as_ref()
+                    .filter(|batch| batch.link_id == *link_id)
+                    .map(|batch| batch.drain.after_close());
+                if after_close == Some(AfterClose::Conclude) {
+                    self.conclude_sync_batch();
+                }
+                if self
+                    .outbound
+                    .as_ref()
+                    .is_some_and(|sync| sync.link_id == *link_id)
+                {
+                    let peer = self.outbound.as_ref().map(|s| s.peer).unwrap_or_default();
+                    self.outbound = None;
+                    if let Some(held) = self.peers.get_mut(&peer) {
+                        held.state = SyncPhase::Idle;
+                    }
+                }
+            }
+            NodeEvent::PacketDeliveryConfirmed { packet_hash } => {
+                if let Some(active) = &self.active {
+                    if &active.packet_hash == packet_hash {
+                        let tid = active.transient_id;
+                        let dest = active.destination;
+                        let _ = self.role.store_mut().purge(&tid);
+                        crate::log::log_fmt(
+                            "PN_DELIVER ",
+                            format_args!("proved tid={} dst={}", Hex(&tid[..8]), Hex(&dest)),
+                        );
+                        self.active = None;
+                        self.next_active_at_ms = node.now_ms().saturating_add(ACTIVE_GAP_MS);
+                    }
+                }
+            }
+            NodeEvent::DeliveryFailed { packet_hash, .. } => {
+                let failed = self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| &active.packet_hash == packet_hash);
+                if failed {
+                    let active = self.active.take();
+                    self.next_active_at_ms = node.now_ms().saturating_add(ACTIVE_GAP_MS);
+                    if let Some(active) = active {
+                        let attempts_left = active.attempts_left.saturating_sub(1);
+                        if attempts_left == 0 {
+                            crate::log::log_fmt(
+                                "PN_DELIVER ",
+                                format_args!("gave_up dst={}", Hex(&active.destination)),
+                            );
+                        } else {
+                            self.resend_active(
+                                node,
+                                active.transient_id,
+                                active.destination,
+                                attempts_left,
+                                out,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Forget per-link state before an engine-initiated close: the
+    /// `LinkClosed` that close produces rides the engine's own output and
+    /// is never fed back to `on_events`, so the cleanup the remote-close
+    /// path does there has to happen here by hand.
+    fn drop_link_state(&mut self, link_id: &LinkId) {
+        self.proofs.forget(link_id);
+        self.validated_links.remove(link_id);
+        self.inbound_transfers.retain(|held| held != link_id);
+    }
+
+    fn owns_link<R, C, S>(&self, node: &NodeCore<R, C, S>, link_id: &LinkId) -> bool
+    where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        node.link(link_id)
+            .is_some_and(|link| link.destination_hash() == &self.dest_hash)
+    }
+
+    /// `is_path_response` is the announce's own
+    /// [`ReceivedAnnounce::is_path_response`](leviculum_core::ReceivedAnnounce::is_path_response),
+    /// and it is handed straight to the peer table, which owns the rule
+    /// (Codeberg #417). The clock seed above it is deliberate and not
+    /// gated: a path response carries the destination's own cached
+    /// announce, so its timebase is a real past timestamp, and a board
+    /// with no plausible wall clock is better off with it than with the
+    /// birth anchor. Peering is the decision that must not be made on
+    /// "somebody asked where this node is".
+    fn on_pn_announce<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        destination_hash: [u8; 16],
+        app_data: &[u8],
+        is_path_response: bool,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let Ok(announce) = PropagationNodeAnnounce::decode(app_data) else {
+            return;
+        };
+        // Item 6: a peer's announce timebase is a clock a clockless
+        // board may take, through the same sanity window as every
+        // other source.
+        self.seed_clock(node, announce.timebase, "pn-announce");
+        let hops = node.hops_to(&DestinationHash::new(destination_hash));
+        let now = node.emission_secs();
+        let change =
+            self.peers
+                .handle_announce(destination_hash, &announce, hops, now, is_path_response);
+        // Capture the announcer's keys with the peer (#388 pass 3): the
+        // announce that created or refreshed this peer also put the
+        // identity into `known_identities`, but that cache is a rolling
+        // 8-slot table — by this peer's sync round the entry may be gone.
+        // The copy kept here (and persisted below with the peer record)
+        // is what the sync recalls first.
+        if let Some(peer) = self.peers.get_mut(&destination_hash) {
+            if peer.public_keys.is_none() || peer.identity_hash.is_none() {
+                if let Some(identity) = node.storage().get_identity(&destination_hash) {
+                    peer.capture_identity(identity);
+                }
+            }
+        }
+        match change {
+            PeerChange::Added => {
+                self.log_peer("add", &destination_hash, "announce");
+                self.persist_peer(&destination_hash);
+                // An announce heard is a contact window open: schedule
+                // the sync pass now rather than at the next interval
+                // (item 7's announce-heard trigger).
+                self.next_sync_at_ms = 0;
+            }
+            PeerChange::Updated => {
+                // The line a REPEATABLE run can assert. `add` is printed
+                // once in a board's life per peer: the table is persisted
+                // as TAG_PEER records and restored at boot, and a restore
+                // prints nothing, so on boards that have met before no
+                // `action=add` can ever come again. A refresh happens on
+                // every announce heard, which is what the two production
+                // cells are actually about — autopeering as upkeep.
+                self.log_peer("refresh", &destination_hash, "announce");
+                self.persist_peer(&destination_hash);
+                self.next_sync_at_ms = 0;
+            }
+            PeerChange::Dropped(reason) => {
+                let _ = self.peer_store.remove(&destination_hash);
+                self.log_peer(
+                    "drop",
+                    &destination_hash,
+                    match reason {
+                        DropReason::Disabled => "disabled",
+                        DropReason::OutOfDepth => "out_of_depth",
+                        DropReason::CostRaised => "cost_raised",
+                        DropReason::Unreachable => "unreachable",
+                        DropReason::NoAccess => "no_access",
+                    },
+                );
+            }
+            PeerChange::Declined(reason) => {
+                if reason == DeclineReason::TableFull {
+                    self.log_peer("decline", &destination_hash, "table_full");
+                }
+            }
+        }
+        self.role
+            .set_compute_stamp_value(self.peers.max_peer_min_cost() > 0);
+    }
+
+    fn log_peer(&self, action: &str, destination_hash: &[u8; 16], reason: &str) {
+        crate::log::log_fmt(
+            "PN_PEER ",
+            format_args!(
+                "peer={} action={} reason={} peers={}",
+                Hex(destination_hash),
+                action,
+                reason,
+                self.peers.len()
+            ),
+        );
+    }
+
+    fn persist_peer(&mut self, destination_hash: &[u8; 16]) {
+        if let Some(peer) = self.peers.get(destination_hash) {
+            let record = PeerRecord::of(peer);
+            let _ = self.peer_store.save(&record);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Outbound sync (synchronous halves)
+    // -----------------------------------------------------------------
+
+    fn on_sync_link_up<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        link_id: &LinkId,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let Some(sync) = self.outbound.as_ref() else {
+            return;
+        };
+        if sync.link_id != *link_id {
+            return;
+        }
+        let peer_hash = sync.peer;
+        // The link took its time to come up; if the share was spent
+        // meanwhile (leviculum#494), the identify, the offer and the
+        // transfer behind them are not started. The round ends as a yield
+        // and the next sync pass retries it.
+        if !self.own_traffic_go("sync_offer") {
+            self.yield_round(&peer_hash);
+            out.merge(node.close_link(link_id));
+            return;
+        }
+        match node.identify_link(link_id, &self.identity) {
+            Ok(send) => out.merge(send),
+            Err(_) => {
+                self.finish_round("identify_failed", 0, 0);
+                out.merge(node.close_link(link_id));
+                return;
+            }
+        }
+        let Some(peer) = self.peers.get_mut(&peer_hash) else {
+            return;
+        };
+        peer.note_link_established();
+        let Some((key, _)) = peer.peering_key else {
+            self.finish_round("no_key", 0, 0);
+            out.merge(node.close_link(link_id));
+            return;
+        };
+        // The offer is planned HERE, against this link, because only now
+        // is the MDU known: `send_request` refuses a body over
+        // `link.mdu()`, which on LoRa is 431 B and admits ten ids. The
+        // plan the round was scheduled with only established that
+        // something above the cursor is offerable at all.
+        let Some(mdu) = node.link(link_id).map(|link| link.mdu()) else {
+            self.finish_round("link_gone", 0, 0);
+            out.merge(node.close_link(link_id));
+            return;
+        };
+        let Some(cursor) = self.peers.get(&peer_hash).map(|peer| peer.cursor) else {
+            return;
+        };
+        let mut entries: Vec<StoredMessage> = Vec::new();
+        if self
+            .role
+            .store()
+            .for_each(&mut |meta| {
+                if meta.sequence > cursor {
+                    entries.push(*meta);
+                }
+            })
+            .is_err()
+        {
+            self.finish_round("store_error", 0, 0);
+            out.merge(node.close_link(link_id));
+            return;
+        }
+        entries.sort_by_key(|meta| meta.sequence);
+        let Some(peer) = self.peers.get(&peer_hash) else {
+            return;
+        };
+        let planned = build_offer(peer, &entries, offer_budget_for_mdu(mdu));
+        let plan = match planned {
+            Some(plan) if !plan.ids.is_empty() => plan,
+            // Everything above the cursor was drained or became
+            // unofferable between scheduling and link-up: conclude the
+            // round so the cursor still steps past what is dead.
+            other => {
+                let target = other.map_or(cursor, |plan| plan.cursor_target);
+                self.conclude_round(node, &peer_hash, link_id, target, 0, 0, out);
+                return;
+            }
+        };
+        let tail_peak = leviculum_heap_budget::store_tail_peak(entries.len(), plan.ids.len());
+        self.peaks.store_tail = self.peaks.store_tail.max(tail_peak);
+        let Some(sync) = self.outbound.as_mut() else {
+            return;
+        };
+        sync.plan = plan;
+        let offer = PeerOffer {
+            peering_key: key,
+            transient_ids: sync.plan.ids.clone(),
+        };
+        match node.send_request(
+            link_id,
+            OFFER_REQUEST_PATH,
+            Some(&offer.encode()),
+            Some(OFFER_REQUEST_TIMEOUT_MS),
+        ) {
+            Ok((request_id, send)) => {
+                sync.request_id = Some(request_id);
+                out.merge(send);
+                if let Some(peer) = self.peers.get_mut(&peer_hash) {
+                    peer.state = SyncPhase::RequestSent;
+                }
+            }
+            Err(_) => {
+                self.finish_round("request_failed", 0, 0);
+                out.merge(node.close_link(link_id));
+            }
+        }
+    }
+
+    fn on_offer_response<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        link_id: &LinkId,
+        request_id: &[u8; 16],
+        response_data: &[u8],
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let Some(sync) = self.outbound.as_mut() else {
+            return;
+        };
+        if sync.link_id != *link_id || sync.request_id != Some(*request_id) {
+            return;
+        }
+        let peer_hash = sync.peer;
+        let response = match OfferResponse::decode(response_data) {
+            Ok(response) => response,
+            Err(_) => {
+                self.finish_round("bad_response", 0, 0);
+                out.merge(node.close_link(link_id));
+                return;
+            }
+        };
+        // The plan stays in `self.outbound`, borrowed by the reply and by
+        // the source below, never cloned; the reply borrows the response's
+        // wanted list instead of collecting a second one (leviculum#388).
+        let Some(plan) = self.outbound.as_ref().map(|sync| &sync.plan) else {
+            return;
+        };
+        let reply = offer_reply(&response, plan);
+        let offered = plan.ids.len();
+        let plan_target = plan.cursor_target;
+        let wanted_count = match &reply {
+            OfferReply::Send(wanted) => plan.ids.iter().filter(|id| wanted.wants(id)).count(),
+            _ => 0,
+        };
+        if !matches!(response, OfferResponse::Error(_)) {
+            crate::log::log_fmt(
+                "PN_OFFER ",
+                format_args!(
+                    "peer={} dir=out offered={} wanted={}",
+                    Hex(&peer_hash),
+                    offered,
+                    wanted_count
+                ),
+            );
+        }
+        match reply {
+            OfferReply::Send(wanted) => {
+                // The transfer is the round's largest airtime by far
+                // (leviculum#494): not started past the share. The cursor
+                // stays, so the next round offers the same messages again.
+                if !self.own_traffic_go("sync_transfer") {
+                    self.yield_round(&peer_hash);
+                    out.merge(node.close_link(link_id));
+                    return;
+                }
+                self.send_sync_batch(node, link_id, &peer_hash, wanted, offered, out);
+            }
+            OfferReply::Concluded => {
+                self.conclude_round(node, &peer_hash, link_id, plan_target, 0, 0, out);
+            }
+            OfferReply::Backoff(secs) => {
+                let next = node.emission_secs().saturating_add(secs);
+                if let Some(peer) = self.peers.get_mut(&peer_hash) {
+                    peer.next_sync_attempt = next;
+                }
+                self.finish_round("throttled", 0, 0);
+                out.merge(node.close_link(link_id));
+            }
+            OfferReply::Unpeer => {
+                self.peers.remove(&peer_hash);
+                let _ = self.peer_store.remove(&peer_hash);
+                self.log_peer("drop", &peer_hash, "no_access");
+                self.outbound = None;
+                out.merge(node.close_link(link_id));
+            }
+            OfferReply::RemineKey => {
+                if let Some(peer) = self.peers.get_mut(&peer_hash) {
+                    peer.peering_key = None;
+                }
+                self.persist_peer(&peer_hash);
+                self.finish_round("invalid_key", 0, 0);
+                out.merge(node.close_link(link_id));
+            }
+            OfferReply::Retry => {
+                self.finish_round("retry", 0, 0);
+                out.merge(node.close_link(link_id));
+            }
+        }
+    }
+
+    /// Answer a want with the bodies the heap affords right now
+    /// (leviculum#388, order 511), streamed out of the store.
+    ///
+    /// The batch is the longest prefix of the want, in plan order, whose
+    /// modelled peak ([`leviculum_heap_budget::offer_response_peak`]) leaves
+    /// [`leviculum_heap_budget::OFFER_RESPONSE_RESERVE_BYTES`] of the role's
+    /// budget beside what the role holds at this moment (queued uploads and
+    /// an inbound batch, the census's `pn_work=` and `pn_batch=`). What it
+    /// stops before stays above the cursor and is offered again next round;
+    /// the derivation of the announced sync limit guarantees that one body
+    /// up to the transfer limit always fits beside two phones' uploads, so a
+    /// round that sends nothing means the role holds more than the budget
+    /// plans for, and it ends without moving the cursor.
+    ///
+    /// No body, no envelope and no id list is built: the source frames the
+    /// envelope on the stack and copies each body a part's worth at a time
+    /// out of mapped flash, and the core's streamed build makes the parts
+    /// the only whole copy (`NodeCore::send_resource_from_source`).
+    fn send_sync_batch<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        link_id: &LinkId,
+        peer_hash: &[u8; 16],
+        wanted: WantedIds<'_>,
+        offered: usize,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let listed = match wanted {
+            WantedIds::All => 0,
+            WantedIds::Listed(ids) => ids.len(),
+        };
+        let census = self.heap_census();
+        let concurrent = census.work + census.batch;
+        let Some(plan) = self.outbound.as_ref().map(|sync| &sync.plan) else {
+            return;
+        };
+        let planned = plan_sync_batch(self.role.store(), plan, &wanted, |_, encoded_len| {
+            leviculum_heap_budget::offer_response_fits(
+                encoded_len,
+                offered,
+                listed,
+                SERVE_RESOURCE_SDU,
+                concurrent,
+            )
+        });
+        let Ok(batch) = planned else {
+            self.finish_round("store_error", 0, 0);
+            out.merge(node.close_link(link_id));
+            return;
+        };
+        if batch.withheld > 0 {
+            crate::log::log_fmt(
+                "PN_SYNC_BATCH ",
+                format_args!(
+                    "peer={} sent={} withheld={} bytes={} concurrent={}",
+                    Hex(peer_hash),
+                    batch.count,
+                    batch.withheld,
+                    batch.encoded_len,
+                    concurrent
+                ),
+            );
+        }
+        if batch.count == 0 {
+            if batch.withheld == 0 {
+                // Every wanted body was gone from the store: the buffered
+                // path concluded here too.
+                self.conclude_round(node, peer_hash, link_id, batch.cursor_target, 0, 0, out);
+            } else {
+                self.finish_round("heap_short", 0, 0);
+                out.merge(node.close_link(link_id));
+            }
+            return;
+        }
+        let peak = leviculum_heap_budget::offer_response_peak(
+            batch.encoded_len,
+            offered,
+            listed,
+            SERVE_RESOURCE_SDU,
+        );
+        self.peaks.offer_response = self.peaks.offer_response.max(peak);
+        let timestamp = node.emission_secs() as f64;
+        let sent = match self.outbound.as_ref() {
+            Some(sync) => {
+                let mut source =
+                    SyncSource::new(self.role.store(), &sync.plan, wanted, batch, timestamp);
+                node.send_resource_from_source(link_id, &mut source)
+            }
+            None => return,
+        };
+        match sent {
+            Ok((_, send)) => {
+                out.merge(send);
+                if let Some(sync) = self.outbound.as_mut() {
+                    sync.sending = Some((batch.count, batch.encoded_len as u64));
+                    // A batch that withheld part of the want concludes
+                    // below it, so the rest is offered again.
+                    sync.plan.cursor_target = batch.cursor_target;
+                }
+                if let Some(peer) = self.peers.get_mut(peer_hash) {
+                    peer.state = SyncPhase::ResourceTransferring;
+                }
+            }
+            Err(_) => {
+                self.finish_round("send_failed", 0, 0);
+                out.merge(node.close_link(link_id));
+            }
+        }
+    }
+
+    fn on_resource_sent<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        link_id: &LinkId,
+        success: bool,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let Some(sync) = self.outbound.as_ref() else {
+            return;
+        };
+        if sync.link_id != *link_id || sync.sending.is_none() {
+            return;
+        }
+        let peer_hash = sync.peer;
+        let (count, bytes) = sync.sending.unwrap_or((0, 0));
+        let cursor_target = sync.plan.cursor_target;
+        if success {
+            self.conclude_round(node, &peer_hash, link_id, cursor_target, count, bytes, out);
+        } else {
+            self.finish_round("transfer_failed", 0, 0);
+            out.merge(node.close_link(link_id));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conclude_round<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        peer_hash: &[u8; 16],
+        link_id: &LinkId,
+        cursor_target: u64,
+        transferred: usize,
+        bytes: u64,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let now = node.emission_secs();
+        if let Some(peer) = self.peers.get_mut(peer_hash) {
+            peer.cursor = cursor_target;
+            peer.state = SyncPhase::Idle;
+            peer.next_sync_attempt = 0;
+            peer.last_heard = now;
+        }
+        self.persist_peer(peer_hash);
+        crate::log::log_fmt(
+            "PN_SYNC ",
+            format_args!(
+                "peer={} dir=out transferred={} bytes={} result=ok",
+                Hex(peer_hash),
+                transferred,
+                bytes
+            ),
+        );
+        self.outbound = None;
+        out.merge(node.close_link(link_id));
+    }
+
+    /// End the outbound round as a `duty_share` yield (leviculum#494): the
+    /// budget's state, not the peer's fault, so the backoff step
+    /// `start_round` booked before it dialled is handed back
+    /// (leviculum#495).
+    fn yield_round(&mut self, peer_hash: &[u8; 16]) {
+        if let Some(peer) = self.peers.get_mut(peer_hash) {
+            peer.release_yielded_round();
+        }
+        self.finish_round("duty_share", 0, 0);
+    }
+
+    fn finish_round(&mut self, result: &str, transferred: usize, bytes: u64) {
+        if let Some(sync) = &self.outbound {
+            crate::log::log_fmt(
+                "PN_SYNC ",
+                format_args!(
+                    "peer={} dir=out transferred={} bytes={} result={}",
+                    Hex(&sync.peer),
+                    transferred,
+                    bytes,
+                    result
+                ),
+            );
+            let peer = sync.peer;
+            if let Some(held) = self.peers.get_mut(&peer) {
+                held.state = SyncPhase::Idle;
+            }
+        }
+        self.outbound = None;
+    }
+
+    fn on_inbound_resource<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        link_id: &LinkId,
+        data: &[u8],
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        self.inbound_transfers.retain(|held| held != link_id);
+        // Route by the SENDER, not by the message count. The reference
+        // ingests a peer's transfer through the peer branch at any
+        // cardinality and lets the count decide only whether a peering key
+        // was required: `reference/LXMF/LXMF/LXMRouter.py:2381-2389` gates
+        // on `len(messages) > 1`, while `:2430-2447` picks the peer
+        // accounting on `remote_hash in self.peers`. Splitting on the
+        // count instead sent a peer's single-message sync — the common
+        // case, one message per round — down the client path, where it
+        // logged `via=resource` and produced no `PN_SYNC dir=in`: the log
+        // could not tell a forwarded message from a fresh one. The
+        // resource admission above already gates on `validated_links`
+        // (`ResourceAdvertised`), so the two now agree.
+        let envelope = PeerSyncEnvelope::decode(data).ok();
+        let decoded = envelope
+            .as_ref()
+            .map_or(&[][..], |envelope| envelope.messages.as_slice());
+        let peak =
+            leviculum_heap_budget::inbound_resource_peak(data.len(), decoded.iter().map(Vec::len));
+        self.peaks.inbound_resource = self.peaks.inbound_resource.max(peak);
+        let multi = envelope
+            .as_ref()
+            .is_some_and(|envelope| envelope.messages.len() > 1);
+        let peer = self.validated_links.get(link_id).copied();
+
+        // Peer off the RECALLED announce, before anything is routed by the
+        // peering key: the reference makes this decision for every remote
+        // with an identity and only afterwards asks whether a key was
+        // presented (`propagation_resource_concluded`,
+        // `reference/LXMF/LXMF/LXMRouter.py:2350-2389`). A single-message
+        // upload from a real propagation node therefore peers it too,
+        // which is why this sits above the client-upload return below.
+        //
+        // The validated peering hash first, the live link second: the
+        // validated hash was computed from the identity when the `/offer`
+        // was answered and needs no live link at all.
+        let link_identity = node.get_remote_identity(link_id).cloned();
+        let remote_of_link = peer.or_else(|| link_identity.as_ref().map(propagation_hash_of));
+        if let Some(remote) = remote_of_link {
+            self.peer_from_recalled_announce(node, remote, link_identity.as_ref());
+        }
+
+        let (Some(remote), Some(envelope)) = (peer, envelope) else {
+            if multi {
+                // Multi-message without a validated peering key: torn down
+                // (`reference/LXMF/LXMF/LXMRouter.py:2381-2389`).
+                self.drop_link_state(link_id);
+                out.merge(node.close_link(link_id));
+                return;
+            }
+            // A client's upload riding a resource; the resource protocol
+            // has its own acknowledgement, so no packet proof exists to
+            // send.
+            self.work.push_back(Work::Upload {
+                link_id: *link_id,
+                data: data.to_vec(),
+                via: "resource",
+            });
+            return;
+        };
+        self.seed_clock(node, envelope.timestamp as u64, "peer-sync");
+        if self.sync_batch.is_some() {
+            // One batch at a time; the gate throttled `/offer`s, so a
+            // second batch here is a peer ignoring the throttle.
+            self.drop_link_state(link_id);
+            out.merge(node.close_link(link_id));
+            return;
+        }
+        self.sync_batch = Some(SyncBatch {
+            link_id: *link_id,
+            remote,
+            drain: leviculum_sync_batch::SyncBatch::new(envelope.messages.into()),
+        });
+    }
+
+    /// A node just synced its store to us; peer it back if its last
+    /// announce — RECALLED, not heard now — says it is a propagation node
+    /// inside our depth (`reference/LXMF/LXMF/LXMRouter.py:2355-2375`).
+    ///
+    /// This is the half of the peering rule [`Self::on_pn_announce`] cannot
+    /// carry. A peer enters the table on a propagation announce heard WHILE
+    /// the role is running, and the next announce is a whole cadence
+    /// interval away ([`crate::announce`]). A neighbour that announced before
+    /// the board took the role — or before its last reset, which on a board
+    /// is an ordinary event — is invisible to that path for the whole
+    /// interval while its syncs keep arriving: its mail lands here and
+    /// nothing of ours ever flows back (Codeberg #417).
+    ///
+    /// **What a board can recall, and for how long.** The recall source is
+    /// [`NodeCore::recall_app_data`] over the announce cache, which on this
+    /// stack is [`EmbeddedStorage`](leviculum_core::EmbeddedStorage)'s
+    /// 16-entry map: RAM only, drop-oldest, and swept of every entry whose
+    /// destination has no path (`clean_announce_cache`). So the honest
+    /// bound is *while a path to that node lives, and not across a reset* —
+    /// the reference recalls from a persisted `known_destinations` and does
+    /// survive one. It covers the case this path is for, because a node
+    /// syncing to us over a link has a path by construction; what it does
+    /// not cover is a reboot between hearing the announce and the sync.
+    /// Closing that needs `app_data` persisted with the destination — a
+    /// store change of its own, not a caller's problem.
+    fn peer_from_recalled_announce<R, C, S>(
+        &mut self,
+        node: &NodeCore<R, C, S>,
+        remote_hash: [u8; 16],
+        link_identity: Option<&Identity>,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        if self.peers.get(&remote_hash).is_some() {
+            // Already peered, so the table would answer `AlreadyPeered`
+            // anyway. Returning here spares the board the recall, a packet
+            // unpack and an announce parse on every single sync round a
+            // known peer sends — the common case by far.
+            return;
+        }
+        let destination = DestinationHash::new(remote_hash);
+        let recalled = node.recall_app_data(&destination);
+        let hops = node.hops_to(&destination);
+        let now = node.emission_secs();
+        if self
+            .peers
+            .handle_inbound_sync_recalled(remote_hash, recalled.as_deref(), hops, now)
+            != PeerChange::Added
+        {
+            return;
+        }
+        // The keys, as the announce path captures them (#388 pass 3): from
+        // the link we are being synced over when it is still up, from the
+        // identity cache otherwise. Without them the peering-key material
+        // for our own sync round back cannot be derived.
+        if let Some(peer) = self.peers.get_mut(&remote_hash) {
+            if let Some(identity) =
+                link_identity.or_else(|| node.storage().get_identity(&remote_hash))
+            {
+                peer.capture_identity(identity);
+            }
+        }
+        // The reason names the EVENT that peered, not the mechanism that
+        // recalled — the reference's own "discovered via incoming sync"
+        // (`:2374`), and the word `PN_SYNC dir=in` already uses, so one
+        // grep of `PN_PEER` answers how each peer got in on either stack.
+        self.log_peer("add", &remote_hash, "inbound_sync");
+        self.persist_peer(&remote_hash);
+        // A peering formed on a contact window that is open right now:
+        // schedule the sync pass instead of waiting out the interval,
+        // exactly as the announce path's `Added` arm does.
+        self.next_sync_at_ms = 0;
+        self.role
+            .set_compute_stamp_value(self.peers.max_peer_min_cost() > 0);
+    }
+
+    fn conclude_sync_batch(&mut self) {
+        // A batch can end while one of its messages has a half-expanded
+        // workblock parked — a peer that ignored the throttle, or a second
+        // envelope arriving under the first. The stream belongs to THAT
+        // message; resuming it against the next one would judge a stamp by
+        // another message's workblock, so it is abandoned here rather than
+        // inherited. A link closing under the batch is no longer one of
+        // these cases: it leaves the grind alone (`on_events`, `LinkClosed`).
+        self.abandon_grind("batch_concluded");
+        if let Some(batch) = self.sync_batch.take() {
+            crate::log::log_fmt(
+                "PN_SYNC ",
+                format_args!(
+                    "peer={} dir=in transferred={} bytes={} result={}",
+                    Hex(&batch.remote),
+                    batch.drain.transferred(),
+                    batch.drain.bytes(),
+                    batch.drain.result()
+                ),
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Active delivery (instruction item 4)
+    // -----------------------------------------------------------------
+
+    /// A path to `destination` appeared: if the store holds a
+    /// packet-sized message for it and nothing else is in flight, send
+    /// it as the single opportunistic packet the originator would have
+    /// sent (`reference/LXMF/LXMF/LXMessage.py:426-434` — the stored
+    /// blob minus its 16-byte prefix IS that packet's ciphertext).
+    fn trigger_active<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        destination: &[u8; 16],
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        if self.active.is_some() || node.now_ms() < self.next_active_at_ms {
+            return;
+        }
+        let mut candidate: Option<StoredMessage> = None;
+        let too_large = &self.too_large;
+        let _ = self.role.store().for_each(&mut |meta| {
+            if &meta.destination_hash == destination
+                && !too_large.contains(&meta.transient_id)
+                && candidate.is_none_or(|held| meta.sequence < held.sequence)
+            {
+                candidate = Some(*meta);
+            }
+        });
+        let Some(meta) = candidate else {
+            return;
+        };
+        self.resend_active(node, meta.transient_id, *destination, ACTIVE_ATTEMPTS, out);
+    }
+
+    fn resend_active<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        transient_id: TransientId,
+        destination: [u8; 16],
+        attempts_left: u8,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        // An active delivery is the engine's own initiative (leviculum#494):
+        // past the share it waits the same gap a missing path costs, and
+        // the message stays in the store for the next trigger or a `/get`.
+        if !self.own_traffic_go("active_delivery") {
+            self.next_active_at_ms = node.now_ms().saturating_add(ACTIVE_GAP_MS);
+            return;
+        }
+        let Ok(Some(body)) = self.role.store().read_body(&transient_id) else {
+            return;
+        };
+        if body.len() < 16 + STAMP_SIZE {
+            return;
+        }
+        // lxmf_data ‖ stamp: strip the destination prefix and the stamp;
+        // what remains is the originator's destination-encrypted payload.
+        let ciphertext = &body[16..body.len() - STAMP_SIZE];
+        match node.send_raw_single_packet(&DestinationHash::new(destination), ciphertext) {
+            Ok((packet_hash, send)) => {
+                out.merge(send);
+                crate::log::log_fmt(
+                    "PN_DELIVER ",
+                    format_args!(
+                        "sent tid={} dst={} bytes={} attempts_left={}",
+                        Hex(&transient_id[..8]),
+                        Hex(&destination),
+                        ciphertext.len(),
+                        attempts_left
+                    ),
+                );
+                self.active = Some(ActiveDelivery {
+                    transient_id,
+                    destination,
+                    packet_hash,
+                    attempts_left,
+                });
+            }
+            Err(leviculum_core::SendError::TooLarge) => {
+                // Left for /get, never retried actively. Bounded: the
+                // list only ever holds ids still in the store.
+                if !self.too_large.contains(&transient_id) {
+                    self.too_large.push(transient_id);
+                    if self.too_large.len() > 64 {
+                        self.too_large.remove(0);
+                    }
+                }
+            }
+            Err(_) => {
+                // No path after all, or pacing: the next trigger retries.
+                self.next_active_at_ms = node.now_ms().saturating_add(ACTIVE_GAP_MS);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The asynchronous half
+    // -----------------------------------------------------------------
+
+    /// Run due periodic jobs, process at most one queued work item — and
+    /// at most one slice of that item's stamp workblock — and flush the
+    /// store adapters. The only awaiting entry point; call from a
+    /// main-loop arm (never inside a `select`).
+    ///
+    /// The pass is bounded on purpose: for as long as it runs, the loop that
+    /// called it is not in its `select`, and nothing drains the LoRa task's
+    /// blocking hand-off. See the module docs, §Why a slice and not a yield.
+    pub async fn settle<R, C, S>(&mut self, node: &mut NodeCore<R, C, S>) -> TickOutput
+    where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let mut out = TickOutput::default();
+        let now_ms = node.now_ms();
+
+        self.harvest_mining();
+        self.tick_announce(node, now_ms, &mut out);
+        self.tick_maintenance(node, now_ms);
+        self.tick_stats(now_ms);
+        self.tick_sync(node, now_ms, &mut out);
+
+        if let Some(work) = self.work.pop_front() {
+            // A work item whose stamp grind is only part-expanded comes back
+            // out of `perform` untouched and goes to the FRONT: the next pass
+            // is owed the same item, and a queue that reordered under a parked
+            // grind would resume one message's workblock against another
+            // message's stamp.
+            if let Some(unfinished) = self.perform(node, work, &mut out).await {
+                self.work.push_front(unfinished);
+            }
+        } else if self.sync_batch.is_some() {
+            self.perform_sync_step(node, &mut out).await;
+        }
+
+        self.flush(node).await;
+        out
+    }
+
+    fn harvest_mining(&mut self) {
+        let Ok(result) = MINE_RES.try_receive() else {
+            return;
+        };
+        if self.mining_peer == Some(result.peer) {
+            self.mining_peer = None;
+        }
+        if let Some(peer) = self.peers.get_mut(&result.peer) {
+            peer.peering_key = Some((result.key, result.value));
+            peer.state = SyncPhase::Idle;
+        }
+        self.persist_peer(&result.peer);
+        self.next_sync_at_ms = 0;
+    }
+
+    fn tick_announce<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        now_ms: u64,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        if !crate::record_store::mounted() {
+            // A role whose store did not mount must not invite uploads
+            // it can never prove. Checked before the cadence is polled,
+            // so a withheld tick spends nothing: the deadline is pushed
+            // out by the retry rather than consumed by an announce that
+            // never happened.
+            if crate::announce::with_cadence(|cadence| {
+                cadence.wait_ms(AnnounceSlot::Propagation, now_ms)
+            }) > 0
+            {
+                return;
+            }
+            if !self.announce_withheld_logged {
+                self.announce_withheld_logged = true;
+                crate::log::log_fmt_critical(
+                    "PN ",
+                    format_args!("announce withheld reason=store-unmounted"),
+                );
+            }
+            crate::announce::with_cadence(|cadence| {
+                cadence.defer(
+                    AnnounceSlot::Propagation,
+                    now_ms,
+                    now_ms + ANNOUNCE_STORE_RETRY_MS,
+                )
+            });
+            return;
+        }
+        // NOT clock-gated (#384 item 6): a clockless board still
+        // announces, with its uptime timebase. A peer treats the small
+        // timebase as merely old — creation is unconditional, only
+        // updates are ordered by it (`peer`,
+        // `reference/LXMF/LXMF/LXMRouter.py:2016`) — and the first
+        // contact the announce invites is exactly what delivers a seed
+        // (an upload's envelope timestamp, a peer's announce timebase).
+        // The age-based bookkeeping the jump would break is epoch-guarded
+        // where it lives (expiry in `PropagationNode::tick`, the peer
+        // cull refresh in `seed_clock`). [TIME_SOURCE] in the periodic
+        // banner says which clock stamped any given announce. The `true`
+        // below is that rule's consequence and not a shortcut:
+        // `AnnounceSlot::Propagation` is not clock-gated, so the flag is
+        // never read for this slot.
+        let announce = crate::announce::with_cadence(|cadence| {
+            cadence.poll(AnnounceSlot::Propagation, now_ms, true)
+        });
+        if announce != Some(Decision::Announce) {
+            return;
+        }
+        self.announce_withheld_logged = false;
+        let app_data = self.role.announce_app_data(node.emission_secs());
+        if let Ok(send) = node.announce_destination(&self.dest_hash, Some(&app_data)) {
+            out.merge(send);
+            let d = self.dest_hash.as_bytes();
+            crate::log::log_fmt_critical(
+                "[INFO!] ",
+                format_args!(
+                    "[ANNOUNCE] sent dst={:02x}{:02x}{:02x}{:02x} reason={}",
+                    d[0],
+                    d[1],
+                    d[2],
+                    d[3],
+                    AnnounceSlot::Propagation.as_str()
+                ),
+            );
+        }
+    }
+
+    /// Announce the role NOW, on every interface, because a host asked
+    /// (`TYPE_ANNOUNCE`). Same announce `Self::tick_announce` sends on
+    /// the cadence — same destination, same app data, same store gate —
+    /// so what a listener hears is what it would have heard at the next
+    /// interval, only sooner.
+    ///
+    /// NOT clock-gated, for the reason the periodic announce is not
+    /// (item 6): a clockless board still announces with its uptime
+    /// timebase, and the contact that announce invites is exactly what
+    /// delivers the seed. The delivery-destination announce beside it in
+    /// the binaries IS clock-gated, and stays that way — the two answer
+    /// to different rules and this one follows its own.
+    ///
+    /// The cadence is deliberately NOT re-armed: `lnflash --announce`
+    /// does not re-arm the delivery announce's periodic gate either, and
+    /// a commanded announce that silently pushed the next scheduled one
+    /// out would make the interval a function of how often the harness
+    /// asked. Returns no actions when the store did not mount — a role
+    /// that cannot prove an upload must not invite one.
+    pub fn announce_now<R, C, S>(&mut self, node: &mut NodeCore<R, C, S>) -> TickOutput
+    where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let mut out = TickOutput::default();
+        if !crate::record_store::mounted() {
+            crate::log::log_fmt_critical(
+                "PN ",
+                format_args!("announce withheld reason=store-unmounted"),
+            );
+            return out;
+        }
+        let app_data = self.role.announce_app_data(node.emission_secs());
+        if let Ok(send) = node.announce_destination(&self.dest_hash, Some(&app_data)) {
+            out.merge(send);
+            let d = self.dest_hash.as_bytes();
+            crate::log::log_fmt_critical(
+                "[INFO!] ",
+                format_args!(
+                    "[ANNOUNCE] sent dst={:02x}{:02x}{:02x}{:02x} reason=pn-host",
+                    d[0], d[1], d[2], d[3]
+                ),
+            );
+        }
+        out
+    }
+
+    /// A BLE peer finished its identity handshake: announce the role to
+    /// it, on its link alone, so a phone that just connected learns this
+    /// board is a propagation node without waiting out the cadence.
+    pub fn on_ble_peer_up<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        iface: usize,
+        peer: [u8; 16],
+    ) -> TickOutput
+    where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let mut out = TickOutput::default();
+        if !crate::record_store::mounted() {
+            return out;
+        }
+        let app_data = self.role.announce_app_data(node.emission_secs());
+        if let Ok(send) =
+            node.announce_destination_to_peer(&self.dest_hash, Some(&app_data), iface, peer)
+        {
+            out.merge(send);
+        }
+        out
+    }
+
+    fn tick_maintenance<R, C, S>(&mut self, node: &mut NodeCore<R, C, S>, now_ms: u64)
+    where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        if now_ms < self.next_maintenance_at_ms {
+            return;
+        }
+        self.next_maintenance_at_ms = now_ms + MAINTENANCE_SECS * 1000;
+        let now = node.emission_secs();
+        let evicted = self.role.tick(now);
+        self.log_evictions(&evicted);
+        for dropped in self.peers.cull(now) {
+            let _ = self.peer_store.remove(&dropped);
+            self.log_peer("drop", &dropped, "unreachable");
+        }
+    }
+
+    fn log_evictions(&self, evicted: &[Eviction]) {
+        for eviction in evicted {
+            crate::log::log_fmt(
+                "PN_EVICT ",
+                format_args!(
+                    "tid={} bytes={} age_s={} reason={}",
+                    Hex(&eviction.transient_id[..8]),
+                    eviction.size,
+                    eviction.age_secs,
+                    match eviction.reason {
+                        EvictionReason::Expired => "expired",
+                        EvictionReason::Displaced => "displaced",
+                    }
+                ),
+            );
+        }
+    }
+
+    /// One refused upload, by reason word and carrier.
+    ///
+    /// `reason` is a fixed word rather than prose, for the same reason
+    /// `lnpnd::engine::log_reject` keeps one: the point of the line is that a
+    /// capture can count refusals per reason without parsing sentences. The
+    /// board needs it more than the daemon does — since #397 the proof leaves
+    /// at receipt, so a refusal is no longer visible on the wire as a missing
+    /// proof and this line is the only place it is recorded.
+    fn log_reject(reason: &'static str, via: &'static str) {
+        crate::log::log_fmt("PN_REJECT ", format_args!("reason={reason} via={via}"));
+    }
+
+    fn tick_stats(&mut self, now_ms: u64) {
+        if now_ms < self.next_stats_at_ms {
+            return;
+        }
+        self.next_stats_at_ms = now_ms + STATS_SECS * 1000;
+        let live = self.role.store().count().unwrap_or(0);
+        STORE_FILL.store(live.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+        crate::log::log_fmt(
+            "PN_STATS ",
+            format_args!(
+                "store={} free_bytes={} capacity={} peers={}",
+                live,
+                self.role.store().free_space(),
+                self.role.store().capacity(),
+                self.peers.len()
+            ),
+        );
+    }
+
+    /// Whether the engine may originate traffic now (leviculum#494): the
+    /// rolling hour's keyed airtime, as the LoRa task last published it, is
+    /// below [`OWN_TRAFFIC_SHARE_PERMILLE`] of the long-term cap.
+    ///
+    /// Asked at every site where the engine hands frames to the modem on its
+    /// own initiative, and nowhere else: what the node forwards as a
+    /// transport node never passes through here, so it keeps the other half
+    /// of the budget. A refusal is stated once, on its edge, as `PN_YIELD`;
+    /// the site retries on its own cadence. `site=` names the first site to
+    /// meet the share, which is the one that opened the yield.
+    fn own_traffic_go(&mut self, site: &'static str) -> bool {
+        let lt_ms = crate::lora::LORA_LT_USED_MS.load(Ordering::Relaxed);
+        let cap_ms = crate::lora::LORA_LT_CAP_MS.load(Ordering::Relaxed);
+        match self
+            .own_share
+            .check(lt_ms, cap_ms, OWN_TRAFFIC_SHARE_PERMILLE)
+        {
+            OwnVerdict::Go => true,
+            OwnVerdict::Yield { edge } => {
+                if edge {
+                    crate::log::log_fmt(
+                        "PN_YIELD ",
+                        format_args!(
+                            "reason=duty_share lt_ms={} cap_ms={} share={} site={}",
+                            lt_ms, cap_ms, OWN_TRAFFIC_SHARE_PERMILLE, site
+                        ),
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn tick_sync<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        now_ms: u64,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        if let Some(sync) = &self.outbound {
+            if now_ms > sync.deadline_ms {
+                let link_id = sync.link_id;
+                self.finish_round("timeout", 0, 0);
+                out.merge(node.close_link(&link_id));
+            }
+        }
+        if self.outbound.is_some() || self.mining_peer.is_some() || now_ms < self.next_sync_at_ms {
+            return;
+        }
+        self.next_sync_at_ms = now_ms + SYNC_INTERVAL_SECS * 1000;
+
+        let now = node.emission_secs();
+        let newest = self.role.store().newest_sequence().unwrap_or(0);
+        let Some(destination) = self.peers.next_due(now, newest, self.last_synced) else {
+            return;
+        };
+        self.last_synced = Some(destination);
+        self.start_round(node, destination, now, now_ms, out);
+    }
+
+    fn start_round<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        destination: [u8; 16],
+        now: u64,
+        now_ms: u64,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        // The own-traffic share first (leviculum#494), ahead of the path
+        // request and the link this round would originate and before any
+        // backoff is booked: a yield is the budget's state, not the peer's
+        // fault, and the next sync pass retries.
+        if !self.own_traffic_go("sync_round") {
+            return;
+        }
+        // Recall order (#388 pass 3): the keys kept with the peer first,
+        // the node's rolling `known_identities` cache second. A cache hit
+        // for a peer that has no keys yet is captured back into the peer
+        // record, so the next recall no longer depends on the cache.
+        let recalled = self
+            .peers
+            .get(&destination)
+            .and_then(|peer| peer.recall_identity(node.storage()));
+        let our_identity_hash = self.identity_hash;
+        let Some(peer) = self.peers.get_mut(&destination) else {
+            return;
+        };
+        let captured = match &recalled {
+            Some(identity) => peer.capture_identity(identity),
+            None => false,
+        };
+        if captured {
+            self.persist_peer(&destination);
+        }
+        let Some(peer) = self.peers.get_mut(&destination) else {
+            return;
+        };
+        if !peer.peering_key_ready() {
+            let Some(peer_identity_hash) = peer.identity_hash else {
+                out.merge(node.request_path(&DestinationHash::new(destination)));
+                return;
+            };
+            peer.state = SyncPhase::KeyMining;
+            let material = peering_key_material(&peer_identity_hash, &our_identity_hash);
+            let cost = peer.peering_cost;
+            if MINE_REQ
+                .try_send(MineJob {
+                    peer: destination,
+                    material,
+                    cost,
+                })
+                .is_ok()
+            {
+                self.mining_peer = Some(destination);
+            } else if let Some(peer) = self.peers.get_mut(&destination) {
+                peer.state = SyncPhase::Idle;
+            }
+            return;
+        }
+
+        let mut entries: Vec<StoredMessage> = Vec::new();
+        let cursor = peer.cursor;
+        if self
+            .role
+            .store()
+            .for_each(&mut |meta| {
+                if meta.sequence > cursor {
+                    entries.push(*meta);
+                }
+            })
+            .is_err()
+        {
+            return;
+        }
+        entries.sort_by_key(|meta| meta.sequence);
+        // A probe, not the offer: there is no link yet, so no MDU to size
+        // against. One id is all this has to answer — "is anything above
+        // the cursor offerable?". The offer itself is built in
+        // `on_sync_link_up` against the link that will carry it. An empty
+        // id list still carries the full skip scan, so dead entries are
+        // stepped past here exactly as before.
+        let Some(plan) = build_offer(peer, &entries, OFFER_PROBE_BUDGET) else {
+            return;
+        };
+        if plan.ids.is_empty() {
+            peer.cursor = plan.cursor_target;
+            self.persist_peer(&destination);
+            return;
+        }
+
+        let Some(signing_key) = recalled
+            .as_ref()
+            .map(|identity| identity.ed25519_verifying().to_bytes())
+        else {
+            out.merge(node.request_path(&DestinationHash::new(destination)));
+            return;
+        };
+        peer.sync_backoff_secs += SYNC_BACKOFF_STEP_SECS;
+        peer.next_sync_attempt = now + peer.sync_backoff_secs;
+        peer.state = SyncPhase::LinkEstablishing;
+        let (link_id, _, core_out) =
+            match node.connect(DestinationHash::new(destination), &signing_key) {
+                Ok(connected) => connected,
+                Err(_) => {
+                    // Link-cap refusal (`MAX_ENDPOINT_LINKS`, #388): the
+                    // core has emitted LinkRefused, which the bins render
+                    // as a LINK_REFUSED line (`crate::events`); the
+                    // backoff above is already booked, so this round
+                    // retries on a later sync pass instead of spinning.
+                    crate::log::log_fmt(
+                        "PN_SYNC ",
+                        format_args!("peer={} action=defer reason=link_cap", Hex(&destination)),
+                    );
+                    if let Some(peer) = self.peers.get_mut(&destination) {
+                        peer.state = SyncPhase::Idle;
+                    }
+                    return;
+                }
+            };
+        out.merge(core_out);
+        self.outbound = Some(OutboundSync {
+            peer: destination,
+            link_id,
+            plan,
+            request_id: None,
+            sending: None,
+            deadline_ms: now_ms + OUTBOUND_DEADLINE_MS,
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Work processing (the awaiting parts)
+    // -----------------------------------------------------------------
+
+    /// Drop a parked stamp grind, because what it belongs to is gone.
+    ///
+    /// The only correctness rule the slicing adds: a parked stream may be
+    /// resumed by the pass that comes back for the SAME message, and by
+    /// nothing else. The work queue keeps that on its own — only
+    /// [`Engine::settle`] ever pops it, and it puts an unfinished item back at
+    /// the front — so the sync batch is the one place that has to say so.
+    fn abandon_grind(&mut self, reason: &'static str) {
+        if let Some(grind) = self.grind.take() {
+            crate::log::log_fmt(
+                "PN_STAMP ",
+                format_args!(
+                    "abandoned rounds={}/{} slices={} reason={}",
+                    grind.stream.rounds_done(),
+                    grind.stream.rounds_total(),
+                    grind.slices,
+                    reason
+                ),
+            );
+        }
+    }
+
+    /// Expand one [`GRIND_SLICE_ROUNDS`]-round slice of the stamp workblock
+    /// that gates the current work item, and report the wall-clock cost as
+    /// `PN_STAMP ms=` when the last slice lands.
+    ///
+    /// # Why this returns instead of awaiting
+    ///
+    /// The whole workblock is 3.7 s on this core, and `settle` is called
+    /// inline from the binaries' single main loop. Awaiting it keeps that loop
+    /// out of its `select` for the whole 3.7 s, which is not merely slow: the
+    /// LoRa task hands received frames up through a four-slot channel whose
+    /// send BLOCKS (`crate::lora`), so a loop that is away long enough leaves
+    /// that task parked in the hand-off with no receive window standing. The
+    /// 2026-09-23 night run measured the consequence — `SX_RX_ARM site=ack
+    /// dark_ms=10284` and `dark_ms=17870` on a board that was validating ten
+    /// synced stamps back to back, and a client link request lost to it.
+    ///
+    /// The cooperative yield inside the validator does not help here, and that
+    /// is worth saying plainly because it looks like it should: it yields to
+    /// the EXECUTOR, which lets other tasks run, but the task that has to run
+    /// is this one — nothing else drains the hand-off. Only returning to the
+    /// loop drains it. So the workblock is expanded a slice at a time, the
+    /// stream is parked in [`Engine::grind`], and the caller puts its work
+    /// item back and comes round again.
+    ///
+    /// `material` is called only when no grind is in flight, so resuming a
+    /// stamp costs no re-decode of the upload it came out of.
+    fn validate_step<F>(&mut self, material: F) -> ValidateStep
+    where
+        F: FnOnce() -> Option<(TransientId, [u8; STAMP_SIZE])>,
+    {
+        let min_cost = self.role.min_accepted_cost();
+        let compute = self.role.compute_stamp_value();
+        if min_cost == 0 && !compute {
+            // No workblock is walked at all, exactly as before: nothing to
+            // slice, and no pass to spend.
+            return ValidateStep::Done(Some(0));
+        }
+        if self.grind.is_none() {
+            let Some((id, stamp)) = material() else {
+                return ValidateStep::Done(None);
+            };
+            self.grind = Some(Grind {
+                material: id,
+                stamp,
+                stream: WorkblockStream::new(WORKBLOCK_EXPAND_ROUNDS_PN),
+                started: embassy_time::Instant::now(),
+                slices: 0,
+            });
+        }
+        let Some(grind) = self.grind.as_mut() else {
+            // Unreachable: the branch above either set it or returned.
+            return ValidateStep::Done(None);
+        };
+        grind.slices += 1;
+        grind.stream.advance(&grind.material, GRIND_SLICE_ROUNDS);
+        if !grind.stream.is_complete() {
+            return ValidateStep::Parked;
+        }
+        let Some(grind) = self.grind.take() else {
+            return ValidateStep::Done(None);
+        };
+        let result = if min_cost == 0 {
+            Some(grind.stream.value(&grind.stamp))
+        } else {
+            grind.stream.validated(&grind.stamp, min_cost)
+        };
+        crate::log::log_fmt(
+            "PN_STAMP ",
+            format_args!(
+                "ms={} slices={} min_cost={} valid={}",
+                grind.started.elapsed().as_millis(),
+                grind.slices,
+                min_cost,
+                result.is_some() as u8
+            ),
+        );
+        ValidateStep::Done(result)
+    }
+
+    /// Re-bound what the next fetch may serve, from the heap this board
+    /// HAS at this moment rather than the worst case its boot plan
+    /// feared (#388, order 138).
+    ///
+    /// The boot cap is a floor: it is the plan's own worst case, every
+    /// term at its maximum at once, and on a T114 that funds 194 B —
+    /// about one minimal message and nothing like a field one. The heap
+    /// it actually stands on when a client fetches is much larger
+    /// (30 380 B free when the 2026-09-23 fetch killed it), and
+    /// [`crate::heap_census::live_serve_cap`] says what that funds,
+    /// after [`crate::heap_census::SERVE_MARGIN_BYTES`] is taken off for
+    /// what can still arrive while the serve is in flight: **7 252 B**,
+    /// which is the field's whole 24-message mailbox in one fetch since
+    /// #384 B2 streamed the response out of the store.
+    ///
+    /// Read here, once per `/get`, and not cached: the point of the
+    /// number is that it moves. Both census figures are read together —
+    /// `free` for the summed model, `largest` for the terms that are one
+    /// allocation, because a heap with the bytes in pieces funds no
+    /// serve. The `largest=` probe is the census's own
+    /// ([`crate::heap_census::largest_free_block`]), ~12 alloc/free
+    /// pairs with no await between claim and release.
+    ///
+    /// The `SERVE_CAP` line is the evidence for the next post-mortem:
+    /// `live_cap=` is what this fetch may ship, and `free=`/`largest=`
+    /// beside `margin=` are every input it was computed from, so the
+    /// arithmetic can be re-run from a capture.
+    fn read_serve_cap(&mut self) {
+        let (_, free) = crate::heap_stats();
+        let largest = crate::heap_census::largest_free_block();
+        let live_cap = crate::heap_census::live_serve_cap(self.serve_boot_cap, free, largest);
+        self.role.set_serve_cap_bytes(Some(live_cap));
+        crate::log::log_fmt(
+            "SERVE_CAP ",
+            format_args!(
+                "boot_cap={} live_cap={} margin={} largest={} free={}",
+                self.serve_boot_cap,
+                live_cap,
+                crate::heap_census::SERVE_MARGIN_BYTES,
+                largest,
+                free
+            ),
+        );
+    }
+
+    /// `Some(work)` gives the item back unperformed: its stamp grind needs
+    /// more settle passes, and the caller owes it the front of the queue.
+    async fn perform<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        work: Work,
+        out: &mut TickOutput,
+    ) -> Option<Work>
+    where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        match work {
+            Work::Upload { link_id, data, via } => {
+                // The stamp first, and before anything with a side effect:
+                // this arm is re-entered once per slice until the workblock is
+                // expanded, so everything ahead of the grind would run fifty
+                // times over. `validate_step` only calls the closure on the
+                // first slice, so the decode is paid once too.
+                let precomputed = match self.validate_step(|| {
+                    leviculum_lxmf::propagation::PropagationUpload::decode(&data)
+                        .ok()
+                        .map(|upload| (*upload.transient_id(), *upload.propagation_stamp()))
+                }) {
+                    ValidateStep::Parked => return Some(Work::Upload { link_id, data, via }),
+                    // An upload that would not decode yields no value, which
+                    // is what a failed decode always amounted to here: the two
+                    // cases the old `Option<Option<u16>>` kept apart were
+                    // flattened into one at its single use, and the role's own
+                    // parser names the outcome below either way.
+                    ValidateStep::Done(value) => value,
+                };
+                // Item 6: the envelope timestamp is a phone's clock. After the
+                // grind, so it is seeded once per upload and not once per
+                // slice.
+                if let Ok(envelope) = PeerSyncEnvelope::decode(&data) {
+                    self.seed_clock(node, envelope.timestamp as u64, "upload");
+                }
+                let now = node.emission_secs();
+                let outcome = self.role.handle_upload(&data, now, |_, _| precomputed);
+                match outcome {
+                    UploadOutcome::Accepted {
+                        transient_id,
+                        destination_hash,
+                        size,
+                        stamp_value,
+                        duplicate,
+                        evicted,
+                    } => {
+                        self.log_evictions(&evicted);
+                        let peak = leviculum_heap_budget::upload_peak(
+                            data.len(),
+                            size as usize,
+                            !duplicate,
+                        );
+                        self.peaks.upload = self.peaks.upload.max(peak);
+                        // The flush still happens here, and `durable=` still
+                        // reports it — what it no longer gates is the proof
+                        // (#397). A packet proof is a receipt statement, not
+                        // a storage statement, and holding it for the flush
+                        // put it behind the whole stamp workblock.
+                        let durable = self.flush(node).await;
+                        crate::log::log_fmt(
+                            "PN_ACCEPT ",
+                            format_args!(
+                                "tid={} dst={} bytes={} value={} dup={} via={} durable={}",
+                                Hex(&transient_id[..8]),
+                                Hex(&destination_hash),
+                                size,
+                                stamp_value,
+                                duplicate as u8,
+                                via,
+                                durable as u8
+                            ),
+                        );
+                    }
+                    UploadOutcome::InvalidStamp { reject } => {
+                        // The verdict is late by construction now — the
+                        // receipt it would once have failed is long
+                        // concluded — but it is still the only thing that
+                        // tells the sender its stamp was refused, and the
+                        // reference sends it
+                        // (`reference/LXMF/LXMF/LXMRouter.py:2253-2256`).
+                        // A Python client turns it into `LXMessage.REJECTED`
+                        // whatever its receipt did
+                        // (`propagation_transfer_signalling_packet`,
+                        // `reference/LXMF/LXMF/LXMRouter.py:2667-2677`), so
+                        // it goes out best-effort and the link is torn down
+                        // behind it.
+                        Self::log_reject("stamp", via);
+                        if let Ok((_, send)) = node.send_packet_on_link(&link_id, &reject) {
+                            out.merge(send);
+                        }
+                        self.drop_link_state(&link_id);
+                        out.merge(node.close_link(&link_id));
+                    }
+                    UploadOutcome::PeerSyncForm => {
+                        // Multi-message on the packet path: nonconforming
+                        // (`reference/LXMF/LXMF/LXMRouter.py:2382-2385`).
+                        Self::log_reject("peer_sync_form", via);
+                        self.drop_link_state(&link_id);
+                        out.merge(node.close_link(&link_id));
+                    }
+                    UploadOutcome::Malformed(_) => Self::log_reject("malformed", via),
+                    UploadOutcome::StoreFailed(_) => {
+                        // The proof is already on the wire (#397), so the
+                        // client will not retry this one: the `PN_REJECT`
+                        // and the `durable=0` beside it are what a capture
+                        // has to read the loss from.
+                        Self::log_reject("store", via);
+                    }
+                }
+            }
+            Work::Get {
+                link_id,
+                request_id,
+                data,
+            } => {
+                let Some(identity) = node.get_remote_identity(&link_id).cloned() else {
+                    let response = MessageListResponse::Error(PeerError::NoIdentity)
+                        .encode()
+                        .unwrap_or_default();
+                    self.respond(node, &link_id, &request_id, &response, out);
+                    return None;
+                };
+                let name_hash = Destination::compute_name_hash(APP_NAME, &["delivery"]);
+                let mailbox =
+                    *Destination::compute_destination_hash(&name_hash, identity.hash()).as_bytes();
+                let now = node.emission_secs();
+                self.read_serve_cap();
+                match self.role.handle_get(&data, &mailbox, now) {
+                    Ok(GetOutcome::List { response, count }) => {
+                        crate::log::log_fmt(
+                            "PN_GET ",
+                            format_args!(
+                                "dst={} form=list count={} bytes=0 purged=0",
+                                Hex(&mailbox),
+                                count
+                            ),
+                        );
+                        self.respond(node, &link_id, &request_id, &response, out);
+                    }
+                    Ok(GetOutcome::Fetch { plan, purged }) => {
+                        // The purges the client confirmed go to flash
+                        // before the response claims anything.
+                        let _ = self.flush(node).await;
+                        crate::log::log_fmt(
+                            "PN_GET ",
+                            format_args!(
+                                "dst={} form=fetch count={} bytes={} purged={}",
+                                Hex(&mailbox),
+                                plan.count(),
+                                plan.served_bytes(),
+                                purged.len()
+                            ),
+                        );
+                        self.respond_fetch(node, &link_id, &request_id, &plan, out);
+                    }
+                    Err(_) => {
+                        // msgpack nil, the reference's answer to a
+                        // request it could not process.
+                        self.respond(node, &link_id, &request_id, &[0xC0], out);
+                    }
+                }
+            }
+            Work::Offer {
+                link_id,
+                request_id,
+                data,
+            } => {
+                let response = self.answer_offer_work(node, &link_id, &data).await;
+                self.respond(node, &link_id, &request_id, &response, out);
+            }
+        }
+        // Only an upload's stamp parks. `/get` walks no workblock, and the
+        // peering stamp an `/offer` checks is the 25-round workblock — forty
+        // times cheaper, ~93 ms on this core, already inside the frame the
+        // slicing is sized against, so it stays one await.
+        None
+    }
+
+    /// Answer one inbound `/offer`
+    /// (`offer_request`, `reference/LXMF/LXMF/LXMRouter.py:2266-2329`).
+    async fn answer_offer_work<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        link_id: &LinkId,
+        data: &[u8],
+    ) -> Vec<u8>
+    where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let now = node.emission_secs();
+        let Some(identity) = node.get_remote_identity(link_id).cloned() else {
+            return OfferResponse::Error(PeerError::NoIdentity).encode();
+        };
+        let remote_identity_hash = *identity.hash();
+        let remote_hash = propagation_hash_of(&identity);
+
+        // Accepting an inbound offer commits this node to a transfer it
+        // carries its half of (resource requests and proofs, then the
+        // batch's own downstream syncs). Past the share (leviculum#494)
+        // the answer is the reference's own postponement,
+        // `ERROR_THROTTLED` (`reference/LXMF/LXMF/LXMRouter.py:2278`),
+        // on which a stock peer waits `PN_STAMP_THROTTLE` and offers again
+        // (`reference/LXMF/LXMF/LXMPeer.py:421-425`). The one small frame
+        // that says so is still sent: silence would cost the peer its
+        // request timeout and the same retry.
+        if !self.own_traffic_go("offer_answer") {
+            return OfferResponse::Error(PeerError::Throttled).encode();
+        }
+
+        if let Err(error) = self.gate.admit(
+            self.peers.config(),
+            &remote_hash,
+            now,
+            // The sequential-validation gate: while a batch drains, new
+            // offers wait (module docs).
+            self.sync_batch.is_some(),
+            self.inbound_transfers.len(),
+        ) {
+            return OfferResponse::Error(error).encode();
+        }
+        let Ok(offer) = PeerOffer::decode(data) else {
+            return OfferResponse::Error(PeerError::InvalidData).encode();
+        };
+        let our_cost = self.peers.config().peering_cost;
+        if our_cost > 0 {
+            let material = peering_key_material(&self.identity_hash, &remote_identity_hash);
+            let mut stamper = CooperativeStamper::cooperative(crate::rng::RawHwRng::new());
+            let valid = stamper
+                .validate_stamp(
+                    &material,
+                    &offer.peering_key,
+                    our_cost,
+                    WORKBLOCK_EXPAND_ROUNDS_PEERING,
+                )
+                .await
+                .unwrap_or(None)
+                .is_some();
+            if !valid {
+                return OfferResponse::Error(PeerError::InvalidKey).encode();
+            }
+        }
+        self.validated_links.insert(*link_id, remote_hash);
+
+        let store = self.role.store();
+        let response = answer_offer(&offer.transient_ids, |id| {
+            store.contains(id).unwrap_or(false)
+        });
+        let wanted = match &response {
+            OfferResponse::WantNone => 0,
+            OfferResponse::WantAll => offer.transient_ids.len(),
+            OfferResponse::Wanted(ids) => ids.len(),
+            OfferResponse::Error(_) => 0,
+        };
+        crate::log::log_fmt(
+            "PN_OFFER ",
+            format_args!(
+                "peer={} dir=in offered={} wanted={}",
+                Hex(&remote_hash),
+                offer.transient_ids.len(),
+                wanted
+            ),
+        );
+        response.encode()
+    }
+
+    /// Ingest one message of the draining sync batch.
+    async fn perform_sync_step<R, C, S>(
+        &mut self,
+        node: &mut NodeCore<R, C, S>,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let Some(message) = self
+            .sync_batch
+            .as_mut()
+            .and_then(|batch| batch.drain.take_next())
+        else {
+            self.conclude_sync_batch();
+            return;
+        };
+        // The same acceptance path as a client upload
+        // (`reference/LXMF/LXMF/LXMRouter.py:2430-2436`).
+        let precomputed = if message.len() > STAMP_SIZE {
+            match self.validate_step(|| {
+                let (unstamped, stamp_bytes) = message.split_at(message.len() - STAMP_SIZE);
+                let transient_id = leviculum_core::crypto::full_hash(unstamped);
+                let mut stamp = [0u8; STAMP_SIZE];
+                stamp.copy_from_slice(stamp_bytes);
+                Some((transient_id, stamp))
+            }) {
+                // The grind wants more passes: the message goes back to the
+                // FRONT of the batch so the next pass resumes the same
+                // workblock, and nothing below runs on a stamp not yet judged.
+                ValidateStep::Parked => {
+                    if let Some(batch) = self.sync_batch.as_mut() {
+                        batch.drain.park(message);
+                    }
+                    return;
+                }
+                ValidateStep::Done(value) => Some(value),
+            }
+        } else {
+            None
+        };
+        let now = node.emission_secs();
+        let outcome = self
+            .role
+            .accept_stamped(&message, now, |_, _| precomputed.flatten());
+        let durable = self.flush(node).await;
+        let reason = match &outcome {
+            UploadOutcome::InvalidStamp { .. } => "stamp",
+            UploadOutcome::Malformed(_) => "malformed",
+            UploadOutcome::PeerSyncForm => "peer_sync_form",
+            _ => "store",
+        };
+        match outcome {
+            UploadOutcome::Accepted {
+                transient_id,
+                destination_hash,
+                size,
+                stamp_value,
+                duplicate,
+                ..
+            } => {
+                crate::log::log_fmt(
+                    "PN_ACCEPT ",
+                    format_args!(
+                        "tid={} dst={} bytes={} value={} dup={} via=sync durable={}",
+                        Hex(&transient_id[..8]),
+                        Hex(&destination_hash),
+                        size,
+                        stamp_value,
+                        duplicate as u8,
+                        durable as u8
+                    ),
+                );
+                if !duplicate && durable {
+                    if let Some(batch) = self.sync_batch.as_mut() {
+                        batch.drain.accept(size as u64);
+                    }
+                }
+            }
+            UploadOutcome::InvalidStamp { .. }
+            | UploadOutcome::Malformed(_)
+            | UploadOutcome::PeerSyncForm => {
+                Self::log_reject(reason, "sync");
+                if let Some(batch) = self.sync_batch.as_mut() {
+                    batch.drain.reject();
+                }
+            }
+            UploadOutcome::StoreFailed(_) => Self::log_reject(reason, "sync"),
+        }
+        let drained = self.sync_batch.as_ref().map(|batch| {
+            (
+                batch.drain.drained(),
+                batch.drain.invalid(),
+                batch.remote,
+                batch.link_id,
+            )
+        });
+        if let Some((true, invalid, remote, link_id)) = drained {
+            self.conclude_sync_batch();
+            if invalid > 0 {
+                // Invalid stamps throttle the sender
+                // (`reference/LXMF/LXMF/LXMRouter.py:2440-2450`).
+                self.gate.throttle(remote, node.emission_secs());
+                self.drop_link_state(&link_id);
+                out.merge(node.close_link(&link_id));
+            }
+        }
+    }
+
+    /// Answer a fetch: one data packet when the response fits one, a
+    /// STREAMED response resource when it does not (Codeberg #384 B2).
+    ///
+    /// This is the line the board died on, twice. Building the response
+    /// as bytes cost a copy of it, a framed copy, a plaintext copy and a
+    /// ciphertext copy before the parts existed, all four live together;
+    /// the T114's `PANIC_PMRT` names the third of them (5 450 B). Here
+    /// the role hands over a plan and the resource builder reads the
+    /// records out of flash as it cuts the parts, so the only whole copy
+    /// is the transfer.
+    ///
+    /// Under the link MDU nothing streams: a few hundred bytes as one
+    /// `Vec` is cheaper than a resource, and it is the same branch
+    /// `lnpnd` takes, so both run one code path.
+    fn respond_fetch<R, C, S>(
+        &self,
+        node: &mut NodeCore<R, C, S>,
+        link_id: &LinkId,
+        request_id: &[u8; 16],
+        plan: &leviculum_lxmf::FetchPlan,
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        if node.response_fits_packet(link_id, plan.encoded_len()) {
+            match self.role.encode_fetch(plan) {
+                Ok(response) => self.respond(node, link_id, request_id, &response, out),
+                // msgpack nil, the reference's answer to a request it
+                // could not process.
+                Err(_) => self.respond(node, link_id, request_id, &[0xC0], out),
+            }
+            return;
+        }
+        let mut source = self.role.fetch_source(plan);
+        if let Ok((_, send)) =
+            node.send_response_resource_from_source(link_id, request_id, &mut source)
+        {
+            out.merge(send);
+        }
+    }
+
+    fn respond<R, C, S>(
+        &self,
+        node: &mut NodeCore<R, C, S>,
+        link_id: &LinkId,
+        request_id: &[u8; 16],
+        response: &[u8],
+        out: &mut TickOutput,
+    ) where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        match node.send_response(link_id, request_id, response) {
+            Ok(send) => out.merge(send),
+            Err(RequestError::PayloadTooLarge) => {
+                if let Ok((_, send)) = node.send_response_resource(link_id, request_id, response) {
+                    out.merge(send);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Drain both adapters' queued writes through the record-store task.
+    /// Returns whether every op landed; a failed append un-remembers its
+    /// id from the duplicate cache so the client's retry is stored.
+    async fn flush<R, C, S>(&mut self, _node: &mut NodeCore<R, C, S>) -> bool
+    where
+        R: CryptoRngCore,
+        C: Clock,
+        S: Storage,
+    {
+        let mut all_ok = true;
+        while let Some(op) = self.role.store().peek_op().cloned() {
+            let ok = execute(&op).await;
+            let done = self.role.store_mut().op_done(ok.is_some());
+            if ok.is_none() {
+                all_ok = false;
+                if let Some(FlushOp::Append { key, .. }) = done {
+                    self.role.forget_processed(&key);
+                }
+            }
+        }
+        while let Some(op) = self.peer_store.peek_op().cloned() {
+            let ok = execute(&op).await;
+            if ok.is_none() {
+                all_ok = false;
+            }
+            let _ = self.peer_store.op_done(ok.is_some());
+        }
+        all_ok
+    }
+}
+
+/// Execute one [`FlushOp`] on the record-store task; `Some(free_bytes)`
+/// on success.
+async fn execute(op: &FlushOp) -> Option<u32> {
+    use crate::record_store::{pn_execute, PnOp};
+    let op = match op {
+        FlushOp::Append {
+            key,
+            time,
+            tag,
+            body,
+        } => PnOp::Append {
+            key: *key,
+            time: *time,
+            tag: *tag,
+            body: body.clone(),
+        },
+        FlushOp::Purge { offset, key } => PnOp::Purge {
+            offset: *offset,
+            key: *key,
+        },
+    };
+    pn_execute(op).await.ok().map(|done| done.free_bytes)
+}

@@ -1,0 +1,11 @@
+--- a/leviculum-std/src/interfaces/byte_channel/mod.rs	2026-10-09 00:22:29.017494179 +0300
++++ b/leviculum-std/src/interfaces/byte_channel/mod.rs	2026-10-09 09:32:05.175233631 +0300
+@@ -22,7 +22,7 @@
+ 
+ /// `HW_MTU` for a byte-channel interface, matching [`PipeInterface`](super::pipe)
+ /// so the two are wire-interchangeable.
+-const BYTE_CHANNEL_HW_MTU: u32 = 1064;
++const BYTE_CHANNEL_HW_MTU: u32 = 16384;
+ 
+ /// Default channel buffer size (packets), matching the pipe interface.
+ pub(crate) const BYTE_CHANNEL_DEFAULT_BUFFER_SIZE: usize = 64;

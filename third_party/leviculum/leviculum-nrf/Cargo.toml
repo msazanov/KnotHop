@@ -1,0 +1,448 @@
+[package]
+name = "leviculum-nrf"
+version = "0.4.0"
+edition = "2021"
+authors = ["Lew Palm"]
+license = "AGPL-3.0-or-later"
+description = "Reticulum firmware for nRF52840-based boards (Heltec Mesh Node T114)"
+
+# leviculum-nrf is excluded from the root workspace (embedded target,
+# own .cargo config); it is itself the root of a small workspace so the
+# pure, host-testable crates (screen painter, SoftDevice policy) can
+# live next to the firmware.
+[workspace]
+members = ["screen", "sd-policy", "gnss-time", "gnss-presence", "gnss-init", "telemetry-policy", "ble-tx", "queue-budget", "log-line", "tx-spacing", "rx-arming", "persist-ack", "boot-trace", "channel-access", "media-state", "announce-policy", "record-log", "pn-store", "store-spike", "qspi-bitbang", "battery-scale", "boot-count", "settle-budget", "drop-budget", "heap-budget", "node-name", "sync-batch", "upload-proof", "mute-lease", "qspi-selftest", "qspi-boot", "usb-policy"]
+
+[dependencies]
+leviculum-core = { path = "../leviculum-core", default-features = false }
+# Board-independent status-screen painter (pure, host-testable golden
+# frames). Pulled by both display backends: the V2 SSD1306 path via
+# `display`, the T114 ST7789 path via `bsp-t114` directly.
+leviculum-screen = { path = "screen", optional = true }
+# Pure SoftDevice-ownership policy (error code + SD-enabled -> action),
+# host-unit-tested next to the firmware (Codeberg #249/#250).
+leviculum-sd-policy = { path = "sd-policy" }
+# LXMF, for the telemetry reporter (#236) and the propagation-node role
+# (#384). `default-features = false` still keeps the bz2 content
+# compression out (encrypted sync payloads do not compress, and the
+# resource path's auto-compression is negotiated); `pow` came IN with the
+# role — the board announces stamp cost 13 (Lead, 2026-09-12) and must
+# validate what it accepts, through the streaming validator that keeps
+# one 256-byte block rather than the reference's materialised workblock.
+# The image cost is sha2, which leviculum-core's crypto already links.
+leviculum-lxmf = { path = "../leviculum-lxmf", default-features = false, features = ["pow"] }
+# The propagation store adapters (#384 part 3): the synchronous
+# memory-mapped scan and the flush queues `src/pn.rs` drains through the
+# record-store task. Host-tested against regions the record log wrote.
+leviculum-pn-store = { path = "pn-store" }
+# Pure telemetry cadence policy and target lifecycle, host-testable next
+# to the gnss crates (#236).
+leviculum-telemetry-policy = { path = "telemetry-policy" }
+# Pure outbound-notification flow control for the BLE peripheral: the
+# retry/abort/report decision around a full SoftDevice HVN queue (#264).
+# Unconditional like sd-policy — it is a handful of enums and costs
+# nothing on a build without the `softdevice` feature.
+leviculum-ble-tx = { path = "ble-tx" }
+# Pure announce cadence and per-peer rate limit (#376): when the board
+# announces itself on a new BLE peer and on its own timer, and when the
+# clock gate withholds it. Shared verbatim with `lnsd`, so the policy the
+# desk measures on a board is the policy the daemon runs.
+leviculum-announce-policy = { path = "announce-policy" }
+# How long one propagation-engine settle pass may keep the main loop away
+# from its radio (#425). The firmware reads GRIND_SLICE_ROUNDS from here, so
+# the slice the board runs and the frame-airtime budget the crate's tests pin
+# it against cannot drift apart.
+leviculum-settle-budget = { path = "settle-budget" }
+# The boot heap budget (#388): the link count the binaries enforce, the boot
+# serve cap and the live serve cap every `/get` re-reads, with every constant
+# they derive from. `heap_census` reads the allocator and prints the lines;
+# the arithmetic is asserted on the host.
+leviculum-heap-budget = { path = "heap-budget" }
+# The derived node names and the rule behind `NODE_NAME_FLAG_BLE_PENDING`
+# (#413): what an unnamed board is called on each surface, and whether a
+# reset would change the BLE name. `src/name.rs` keeps the flash read and
+# the statics and calls in here, so "one reset behind" is asserted on the
+# host instead of read off captures.
+leviculum-node-name = { path = "node-name" }
+# How long a host's transmit mute may last before the board takes its own
+# voice back (#410), and the default lease an old host's frame gets. The LoRa
+# task reads both from here, so the deadline the board runs is the deadline
+# the crate's host tests derive from the corpus it has to cover.
+leviculum-mute-lease = { path = "mute-lease" }
+# The inbound peer-sync batch: its counters, and what the sender's LINKCLOSE
+# means for messages already resident here. The engine drains through this
+# type, so the rule the board runs is the rule the crate's host tests assert.
+leviculum-sync-batch = { path = "sync-batch" }
+# When a client upload's packet proof leaves, and the uploader's receipt
+# window it has to land in (#397). The engine holds this crate's ledger
+# instead of its own map, so the release point its host tests assert is the
+# release point the board runs.
+leviculum-upload-proof = { path = "upload-proof" }
+# Pure two-bound admission (slots and bytes) for the outbound LoRa queue,
+# host-testable like sd-policy/ble-tx (#344). Not in leviculum-core: that
+# crate must build for thumbv6m, which has no atomic CAS.
+leviculum-queue-budget = { path = "queue-budget" }
+# How many per-drop `[DROP]` lines the debug CDC may carry per second, and
+# what one clipped window reports (#346). The overheard-packet drop is the
+# highest-volume event the core raises, so the board renders it through this
+# budget; the window arithmetic is only provable against a fake clock, which
+# the firmware crate cannot run.
+leviculum-drop-budget = { path = "drop-budget" }
+# Pure debug-log line shaping, including the board-side `t=<ms>` uptime
+# stamp. The firmware crate cross-compiles and runs no host tests, so the
+# byte-exact shape every capture consumer greps lives here where it can be
+# asserted (#344).
+leviculum-log-line = { path = "log-line" }
+# Pure on-air spacing knob for the LoRa transmit path (#345): the gap the
+# interface leaves between the end of one packet's airtime and the key-up
+# of the next. Host-testable against a fake clock, which the firmware
+# crate itself cannot be.
+leviculum-tx-spacing = { path = "tx-spacing" }
+# The 1200-baud touch predicate and the control-envelope answer windows of
+# `src/usb.rs` (leviculum#413). The firmware keeps only the GPREGRET write,
+# the reset and the timers; the predicate, the three window constants and
+# the airtime arithmetic that justifies them are asserted on the host.
+leviculum-usb-policy = { path = "usb-policy" }
+# Pure LoRa channel-access policy: the seeded acquisition jitter and the
+# CAD retry gate around every key-up. Host-testable against scripted CAD
+# outcomes, which the firmware crate itself cannot be. Parameters mirror
+# the RNode firmware's CSMA (citations in the crate docs).
+leviculum-channel-access = { path = "channel-access" }
+# The board-side media profile: running versus configured (including the
+# boot window before the carriers' spawn decisions are noted) and the
+# drop-run reporting of a carrier that is switched off. A state machine
+# whose bug is in the order of events, so it lives where a host test can
+# drive that order (#255).
+leviculum-media-state = { path = "media-state" }
+# The order in which the receive path arms the radio and hands a frame
+# upward. The re-arm has to precede the hand-off, and the firmware crate
+# cannot assert an order of operations against a fake radio — this crate
+# holds the sequence itself, plus the "is the chip listening" state every
+# path that leaves RX consults.
+leviculum-rx-arming = { path = "rx-arming" }
+# Boot-phase breadcrumb record in noinit RAM (ledger
+# local-pocket-dark-d66209e): layout, magic handling, phase names,
+# RESETREAS decode and the byte-exact BOOT_TRACE line, host-testable like
+# log-line. The firmware keeps only the volatile `.uninit` I/O.
+leviculum-boot-trace = { path = "boot-trace" }
+# How many times this board restarted while nobody was watching (#380).
+# The RAM breadcrumbs above cannot answer it — retained RAM is gone after
+# the power loss that is exactly the case that matters — so the count is
+# appended to a page of internal flash. Layout, the scan for the free
+# slot, the wrap that carries the number forward and the wear arithmetic
+# live here because a power cut at every word boundary is only provable
+# over a simulated page on the host.
+leviculum-boot-count = { path = "boot-count" }
+# The forward-only record log. Written for a QSPI NOR, which neither board
+# turned out to carry (#384), so it drives the nRF52840's own flash: the
+# 64 KiB region `memory.x` reserves behind the image, mounted at boot by
+# `src/record_store.rs`. The store, not the propagation node — bytes with a
+# key, no LXMF, and nothing stores messages in it yet. It lives
+# in its own crate because its whole safety argument — power cut at every
+# byte offset, program-once bits, level wear — is only provable over a
+# simulated part on the host, which the firmware crate cannot run. Pulled
+# with default features so the simulation and its `alloc` stay out of the
+# image.
+leviculum-record-log = { path = "record-log" }
+# The hand-clocked JEDEC-id read the QSPI failure path falls back to
+# (#384): which edge launches a bit and which samples it. An off-by-one
+# there returns a plausible wrong part number instead of failing, so the
+# edges live in a crate a host test can drive against a replaying fake
+# part; the firmware supplies six GPIOs and a delay.
+leviculum-qspi-bitbang = { path = "qspi-bitbang" }
+# How long the SolarNode's boot waits on its QSPI flash before it gives the
+# part up, and the `[QSPI] state=timeout` line: a deadline wrong by a factor
+# fails silently, so it is asserted on the host.
+leviculum-qspi-boot = { path = "qspi-boot" }
+# What a raw SAADC count means in millivolts at a battery terminal
+# (#380): the configured ADC gain, the board's divider, the 1S/2S
+# classification and the `BATTERY` line. Here rather than in `battery.rs`
+# because the full scale is derived from the gain the channel is set to,
+# and the whole point is that the two cannot drift apart — which only a
+# host test can hold them to.
+leviculum-battery-scale = { path = "battery-scale" }
+# When a control-envelope ack may claim the record reached flash (#358).
+# The ordering between the task that answers the frame and the task that
+# writes the page is the whole defect, and the firmware crate runs no host
+# tests — so the gate, and the slow-flash reproduction of the old
+# ordering, live here where they can be asserted.
+leviculum-persist-ack = { path = "persist-ack" }
+# The arithmetic of the SolarNode external-flash self-test (OTA stage 2):
+# the address-derived pattern, the comparator, the census, the
+# status-register protection rule and the verdict, host-tested. Optional,
+# and only the `qspi-selftest` feature below pulls it; see there for why.
+leviculum-qspi-selftest = { path = "qspi-selftest", optional = true }
+
+# Embassy async runtime
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread"] }
+embassy-nrf = { version = "0.9", features = ["nrf52840", "time-driver-rtc1", "nfc-pins-as-gpio", "gpiote"] }
+embassy-time = "0.5"
+embassy-sync = "0.7"
+embassy-usb = "0.5"
+embassy-futures = "0.1"
+embassy-embedded-hal = "0.5"
+embedded-hal-async = "1"
+
+# Cortex-M support.
+#
+# Plain `cortex-m`, with no `critical-section-single-core`: BOTH BSPs run
+# the SoftDevice, so both take the SoftDevice-aware impl that the
+# `softdevice` aggregator below pulls in
+# (`nrf-softdevice/critical-section-impl`), and that is the only
+# `critical_section::Impl` either binary links. The note that stood here
+# until #380 — "`critical-section-single-core` is opt-in via `bsp-t114`
+# (T114 has no BLE)" — described a build that stopped existing when
+# `bsp-t114` started pulling `softdevice`; cortex-m's feature is not
+# selected on either path. BSP mutex enforced by `compile_error!` in
+# `lib.rs`.
+# Bug #32 history: the prior `nrf-mpsl/critical-section-impl` (selective
+# mask, kept BLE-priority IRQs running during app CS) caused
+# Mutex<RefCell<…>> reentrance panics; resolved by SoftDevice migration.
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+
+# Heap allocator for alloc
+embedded-alloc = "0.7"
+
+# Static initialization
+static_cell = "2"
+
+tracing-core = { version = "0.1", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+heapless = { version = "0.9", default-features = false }
+embedded-storage = "0.3"
+# Async NorFlash trait, implemented by `nrf_softdevice::Flash`: the only
+# legal way to write internal flash while the SoftDevice is enabled
+# (`radio_store`). Same version nrf-softdevice itself pulls.
+embedded-storage-async = "0.4"
+# #384 spike only, and optional: the size harness below builds this
+# candidate into the image so `arm-none-eabi-size` can weigh it. No default
+# build pulls it, and nothing outside `store_spike.rs` names it.
+sequential-storage = { version = "8.0.1", optional = true }
+
+# Optional baseboard peripherals (RAK19026 VC on the WisMesh Pocket V2).
+# All gated behind features so the bare nRF52840 + SX1262 build (T114, or a
+# RAK4631 module without the baseboard) stays unchanged.
+#
+# Note: only SSD1306 is wired up today. The sh1106 crate (v0.5.x) still
+# pins embedded-hal 0.2.3 which would require an embedded-hal-compat shim
+# against our embassy-nrf 0.9 Twim (which speaks embedded-hal 1.0 only).
+# If the WisMesh Pocket V2's OLED probes as SH1106, the display task will
+# log a warning and stay idle — adding SH1106 support is a separate task.
+ssd1306 = { version = "0.10", default-features = false, features = ["graphics"], optional = true }
+embedded-graphics = { version = "0.8", optional = true }
+nmea0183 = { version = "0.6", default-features = false, optional = true }
+# Pure NMEA-UTC→unix conversion + seed-once policy, host-unit-tested next
+# to the firmware like leviculum-screen / leviculum-sd-policy (#166).
+leviculum-gnss-time = { path = "gnss-time", optional = true }
+# Pure GNSS presence tri-state: baud sweep + fix hysteresis, same
+# host-testable pattern (#240).
+leviculum-gnss-presence = { path = "gnss-presence", optional = true }
+leviculum-gnss-init = { path = "gnss-init", optional = true }
+
+# BLE stack — Nordic S140 SoftDevice via nrf-softdevice (Embassy-async
+# bindings by Dirbaio). Both boards run BLE through the SoftDevice's
+# closed-source C blob; nrf-softdevice provides the Rust-async wrappers
+# and registers a SoftDevice-aware `critical_section::Impl`. This
+# replaces the Day-1 nrf-mpsl/nrf-sdc/trouble-host stack which exhibited
+# Bug #32 (Mutex<RefCell<…>> reentrance under MPSL-IRQ preemption).
+#
+# Pin: 5949a5b1445cc907745c6449a35577e4544cd255 = HEAD as of 2025-06-26
+# (PR #296 "Support larger discovery characteristics"). The crates.io
+# 0.1.0 publish is stale (nrf-softdevice issue #304); we pin to git HEAD
+# for compatibility with current embassy-nrf.
+nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice", rev = "5949a5b", optional = true }
+nrf-softdevice-s140 = { git = "https://github.com/embassy-rs/nrf-softdevice", rev = "5949a5b", optional = true }
+
+# cortex-m-rt supplies the startup runtime, panic handler, and vector
+# table that the linker needs for a no_std no_main firmware image, even
+# though no Rust module imports it directly. nrf-softdevice is pulled via
+# the `softdevice` aggregator feature (under both bsp-rak4631 and
+# bsp-t114); cargo-machete still flags it as "not directly imported"
+# because its effect is feature-driven.
+[package.metadata.cargo-machete]
+ignored = ["cortex-m-rt", "nrf-softdevice"]
+
+# Optional baseboard peripherals on the RAK19026 VC (WisMesh Pocket V2).
+# Each is independent. `rak-baseboard` is the convenience aggregate built
+# by the `flash-rak4631-pocket` recipe.
+[features]
+default = []
+
+# The A/B control for the dial ledger (#412 part 2/3). OFF by default in
+# the sense that enabling this feature turns the LEDGER off: the shipped
+# image runs `LedgerPolicy::MEASURED`, and this switch compiles
+# `LedgerPolicy::OFF` in its place so the rig can flash the same source
+# twice and attribute a capture difference to the ledger alone. Not a
+# runtime knob on purpose — a knob would leave the ledger's code and
+# state in the control image, and the control has to be the board that
+# never had one.
+ble-dial-ledger-off = []
+
+# The same A/B control for the churn penalty (#417): enabling the
+# feature compiles `ChurnPolicy::OFF` in place of the measured policy,
+# so the rig can attribute a capture difference to the penalty alone.
+ble-churn-penalty-off = []
+
+# BSP selection — exactly one must be enabled. Mutex enforced via
+# `compile_error!` in `lib.rs`. Both go through `softdevice` below and
+# therefore share one critical-section impl, the SoftDevice-aware one
+# added Day 2-3 of bug32-softdevice-spike; see the `cortex-m` block
+# above for why neither picks cortex-m's single-core impl.
+# Internal aggregator for the SoftDevice + nrf-softdevice feature set.
+# Both BSPs depend on this; expressing it once here keeps the BSP-feature
+# definitions free of SoftDevice-flag drift.
+softdevice = [
+    "dep:nrf-softdevice",
+    "dep:nrf-softdevice-s140",
+    "nrf-softdevice/nrf52840",
+    "nrf-softdevice/s140",
+    "nrf-softdevice/ble-peripheral",
+    # The central role (#255 phase B): scanning + initiating, and the
+    # GATT client that drives the peer's server once connected.
+    "nrf-softdevice/ble-central",
+    "nrf-softdevice/ble-gatt-client",
+    "nrf-softdevice/ble-gatt-server",
+    "nrf-softdevice/critical-section-impl",
+    "nrf-softdevice/macros",
+    # Sizes the buffer nrf-softdevice hands to `sd_ble_evt_get`. With no
+    # evt-max-size-* feature selected the buffer is 128 bytes, and an event
+    # that does not fit makes the call return `DataSize`, on which the crate
+    # panics unconditionally (nrf-softdevice/src/events.rs:92). That killed
+    # every LNode within seconds of a real Android peer connecting
+    # (Codeberg #354).
+    #
+    # `-256` is not enough. A GATTS write event carries the peer's value
+    # behind 18 bytes of event header (measured offset of
+    # `ble_evt_t.evt.gatts_evt.params.write.data` for the pinned s140
+    # bindings). Our characteristics are `GATT_VALUE_MAX` = 253 bytes wide
+    # (`GattData` in src/ble/columba.rs, constant in leviculum-ble-tx's
+    # gatt_bytes: att_mtu 256 − 3), giving 271-byte events; change that
+    # constant and this line has to be rechecked — the doc comment there
+    # carries the pointer back here.
+    #
+    # 512 is the largest the crate offers, so 271 sits inside it with room
+    # to spare. Do NOT reason the buffer down from the attribute's max_len:
+    # the 2026-09-12 field panic (#387) showed the SoftDevice delivering a
+    # write event LONGER than max_len, so the honest upper bound on one
+    # event is this buffer itself (512 − 18 = 494 bytes of data), and the
+    # value conversion (`GattData::from_gatt`) tolerates all of it.
+    "nrf-softdevice/evt-max-size-512",
+]
+
+# Per-board BSPs: same SoftDevice stack, board-specific peripherals
+# layered on top. Mutex enforced via compile_error! in lib.rs.
+bsp-rak4631 = ["softdevice"]
+# bsp-t114 pulls the ST7789 status display unconditionally: the panel is
+# write-only (MISO not connected), presence detection is physically
+# impossible, and both references (Meshtastic, RNode firmware) drive it
+# blind. One t114 UF2 therefore serves panel-equipped and panel-less
+# boards alike; on the latter the SPI writes go nowhere, harmlessly.
+#
+# It also pulls `gnss` unconditionally, for the same universal-build
+# reason: the Quectel L76K is soldered to every T114, not an optional
+# baseboard part, and a receiver that is absent or unpowered reports
+# itself as `no-hardware` at runtime rather than needing its own UF2
+# (#69, #240).
+# `battery` is unconditional for the same universal-build reason as the
+# panel and the L76K: the 100/490 divider and its enable pin are on every
+# T114, not on an optional baseboard, so one UF2 serves every board and a
+# board whose reading is implausible says so at runtime (#380).
+bsp-t114 = ["softdevice", "dep:leviculum-screen", "gnss", "battery"]
+# SenseCAP Solar Node P1-Pro (#233): XIAO nRF52840 Plus + Wio-SX1262 +
+# XIAO L76K on a carrier board. No display, so no `leviculum-screen`.
+#
+# `battery` is on for the same universal-build reason as the T114's: the
+# 1 M/510 k divider and its enable pin are on the XIAO module itself, so
+# every board carrying one has them. It is the second of the bring-up
+# steps the Lead split out on 2026-09-15 — boot, identity and radio were
+# the first — and it is the one a solar node cannot do without, since a
+# node whose state of charge nobody knows is a node nobody knows will
+# still be there tomorrow.
+#
+# `gnss` is on since 2026-09-16, the third of those steps. It is
+# unconditional for the same universal-build reason as the divider: the
+# XIAO L76K is a module of the carrier board, not an optional part, and a
+# receiver that is absent or unpowered reports itself as `no-hardware` at
+# runtime rather than needing a UF2 of its own (#240). The module speaks
+# the same CASIC `$PCAS` language as the T114's L76K and answers the same
+# probe, so `leviculum-gnss-init` needs no board-specific branch — the two
+# differences are pins and the absent PPS line, and both live in the
+# `GnssWiring` value in `bin/solarnode.rs`.
+bsp-solarnode = ["softdevice", "battery", "gnss"]
+
+display = ["dep:ssd1306", "dep:embedded-graphics", "dep:leviculum-screen"]
+gnss = [
+    "dep:nmea0183",
+    "dep:leviculum-gnss-time",
+    "dep:leviculum-gnss-presence",
+    "dep:leviculum-gnss-init",
+]
+battery = []
+rak-baseboard = ["display", "gnss", "battery"]
+# The `qspi-selftest` instrument's crate, and nothing else. Not a plain
+# dependency, because a plain one changes this package's `-C metadata` hash
+# for EVERY bin, and with it the mangled symbol names, their order under LTO
+# and the machine outliner's choices: measured +32 bytes of `.text` on an
+# unchanged `solarnode` image, same path, same toolchain. As a feature it
+# is off in every firmware build, so the firmware bins are byte-identical.
+qspi-selftest = ["dep:leviculum-qspi-selftest"]
+
+# Codeberg #384 size harness. Throwaway, mutually exclusive, never default:
+# each drags one candidate store's code into both firmware bins so its
+# `.text`/`.rodata` cost can be measured against the same bin without it.
+# `src/store_spike.rs` says how to run the measurement. Do not flash a build
+# with either of these on.
+store-spike-record-log = []
+store-spike-sequential = ["dep:sequential-storage"]
+
+[profile.release]
+opt-level = "z"      # optimize for size
+lto = true           # link-time optimization across all crates
+codegen-units = 1    # single codegen unit for maximum LTO
+strip = "none"       # was "symbols" — kept off so DWARF survives in
+                     # the .elf for addr2line / objdump on HardFault
+                     # post-mortem PCs. Does NOT bloat the UF2: the
+                     # .bin used to build the UF2 only includes
+                     # loadable sections, debug info stays in the .elf.
+debug = true         # emit DWARF in the first place; required even
+                     # with strip=none, otherwise compiler omits it
+
+# Firmware binaries
+[[bin]]
+name = "t114"
+path = "src/bin/t114.rs"
+
+[[bin]]
+name = "rak4631"
+path = "src/bin/rak4631.rs"
+
+[[bin]]
+name = "solarnode"
+path = "src/bin/solarnode.rs"
+
+# Measurement instrument, not firmware: prints the S140's required app
+# RAM base for a series of BLE configs (#255 T2 central-role design).
+# No flash recipe references it; flashing it is a deliberate act.
+[[bin]]
+name = "sd-ram-probe"
+path = "src/bin/sd-ram-probe.rs"
+
+# Measurement instrument, not firmware, and a destructive one: ERASES the
+# whole external flash of a SolarNode, programs two patterns over it, reads
+# them back and leaves the part erased (OTA stage 2). Flashed only by
+# `just flash-solarnode-qspi-selftest`; in no bundle and no lnflash entry.
+[[bin]]
+name = "qspi-selftest"
+path = "src/bin/qspi-selftest.rs"
+required-features = ["bsp-solarnode", "qspi-selftest"]
+
+# Vendored nmea0183 with the float parse replaced by a fixed-point one
+# (Codeberg #386). Upstream parses every decimal field through
+# `str::parse::<f32>()`/`::<f64>()`, which links `core::num::dec2flt` —
+# 14.8 KiB of flash, the last floating-point code in either image after
+# 9c2186ea removed the float formatters. A patch rather than three path
+# deps so `leviculum-nrf`, `gnss-time` and `gnss-presence` cannot end up
+# resolving different copies of the crate.
+[patch.crates-io]
+nmea0183 = { path = "../vendor/nmea0183" }

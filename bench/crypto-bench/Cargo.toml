@@ -1,0 +1,15 @@
+[package]
+name = "rawg-crypto-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# aes-gcm: Apache-2.0 OR MIT; compatible with leviculum's AGPL-3.0-or-later.
+# Experimental benchmark only: it does not change the RNS token format.
+[dependencies]
+leviculum-core = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "cb814c8513fb59d991c96106f1dcdd5d070cb423" }
+aes-gcm = "=0.10.3"
+# ring: Apache-2.0 AND ISC. Already in the tree through QUIC (rustls); compared here as a Link AEAD candidate.
+ring = "=0.17.14"
+serde_json = "1"
+libc = "0.2"

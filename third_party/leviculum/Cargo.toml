@@ -1,0 +1,180 @@
+[workspace]
+resolver = "2"
+members = [
+    "leviculum-core",
+    "leviculum-micron",
+    "lnomad",
+    "lblogd",
+    "leviculum-lxmf",
+    "leviculum-lxmf-node",
+    "leviculum-std",
+    "leviculum-ffi",
+    "leviculum-cli",
+    "leviculum-proxy",
+    "lnflash",
+    "lnmsg",
+    "lnpnd",
+    "lndecode",
+    "vectors-verify",
+    # Vendored nmea0183 with the float parse replaced (Codeberg #386). A
+    # member, unlike vendor/crossterm, because the patch is ours: its unit
+    # tests assert the fixed-point parse is bit-identical to `str::parse`,
+    # and `cargo test --workspace` is what runs them. Not a default member —
+    # no host binary links it, only the nRF firmware does, through the
+    # `[patch.crates-io]` in leviculum-nrf/Cargo.toml.
+    "vendor/nmea0183",
+]
+
+# leviculum-ffi is a gnu-target cdylib (built via the `build-ffi` alias). It is
+# excluded from the default musl build (default target per .cargo/config.toml)
+# because cdylib is unsupported on musl, which otherwise emits
+# `warning: dropping unsupported crate type cdylib` on a bare build. It stays a
+# member so `-p leviculum-ffi`, `--workspace`, and `build-ffi` still work.
+default-members = [
+    "leviculum-core",
+    "leviculum-micron",
+    "lnomad",
+    "lblogd",
+    "leviculum-lxmf-node",
+    "leviculum-std",
+    "leviculum-cli",
+    "leviculum-proxy",
+    "lnflash",
+    "lnmsg",
+    "lnpnd",
+    "lndecode",
+    "vectors-verify",
+]
+
+# leviculum-nrf requires cross-compilation (thumbv7em-none-eabihf) and
+# cannot build with --workspace on the host.
+# Build with: cargo build -p leviculum-nrf --target thumbv7em-none-eabihf
+#
+# leviculum-esp is excluded for a harder reason than cross-compilation: its
+# target (xtensa-esp32s3-none-elf) does not exist in stock rustc at all, only
+# in the esp-rs compiler fork espup installs. As a member it would make
+# `cargo test --workspace` on any machine require that fork. It carries its
+# own workspace, Cargo.lock, .cargo/config.toml and rust-toolchain.toml.
+# Build with: just build-esp32  (or `cargo build --release` inside it)
+exclude = ["leviculum-nrf", "leviculum-esp", "vendor/crossterm"]
+
+# Vendored, minimally-patched crossterm 0.29.0. The patch exposes mouse side
+# buttons (X buttons 8/9) as MouseButton::Back / MouseButton::Forward, which
+# upstream crossterm swallows in parse_cb. Both lnomad and ratatui-crossterm
+# resolve to crossterm 0.29.0, so this replaces it everywhere.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
+
+[workspace.package]
+# The development window, not a release. Every build between 0.9.0 and
+# 0.10.0 says so, so a package installed anywhere reads as on the way to
+# something instead of claiming a release it is not. The tag for 0.9.0
+# points at the commit below this one; this line opens the window after it.
+#
+# `-dev` is the semver spelling. Debian reads a `-` as the start of a
+# Debian revision and sorts it ABOVE the release, so the packaging
+# translates it to `~` when it derives a Debian version — the comparison
+# is run, not reasoned, in scripts/deb-stamp.sh and its selftest.
+version = "0.10.0-dev"
+edition = "2021"
+authors = ["Lew Palm"]
+license = "AGPL-3.0-or-later"
+repository = "https://codeberg.org/Lew_Palm/leviculum"
+homepage = "https://codeberg.org/Lew_Palm/leviculum"
+description = "Rust implementation of the Reticulum network stack"
+
+[workspace.dependencies]
+# Core crypto dependencies (no_std compatible)
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["alloc"] }
+# `asm` is NOT in the crate's default features, so without it SHA-256 runs the
+# portable C path even on hardware that has the instructions. It costs nothing
+# at runtime on older CPUs (the crate detects support) and is worth several
+# times the SHA-256 rate on SHA-NI x86 (Ice Lake+, Zen 3+) and on the ARMv8
+# SHA-256 instructions every current Android SoC has. Digest output is
+# identical either way - it is the same algorithm, just computed in hardware.
+sha2 = { version = "0.10", default-features = false, features = ["asm"] }
+hmac = { version = "0.12", default-features = false }
+md-5 = { version = "0.10" }
+hkdf = { version = "0.12", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# MessagePack wire primitives for the no_std + alloc LXMF codec.
+rmp = { version = "0.8.15", default-features = false }
+
+# std dependencies
+tokio = { version = "1", features = ["full"] }
+tokio-serial = "5"
+tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+rmpv = "1"
+serde-pickle = "1"
+toml = "0.8"
+thiserror = "2"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+bytes = "1"
+
+# Compression (no_std compatible)
+libbz2-rs-sys = { version = "0.2", default-features = false, features = ["rust-allocator"] }
+
+# Networking
+if-addrs = { version = "0.15", features = ["link-local"] }
+socket2 = { version = "0.6", features = ["all"] }
+
+# BLE (Columba mesh interface in leviculum-std). bluer is the official BlueZ
+# Rust binding; it speaks D-Bus through the libdbus-based `dbus` crate, whose
+# `vendored` feature compiles libdbus from source so the musl-static default
+# target keeps producing self-contained binaries (the same reason rustls-acme
+# rides on ring above).
+bluer = { version = "0.17", default-features = false, features = ["bluetoothd"] }
+dbus = { version = "0.9", features = ["vendored"] }
+
+# Web server (lblogd clearnet side). rustls-acme runs on ring instead of its
+# aws-lc-rs default: ring cross-builds cleanly for the musl-static default
+# target without a cmake toolchain.
+axum = "0.8"
+axum-server = "0.8"
+rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tls12", "webpki-roots", "axum"] }
+futures = "0.3"
+tower = { version = "0.5", features = ["util"] }
+# Filesystem watching for lblogd's optional posts auto-reload. Version 8 is
+# the stable line; 9 is still a release candidate.
+notify = "8"
+
+# FFI
+libc = "0.2"
+
+# Testing
+proptest = "1"
+
+# Crypto libs are unusably slow without optimizations (constant-time field
+# arithmetic, scalar multiplication). Build them at max opt even in debug.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.x25519-dalek]
+opt-level = 3
+
+# Strip debug info (not symbols) at link time. Rustc passes the right
+# flags per target, which avoids the post-link `strip --strip-all` that
+# cargo-deb runs by default — that one corrupted x86_64 musl-static
+# binaries (segfault at startup, see commit history). "debuginfo" keeps
+# the symbol table, so panic backtraces still show function names.
+# .deb builds pair this with `cargo deb --no-strip` in
+# .woodpecker/nightly.yml so cargo-deb's strip is skipped entirely.
+[profile.release]
+strip = "debuginfo"
+# Pin unwinding (already the default). The leviculum-ffi cdylib relies on
+# catch_unwind at every extern "C" boundary so a Rust panic becomes an error
+# code instead of unwinding into C (undefined behaviour). panic = "abort"
+# would make catch_unwind a no-op and turn any internal panic into a process
+# abort of the host application embedding libleviculum, which a library must
+# never do. This forecloses an abort-for-size option on the daemons; that is
+# the intended tradeoff. Behaviour-preserving since unwind is already default.
+panic = "unwind"

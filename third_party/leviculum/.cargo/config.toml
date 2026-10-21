@@ -1,0 +1,110 @@
+# Default all host builds to musl-static. Gives us "runs on any Linux,
+# no libc dependency" for free (binary size delta ~1.5% vs glibc-dynamic).
+# Requires `musl-tools` on Debian/Ubuntu (provides musl-gcc as linker).
+#
+# leviculum-ffi is the exception — see the `build-ffi*` aliases below.
+# It is the C-API surface (cdylib + staticlib) meant to feel like a
+# native Unix library for glibc-host consumers (Python ctypes, C apps
+# on stock Debian, `apt install libreticulum-dev`). A musl-cdylib
+# dlopen'd into a glibc host gives you two libcs in one process —
+# malloc/pthread/TLS state gets corrupted — so the release artefacts
+# MUST be built against glibc. During `cargo check --workspace` the
+# FFI crate rides the workspace musl default as staticlib-only; that
+# is harmless for CI coverage and does not produce a shippable .so.
+# The "dropping unsupported crate type `cdylib`" warning during
+# workspace checks is therefore EXPECTED — leave it; Cargo has no
+# target-conditional crate-type to silence it properly.
+#
+# The pin below names an ARCHITECTURE, and cargo has no per-host
+# conditional in [build], so it is also the answer on hosts that are not
+# x86_64. On an arm64 machine — a Raspberry Pi, which is one of the more
+# natural places to run a Reticulum node — a fresh clone therefore builds
+# x86_64 binaries that link fine and then do not run (Codeberg #291).
+# Override it per host, which takes precedence over this file:
+#
+#   rustup target add aarch64-unknown-linux-musl            # once
+#   CARGO_BUILD_TARGET=aarch64-unknown-linux-musl cargo build --release …
+#
+# Moving the pin to arm64 would only mirror the problem, and dropping it
+# would give up musl-static for every developer build, so it stays and
+# the mismatch is reported instead: leviculum-cli/build.rs warns when a
+# build is producing the pinned target on a host of another architecture,
+# and `leviculum-std/tests/build_target_host_arch.rs` holds both that
+# detection and the two source-build documents to it.
+[build]
+target = "x86_64-unknown-linux-musl"
+
+# Use rust-lld (bundled with rustc) and link-self-contained instead of
+# the system musl-gcc wrapper. Reason: Debian Bookworm's musl-tools
+# 1.2.3 mishandles -static-pie and produces a dynamic-PIE binary with
+# an INTERP entry pointing at /lib/ld-musl-x86_64.so.1 — which doesn't
+# exist on a glibc host, so the kernel can't load the interpreter and
+# the binary segfaults at startup. rust-lld + self-contained avoids
+# the buggy wrapper entirely and produces a real static-PIE binary
+# that runs on any Linux. Newer host musl-tools (≥ 1.2.4) work too,
+# but we'd rather not depend on the host musl version.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+# The arm64 host override, linked by rust-lld for the same reason as
+# above: an arm64 host that sets CARGO_BUILD_TARGET then needs no musl
+# toolchain of its own, exactly as an x86_64 host needs none.
+#
+# No rustflags here, deliberately, although the x86_64 section carries
+# them. This triple is also what `scripts/build-deb.sh arm64` cross-
+# builds from an amd64 host through cargo-zigbuild, and zig is the C
+# compiler in that build: its CARGO_TARGET_*_LINKER overrides the line
+# below, but cargo uses only the first rustflags source it finds, so a
+# rustflags key here would either be ignored or feed self-contained crt
+# objects to a zig link that never asked for them. musl targets enable
+# link-self-contained by default anyway, so the key would buy nothing
+# and put the nightly's arm64 packages at risk for it.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[alias]
+# Development workflow
+test-core = "test -p leviculum-core --lib"
+test-std = "test -p leviculum-std --lib"
+test-interop = "test -p leviculum-std --test rnsd_interop"
+# No test-integ alias: the scenario suites are periculum's, not a cargo
+# target. `just extensive` runs them; `periculum run <file>` runs one.
+lint = "clippy --all"
+
+# C-API library builds — explicitly glibc, overriding the workspace
+# musl default. Outputs a real .so/.a under target/<arch>-unknown-linux-gnu/.
+# arm64 cross-compile needs `gcc-aarch64-linux-gnu` on Debian/Ubuntu.
+build-ffi = "build -p leviculum-ffi --release --target x86_64-unknown-linux-gnu"
+build-ffi-arm64 = "build -p leviculum-ffi --release --target aarch64-unknown-linux-gnu"
+test-ffi = "test -p leviculum-ffi --target x86_64-unknown-linux-gnu"
+# Just the C-API-to-Python-RNS interop suite (spawns scripts/test_daemon.py;
+# skips if Python RNS is unavailable), called out like leviculum-std's
+# test-interop. The Rust suites also run on the musl default via the rlib.
+test-ffi-interop = "test -p leviculum-ffi --test ffi_interop"
+
+# Embedded cross-compilation (requires: rustup target add <target>)
+check-nrf52 = "build -p leviculum-core --target thumbv7em-none-eabihf"
+check-rp2040 = "build -p leviculum-core --target thumbv6m-none-eabi"
+check-esp32s3 = "build -p leviculum-core --target xtensa-esp32s3-none-elf"
+check-embedded = "build -p leviculum-core --target thumbv7em-none-eabihf --target thumbv6m-none-eabi"
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# Android / ARMv8. The aes crate only reaches for the ARMv8 AES intrinsics when
+# this cfg flag is set - there is no runtime detection on aarch64, so without
+# it every Android build encrypts in software. That is the client platform for
+# this project, so it is set here rather than left to each build script.
+#
+# Deliberately scoped to the Android triple: the comment above the arm64 musl
+# section explains why rustflags keys there are risky, and this target has no
+# other role.
+#
+# Note for cross builds: with the workspace `sha2/asm` feature enabled, building
+# this target REQUIRES the NDK clang (sha2-asm compiles assembly via $CC).
+# Without it the build fails with `failed to find tool aarch64-linux-android-clang`
+# rather than silently producing a slow binary - build Android through
+# cargo-ndk, which sets that toolchain up.
+[target.aarch64-linux-android]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]

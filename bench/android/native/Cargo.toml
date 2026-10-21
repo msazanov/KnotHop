@@ -1,0 +1,28 @@
+[package]
+name = "rawgmeas"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "JNI-обёртка над rns-iroh-node для тестового Android-приложения замеров (не клиент)"
+
+[lib]
+name = "rawgmeas"
+crate-type = ["cdylib"]
+
+[dependencies]
+rns-iroh-node = { path = "../../rns-iroh-node" }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync", "fs", "io-util", "macros"] }
+clap = { version = "4", features = ["derive"] }
+jni = "0.21"
+anyhow = "1"
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[features]
+mimalloc = ["dep:mimalloc"]
+udp-stats = ["rns-iroh-node/udp-stats"]
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = true
+panic = "unwind"

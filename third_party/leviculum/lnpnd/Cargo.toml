@@ -1,0 +1,129 @@
+[package]
+name = "lnpnd"
+# Versioned independently of the leviculum stack, like lnmsg and lnomad: a
+# mailbox daemon's releases track its own storage format and operator
+# surface, not the protocol core it is built from.
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "LXMF propagation node daemon for Reticulum — the host-side mailbox role"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[package.metadata.deb]
+name = "lnpnd"
+maintainer = "Lew Palm <lp@lew-palm.de>"
+copyright = "2026, Lew Palm"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+lnpnd runs an LXMF propagation node -- a store-and-forward mailbox on a
+Reticulum mesh. Clients (Sideband, MeshChat, lxmd-based tools) configure
+its destination hash as their propagation node; messages for offline
+recipients wait in its store, and the node peers with other propagation
+nodes and syncs stored messages both ways.
+
+lnpnd is a drop-in counterpart to Python's lxmd: it reads lxmd's config
+file format and keys, keeps lxmd's config-directory layout, answers the
+same remote-management queries (lxmd --status --remote works against it
+and vice versa), and carries its own LXMF mailbox with an on_inbound
+hook.
+
+The package installs lnpnd as a systemd service under a dedicated
+'lnpnd' user. The unit is enabled but not started by the installation:
+a node's identity is its address on the mesh, and starting the daemon
+before the operator has placed one would mint a throwaway address and
+announce it. Put an existing identity at /etc/lnpnd/identity, or accept
+that the first start creates one, then start the service.
+
+lnpnd attaches to a running Reticulum shared instance -- lnsd from the
+'leviculum' package, or the Python rnsd.
+"""
+section = "net"
+priority = "optional"
+# Both entries are real: adduser because postinst creates the service
+# user; the binary itself is musl-static with no library dependencies.
+# leviculum is a Recommends rather than a Depends for the same reason as
+# in lblogd: the daemon needs *a* Reticulum shared instance, and the
+# Python rnsd is equally valid.
+depends = "adduser"
+recommends = "leviculum"
+assets = [
+    # cargo-deb only recognises "target/release/..." exactly as a Cargo
+    # target path and auto-substitutes the --target triple into it. Any
+    # prefix disables the rewrite and silently picks up stale non-musl
+    # builds -- see leviculum-cli/Cargo.toml.
+    ["target/release/lnpnd", "usr/bin/", "755"],
+    # Rendered from docs/src/man/ by scripts/md2man.py, which the
+    # build-deb recipes run before this; cargo-deb gzips it itself.
+    ["../target/man/lnpnd.1", "usr/share/man/man1/lnpnd.1", "644"],
+    ["README.md", "usr/share/doc/lnpnd/README.md", "644"],
+    # Documented overrides for the two lintian tags a musl-static binary
+    # always trips.
+    ["../packaging/lintian/lnpnd", "usr/share/lintian/overrides/lnpnd", "644"],
+    # Codeberg #288; see leviculum-cli/Cargo.toml for what this file is
+    # and why a musl-static package needs it.
+    ["../THIRD-PARTY-NOTICES", "usr/share/doc/lnpnd/THIRD-PARTY-NOTICES", "644"],
+]
+# Generated per build by scripts/deb-stamp.sh, because Debian wants the
+# top entry to carry this build's version and the version is stamped.
+changelog = "../target/deb-changelog/lnpnd"
+maintainer-scripts = "../packaging/lnpnd/"
+
+[package.metadata.deb.systemd-units]
+unit-name = "lnpnd"
+unit-scripts = "../packaging/lnpnd/"
+enable = true
+# Enabled but NOT started by the installation, which is cargo-deb's
+# rendering of `dh_installsystemd --no-start`. On 2026-09-17 installing
+# this package started the daemon straight out of dpkg; with no identity
+# and no config in place yet it minted an address of its own and
+# announced it on the public network for 33 seconds. Nobody had had a
+# chance to put the node's real identity at /etc/lnpnd/identity, because
+# the package had not finished installing.
+#
+# `start = false` together with `restart-after-upgrade = true` is exactly
+# the pair of behaviours this needs (measured against cargo-deb 3.7.0, on
+# the generated postinst): a fresh install ($2 empty) only runs
+# `daemon-reload`, while an upgrade ($2 set) runs `try-restart`, which
+# brings a node that was running back and leaves a stopped one stopped.
+# Asserted on the built .deb in scripts/verify-deb-packaging.sh, and on
+# this file in lnpnd/tests/first_start_identity.rs, because the packaging
+# script is deliberately outside every test tier.
+start = false
+restart-after-upgrade = true
+
+[dependencies]
+# The propagation-node role, the store trait, and the wire codecs.
+leviculum-lxmf = { path = "../leviculum-lxmf" }
+# The driver seam. Uploads arrive as `LinkDataReceived`, which is a
+# Data-class event the public receiver may drop under load, so the role runs
+# as a `CoreProcessor` inside the driver's tick — the same reasoning as
+# lnmsg's engine (docs/src/concepts/lnmsg-architecture.md §3).
+leviculum-std = { path = "../leviculum-std" }
+leviculum-core = { path = "../leviculum-core" }
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+tracing.workspace = true
+rand_core = { version = "0.6", features = ["std", "getrandom"] }
+# `block_on` for stamp validation inside the hook; see engine.rs for the
+# budget note.
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+hex = "0.4"
+# The provenance test asserts the PN_ACCEPT line itself, because the line is
+# what the hardware cells wait for; capturing it needs a subscriber.
+tracing-subscriber.workspace = true
+
+[lib]
+name = "lnpnd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lnpnd"
+path = "src/main.rs"

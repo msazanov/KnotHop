@@ -1,0 +1,1022 @@
+//! End-to-end integration test for runtime auto-connect of discovered
+//! interfaces (Codeberg #32, sub-task b).
+//!
+//! Proves the whole discovery -> auto-connect -> traffic chain with two of our
+//! own nodes over TCP loopback:
+//!
+//!   * Node B is discoverable: it runs a TCP server on its "backbone" port and
+//!     emits a discovery announce (32a wire format) advertising that endpoint.
+//!   * Node A has auto-connect enabled and reaches B over a separate bootstrap
+//!     link. When A hears B's discovery announce it persists the record and,
+//!     at runtime, spawns a TCP client to B's advertised host:port and
+//!     registers it with the transport.
+//!   * Traffic then crosses the auto-established link: B re-announces over the
+//!     accepted connection, so A's auto-connected interface receives bytes.
+//!
+//! The bootstrap link (A -> B:bootstrap_port) exists only so A can *hear* B's
+//! discovery announce; the endpoint A auto-connects to is B's *second*,
+//! separately-advertised server port, so the auto-connected interface is a
+//! genuinely new link, distinct from the bootstrap one.
+
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use leviculum_core::discovery::{
+    build_announce_app_data, DiscoveredInterface, DiscoveredInterfaceRecord, InterfaceDescriptor,
+};
+use leviculum_core::{Destination, DestinationType, Direction, Identity};
+use leviculum_std::config::{Config, InterfaceConfig};
+use leviculum_std::driver::ReticulumNodeBuilder;
+
+/// Host-wide listener-port allocator, shared with the `mvr` and
+/// `rnsd_interop` suites.
+#[path = "support/port_alloc.rs"]
+#[allow(dead_code)]
+mod port_alloc;
+
+/// This file used to draw from a private counter based at 53100 — inside the
+/// default `ip_local_port_range`, where an OS-assigned `bind(0)` anywhere on
+/// the host can take a number between the probe and the consumer's bind. The
+/// shared band sits above that ceiling; see `port_alloc`.
+fn next_port() -> u16 {
+    port_alloc::free_tcp_port()
+}
+
+/// Poll `cond` every 100 ms until it returns true or the deadline passes.
+async fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + deadline;
+    while Instant::now() < end {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    cond()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn discovered_backbone_endpoint_is_auto_connected_and_carries_traffic() {
+    let bootstrap_port = next_port();
+    let backbone_port = next_port();
+    let bootstrap_addr: SocketAddr = format!("127.0.0.1:{bootstrap_port}").parse().unwrap();
+    let backbone_addr: SocketAddr = format!("127.0.0.1:{backbone_port}").parse().unwrap();
+
+    // Node B: discoverable server. Bootstrap port carries the discovery
+    // announce to A; the backbone port is the endpoint A will auto-connect to.
+    let b_storage = tempfile::tempdir().expect("tempdir b");
+    let mut node_b = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .add_tcp_server(bootstrap_addr)
+        .add_tcp_server(backbone_addr)
+        .storage_path(b_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build b");
+    node_b.start().await.expect("start b");
+
+    // Node A: auto-connect enabled, bootstrap client to B.
+    let a_storage = tempfile::tempdir().expect("tempdir a");
+    let mut node_a = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .autoconnect_discovered_interfaces(4)
+        .add_tcp_client(bootstrap_addr)
+        .storage_path(a_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build a");
+    node_a.start().await.expect("start a");
+
+    // Let the bootstrap link peer before B announces itself.
+    let bootstrap_up = wait_until(Duration::from_secs(10), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.online && !i.is_local_client)
+    })
+    .await;
+    assert!(bootstrap_up, "bootstrap A->B link did not come online");
+
+    // B emits a discovery announce advertising its backbone endpoint. The
+    // descriptor carries reachable_on/port; the announce app_data is the 32a
+    // wire format (PoW-stamped msgpack). `transport = true` so it passes the
+    // only-transport auto-connect filter.
+    let disco_identity = Identity::generate(&mut rand_core::OsRng);
+    let disco_dest = Destination::new(
+        Some(disco_identity),
+        Direction::In,
+        DestinationType::Single,
+        "rnstransport",
+        &["discovery", "interface"],
+    )
+    .expect("discovery destination");
+    let disco_hash = *disco_dest.hash();
+    node_b.register_destination(disco_dest);
+
+    let descriptor = InterfaceDescriptor {
+        interface_type: "BackboneInterface".to_string(),
+        name: Some("B Backbone".to_string()),
+        reachable_on: Some("127.0.0.1".to_string()),
+        port: Some(backbone_port as u64),
+        ..Default::default()
+    };
+    let transport_id = [0xB0u8; 16];
+    let app_data = build_announce_app_data(&descriptor, &transport_id, true, &mut rand_core::OsRng)
+        .expect("build discovery announce app_data");
+
+    node_b
+        .announce_destination(&disco_hash, Some(&app_data))
+        .await
+        .expect("announce discovery record");
+
+    // A should persist the record, spawn a TCP client to B's backbone port,
+    // and register it. The auto-connected interface is named `autoconnect/*`.
+    let auto_connected = wait_until(Duration::from_secs(20), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name.starts_with("autoconnect/"))
+    })
+    .await;
+    assert!(
+        auto_connected,
+        "A did not auto-connect a discovered interface; interfaces = {:?}",
+        node_a
+            .interface_stats()
+            .iter()
+            .map(|i| i.name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // Traffic crosses the auto-established link: B re-announces so the accepted
+    // connection carries protocol bytes back to A's auto-connected interface.
+    node_b
+        .announce_destination(&disco_hash, Some(&app_data))
+        .await
+        .expect("re-announce over auto link");
+
+    let carried_traffic = wait_until(Duration::from_secs(20), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name.starts_with("autoconnect/") && i.online && i.rx_bytes > 0)
+    })
+    .await;
+    assert!(
+        carried_traffic,
+        "auto-connected interface carried no traffic; interfaces = {:?}",
+        node_a.interface_stats()
+    );
+
+    let _ = node_a.stop().await;
+    let _ = node_b.stop().await;
+}
+
+// ===========================================================================
+// Codeberg #151: discovered peers get their IFAC, and fail closed when they
+// cannot.
+// ===========================================================================
+
+/// Unix wall-clock seconds, like the driver's `now_unix_secs`.
+fn now_unix() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Seed `storage` with a persisted discovered-interface record advertising a
+/// TCP endpoint at `127.0.0.1:port`, optionally carrying IFAC netname/netkey.
+/// Writing the record directly (instead of hearing an announce) keeps the test
+/// deterministic and interface-free: the auto-connect poll reads it from disk.
+fn seed_discovered_record(
+    storage: &std::path::Path,
+    port: u16,
+    ifac_netname: Option<&str>,
+    ifac_netkey: Option<&str>,
+    seed: u8,
+) {
+    let di = DiscoveredInterface {
+        interface_type: "TCPServerInterface".to_string(),
+        transport: true,
+        name: format!("Seeded-{seed}"),
+        transport_id: [seed; 16],
+        network_id: [seed; 16],
+        value: 20,
+        stamp: [seed; 32],
+        latitude: None,
+        longitude: None,
+        height: None,
+        reachable_on: Some("127.0.0.1".to_string()),
+        port: Some(port as u64),
+        frequency: None,
+        bandwidth: None,
+        spreadingfactor: None,
+        codingrate: None,
+        ifac_netname: ifac_netname.map(str::to_string),
+        ifac_netkey: ifac_netkey.map(str::to_string),
+        discovery_hash: [seed; 32],
+    };
+    let now = now_unix();
+    let rec = DiscoveredInterfaceRecord::from_discovered(&di, 1, now, now, now, 0);
+    let dir = storage.join("discovery").join("interfaces");
+    std::fs::create_dir_all(&dir).expect("create discovery dir");
+    let mut name = String::new();
+    for b in di.discovery_hash {
+        name.push_str(&format!("{b:02x}"));
+    }
+    std::fs::write(dir.join(name), rec.encode_msgpack()).expect("write record");
+}
+
+const IFAC_NETNAME: &str = "closednet-151";
+const IFAC_NETKEY: &str = "closedkey-151";
+
+/// #151 case 1, end to end: the discovery record advertises IFAC
+/// netname/netkey, node B's advertised TCP server runs the same IFAC, and node
+/// A (no IFAC configured anywhere) auto-connects. A must derive the advertised
+/// IFAC for the spawned client, otherwise B drops every packet A sends and A
+/// drops every (masked) announce B sends -- so A learning a path to B's probe
+/// destination proves the spawned client authenticates in both directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn advertised_ifac_record_connects_under_that_ifac() {
+    let server_port = next_port();
+    let server_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+
+    // Node B: an IFAC-protected TCP server, built through the production
+    // config path (network_name/passphrase -> build_ifac_config).
+    let mut b_config = Config::default();
+    b_config.interfaces.insert(
+        "Protected Server".to_string(),
+        InterfaceConfig {
+            interface_type: "TCPServerInterface".to_string(),
+            listen_ip: Some("127.0.0.1".to_string()),
+            listen_port: Some(server_port),
+            networkname: Some(IFAC_NETNAME.to_string()),
+            passphrase: Some(IFAC_NETKEY.to_string()),
+            ..Default::default()
+        },
+    );
+    let _ = server_addr;
+    let b_storage = tempfile::tempdir().expect("tempdir b");
+    let mut node_b = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .config(b_config)
+        .storage_path(b_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build b");
+    node_b.start().await.expect("start b");
+
+    // B's probe destination; its announce is the traffic A must authenticate.
+    let probe_identity = Identity::generate(&mut rand_core::OsRng);
+    let probe_dest = Destination::new(
+        Some(probe_identity),
+        Direction::In,
+        DestinationType::Single,
+        "test151",
+        &["probe"],
+    )
+    .expect("probe destination");
+    let probe_hash = *probe_dest.hash();
+    node_b.register_destination(probe_dest);
+
+    // Node A: auto-connect enabled, NO interfaces, NO IFAC configured. The
+    // pre-seeded record is its only knowledge of B.
+    let a_storage = tempfile::tempdir().expect("tempdir a");
+    seed_discovered_record(
+        a_storage.path(),
+        server_port,
+        Some(IFAC_NETNAME),
+        Some(IFAC_NETKEY),
+        0x51,
+    );
+    let mut node_a = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .autoconnect_discovered_interfaces(4)
+        .storage_path(a_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build a");
+    node_a.start().await.expect("start a");
+
+    // A spawns the auto-connect client from the seeded record.
+    let auto_connected = wait_until(Duration::from_secs(15), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name.starts_with("autoconnect/"))
+    })
+    .await;
+    assert!(
+        auto_connected,
+        "A did not auto-connect the seeded record; interfaces = {:?}",
+        node_a.interface_stats()
+    );
+
+    // B announces its probe destination until A has authenticated the masked
+    // announce and learned the path. Without the advertised IFAC on the
+    // spawned client this never happens: B's announces fail A's IFAC check
+    // (and A's own packets are dropped by B).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut path_learned = false;
+    while Instant::now() < deadline {
+        node_b
+            .announce_destination(&probe_hash, None)
+            .await
+            .expect("announce probe");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        if node_a.has_path(&probe_hash) {
+            path_learned = true;
+            break;
+        }
+    }
+    assert!(
+        path_learned,
+        "A never learned B's probe path over the IFAC-protected auto-connect \
+         link; the spawned client is not authenticating (Codeberg #151)"
+    );
+
+    let _ = node_a.stop().await;
+    let _ = node_b.stop().await;
+}
+
+/// #151 case 2, end to end, through the production hearing path: the discovery
+/// record advertises NO IFAC material, but A hears the announce over its
+/// IFAC-protected bootstrap client, so the spawned auto-connect client must
+/// inherit the hearing interface's IFAC (the `AutoInterface.py:559-561`
+/// parent-child rule). This exercises the real insert side of the inherit rule
+/// (`record_discovery_announce` -> heard-IFAC map), which the seeded-record
+/// tests bypass.
+///
+/// Proof of authentication: after the bootstrap link is removed, a probe
+/// destination registered on B afterwards can reach A only over the
+/// auto-connected link, and B's backbone server drops unauthenticated traffic
+/// in both directions. Pre-#151 this test is red twice over: without the
+/// inherit rule an IFAC-running A refuses the endpoint entirely, and without
+/// any IFAC on the spawned client the path is never learned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autoconnect_inherits_ifac_of_hearing_interface() {
+    let bootstrap_port = next_port();
+    let backbone_port = next_port();
+
+    // Node B: bootstrap + backbone TCP servers, both under the operator's
+    // IFAC (one closed network), built through the production config path.
+    let mut b_config = Config::default();
+    for (name, port) in [("Bootstrap", bootstrap_port), ("Backbone", backbone_port)] {
+        b_config.interfaces.insert(
+            name.to_string(),
+            InterfaceConfig {
+                interface_type: "TCPServerInterface".to_string(),
+                listen_ip: Some("127.0.0.1".to_string()),
+                listen_port: Some(port),
+                networkname: Some(IFAC_NETNAME.to_string()),
+                passphrase: Some(IFAC_NETKEY.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    let b_storage = tempfile::tempdir().expect("tempdir b");
+    let mut node_b = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .config(b_config)
+        .storage_path(b_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build b");
+    node_b.start().await.expect("start b");
+
+    // Node A: an IFAC'd bootstrap client to B (the hearing interface) and
+    // auto-connect enabled. No seeded records: A learns of the backbone only
+    // by hearing B's announce over the protected bootstrap link.
+    let mut a_config = Config::default();
+    a_config.interfaces.insert(
+        "Bootstrap Client".to_string(),
+        InterfaceConfig {
+            interface_type: "TCPClientInterface".to_string(),
+            target_host: Some("127.0.0.1".to_string()),
+            target_port: Some(bootstrap_port),
+            networkname: Some(IFAC_NETNAME.to_string()),
+            passphrase: Some(IFAC_NETKEY.to_string()),
+            ..Default::default()
+        },
+    );
+    let a_storage = tempfile::tempdir().expect("tempdir a");
+    let mut node_a = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .autoconnect_discovered_interfaces(4)
+        .config(a_config)
+        .storage_path(a_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build a");
+    node_a.start().await.expect("start a");
+
+    let bootstrap_up = wait_until(Duration::from_secs(10), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.online && !i.is_local_client)
+    })
+    .await;
+    assert!(bootstrap_up, "bootstrap A->B link did not come online");
+    let bootstrap_id = node_a
+        .interface_stats()
+        .iter()
+        .find(|i| !i.is_local_client && !i.name.starts_with("autoconnect/"))
+        .map(|i| i.interface_id)
+        .expect("bootstrap interface present");
+
+    // B advertises its backbone endpoint. The descriptor carries NO IFAC
+    // fields — what our advertisement path publishes for an interface that
+    // did not ask for it (`publish_ifac`, Codeberg #162) — so only
+    // inheritance can protect the spawned client.
+    let disco_identity = Identity::generate(&mut rand_core::OsRng);
+    let disco_dest = Destination::new(
+        Some(disco_identity),
+        Direction::In,
+        DestinationType::Single,
+        "rnstransport",
+        &["discovery", "interface"],
+    )
+    .expect("discovery destination");
+    let disco_hash = *disco_dest.hash();
+    node_b.register_destination(disco_dest);
+    let descriptor = InterfaceDescriptor {
+        interface_type: "TCPServerInterface".to_string(),
+        name: Some("B Protected Backbone".to_string()),
+        reachable_on: Some("127.0.0.1".to_string()),
+        port: Some(backbone_port as u64),
+        ..Default::default()
+    };
+    let transport_id = [0xB1u8; 16];
+    let app_data = build_announce_app_data(&descriptor, &transport_id, true, &mut rand_core::OsRng)
+        .expect("build discovery announce app_data");
+
+    // Announce until A has heard it (over the IFAC'd bootstrap) and spawned
+    // the auto-connect client. An IFAC-running A without the inherit rule
+    // refuses the endpoint here (fail closed), so this wait itself is the
+    // first red assertion pre-#151.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut auto_connected = false;
+    while Instant::now() < deadline {
+        node_b
+            .announce_destination(&disco_hash, Some(&app_data))
+            .await
+            .expect("announce discovery record");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        if node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name.starts_with("autoconnect/") && i.online)
+        {
+            auto_connected = true;
+            break;
+        }
+    }
+    assert!(
+        auto_connected,
+        "A did not auto-connect the heard endpoint under inherited IFAC; \
+         interfaces = {:?}",
+        node_a.interface_stats()
+    );
+
+    // Remove the bootstrap link; from here on, only the auto-connected link
+    // remains, and it only carries traffic if it inherited the IFAC.
+    node_a
+        .remove_interface(bootstrap_id)
+        .expect("remove bootstrap interface");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let probe_identity = Identity::generate(&mut rand_core::OsRng);
+    let probe_dest = Destination::new(
+        Some(probe_identity),
+        Direction::In,
+        DestinationType::Single,
+        "test151",
+        &["inherit", "probe"],
+    )
+    .expect("probe destination");
+    let probe_hash = *probe_dest.hash();
+    node_b.register_destination(probe_dest);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut path_learned = false;
+    while Instant::now() < deadline {
+        node_b
+            .announce_destination(&probe_hash, None)
+            .await
+            .expect("announce probe");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        if node_a.has_path(&probe_hash) {
+            path_learned = true;
+            break;
+        }
+    }
+    assert!(
+        path_learned,
+        "A never learned B's probe path over the auto-connected link; the \
+         spawned client did not inherit the hearing interface's IFAC \
+         (Codeberg #151)"
+    );
+
+    let _ = node_a.stop().await;
+    let _ = node_b.stop().await;
+}
+
+/// #151 case 3, end to end: this node runs IFAC (an operator-configured UDP
+/// interface), the seeded record offers no IFAC material, and no hearing
+/// interface can be inherited from (the record was read from disk). The
+/// auto-connect must fail closed: no `autoconnect/*` interface may appear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ifac_node_refuses_open_discovered_endpoint() {
+    let udp_listen = next_port();
+    let udp_forward = next_port();
+    let target_port = next_port(); // nothing listens; must not even be dialed
+
+    let mut config = Config::default();
+    config.interfaces.insert(
+        "Protected UDP".to_string(),
+        InterfaceConfig {
+            interface_type: "UDPInterface".to_string(),
+            listen_ip: Some("127.0.0.1".to_string()),
+            listen_port: Some(udp_listen),
+            forward_ip: Some("127.0.0.1".to_string()),
+            forward_port: Some(udp_forward),
+            networkname: Some(IFAC_NETNAME.to_string()),
+            passphrase: Some(IFAC_NETKEY.to_string()),
+            ..Default::default()
+        },
+    );
+
+    let storage = tempfile::tempdir().expect("tempdir");
+    seed_discovered_record(storage.path(), target_port, None, None, 0x52);
+    let mut node = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .autoconnect_discovered_interfaces(4)
+        .config(config)
+        .storage_path(storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build node");
+    node.start().await.expect("start node");
+
+    // Several auto-connect polls (1 s interval) worth of settling time: the
+    // record is live and auto-connectable, so pre-#151 the spawner would have
+    // registered an `autoconnect/*` interface on the first poll.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let spawned: Vec<String> = node
+        .interface_stats()
+        .iter()
+        .map(|i| i.name.clone())
+        .filter(|n| n.starts_with("autoconnect/"))
+        .collect();
+    assert!(
+        spawned.is_empty(),
+        "IFAC-running node must NOT auto-connect an endpoint with no \
+         resolvable IFAC (fail closed, Codeberg #151); spawned = {spawned:?}"
+    );
+
+    let _ = node.stop().await;
+}
+
+// ===========================================================================
+// Codeberg #162: what a discovered peer authenticates with can also come out
+// of OUR announcer, not only out of Python's.
+// ===========================================================================
+
+/// Read back the discovered-interface records a node persisted under
+/// `storage`, so a test can assert on what actually came off the air.
+fn read_discovery_records(storage: &std::path::Path) -> Vec<DiscoveredInterfaceRecord> {
+    let dir = storage.join("discovery").join("interfaces");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .filter_map(|bytes| DiscoveredInterfaceRecord::decode_msgpack(&bytes))
+        .collect()
+}
+
+/// #162 end to end, without a seeded record anywhere: B advertises its own
+/// IFAC-protected backbone with `publish_ifac = yes`, and A -- which knows no
+/// credentials at all and hears B only over an OPEN bootstrap link -- brings
+/// the auto-connected link up under exactly the credentials B published.
+///
+/// This is the outbound half of the mechanism #151 consumed from Python: every
+/// other test in this file hands A its IFAC material (seeded record, or
+/// inherited from a protected hearing interface). Here the material can only
+/// have come off the air, out of our own announcer.
+///
+/// Proof of authentication, as in the inherit case: the open bootstrap link is
+/// removed once the auto-connect is up, so a probe destination registered on B
+/// afterwards can reach A only over the auto-connected link, and B's backbone
+/// drops unauthenticated traffic in both directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn published_ifac_record_connects_under_that_ifac() {
+    let bootstrap_port = next_port();
+    let backbone_port = next_port();
+
+    // Node B: an OPEN bootstrap server (so A can hear anything at all) plus the
+    // IFAC-protected backbone it advertises, publishing its access code.
+    let mut b_config = Config::default();
+    b_config.interfaces.insert(
+        "Open Bootstrap".to_string(),
+        InterfaceConfig {
+            name: "Open Bootstrap".to_string(),
+            interface_type: "TCPServerInterface".to_string(),
+            listen_ip: Some("127.0.0.1".to_string()),
+            listen_port: Some(bootstrap_port),
+            ..Default::default()
+        },
+    );
+    b_config.interfaces.insert(
+        "Published Backbone".to_string(),
+        InterfaceConfig {
+            name: "Published Backbone".to_string(),
+            interface_type: "TCPServerInterface".to_string(),
+            listen_ip: Some("127.0.0.1".to_string()),
+            listen_port: Some(backbone_port),
+            networkname: Some(IFAC_NETNAME.to_string()),
+            passphrase: Some(IFAC_NETKEY.to_string()),
+            discoverable: true,
+            publish_ifac: true,
+            discovery_name: Some("B Published Backbone".to_string()),
+            reachable_on: Some("127.0.0.1".to_string()),
+            discovery_announce_interval_secs: Some(0),
+            ..Default::default()
+        },
+    );
+    // Transport ON: `poll` lists candidates with Python's `only_transport=True`
+    // (autoconnect.rs), so a non-transport announcer is never auto-connected.
+    let b_storage = tempfile::tempdir().expect("tempdir b");
+    let mut node_b = ReticulumNodeBuilder::new()
+        .config(b_config)
+        .discovery_announce_job_interval_secs(1)
+        .storage_path(b_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build b");
+    node_b.start().await.expect("start b");
+
+    // Node A: an OPEN bootstrap client to B and auto-connect enabled. No IFAC
+    // configured, no seeded record -- everything it will authenticate with has
+    // to arrive in B's announce.
+    let mut a_config = Config::default();
+    a_config.interfaces.insert(
+        "Bootstrap Client".to_string(),
+        InterfaceConfig {
+            name: "Bootstrap Client".to_string(),
+            interface_type: "TCPClientInterface".to_string(),
+            target_host: Some("127.0.0.1".to_string()),
+            target_port: Some(bootstrap_port),
+            ..Default::default()
+        },
+    );
+    let a_storage = tempfile::tempdir().expect("tempdir a");
+    let mut node_a = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .autoconnect_discovered_interfaces(4)
+        .config(a_config)
+        .storage_path(a_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build a");
+    node_a.start().await.expect("start a");
+
+    let bootstrap_up = wait_until(Duration::from_secs(10), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.online && !i.is_local_client)
+    })
+    .await;
+    assert!(bootstrap_up, "bootstrap A->B link did not come online");
+    let bootstrap_id = node_a
+        .interface_stats()
+        .iter()
+        .find(|i| !i.is_local_client && !i.name.starts_with("autoconnect/"))
+        .map(|i| i.interface_id)
+        .expect("bootstrap interface present");
+
+    // B's own announcer advertises the backbone; A persists the record and
+    // spawns the auto-connect client from it.
+    let heard = wait_until(Duration::from_secs(30), || {
+        !read_discovery_records(a_storage.path()).is_empty()
+    })
+    .await;
+    assert!(heard, "A persisted no discovery record at all");
+
+    let auto_connected = wait_until(Duration::from_secs(30), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name.starts_with("autoconnect/") && i.online)
+    })
+    .await;
+    assert!(
+        auto_connected,
+        "A did not auto-connect B's self-advertised backbone; interfaces = {:?}",
+        node_a.interface_stats()
+    );
+
+    // The record A wrote must carry the published access code; without it the
+    // link below is open and B's IFAC'd backbone would drop every packet.
+    let records = read_discovery_records(a_storage.path());
+    assert!(
+        records
+            .iter()
+            .any(|r| r.ifac_netname.as_deref() == Some(IFAC_NETNAME)
+                && r.ifac_netkey.as_deref() == Some(IFAC_NETKEY)),
+        "the persisted record carries no published IFAC material: {:?}",
+        records
+            .iter()
+            .map(|r| (
+                r.name.clone(),
+                r.ifac_netname.clone(),
+                r.ifac_netkey.clone()
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    // Remove the open bootstrap link: from here on only the auto-connected
+    // link remains, and it carries traffic only if it is authenticated.
+    node_a
+        .remove_interface(bootstrap_id)
+        .expect("remove bootstrap interface");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let probe_identity = Identity::generate(&mut rand_core::OsRng);
+    let probe_dest = Destination::new(
+        Some(probe_identity),
+        Direction::In,
+        DestinationType::Single,
+        "test162",
+        &["published", "probe"],
+    )
+    .expect("probe destination");
+    let probe_hash = *probe_dest.hash();
+    node_b.register_destination(probe_dest);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut path_learned = false;
+    while Instant::now() < deadline {
+        node_b
+            .announce_destination(&probe_hash, None)
+            .await
+            .expect("announce probe");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        if node_a.has_path(&probe_hash) {
+            path_learned = true;
+            break;
+        }
+    }
+    assert!(
+        path_learned,
+        "A never learned B's probe path over the auto-connected link; the \
+         spawned client did not pick up the PUBLISHED IFAC (Codeberg #162)"
+    );
+
+    let _ = node_a.stop().await;
+    let _ = node_b.stop().await;
+}
+
+// ===========================================================================
+// Codeberg #414: an endpoint that never connects must not be re-dialled at the
+// detach-threshold rate.
+// ===========================================================================
+
+/// End to end for the never-connected cooldown, on the production event loop
+/// rather than the manager's mock spawner. Two things only the real loop can
+/// show:
+///
+///   * a peer that DOES connect is observed online by the live spawner's
+///     `is_online`, so it is never mistaken for a never-connected endpoint and
+///     survives well past the detach threshold untouched;
+///   * an endpoint nothing listens on is torn down once and then left alone
+///     for its cooldown, instead of being re-dialled every ~14 s the way it
+///     was before (measured: 22 dial cycles per five minutes, each rebuilding
+///     the TCP client and restarting its connect backoff from attempt 1).
+///
+/// Observing for 30 s covers the first detach (~13 s) and the whole first
+/// cooldown (12 s more); without the cooldown the dead endpoint is back within
+/// a second of every teardown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_never_connected_endpoint_is_not_redialled_at_the_detach_rate() {
+    let good_port = next_port();
+    let dead_port = next_port(); // nothing ever listens here
+    let good_addr: SocketAddr = format!("127.0.0.1:{good_port}").parse().unwrap();
+
+    let b_storage = tempfile::tempdir().expect("tempdir b");
+    let mut node_b = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .add_tcp_server(good_addr)
+        .storage_path(b_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build b");
+    node_b.start().await.expect("start b");
+
+    // Both records are on disk before A starts, so the first auto-connect poll
+    // sees them together and the cap (2) covers both: which one ranks higher
+    // cannot influence the result.
+    let a_storage = tempfile::tempdir().expect("tempdir a");
+    seed_discovered_record(a_storage.path(), good_port, None, None, 0xA1);
+    seed_discovered_record(a_storage.path(), dead_port, None, None, 0xD1);
+    let mut node_a = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .autoconnect_discovered_interfaces(2)
+        .storage_path(a_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build a");
+    node_a.start().await.expect("start a");
+
+    let good_name = "autoconnect/Seeded-161";
+    let dead_name = "autoconnect/Seeded-209";
+
+    let good_up = wait_until(Duration::from_secs(15), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name == good_name && i.online)
+    })
+    .await;
+    assert!(
+        good_up,
+        "reachable discovered endpoint did not auto-connect; interfaces = {:?}",
+        node_a
+            .interface_stats()
+            .iter()
+            .map(|i| i.name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // Sample both endpoints for 30 s at 250 ms.
+    let sample = Duration::from_millis(250);
+    let samples = 120u32;
+    let mut good_offline_samples = 0u32;
+    let mut dead_absent_samples = 0u32;
+    for _ in 0..samples {
+        tokio::time::sleep(sample).await;
+        let stats = node_a.interface_stats();
+        if !stats.iter().any(|i| i.name == good_name && i.online) {
+            good_offline_samples += 1;
+        }
+        if !stats.iter().any(|i| i.name == dead_name) {
+            dead_absent_samples += 1;
+        }
+    }
+
+    assert_eq!(
+        good_offline_samples, 0,
+        "a connected peer must stay attached past the detach threshold, \
+         not be cooled down as if it had never connected"
+    );
+    // One cooldown is 12 s = 48 samples; allow half of that for scheduling and
+    // for where in the cycle the observation window opened. Before the fix the
+    // endpoint was absent for the single poll between teardown and re-dial,
+    // roughly 2 of these 120 samples.
+    assert!(
+        dead_absent_samples >= 24,
+        "dead endpoint was absent for only {dead_absent_samples}/120 samples; \
+         it is being re-dialled at the detach-threshold rate"
+    );
+
+    let _ = node_a.stop().await;
+    let _ = node_b.stop().await;
+}
+
+/// Codeberg #416, end to end: a `bootstrap_only` interface is a way into the
+/// network, not a permanent link. Python detaches every bootstrap-only
+/// interface once the online auto-connected count reaches
+/// `autoconnect_discovered_interfaces`, and re-creates it when that count
+/// falls back to zero (`Discovery.py:553-563`). lnsd parsed the key and kept
+/// the connection for the life of the daemon, which on a public backbone node
+/// left a seed client carrying tens of megabytes it was never meant to carry.
+///
+/// The test drives both halves against real loopback TCP: node A reaches B
+/// over a bootstrap-only client, auto-connects to B's separately advertised
+/// second port, and must then drop the bootstrap client; removing the
+/// discovery record kills the auto-connect again, and the bootstrap client
+/// must come back rather than leaving A with no way into the network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bootstrap_only_interface_is_detached_once_autoconnect_is_satisfied() {
+    let bootstrap_port = next_port();
+    let backbone_port = next_port();
+    let bootstrap_addr: SocketAddr = format!("127.0.0.1:{bootstrap_port}").parse().unwrap();
+    let backbone_addr: SocketAddr = format!("127.0.0.1:{backbone_port}").parse().unwrap();
+
+    // Node B: two listeners. The first is the seed entry point A dials with its
+    // bootstrap-only client; the second is the endpoint A discovers.
+    let b_storage = tempfile::tempdir().expect("tempdir b");
+    let mut node_b = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .add_tcp_server(bootstrap_addr)
+        .add_tcp_server(backbone_addr)
+        .storage_path(b_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build b");
+    node_b.start().await.expect("start b");
+
+    let a_storage = tempfile::tempdir().expect("tempdir a");
+    seed_discovered_record(a_storage.path(), backbone_port, None, None, 0xB1);
+    let mut node_a = ReticulumNodeBuilder::new()
+        .enable_transport(false)
+        .add_tcp_client(bootstrap_addr)
+        .bootstrap_only()
+        .autoconnect_discovered_interfaces(1)
+        .storage_path(a_storage.path().to_path_buf())
+        .build()
+        .await
+        .expect("build a");
+    node_a.start().await.expect("start a");
+
+    // The bootstrap client is A's only configured interface, so it takes
+    // config index 0 and with it the `tcp_client_0` name.
+    let bootstrap_name = "tcp_client_0";
+    let autoconnect_name = "autoconnect/Seeded-177";
+
+    let seed_up = wait_until(Duration::from_secs(15), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name == bootstrap_name && i.online)
+    })
+    .await;
+    assert!(seed_up, "bootstrap-only seed client never connected");
+
+    let auto_up = wait_until(Duration::from_secs(15), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name == autoconnect_name && i.online)
+    })
+    .await;
+    assert!(
+        auto_up,
+        "discovered endpoint did not auto-connect; interfaces = {:?}",
+        node_a
+            .interface_stats()
+            .iter()
+            .map(|i| i.name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let seed_gone = wait_until(Duration::from_secs(15), || {
+        !node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name == bootstrap_name)
+    })
+    .await;
+    assert!(
+        seed_gone,
+        "bootstrap_only interface was still attached with the autoconnect target \
+         reached; interfaces = {:?}",
+        node_a
+            .interface_stats()
+            .iter()
+            .map(|i| i.name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // Second half: the auto-connected interface goes away (its record expires,
+    // emulated by deleting it), leaving A with nothing. The seed must return.
+    let dir = a_storage.path().join("discovery").join("interfaces");
+    for entry in std::fs::read_dir(&dir).expect("read discovery dir") {
+        let entry = entry.expect("dir entry");
+        std::fs::remove_file(entry.path()).expect("remove record");
+    }
+
+    let auto_gone = wait_until(Duration::from_secs(15), || {
+        !node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name == autoconnect_name)
+    })
+    .await;
+    assert!(auto_gone, "auto-connected interface outlived its record");
+
+    let seed_back = wait_until(Duration::from_secs(20), || {
+        node_a
+            .interface_stats()
+            .iter()
+            .any(|i| i.name == bootstrap_name && i.online)
+    })
+    .await;
+    assert!(
+        seed_back,
+        "no auto-connected interface is left and the bootstrap interface was not \
+         re-established: the node has no way back into the network; interfaces = {:?}",
+        node_a
+            .interface_stats()
+            .iter()
+            .map(|i| i.name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let _ = node_a.stop().await;
+    let _ = node_b.stop().await;
+}
