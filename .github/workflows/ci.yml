@@ -24,23 +24,17 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cache/rawg-target/ci
-          key: rust-test-${{ runner.os }}-${{ hashFiles('bench/rns-iroh-node/Cargo.lock', 'docs/patches/*.patch') }}
+          key: rust-test-${{ runner.os }}-${{ hashFiles('bench/rns-iroh-node/Cargo.lock') }}
           restore-keys: rust-test-${{ runner.os }}-
       - name: Настроить Rust
         run: rustup toolchain install stable --profile minimal
-      - name: Получить закреплённый Leviculum и применить патчи
-        run: |
-          git clone https://codeberg.org/Lew_Palm/Leviculum "$RUNNER_TEMP/leviculum"
-          git -C "$RUNNER_TEMP/leviculum" checkout --detach cb814c8513fb59d991c96106f1dcdd5d070cb423
-          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-path-expiry-cache.patch"
-          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-per-link-cipher.patch"
       - name: Тесты библиотеки Rust
         working-directory: bench/rns-iroh-node
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/test
         run: >-
           cargo test --lib
-          --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ runner.temp }}/leviculum/leviculum-std"'
+          --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ github.workspace }}/third_party/leviculum/leviculum-std"'
       - name: Python-тесты
         run: python3 -m pytest -q deploy/test_push.py
       - name: Проверка Bash и ShellCheck
@@ -57,23 +51,17 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # закреплённый SHA, v4
         with:
           path: ~/.cargo
-          key: server-24-${{ hashFiles('bench/rns-iroh-node/Cargo.lock', 'docs/patches/*.patch') }}
+          key: server-24-${{ hashFiles('bench/rns-iroh-node/Cargo.lock') }}
           restore-keys: server-24-
       - name: Системные зависимости
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev binutils
       - name: Настроить Rust
         run: rustup toolchain install stable --profile minimal
-      - name: Получить Leviculum и применить патчи
-        run: |
-          git clone https://codeberg.org/Lew_Palm/Leviculum "$RUNNER_TEMP/leviculum"
-          git -C "$RUNNER_TEMP/leviculum" checkout --detach cb814c8513fb59d991c96106f1dcdd5d070cb423
-          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-path-expiry-cache.patch"
-          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-per-link-cipher.patch"
       - name: Собрать rawgd
         working-directory: bench/rns-iroh-node
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/server-24
-        run: cargo build --release --bin rawgd --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ runner.temp }}/leviculum/leviculum-std"'
+        run: cargo build --release --bin rawgd --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ github.workspace }}/third_party/leviculum/leviculum-std"'
       - name: Проверить glibc и сформировать SHA256SUMS
         run: |
           mkdir -p dist
@@ -95,23 +83,17 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # закреплённый SHA, v4
         with:
           path: ~/.cargo
-          key: server-22-${{ hashFiles('bench/rns-iroh-node/Cargo.lock', 'docs/patches/*.patch') }}
+          key: server-22-${{ hashFiles('bench/rns-iroh-node/Cargo.lock') }}
           restore-keys: server-22-
       - name: Системные зависимости
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev binutils
       - name: Настроить Rust
         run: rustup toolchain install stable --profile minimal
-      - name: Получить Leviculum и применить патчи
-        run: |
-          git clone https://codeberg.org/Lew_Palm/Leviculum "$RUNNER_TEMP/leviculum"
-          git -C "$RUNNER_TEMP/leviculum" checkout --detach cb814c8513fb59d991c96106f1dcdd5d070cb423
-          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-path-expiry-cache.patch"
-          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-per-link-cipher.patch"
       - name: Собрать rawgd-u2204
         working-directory: bench/rns-iroh-node
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/server-22
-        run: cargo build --release --bin rawgd --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ runner.temp }}/leviculum/leviculum-std"'
+        run: cargo build --release --bin rawgd --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ github.workspace }}/third_party/leviculum/leviculum-std"'
       - name: Проверить glibc 2.35 и сформировать SHA256SUMS
         run: |
           mkdir -p dist
@@ -137,33 +119,28 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # закреплённый SHA, v3
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # закреплённый SHA, v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cache/rawg-target/android-ci
-          key: android-${{ hashFiles('bench/android/native/Cargo.lock', 'bench/rns-iroh-node/Cargo.lock', 'docs/patches/*.patch') }}
+          key: android-${{ hashFiles('bench/android/native/Cargo.lock', 'bench/rns-iroh-node/Cargo.lock') }}
           restore-keys: android-
       - name: Установить Android SDK и Rust target
         run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           set +o pipefail
-          yes | sdkmanager --licenses >/dev/null
+          yes | "$SDKM" --licenses >/dev/null
           set -o pipefail
-          sdkmanager 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0' 'ndk;29.0.14206865'
+          "$SDKM" 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0' 'ndk;29.0.14206865'
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-linux-android
-      - name: Получить Leviculum и применить патчи
-        run: |
-          git clone https://codeberg.org/Lew_Palm/Leviculum "$RUNNER_TEMP/leviculum"
-          git -C "$RUNNER_TEMP/leviculum" checkout --detach cb814c8513fb59d991c96106f1dcdd5d070cb423
-          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-path-expiry-cache.patch"
-          git -C "$RUNNER_TEMP/leviculum" apply "$GITHUB_WORKSPACE/docs/patches/leviculum-per-link-cipher.patch"
       - name: Собрать VPN APK с временной debug-подписью
         working-directory: bench/android
         env:
-          LEVICULUM_FORK: ${{ runner.temp }}/leviculum
+          LEVICULUM_FORK: ${{ github.workspace }}/third_party/leviculum
           OUT: ${{ runner.temp }}/apk-out
           CARGO_TARGET_DIR: ${{ runner.temp }}/android-ci-target
         run: |
