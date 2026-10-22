@@ -2,10 +2,41 @@
 # Сборка тестового APK (arm64-v8a) без Gradle: cargo (NDK clang) -> javac -> d8 -> aapt2 -> zipalign -> apksigner.
 # Использование: build.sh [meas|vpn]   (meas - приложение замеров, vpn - VPN-приложение)
 # Результат: $OUT/rawgmeas.apk или $OUT/rawgvpn.apk (по умолчанию ~/.cache/rawg-android/)
+# Окружение: KNOTHOP_KS/KNOTHOP_KEY_ALIAS/KNOTHOP_KS_PASS - релизная подпись (PKCS12), KNOTHOP_RELEASE=1 берёт
+# файлы из ~/.config/knothop/release; KNOTHOP_VERSION_CODE/KNOTHOP_VERSION_NAME - версия в рабочей копии манифеста.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP="${1:-meas}"
 case "$APP" in meas) SRC="$HERE/app"; PKG=com/rawg/meas ;; vpn) SRC="$HERE/vpn"; PKG=com/rawg/vpn ;; *) echo "meas|vpn"; exit 1 ;; esac
+# Подпись. Без KNOTHOP_KS - локальный debug.keystore, как раньше. Пароль релизного ключа идёт только через
+# окружение (apksigner env:), не в argv и не в журнал. Релизный ключ не сочетается с лабораторными сборками.
+RELEASE_DIR="$HOME/.config/knothop/release"
+if [ "${KNOTHOP_RELEASE:-0}" = 1 ]; then
+  KNOTHOP_KS="${KNOTHOP_KS:-$RELEASE_DIR/knothop-release.p12}"
+  KNOTHOP_KEY_ALIAS="${KNOTHOP_KEY_ALIAS:-$(cat "$RELEASE_DIR/alias")}"
+  KNOTHOP_KS_PASS="$(cat "$RELEASE_DIR/store.pass")"
+  export KNOTHOP_KS_PASS
+fi
+if [ -n "${KNOTHOP_KS:-}" ]; then
+  if [ "$APP" != vpn ]; then echo "релизная подпись только для vpn" >&2; exit 1; fi
+  if [ "${RAWG_LAB:-0}" = 1 ] || [ "${RAWG_PROFILEABLE:-0}" = 1 ]; then
+    echo "релизная подпись не совместима с RAWG_LAB и RAWG_PROFILEABLE" >&2; exit 1
+  fi
+  : "${KNOTHOP_KEY_ALIAS:?нужен KNOTHOP_KEY_ALIAS}" "${KNOTHOP_KS_PASS:?нужен KNOTHOP_KS_PASS}"
+fi
+# в CI (CI=true выставляет GitHub Actions) собирается только обычная сборка
+if [ "${CI:-}" = true ]; then
+  if [ "${RAWG_LAB:-0}" = 1 ] || [ "${RAWG_PROFILEABLE:-0}" = 1 ]; then
+    echo "в CI запрещены RAWG_LAB и RAWG_PROFILEABLE" >&2; exit 1
+  fi
+fi
+# версия проверяется до долгой сборки; подстановка в манифест - ниже
+if [ -n "${KNOTHOP_VERSION_CODE:-}" ] && [[ ! "$KNOTHOP_VERSION_CODE" =~ ^[0-9]+$ ]]; then
+  echo "KNOTHOP_VERSION_CODE: нужно целое число" >&2; exit 1
+fi
+if [ -n "${KNOTHOP_VERSION_NAME:-}" ] && [[ ! "$KNOTHOP_VERSION_NAME" =~ ^[0-9A-Za-z._-]+$ ]]; then
+  echo "KNOTHOP_VERSION_NAME: допустимы буквы, цифры, точка, _ и -" >&2; exit 1
+fi
 export PATH="$HOME/.cargo/bin:$PATH"
 SDK="${ANDROID_HOME:-$HOME/Android/Sdk}"
 NDK="${ANDROID_NDK_HOME:-$(ls -d "$SDK"/ndk/* | sort -V | tail -1)}"
@@ -15,6 +46,12 @@ API=26
 TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
 CLANG="$TOOLCHAIN/bin/aarch64-linux-android${API}-clang"
 FORK="${LEVICULUM_FORK:-$HOME/dev/leviculum}"
+# воспроизводимый штамп leviculum-core/build.rs: время сборки берём из HEAD форка
+# (SOURCE_DATE_EPOCH можно переопределить снаружи)
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+  SOURCE_DATE_EPOCH="$(git -C "$FORK" log -1 --format=%ct HEAD 2>/dev/null || echo 0)"
+  export SOURCE_DATE_EPOCH
+fi
 OUT="${OUT:-$HOME/.cache/rawg-android}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/rawg-target/android}"
 mkdir -p "$OUT"
@@ -57,6 +94,15 @@ fi
 # только shell-профилирование, без LAB_BUILD, интентов и подробного logcat.
 # Обычная сборка по умолчанию не разрешает ни то ни другое.
 SRC_WORK="$OUT/src-$APP"; rm -rf "$SRC_WORK"; mkdir -p "$SRC_WORK"; cp -r "$SRC"/. "$SRC_WORK"/
+# версия подставляется только в рабочую копию манифеста; исходник не меняется; без переменных - как в исходнике
+if [ -n "${KNOTHOP_VERSION_CODE:-}" ]; then
+  sed -i "s/android:versionCode=\"[0-9]*\"/android:versionCode=\"$KNOTHOP_VERSION_CODE\"/" "$SRC_WORK/AndroidManifest.xml"
+  grep -q "android:versionCode=\"$KNOTHOP_VERSION_CODE\"" "$SRC_WORK/AndroidManifest.xml" || { echo "versionCode не подставился" >&2; exit 1; }
+fi
+if [ -n "${KNOTHOP_VERSION_NAME:-}" ]; then
+  sed -i "s/android:versionName=\"[^\"]*\"/android:versionName=\"$KNOTHOP_VERSION_NAME\"/" "$SRC_WORK/AndroidManifest.xml"
+  grep -q "android:versionName=\"$KNOTHOP_VERSION_NAME\"" "$SRC_WORK/AndroidManifest.xml" || { echo "versionName не подставился" >&2; exit 1; }
+fi
 if [ "${RAWG_LAB:-0}" = "1" ]; then
   sed -i 's/LAB_BUILD = false/LAB_BUILD = true/' "$SRC_WORK"/java/$PKG/*.java
   grep -rq "LAB_BUILD = true" "$SRC_WORK"/java/$PKG/*.java || { echo "LAB_BUILD не включился: проверь формат строки в Util.java" >&2; exit 1; }
@@ -78,12 +124,21 @@ if [ "$APP" = vpn ]; then mkdir -p "$W/stage/assets"; cp "$HERE/LICENSE-ZXing.tx
 cp "$SO" "$W/stage/lib/arm64-v8a/"
 # снимок состояния форка, из которого собрана .so
 bash "$HERE/../../deploy/fork-manifest.sh" "$W/FORK-MANIFEST.txt"
-( cd "$W/stage" && zip -q -r "$W/base.apk" classes.dex lib $( [ -d assets ] && echo assets ) )
+( cd "$W/stage" && zip -q -r "$W/base.apk" classes.dex lib && if [ -d assets ]; then zip -q -r "$W/base.apk" assets; fi )
 cp "$W/FORK-MANIFEST.txt" "$W/stage/FORK-MANIFEST.txt"
 ( cd "$W/stage" && zip -q "$W/base.apk" FORK-MANIFEST.txt )
 "$BT/zipalign" -f -p 4 "$W/base.apk" "$W/aligned.apk"
-KS="$OUT/debug.keystore"
-[ -f "$KS" ] || keytool -genkeypair -keystore "$KS" -storepass android -keypass android -alias rawg -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=rawg test" >/dev/null 2>&1
-"$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --out "$OUT/rawg$APP.apk" "$W/aligned.apk"
-"$BT/apksigner" verify --verbose "$OUT/rawg$APP.apk" | head -4
-ls -l "$OUT/rawg$APP.apk"
+SIGNED="$OUT/rawg$APP.apk"
+if [ -n "${KNOTHOP_KS:-}" ]; then
+  "$BT/apksigner" sign --ks "$KNOTHOP_KS" --ks-type PKCS12 --ks-key-alias "$KNOTHOP_KEY_ALIAS" \
+    --ks-pass env:KNOTHOP_KS_PASS --key-pass env:KNOTHOP_KS_PASS --out "$SIGNED" "$W/aligned.apk"
+  echo "подпись: релизный ключ (PKCS12)"
+else
+  KS="$OUT/debug.keystore"
+  [ -f "$KS" ] || keytool -genkeypair -keystore "$KS" -storepass android -keypass android -alias rawg -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=rawg test" >/dev/null 2>&1
+  "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --out "$SIGNED" "$W/aligned.apk"
+  echo "подпись: локальный debug.keystore (не релизная)"
+fi
+# --print-certs: SHA-256 сертификата подписи публичен и нужен для сверки релиза
+"$BT/apksigner" verify --verbose --print-certs "$SIGNED"
+ls -l "$SIGNED"

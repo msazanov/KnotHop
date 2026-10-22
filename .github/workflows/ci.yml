@@ -1,4 +1,8 @@
-name: CI
+name: CI и релиз
+
+# Тесты - на каждом push и pull_request. Сборки и релиз - только на main (push или ручной запуск с main).
+# Секреты подписи читаются только в job apk и только на main: pull_request их не получает.
+# Форк Leviculum берётся по коммиту из deploy/leviculum.ref, вендорного снимка нет.
 
 on:
   push:
@@ -9,23 +13,37 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # на main сборки не отменяются: каждый push там выпускает свой релиз
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   tests:
-    name: Тесты Rust и deploy
+    name: Тесты и проверки
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+        with:
+          persist-credentials: false
+      - name: Закреплённый коммит форка
+        id: pin
+        run: |
+          ref="$(tr -d '[:space:]' < deploy/leviculum.ref)"
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "deploy/leviculum.ref: нужен полный SHA-1" >&2; exit 1; }
+          echo "sha=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+        with:
+          repository: msazanov/leviculum
+          ref: ${{ steps.pin.outputs.sha }}
+          path: leviculum
+          persist-credentials: false
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # закреплённый SHA, v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cache/rawg-target/ci
-          key: rust-test-${{ runner.os }}-${{ hashFiles('bench/rns-iroh-node/Cargo.lock') }}
-          restore-keys: rust-test-${{ runner.os }}-
+          key: tests-${{ runner.os }}-${{ hashFiles('bench/rns-iroh-node/Cargo.lock') }}
+          restore-keys: tests-${{ runner.os }}-
       - name: Настроить Rust
         run: rustup toolchain install stable --profile minimal
       - name: Тесты библиотеки Rust
@@ -34,87 +52,111 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/test
         run: >-
           cargo test --lib
-          --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ github.workspace }}/third_party/leviculum/leviculum-std"'
+          --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ github.workspace }}/leviculum/leviculum-std"'
       - name: Python-тесты
         run: python3 -m unittest deploy/test_push.py deploy/test_sanitize_public.py
       - name: Проверка Bash и ShellCheck
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          for script in deploy/*.sh; do bash -n "$script"; shellcheck -S warning -x "$script"; done
+          for script in deploy/*.sh bench/android/build.sh; do bash -n "$script"; shellcheck -S warning -x "$script"; done
 
-  server-ubuntu-24:
+  host:
     name: rawgd (Ubuntu 24.04)
+    needs: tests
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+        with:
+          persist-credentials: false
+      - name: Закреплённый коммит форка
+        id: pin
+        run: |
+          ref="$(tr -d '[:space:]' < deploy/leviculum.ref)"
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "deploy/leviculum.ref: нужен полный SHA-1" >&2; exit 1; }
+          echo "sha=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+        with:
+          repository: msazanov/leviculum
+          ref: ${{ steps.pin.outputs.sha }}
+          path: leviculum
+          persist-credentials: false
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # закреплённый SHA, v4
         with:
-          path: ~/.cargo
-          key: server-24-${{ hashFiles('bench/rns-iroh-node/Cargo.lock') }}
-          restore-keys: server-24-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: host-${{ runner.os }}-${{ hashFiles('bench/rns-iroh-node/Cargo.lock') }}
+          restore-keys: host-${{ runner.os }}-
       - name: Системные зависимости
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev binutils
       - name: Настроить Rust
         run: rustup toolchain install stable --profile minimal
-      - name: Собрать rawgd
-        working-directory: bench/rns-iroh-node
+      - name: Собрать rawgd и FORK-MANIFEST
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/server-24
-        run: cargo build --release --bin rawgd --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ github.workspace }}/third_party/leviculum/leviculum-std"'
-      - name: Проверить glibc и сформировать SHA256SUMS
-        run: |
-          mkdir -p dist
-          install -m 0755 "$RUNNER_TEMP/cargo-target/server-24/release/rawgd" dist/rawgd
-          need=$(objdump -T dist/rawgd | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
-          echo "rawgd requires up to $need"
-          (cd dist && sha256sum rawgd > SHA256SUMS)
+          LEVICULUM_FORK: ${{ github.workspace }}/leviculum
+          CI_TARGET: ${{ runner.temp }}/knothop-target
+        run: bash deploy/ci-build.sh host "$RUNNER_TEMP/dist-host"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4
         with:
-          name: rawgd-ubuntu-24.04
-          path: dist/
+          name: host
+          path: ${{ runner.temp }}/dist-host/
           if-no-files-found: error
 
-  server-ubuntu-22:
-    name: rawgd-u2204 (glibc 2.35)
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # закреплённый SHA, v4
-        with:
-          path: ~/.cargo
-          key: server-22-${{ hashFiles('bench/rns-iroh-node/Cargo.lock') }}
-          restore-keys: server-22-
-      - name: Системные зависимости
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev binutils
-      - name: Настроить Rust
-        run: rustup toolchain install stable --profile minimal
-      - name: Собрать rawgd-u2204
-        working-directory: bench/rns-iroh-node
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/server-22
-        run: cargo build --release --bin rawgd --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ github.workspace }}/third_party/leviculum/leviculum-std"'
-      - name: Проверить glibc 2.35 и сформировать SHA256SUMS
-        run: |
-          mkdir -p dist
-          install -m 0755 "$RUNNER_TEMP/cargo-target/server-22/release/rawgd" dist/rawgd-u2204
-          need=$(objdump -T dist/rawgd-u2204 | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
-          echo "rawgd-u2204 requires up to $need"
-          if [ "${need#GLIBC_}" != "$need" ] && [ "$(printf '%s\n' 2.35 "${need#GLIBC_}" | sort -V | tail -1)" != 2.35 ]; then
-            echo "rawgd-u2204 requires newer than GLIBC_2.35" >&2; exit 1
-          fi
-          (cd dist && sha256sum rawgd-u2204 > SHA256SUMS)
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4
-        with:
-          name: rawgd-u2204-glibc-2.35
-          path: dist/
-          if-no-files-found: error
-
-  android-apk:
-    name: Android APK (debug signature)
+  u2204:
+    name: rawgd-u2204 (контейнер ubuntu:22.04)
+    needs: tests
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+        with:
+          persist-credentials: false
+      - name: Закреплённый коммит форка
+        id: pin
+        run: |
+          ref="$(tr -d '[:space:]' < deploy/leviculum.ref)"
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "deploy/leviculum.ref: нужен полный SHA-1" >&2; exit 1; }
+          echo "sha=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+        with:
+          repository: msazanov/leviculum
+          ref: ${{ steps.pin.outputs.sha }}
+          path: leviculum
+          persist-credentials: false
+      - name: Собрать rawgd-u2204 в ubuntu:22.04
+        env:
+          LEVICULUM_FORK: ${{ github.workspace }}/leviculum
+          CI_TARGET: ${{ runner.temp }}/knothop-target
+        run: bash deploy/ci-build.sh u2204 "$RUNNER_TEMP/dist-u2204"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4
+        with:
+          name: u2204
+          path: ${{ runner.temp }}/dist-u2204/
+          if-no-files-found: error
+
+  apk:
+    name: VPN APK (релизная подпись)
+    needs: tests
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+        with:
+          persist-credentials: false
+      - name: Закреплённый коммит форка
+        id: pin
+        run: |
+          ref="$(tr -d '[:space:]' < deploy/leviculum.ref)"
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "deploy/leviculum.ref: нужен полный SHA-1" >&2; exit 1; }
+          echo "sha=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+        with:
+          repository: msazanov/leviculum
+          ref: ${{ steps.pin.outputs.sha }}
+          path: leviculum
+          persist-credentials: false
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # закреплённый SHA, v4
         with:
           distribution: temurin
@@ -124,9 +166,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cache/rawg-target/android-ci
-          key: android-${{ hashFiles('bench/android/native/Cargo.lock', 'bench/rns-iroh-node/Cargo.lock') }}
-          restore-keys: android-
+          key: apk-${{ runner.os }}-${{ hashFiles('bench/android/native/Cargo.lock', 'bench/rns-iroh-node/Cargo.lock') }}
+          restore-keys: apk-${{ runner.os }}-
       - name: Установить Android SDK и Rust target
         run: |
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
@@ -137,24 +178,87 @@ jobs:
           "$SDKM" 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0' 'ndk;29.0.14206865'
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-linux-android
-      - name: Собрать VPN APK с временной debug-подписью
+      - name: Ключ подписи во временный файл
+        env:
+          KEYSTORE_B64: ${{ secrets.KNOTHOP_KEYSTORE_B64 }}
+        run: |
+          set -o pipefail
+          umask 077
+          ks="$RUNNER_TEMP/knothop-release.p12"
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$ks"
+          [ -s "$ks" ] || { echo "KNOTHOP_KEYSTORE_B64 не задан или пуст" >&2; exit 1; }
+          echo "KNOTHOP_KS=$ks" >> "$GITHUB_ENV"
+      - name: Собрать VPN APK с релизной подписью
         working-directory: bench/android
         env:
-          LEVICULUM_FORK: ${{ github.workspace }}/third_party/leviculum
+          KNOTHOP_KS_PASS: ${{ secrets.KNOTHOP_KEYSTORE_PASS }}
+          KNOTHOP_KEY_ALIAS: ${{ secrets.KNOTHOP_KEY_ALIAS }}
+          KNOTHOP_VERSION_CODE: ${{ github.run_number }}
+          KNOTHOP_VERSION_NAME: 0.1.${{ github.run_number }}
+          RAWG_LAB: '0'
+          LEVICULUM_FORK: ${{ github.workspace }}/leviculum
           OUT: ${{ runner.temp }}/apk-out
-          CARGO_TARGET_DIR: ${{ runner.temp }}/android-ci-target
+          CARGO_TARGET_DIR: ${{ runner.temp }}/android-target
         run: |
           export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
           ./build.sh vpn
-      - name: Сформировать и проверить SHA256SUMS
+      - name: Проверить подпись APK
         run: |
-          mkdir -p artifacts
-          install -m 0644 "$RUNNER_TEMP/apk-out/rawgvpn.apk" artifacts/rawgvpn.apk
-          (cd artifacts && sha256sum rawgvpn.apk > SHA256SUMS)
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose artifacts/rawgvpn.apk
+          apk="$RUNNER_TEMP/apk-out/rawgvpn.apk"
+          # SHA-256 сертификата подписи публичен: печатаем в журнал для сверки релиза
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk"
+      - name: Удалить ключ подписи
+        if: always()
+        run: rm -f "$RUNNER_TEMP/knothop-release.p12"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4
         with:
-          name: rawgvpn-apk-debug
-          path: artifacts/
+          name: apk
+          path: ${{ runner.temp }}/apk-out/rawgvpn.apk
           if-no-files-found: error
+
+  release:
+    name: Релиз на GitHub
+    needs: [host, u2204, apk]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    # единственная job с правом записи: создаёт тег и релиз; релизы выпускаются по очереди
+    permissions:
+      contents: write
+    concurrency:
+      group: knothop-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: v0.1.${{ github.run_number }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # закреплённый SHA, v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS и описание релиза
+        run: |
+          cd dist
+          sha256sum rawgd rawgd-u2204 rawgvpn.apk > SHA256SUMS
+          fork="$(sed -n 's/^head=//p' FORK-MANIFEST.txt)"
+          {
+            echo "Сборка из коммита \`${GITHUB_SHA:0:9}\`, версия 0.1.${{ github.run_number }} (versionCode ${{ github.run_number }})."
+            echo
+            echo "Коммит форка Leviculum: \`$fork\` (github.com/msazanov/leviculum)."
+            echo
+            echo "SHA-256 артефактов:"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+            echo
+            echo "rawgd собран на Ubuntu 24.04, rawgd-u2204 - в контейнере ubuntu:22.04 (glibc 2.35)."
+            echo "rawgvpn.apk подписан релизным ключом; SHA-256 сертификата - в журнале job apk."
+          } > "$RUNNER_TEMP/notes.md"
+          ls -l
+      - name: Создать релиз
+        run: |
+          gh release create "$TAG" \
+            dist/rawgd dist/rawgd-u2204 dist/rawgvpn.apk dist/SHA256SUMS dist/FORK-MANIFEST.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "KnotHop $TAG (${GITHUB_SHA:0:9})" --notes-file "$RUNNER_TEMP/notes.md"

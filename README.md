@@ -8,6 +8,6 @@ KnotHop — экспериментальный пилот IPv4-VPN поверх 
 
 ## Происхождение и лицензии
 
-Leviculum: первоисточник — [Lew_Palm/Leviculum](https://codeberg.org/Lew_Palm/Leviculum); изменённый форк находится в `third_party/leviculum/`, лицензия AGPL-3.0-or-later.
+Leviculum: первоисточник — [Lew_Palm/Leviculum](https://codeberg.org/Lew_Palm/Leviculum); изменённый форк подключается по коммиту из `deploy/leviculum.ref` (github.com/msazanov/leviculum), лицензия AGPL-3.0-or-later; см. [NOTICE-KNOTHOP.md](NOTICE-KNOTHOP.md).
 
 Reticulum: [reticulum.network](https://reticulum.network). KnotHop распространяется по AGPL-3.0-or-later; см. [LICENSE](LICENSE).

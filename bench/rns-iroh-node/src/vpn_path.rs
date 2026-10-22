@@ -65,9 +65,112 @@ pub(super) fn link_timed_out(now: Instant, authenticated_rx: Option<Instant>, ti
     authenticated_rx.map(|t| now.saturating_duration_since(t) > timeout).unwrap_or(true)
 }
 
+/// Отступ относится к выходу, а не к текущему запасному Link. Истечение паузы
+/// разрешает пробу, но само по себе не доказывает восстановление выхода.
+#[derive(Default)]
+pub(super) struct ExitBackoff(HashMap<[u8; 16], (u64, Instant)>);
+
+/// Запоминаем именно интерфейс неудачной попытки, а не новый путь,
+/// который RNS мог успеть найти, пока устанавливался Link.
+#[derive(Debug)]
+pub(super) struct FailedPath {
+    pub(super) iface: usize,
+    pub(super) why: String,
+}
+
+impl std::fmt::Display for FailedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.why) }
+}
+
+impl std::error::Error for FailedPath {}
+
+pub(super) fn forget_failed_path(failed: usize, current: Option<usize>) -> bool {
+    current == Some(failed)
+}
+
+impl ExitBackoff {
+    pub(super) fn failed(&mut self, dest: [u8; 16], now: Instant) -> Duration {
+        let secs = self.0.get(&dest).map(|(s, _)| s.saturating_mul(2).min(300)).unwrap_or(10);
+        self.0.insert(dest, (secs, now + Duration::from_secs(secs)));
+        Duration::from_secs(secs)
+    }
+
+    pub(super) fn ready(&self, dest: &[u8; 16], now: Instant) -> bool {
+        self.remaining(dest, now).is_zero()
+    }
+
+    pub(super) fn remaining(&self, dest: &[u8; 16], now: Instant) -> Duration {
+        self.0.get(dest).map(|(_, until)| until.saturating_duration_since(now)).unwrap_or_default()
+    }
+
+    pub(super) fn succeeded(&mut self, dest: &[u8; 16]) {
+        self.0.remove(dest);
+    }
+
+    pub(super) fn healthy(&mut self, dest: &[u8; 16], connected: Instant, now: Instant) {
+        // Короткий всплеск связи не обнуляет историю флапа: иначе AUTH_OK/один
+        // pong снова превращают отказ через секунды в бесконечный отступ 10 с.
+        if now.saturating_duration_since(connected) >= Duration::from_secs(300) {
+            self.succeeded(dest);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_backoff_doubles_caps_and_does_not_reset_when_pause_expires() {
+        let mut b = ExitBackoff::default();
+        let mut t = Instant::now();
+        let d = [1; 16];
+        for secs in [10, 20, 40, 80, 160, 300, 300] {
+            assert!(b.ready(&d, t));
+            assert_eq!(b.failed(d, t), Duration::from_secs(secs));
+            assert!(!b.ready(&d, t + Duration::from_secs(secs - 1)));
+            t += Duration::from_secs(secs);
+            assert!(b.ready(&d, t));
+        }
+    }
+
+    #[test]
+    fn exit_backoff_success_is_per_exit_and_restores_fast_retry() {
+        let mut b = ExitBackoff::default();
+        let t = Instant::now();
+        b.failed([1; 16], t);
+        b.failed([1; 16], t);
+        b.failed([2; 16], t);
+        b.succeeded(&[1; 16]);
+        assert!(b.ready(&[1; 16], t));
+        assert!(!b.ready(&[2; 16], t));
+        assert_eq!(b.failed([1; 16], t), Duration::from_secs(10));
+        assert_eq!(b.remaining(&[2; 16], t + Duration::from_secs(4)), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn failed_transit_path_is_invalidated_but_replacement_is_kept() {
+        assert!(forget_failed_path(2, Some(2)));
+        assert!(!forget_failed_path(2, Some(3)));
+        assert!(!forget_failed_path(2, None));
+        assert!(!acceptable(Some(2), &[2, 3], Some(2)));
+        assert!(acceptable(Some(3), &[2, 3], Some(2)));
+    }
+
+    #[test]
+    fn flapping_exit_keeps_failure_history_until_stable_success() {
+        let mut b = ExitBackoff::default();
+        let t = Instant::now();
+        let d = [3; 16];
+        b.failed(d, t);
+        b.healthy(&d, t + Duration::from_secs(10), t + Duration::from_secs(100));
+        assert_eq!(b.failed(d, t + Duration::from_secs(100)), Duration::from_secs(20));
+        let connected = t + Duration::from_secs(120);
+        b.healthy(&d, connected, connected + Duration::from_secs(299));
+        assert_eq!(b.failed(d, connected + Duration::from_secs(299)), Duration::from_secs(40));
+        b.healthy(&d, connected, connected + Duration::from_secs(300));
+        assert_eq!(b.failed(d, connected + Duration::from_secs(301)), Duration::from_secs(10));
+    }
 
     #[test]
     fn one_owner_and_shared_twenty_second_budget() {

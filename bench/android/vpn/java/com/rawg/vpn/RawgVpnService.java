@@ -157,7 +157,15 @@ public class RawgVpnService extends VpnService {
             Util.lab("phase connecting, tun fd " + tun.getFd());
             String args = "client --state " + state.getAbsolutePath() + " " + clientArgs
                     + " --tun-fd " + tun.getFd() + " --fail-ms 3000 --workers 4 " + extraArgs;
-            if (Util.LAB_BUILD) { try { android.system.Os.setenv("RAWGD_ALLOW_PRIVATE_DIAL", "1", true); android.system.Os.setenv("RAWG_DEBUG", "1", true); } catch (Exception ignored) { } }   // лаборатория: узлы в частной сети
+            if (Util.LAB_BUILD) {
+                try {
+                    // Частные адреса разрешены только в явно настроенной изолированной лаборатории, не при диагностике пилота.
+                    boolean localLab = !getSharedPreferences("p", MODE_PRIVATE).getString("lab_pub", "").isEmpty();
+                    if (localLab) android.system.Os.setenv("RAWGD_ALLOW_PRIVATE_DIAL", "1", true);
+                    else android.system.Os.unsetenv("RAWGD_ALLOW_PRIVATE_DIAL");
+                    android.system.Os.setenv("RAWG_DEBUG", "1", true);
+                } catch (Exception ignored) { }
+            }
             int rc = Native.runVpn(args, state.getAbsolutePath());
             if (!"stopping".equals(phase)) {
                 String err = Util.read(new File(state, "error.txt"));

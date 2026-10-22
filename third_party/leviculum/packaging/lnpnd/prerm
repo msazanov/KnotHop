@@ -1,9 +1,0 @@
-#!/bin/sh
-# prerm for lnpnd. Service teardown is auto-injected by cargo-deb from
-# the systemd-units metadata (the marker below).
-
-set -e
-
-#DEBHELPER#
-
-exit 0

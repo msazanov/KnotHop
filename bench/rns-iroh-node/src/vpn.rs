@@ -931,6 +931,17 @@ impl<'a> Rd<'a> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn exit_datagram_probe_requires_exact_echo_not_control_or_foreign_nonce() {
+        let reply = dgram_ping(42, 1234, b'R');
+        assert!(data_probe_matches(42, 1234, &reply));
+        assert!(!data_probe_matches(41, 1234, &reply));
+        assert!(!data_probe_matches(42, 1235, &reply));
+        assert!(!data_probe_matches(42, 1234, &dgram_ping(42, 1234, b'P')));
+        assert!(!data_probe_matches(42, 1234, &reply[..15]));
+        assert!(!data_probe_matches(42, 1234, &[T_AUTH_OK]));
+    }
+
+    #[test]
     fn platform_allowlist() {
         assert_eq!(parse_platform(b"android"), Some("android"));
         assert_eq!(parse_platform(b" server\n"), Some("server"));
@@ -5227,7 +5238,18 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
                     ctx.send_table(c);
                 }
             }
-            let st = serde_json::json!({"uptime_s": ctx.started.elapsed().as_secs(), "links": ctx.links.lock().unwrap().len(),
+            // Только допущенные соседи, без адресов: Link может работать по старому
+            // интерфейсу, пока таблица RNS уже выбрала для новых Link другой путь.
+            let private_ifaces = own_carrier_ifaces(&ctx.node);
+            let ifaces = ctx.node.engine().interface_stats();
+            let vpn_paths: Vec<serde_json::Value> = ctx.neigh.lock().unwrap().values().filter(|n| n.link.is_some()).take(64).map(|n| {
+                let p = ctx.node.engine().get_path_clone(&DestinationHash::new(n.dest));
+                serde_json::json!({"d": hex(&n.dest), "n": n.name, "h": p.as_ref().map(|p| p.hops),
+                    "iface": p.as_ref().and_then(|p| ifaces.iter().find(|i| i.interface_id.0 == p.interface_index).map(|i| i.name.clone())),
+                    "private": p.as_ref().map(|p| private_ifaces.contains(&p.interface_index)),
+                    "nh": p.and_then(|p| p.next_hop).map(|h| hex(&h))})
+            }).collect();
+            let st = serde_json::json!({"uptime_s": ctx.started.elapsed().as_secs(), "links": ctx.links.lock().unwrap().len(), "vpn_paths": vpn_paths,
                 "clients": n_clients, "tun": ctx.tun.as_ref().map(|t| t.stats()), "registry": ctx.reg.lock().unwrap().recs.len(),
                 "model": if ctx.t13.is_some() { "0013" } else { "legacy" }, "pol": pol_counters(),
                 "policy": ctx.t13.as_ref().map(|t| t.trust.lock().unwrap().policy_view(now_ms() as u64).iter()
@@ -5683,6 +5705,8 @@ struct ClientCtx {
     servers: Mutex<Vec<CServer>>,
     tun: Arc<TunState>,
     auth_wait: Mutex<HashMap<LinkId, tokio::sync::oneshot::Sender<std::result::Result<serde_json::Value, String>>>>,
+    /// Пробы датаграмм только после AUTH_OK и проверки EXIT: Link -> случайный seq, метка времени, ответ.
+    data_wait: Mutex<HashMap<LinkId, (u32, u64, tokio::sync::oneshot::Sender<()>)>>,
     cur: Mutex<Option<([u8; 16], LinkId, Instant)>>,
     last_pong: std::sync::atomic::AtomicU64,
     rtt_pong: std::sync::atomic::AtomicU64,
@@ -6137,7 +6161,7 @@ pub async fn run_client(a: ClientArgs) -> Result<()> {
         bail!("в профиле нет серверов");
     }
     let ctx = Arc::new(ClientCtx { node: node.clone(), sh: sh.clone(), ep: ep.clone(), identity, group: prof.group.clone(), ip: ip_str(prof.ip), servers: Mutex::new(servers.clone()), tun,
-        auth_wait: Mutex::new(HashMap::new()), cur: Mutex::new(None), last_pong: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
+        auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), cur: Mutex::new(None), last_pong: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
         state: a.state.clone(), status: Mutex::new("подключаюсь".into()), dialers: Mutex::new(HashMap::new()),
         carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), hints: Mutex::new(HashMap::new()), platforms: Mutex::new(HashMap::new()), books: Mutex::new(HashMap::new()), table_acc: Mutex::new(HashSet::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
         c13, path_gate: path::PathGate::default(), nbrs: Mutex::new(HashMap::new()), admitted_exits: Mutex::new(HashMap::new()), ctrl: Mutex::new(HashMap::new()), lk_fail: Mutex::new(HashMap::new()), vis: Mutex::new(HashMap::new()), qstat: Mutex::new(HashMap::new()),
@@ -7085,6 +7109,7 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
             NodeEvent::LinkClosed { link_id, reason, .. } => {
                 ctx.admitted_exits.lock().unwrap().remove(&link_id);
                 ctx.ctrl.lock().unwrap().remove(&link_id);
+                ctx.data_wait.lock().unwrap().remove(&link_id);
                 ctx.sh.closed.lock().unwrap().insert(hex(link_id.as_bytes()), format!("{reason:?}"));
             }
             NodeEvent::MessageReceived { link_id, data, .. } if !data.is_empty() => {
@@ -7176,6 +7201,16 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
             }
             NodeEvent::LinkDataReceived { link_id, data, .. } if data.first() == Some(&T_BENCH_DATA) => bench_rx(&ctx.bench_sess, link_id, &data),
             NodeEvent::LinkDataReceived { link_id, data, .. } => {
+                // IP-пакеты не берут дополнительный мьютекс таблицы проб.
+                if is_rgp(&data) && data[3] == b'R' {
+                    let probe = {
+                        let mut pending = ctx.data_wait.lock().unwrap();
+                        if pending.get(&link_id).map(|(seq, ts, _)| data_probe_matches(*seq, *ts, &data)).unwrap_or(false) {
+                            pending.remove(&link_id)
+                        } else { None }
+                    };
+                    if let Some((_, _, tx)) = probe { let _ = tx.send(()); }
+                }
                 let cur = ctx.cur.lock().unwrap().map(|c| c.1);
                 if cur == Some(link_id) {
                     ctx.last_pong.store(now_ms() as u64, Relaxed); // любой пакет от выхода - признак жизни
@@ -7349,7 +7384,7 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
         }
     } else {
         // Тот же порядок, что у ноды к соседу: прямой путь по нашему носителю, иначе транзит через наши узлы.
-        if !scoped_path(&ctx.node, &dest, &carrier_ifaces(ctx, avoid_iface), avoid_iface) {
+        {
             start_dialer(ctx, cand);
             let carrier_now = || {
                 let label = ctx.carriers.lock().unwrap().get(&cand.dest).filter(|x| *x.mode.lock().unwrap() != "none").map(|x| x.label.lock().unwrap().clone()).unwrap_or_default();
@@ -7361,6 +7396,12 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
     if !scoped_path(&ctx.node, &dest, &allowed(), avoid_iface) {
         bail!("нет пути до {}", cand.name);
     }
+    let used_iface = ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index);
+    if let Some(p) = ctx.node.engine().get_path_clone(&dest) {
+        let iface = ctx.node.engine().interface_stats().iter().find(|i| i.interface_id.0 == p.interface_index).map(|i| i.name.clone()).unwrap_or_default();
+        ctx.sh.note(format!("путь к {}: {} хоп, интерфейс {}, транспорт {}", cand.name, p.hops, iface,
+            p.next_hop.map(|h| hex(&h)[..8].to_string()).unwrap_or_else(|| "—".into())));
+    }
     let handle = ctx.node.connect_with_key_cipher(&dest, &cand.key, cipher).await?;
     let id = *handle.link_id();
     let k = hex(id.as_bytes());
@@ -7368,7 +7409,11 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
     while !ctx.sh.established.lock().unwrap().contains(&k) {
         if ctx.sh.closed.lock().unwrap().contains_key(&k) || t.elapsed() > Duration::from_secs(est_s) {
             let _ = ctx.node.engine().close_link(&id).await;
-            bail!("link до {} не установился", cand.name);
+            let why = format!("link до {} не установился", cand.name);
+            return Err(match used_iface {
+                Some(iface) => anyhow::Error::new(path::FailedPath { iface, why }),
+                None => anyhow::anyhow!(why),
+            });
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -7381,7 +7426,29 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
     Ok((id, Arc::new(handle)))
 }
 
-/// Подключиться к выходу: путь, Link, identify (доказательство владения ключом клиента), ответ AUTH_OK.
+fn data_probe_matches(seq: u32, ts: u64, data: &[u8]) -> bool {
+    is_rgp(data) && data[3] == b'R'
+        && data[4..8] == seq.to_le_bytes() && data[8..16] == ts.to_le_bytes()
+}
+
+struct ExitProbeGuard<'a> {
+    ctx: &'a ClientCtx,
+    id: LinkId,
+    ready: bool,
+}
+
+impl Drop for ExitProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.data_wait.lock().unwrap().remove(&self.id);
+        if !self.ready {
+            // Отмена внешнего timeout тоже освобождает только новый пробный Link.
+            let (node, id) = (self.ctx.node.clone(), self.id);
+            tokio::spawn(async move { let _ = node.engine().close_link(&id).await; });
+        }
+    }
+}
+
+/// Подключиться к выходу: путь, Link, identify, AUTH_OK и проверенная датаграмма.
 async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usize>) -> Result<(LinkId, Arc<leviculum_std::LinkHandle>)> {
     if ctx.c13.is_some() && !exit_eligible(ctx, cand) {
         bail!("{} не имеет действующего права/политики EXIT в общей сети", cand.name);
@@ -7468,14 +7535,45 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     if let Some(t) = reply.get("table") {
         ctx.merge_table(t);
     }
+    // Управляющий Channel может отвечать, пока ненадёжные датаграммы по тому же
+    // пути не проходят. Такой Link не должен вытеснять рабочий запасной выход.
+    let (seq, ts) = (rand_core::OsRng.next_u32(), now_us());
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let room = {
+        let mut pending = ctx.data_wait.lock().unwrap();
+        if pending.len() >= 32 { false } else { pending.insert(id, (seq, ts, tx)); true }
+    };
+    if !room {
+        let _ = ctx.node.engine().close_link(&id).await;
+        bail!("слишком много проверок датаграмм выхода");
+    }
+    let mut probe = ExitProbeGuard { ctx, id, ready: false };
+    for _ in 0..3 {
+        spawn_dgram(&ctx.node, id, dgram_ping(seq, ts, b'P'));
+        match tokio::time::timeout(Duration::from_secs(1), &mut rx).await {
+            Ok(Ok(())) => { probe.ready = true; break; }
+            Ok(Err(_)) => break,
+            Err(_) => {}
+        }
+    }
+    ctx.data_wait.lock().unwrap().remove(&id);
+    if !probe.ready {
+        let iface = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface());
+        let _ = ctx.node.engine().close_link(&id).await;
+        let why = format!("{}: нет ответа на датаграммы выхода", cand.name);
+        return Err(match iface {
+            Some(iface) => anyhow::Error::new(path::FailedPath { iface, why }),
+            None => anyhow::anyhow!(why),
+        });
+    }
     ctx.sh.note(format!("выход {} принял клиента за {} мс (хопов {:?})", cand.name, t0.elapsed().as_millis(), ctx.node.hops_to(&dest)));
     Ok((id, handle))
 }
 
-fn candidates(ctx: &Arc<ClientCtx>, banned: &HashMap<[u8; 16], Instant>, only: Option<[u8; 16]>) -> Vec<CServer> {
+fn candidates(ctx: &Arc<ClientCtx>, banned: &path::ExitBackoff, only: Option<[u8; 16]>) -> Vec<CServer> {
     // 0013: допущенный EXIT может требовать discovery, даже без адресов/кэша пути.
     // Legacy сохраняет прежнее требование достижимости; бан ограничивает повторные попытки.
-    let mut v: Vec<CServer> = ctx.servers.lock().unwrap().iter().filter(|s| exit_eligible(ctx, s) && banned.get(&s.dest).map(|t| *t < Instant::now()).unwrap_or(true)).cloned().collect();
+    let mut v: Vec<CServer> = ctx.servers.lock().unwrap().iter().filter(|s| exit_eligible(ctx, s) && banned.ready(&s.dest, Instant::now())).cloned().collect();
     if let Some(o) = only {
         v.retain(|s| s.dest == o);
         return v;
@@ -7652,8 +7750,13 @@ async fn client_policy_loop(ctx: Arc<ClientCtx>) {
 async fn client_supervisor(ctx: Arc<ClientCtx>) {
     let fin = ctx.state.join("fin");
     let sel_file = ctx.state.join("select");
-    let mut banned: HashMap<[u8; 16], Instant> = HashMap::new();
-    let mut avoid: Option<([u8; 16], usize)> = None;
+    let mut banned = path::ExitBackoff::default();
+    let mut avoid: HashMap<[u8; 16], usize> = HashMap::new();
+    // Рабочий запасной Link живёт и во время проверки выбранного выхода.
+    // Неудачная проба не создаёт новый Link к прежнему выходу и не считается сменой.
+    let mut active: Option<(CServer, LinkId, Arc<leviculum_std::LinkHandle>)> = None;
+    let mut pending_reason: Option<String> = None;
+    let mut seq = 0u32;
     let mut keep_trying: HashMap<[u8; 16], Instant> = HashMap::new();
     // переходы текущего выхода с транзита на прямой путь: не чаще раза в 5 мин на выход (если прямой путь не держится - не зацикливаемся)
     let mut direct_retry: HashMap<[u8; 16], Instant> = HashMap::new();
@@ -7681,10 +7784,32 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         }
         let mut connected = None;
         for c in cands {
+            if let Some(old) = active.as_ref().filter(|a| a.0.dest == c.dest && !keep_trying.get(&c.dest).map(|t| *t > Instant::now()).unwrap_or(false)) {
+                connected = Some(old.clone());
+                break;
+            }
             *ctx.status.lock().unwrap() = format!("подключаюсь к {}", c.name);
-            let av = avoid.and_then(|(d, i)| if d == c.dest { Some(i) } else { None });
-            match connect_exit(&ctx, &c, av).await {
+            let av = avoid.get(&c.dest).copied();
+            let result = {
+                let attempt = connect_exit(&ctx, &c, av);
+                tokio::pin!(attempt);
+                loop {
+                    tokio::select! {
+                        result = &mut attempt => break result,
+                        _ = tokio::time::sleep(Duration::from_secs(1)), if active.is_some() => {
+                            // Пинги старого Link не прерываются длительным поиском/авторизацией нового.
+                            if let Some((_, id, _)) = &active {
+                                seq = seq.wrapping_add(1);
+                                spawn_dgram(&ctx.node, *id, dgram_ping(seq, now_us(), b'P'));
+                                ctx.loss.lock().unwrap().sent(seq);
+                            }
+                        }
+                    }
+                }
+            };
+            match result {
                 Ok((id, h)) => {
+                    avoid.remove(&c.dest);
                     ctx.lk_fail.lock().unwrap().remove(&c.dest);
                     ctx.note_link(&c.dest, true);
                     if let Some(cc) = ctx.carriers.lock().unwrap().get(&c.dest) {
@@ -7697,15 +7822,20 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                     ctx.sh.note(format!("выход {}: {e:#}", c.name));
                     ctx.lk_fail.lock().unwrap().insert(c.dest, (Instant::now(), format!("{e:#}").chars().take(80).collect()));
                     ctx.note_link(&c.dest, false);
-                    // FI: прямой путь через наш носитель не дал Link - забываем его, следующая попытка обходит этот интерфейс
-                    if let Some(i) = direct_carrier_iface(&ctx, &c.dest) {
-                        ctx.node.engine().remove_path(&DestinationHash::new(c.dest));
-                        avoid = Some((c.dest, i));
+                    // Неудачный путь забываем и через транзит: следующий scoped discovery
+                    // спрашивает другие наши интерфейсы; сам маршрут по-прежнему выбирает RNS.
+                    if let Some(i) = e.downcast_ref::<path::FailedPath>().map(|p| p.iface) {
+                        let dest = DestinationHash::new(c.dest);
+                        if path::forget_failed_path(i, ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index)) {
+                            ctx.node.engine().remove_path(&dest);
+                        }
+                        avoid.insert(c.dest, i);
                     }
                     // после смены носителя этот выход пробуем снова сразу, без бана (пока не истёк срок keep_trying)
                     let keep = keep_trying.get(&c.dest).map(|t| *t > Instant::now()).unwrap_or(false);
                     if !keep {
-                        banned.insert(c.dest, Instant::now() + Duration::from_secs(10));
+                        let delay = banned.failed(c.dest, Instant::now());
+                        ctx.sh.note(format!("{}: повторная проверка через {} с", c.name, delay.as_secs()));
                     }
                     let cc = ctx.carriers.lock().unwrap().get(&c.dest).cloned();
                     if let Some(cc) = cc {
@@ -7719,38 +7849,57 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                 }
             }
         }
+        if connected.is_none() {
+            connected = active.clone();
+        }
         let Some((cand, id, handle)) = connected else {
             *ctx.status.lock().unwrap() = "нет доступных выходов, повторяю".into();
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         };
-        avoid = None;
         keep_trying.remove(&cand.dest);
         let gen_at_connect = ctx.carriers.lock().unwrap().get(&cand.dest).map(|c| c.generation.load(Relaxed)).unwrap_or(0);
-        *ctx.tun.client_link.write().unwrap() = Some(handle);
-        *ctx.tun.main_dest.write().unwrap() = cand.dest;
-        let prev = ctx.cur.lock().unwrap().replace((cand.dest, id, Instant::now()));
-        ctx.last_pong.store(now_ms() as u64, Relaxed);
-        ctx.loss.lock().unwrap().clear();
-        *ctx.rtt_ms.lock().unwrap() = None;
-        *ctx.status.lock().unwrap() = format!("выход: {}", cand.name);
-        ctx.publish_service();
-        if let Some((_, old, _)) = prev {
-            let _ = ctx.node.engine().close_link(&old).await;
+        let reused = active.as_ref().map(|a| a.1 == id).unwrap_or(false);
+        let previous_name = active.as_ref().map(|a| a.0.name.clone()).unwrap_or_default();
+        active = Some((cand.clone(), id, handle.clone()));
+        if !reused {
+            *ctx.tun.client_link.write().unwrap() = Some(handle);
+            *ctx.tun.main_dest.write().unwrap() = cand.dest;
+            let prev = ctx.cur.lock().unwrap().replace((cand.dest, id, Instant::now()));
+            ctx.last_pong.store(now_ms() as u64, Relaxed);
+            ctx.loss.lock().unwrap().clear();
+            *ctx.rtt_ms.lock().unwrap() = None;
+            *ctx.status.lock().unwrap() = format!("выход: {}", cand.name);
+            ctx.publish_service();
+            if let Some((_, old, _)) = prev {
+                if let Some(reason) = pending_reason.take() {
+                    ctx.failovers.lock().unwrap().push(serde_json::json!({"at_ms": now_ms() as u64, "from": previous_name, "reason": reason}));
+                }
+                let _ = ctx.node.engine().close_link(&old).await;
+            }
+            ctx.sh.note(format!("текущий выход: {} ({})", cand.name, &hex(&cand.dest)[..8]));
         }
-        ctx.sh.note(format!("текущий выход: {} ({})", cand.name, &hex(&cand.dest)[..8]));
 
         // обслуживание: пинг раз в секунду, смена по просьбе пользователя, отказ -> следующий выход
-        let mut seq = 0u32;
         let mut last_ping = Instant::now() - Duration::from_secs(5);
         let mut better_since: Option<Instant> = None;
         let mut last_eval = Instant::now();
         let mut direct_since: Option<Instant> = None;
         let mut last_direct_check = Instant::now();
+        let connected_at = ctx.cur.lock().unwrap().map(|c| c.2).unwrap_or_else(Instant::now);
         let reason = loop {
             if fin.exists() {
                 break "fin".to_string();
             }
+            banned.healthy(&cand.dest, connected_at, Instant::now());
+            let want: Option<[u8; 16]> = std::fs::read_to_string(&sel_file).ok().and_then(|t| dest32(t.trim()));
+            let unavailable = want.filter(|w| *w != cand.dest).and_then(|w| {
+                let why = ctx.lk_fail.lock().unwrap().get(&w).map(|(_, why)| why.clone())?;
+                let name = ctx.servers.lock().unwrap().iter().find(|s| s.dest == w).map(|s| ctx.shown_name(s)).unwrap_or_else(|| hex(&w[..4]));
+                let retry = banned.remaining(&w, Instant::now()).as_secs();
+                Some(format!("выбранный выход {name} недоступен: {why}; повтор через {retry} с; работаю через {}", ctx.shown_name(&cand)))
+            });
+            *ctx.status.lock().unwrap() = unavailable.unwrap_or_else(|| format!("выход: {}", ctx.shown_name(&cand)));
             // «Авто» пересматривается: если другой выход заметно быстрее по RTT телефона (в 1,4 раза и на 15 мс) 15 с подряд - переходим на него.
             let rc = ctx.rcfg.read().unwrap().clone();
             if want.is_none() && rc.mode != "auto" && !rc.priority.is_empty() {
@@ -7814,10 +7963,9 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             if silent > ctx.fail_ms {
                 break format!("нет ответа {silent} мс");
             }
-            let want: Option<[u8; 16]> = std::fs::read_to_string(&sel_file).ok().and_then(|t| dest32(t.trim()));
             if let Some(w) = want {
                 // вернуться к выбранному выходу можно, только если он снова доступен (не забанен и не потерян)
-                let usable = banned.get(&w).map(|t| *t < Instant::now()).unwrap_or(true)
+                let usable = banned.ready(&w, Instant::now())
                     && ctx.servers.lock().unwrap().iter().any(|e| e.dest == w && e.state != "lost" && (ctx.c13.is_none() || exit_eligible(&ctx, e)));
                 if w != cand.dest && usable {
                     break "выбор пользователя".to_string();
@@ -7825,7 +7973,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             }
             if last_ping.elapsed() >= Duration::from_secs(1) {
                 last_ping = Instant::now();
-                seq += 1;
+                seq = seq.wrapping_add(1);
                 spawn_dgram(&ctx.node, id, dgram_ping(seq, now_us(), b'P'));
                 ctx.loss.lock().unwrap().sent(seq);
                 // монитор качества: на QUIC потери пингов >= 30% при >= 8 созревших -> запасной TCP для этого выхода
@@ -7854,8 +8002,14 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
         }
         let user = reason == "выбор пользователя" || reason.starts_with("авто:") || direct_move;
-        ctx.sh.note(format!("смена выхода: {reason}"));
-        ctx.failovers.lock().unwrap().push(serde_json::json!({"at_ms": now_ms() as u64, "from": cand.name, "reason": reason}));
+        if user {
+            ctx.sh.note(format!("проверка выхода: {reason}"));
+            pending_reason = Some(reason.clone());
+        } else {
+            ctx.sh.note(format!("смена выхода: {reason}"));
+            ctx.failovers.lock().unwrap().push(serde_json::json!({"at_ms": now_ms() as u64, "from": cand.name, "reason": reason}));
+            pending_reason = None;
+        }
         if reason.starts_with("нет ответа") {
             // тишина по QUIC: вероятно, UDP режется; у этого пира пробуем запасной TCP (если и он не пойдёт, дозвон сам вернётся на QUIC)
             let cc = ctx.carriers.lock().unwrap().get(&cand.dest).cloned();
@@ -7868,18 +8022,24 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             }
         }
         // Выбранный пользователем выход при смене носителя не бросаем: Link закрыт ради TCP, тот же выход поднимется заново за секунды.
-        // Если за это время не поднялся - обычные правила (бан 10 с и переход на лучший из остальных).
+        // Если за это время не поднялся — обычный отступ и переход на лучший из остальных.
         let carrier_flip = ctx.carriers.lock().unwrap().get(&cand.dest).map(|c| c.generation.load(Relaxed) != gen_at_connect).unwrap_or(false);
         if carrier_flip && !user {
             keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
             ctx.sh.note(format!("{}: смена носителя, остаюсь на этом выходе", cand.name));
         }
         if !user {
-            // отказавший выход не пробуем 10 с; путь к нему ведёт через интерфейс, который и подвёл
-            banned.insert(cand.dest, Instant::now() + Duration::from_secs(10));
+            // Отказавший выход отступает независимо от работающего запасного.
+            ctx.lk_fail.lock().unwrap().insert(cand.dest, (Instant::now(), reason.chars().take(80).collect()));
+            banned.failed(cand.dest, Instant::now());
             if let Some(i) = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface()) {
-                avoid = Some((cand.dest, i));
+                avoid.insert(cand.dest, i);
+                let dest = DestinationHash::new(cand.dest);
+                if ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index) == Some(i) {
+                    ctx.node.engine().remove_path(&dest);
+                }
             }
+            active = None;
             *ctx.tun.client_link.write().unwrap() = None;
             *ctx.cur.lock().unwrap() = None;
             ctx.publish_service();

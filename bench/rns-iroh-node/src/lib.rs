@@ -563,8 +563,48 @@ impl Shared {
     }
 }
 
-/// Дописать строку в журнал файла; при размере от LOG_FILE_MAX текущий файл переименовывается в `<имя>.1`.
+/// Строки журнала файла, которые ждут потока записи (см. `append_log`).
+const LOG_QUEUE_MAX: usize = 1024;
+/// Строки, не поместившиеся в очередь журнала с начала последней записи; пишутся отдельной строкой.
+static LOG_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOG_QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<(PathBuf, String)>>> = std::sync::OnceLock::new();
+
+/// Дописать строку в журнал файла без ожидания диска: строка уходит в очередь потока журнала.
+/// Открытие файла с O_CREAT на рабочем (async) потоке ждёт блокировку каталога `state/`, которую держит
+/// `rename` фонового записывающего потока, а тот ждёт журнал диска (W72, fin1: tokio-rt-worker в D на
+/// open(log.txt)). При переполнении очереди строка пропускается и учитывается в `LOG_DROPPED`.
 fn append_log(p: &Path, line: &str) {
+    let queue = LOG_QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(PathBuf, String)>(LOG_QUEUE_MAX);
+        match std::thread::Builder::new().name("rawg-log".into()).spawn(move || log_writer(rx)) {
+            Ok(_) => Some(tx),
+            Err(_) => None,
+        }
+    });
+    match queue {
+        Some(tx) => {
+            if tx.try_send((p.to_path_buf(), line.to_string())).is_err() {
+                LOG_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        None => append_log_sync(p, line),
+    }
+}
+
+/// Поток журнала: пишет строки по порядку и сообщает о пропущенных при переполнении очереди.
+fn log_writer(rx: std::sync::mpsc::Receiver<(PathBuf, String)>) {
+    for (p, line) in rx {
+        let dropped = LOG_DROPPED.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if dropped > 0 {
+            append_log_sync(&p, &format!("[{}] журнал: пропущено строк при переполнении очереди: {dropped}", now_ms()));
+        }
+        append_log_sync(&p, &line);
+    }
+}
+
+/// Дописать строку в журнал файла; при размере от LOG_FILE_MAX текущий файл переименовывается в `<имя>.1`.
+/// Синхронно: вызывается из потока журнала (и напрямую в тестах).
+fn append_log_sync(p: &Path, line: &str) {
     use std::io::Write;
     let _io = LOG_IO.lock().unwrap();
     if std::fs::metadata(p).is_ok_and(|m| m.len() >= LOG_FILE_MAX) {
@@ -2205,10 +2245,28 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("log.txt");
         std::fs::write(&p, vec![b'x'; LOG_FILE_MAX as usize]).unwrap();
-        append_log(&p, "новая строка");
+        append_log_sync(&p, "новая строка");
         let old = dir.join("log.txt.1");
         assert_eq!(std::fs::metadata(&old).unwrap().len(), LOG_FILE_MAX);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "новая строка\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn queued_log_lines_reach_the_file_in_order() {
+        let dir = std::env::temp_dir().join(format!("rawg-log-queue-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("log.txt");
+        append_log(&p, "первая");
+        append_log(&p, "вторая");
+        // поток журнала пишет асинхронно: ждём, пока вторая строка попадёт в файл
+        for _ in 0..200 {
+            if std::fs::read_to_string(&p).is_ok_and(|t| t.contains("вторая")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "первая\nвторая\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

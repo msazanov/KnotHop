@@ -85,13 +85,12 @@ impl Health {
         *self.path.lock().unwrap() = Some(path);
     }
 
+    /// Запись идёт в фоновом потоке (bgwrite): создание и rename файла на рабочем потоке ждут журнал диска,
+    /// а `fail`/`ok` вызываются из async-задач (W72: tokio-rt-worker в D на rename carrier_health.tmp).
     fn save(&self, m: &std::collections::HashMap<String, Entry>) {
         let Some(p) = self.path.lock().unwrap().clone() else { return };
         let Ok(data) = serde_json::to_vec(m) else { return };
-        let tmp = p.with_extension("tmp");
-        if std::fs::write(&tmp, data).is_ok() {
-            let _ = std::fs::rename(&tmp, &p);
-        }
+        crate::bgwrite::put(&p, data, Duration::ZERO);
     }
 
     /// Сколько ещё носитель считается неработающим.
@@ -192,9 +191,18 @@ mod tests {
         }
         assert!(h.m.lock().unwrap().len() <= MAX_ENTRIES);
         h.fail("x", Kind::Quic);
-        let h2 = Health::default();
-        h2.init(p.clone());
-        assert!(h2.is_bad("x", Kind::Quic));
+        // запись в фоновом потоке: ждём, пока файл догонит память
+        let mut on_disk = false;
+        for _ in 0..200 {
+            let h2 = Health::default();
+            h2.init(p.clone());
+            if h2.is_bad("x", Kind::Quic) {
+                on_disk = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(on_disk, "carrier health must reach the disk");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

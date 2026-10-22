@@ -7,7 +7,6 @@ import hashlib
 import ipaddress
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -290,7 +289,7 @@ def audit_pair(src: Path, dst: Path, rel: Path, tokens: dict[str, set[str]], rep
     return after == expected and has_explicit_tokens
 
 
-def audit_tree(source: Path, destination: Path, fork: Path | None, tokens: dict[str, set[str]]) -> tuple[dict[str, int], bool]:
+def audit_tree(source: Path, destination: Path, tokens: dict[str, set[str]]) -> tuple[dict[str, int], bool]:
     report: dict[str, int] = {}
     valid = True
     for path in source.rglob("*"):
@@ -302,35 +301,42 @@ def audit_tree(source: Path, destination: Path, fork: Path | None, tokens: dict[
         target = destination / rel
         if target.is_file() and is_code_config(rel):
             valid = audit_pair(path, target, rel, tokens, report) and valid
-    if fork is not None:
-        vendored = destination / "third_party/leviculum"
-        for path in fork.rglob("*"):
-            if not path.is_file() or any(part in {".git", "target", "state", "__pycache__"} for part in path.relative_to(fork).parts):
-                continue
-            rel = path.relative_to(fork)
-            if is_code_config(rel):
-                valid = audit_pair(path, vendored / rel, Path("third_party/leviculum") / rel, tokens, report) and valid
     return report, valid
 
 
-def create_notice(source: Path, fork: Path, destination: Path, tokens: dict[str, set[str]]) -> None:
-    cargo = source / "bench/rns-iroh-node/Cargo.toml"
-    cargo_text = text_or_none(cargo) or ""
+def check_fork_pin(source: Path, fork: Path) -> str:
+    """Форк должен стоять на коммите из deploy/leviculum.ref и без незакоммиченных правок.
+
+    Публикуется ссылка на коммит, а не снимок дерева: иначе в KnotHop попало бы то, что не собрано в CI.
+    """
+    pin = (text_or_none(source / "deploy/leviculum.ref") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", pin):
+        raise SystemExit("deploy/leviculum.ref: нужен полный SHA-1 коммита форка")
+    head = subprocess.run(["git", "-C", str(fork), "rev-parse", "HEAD"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False).stdout.strip()
+    if head != pin:
+        raise SystemExit("HEAD форка не совпадает с deploy/leviculum.ref: обновите ref или переключите форк")
+    dirty = subprocess.run(["git", "-C", str(fork), "status", "--porcelain"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False).stdout.strip()
+    if dirty:
+        raise SystemExit("в форке есть незакоммиченные изменения: закоммитьте или уберите их, ref закрепляет только коммит")
+    return pin
+
+
+def create_notice(source: Path, fork: Path | None, destination: Path, tokens: dict[str, set[str]]) -> None:
+    cargo_text = text_or_none(source / "bench/rns-iroh-node/Cargo.toml") or ""
     rev_match = re.search(r'leviculum-std\s*=\s*\{[^}]*rev\s*=\s*"([0-9a-f]{40})"', cargo_text)
     base = rev_match.group(1) if rev_match else "unknown"
+    pin = (text_or_none(destination / "deploy/leviculum.ref") or "").strip() or "unknown"
     commits = ""
-    changed = ""
-    if base != "unknown" and (fork / ".git").exists():
-        commits = subprocess.run(["git", "-C", str(fork), "log", "--oneline", f"{base}..HEAD"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False).stdout.strip()
-        changed = subprocess.run(["git", "-C", str(fork), "diff", "--name-only"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False).stdout.strip()
+    if fork is not None and base != "unknown" and pin != "unknown":
+        commits = subprocess.run(["git", "-C", str(fork), "log", "--oneline", f"{base}..{pin}"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False).stdout.strip()
+    listing = "".join(f"- {line}\n" for line in commits.splitlines()) or "- список не сформирован (нужен --leviculum-fork и база в истории форка)\n"
     text = (
-        "# NOTICE для форка KnotHop\n\n"
+        "# NOTICE для Leviculum (зависимость KnotHop)\n\n"
         "Первоисточник: https://codeberg.org/Lew_Palm/Leviculum (автор Lew_Palm).\n"
-        f"База форка: `{base}`. В публикационную копию включено текущее состояние форка, включая незакоммиченные изменения.\n"
-        "Лицензия Leviculum и этого форка: AGPL-3.0-or-later; см. LICENSE и лицензионные заголовки.\n\n"
-        "## Коммиты поверх базы\n\n" + "".join(f"- {line}\n" for line in commits.splitlines())
-        + "\n## Файлы с незакоммиченными изменениями\n\n" + "".join(f"- `{line}`\n" for line in changed.splitlines())
-        + "\nСправочные патчи KnotHop находятся в `../../docs/patches/` и являются историческими.\n"
+        f"Используется изменённый форк https://github.com/msazanov/leviculum на коммите `{pin}` (см. deploy/leviculum.ref).\n"
+        f"База в Cargo.toml: `{base}`.\n"
+        "Лицензия Leviculum и форка: AGPL-3.0-or-later; см. LICENSE.\n\n"
+        "## Коммиты форка поверх базы\n\n" + listing
     )
     (destination / "NOTICE-KNOTHOP.md").write_text(sanitize_text(text, tokens), encoding="utf-8")
 
@@ -342,6 +348,8 @@ def sanitize(source: Path, destination: Path, fork: Path | None = None) -> dict[
         raise SystemExit("исходный каталог не существует")
     if destination.exists():
         raise SystemExit("каталог назначения уже существует; выберите новый чистый путь")
+    if fork is not None:
+        check_fork_pin(source, fork)
     tokens = collect_private_tokens(source, fork)
 
     for path in source.rglob("*"):
@@ -370,7 +378,8 @@ def sanitize(source: Path, destination: Path, fork: Path | None = None) -> dict[
         "## Сборка и проверки\n\nСм. [docs/ci.md](docs/ci.md).\n\n"
         "## Происхождение и лицензии\n\n"
         "Leviculum: первоисточник — [Lew_Palm/Leviculum](https://codeberg.org/Lew_Palm/Leviculum); "
-        "изменённый форк находится в `third_party/leviculum/`, лицензия AGPL-3.0-or-later.\n\n"
+        "изменённый форк подключается по коммиту из `deploy/leviculum.ref` (github.com/msazanov/leviculum), "
+        "лицензия AGPL-3.0-or-later; см. [NOTICE-KNOTHOP.md](NOTICE-KNOTHOP.md).\n\n"
         "Reticulum: [reticulum.network](https://reticulum.network). KnotHop распространяется по AGPL-3.0-or-later; см. [LICENSE](LICENSE).\n",
         encoding="utf-8",
     )
@@ -379,25 +388,10 @@ def sanitize(source: Path, destination: Path, fork: Path | None = None) -> dict[
         encoding="utf-8",
     )
 
-    if fork is not None:
-        vendored = destination / "third_party/leviculum"
-        shutil.copytree(fork, vendored, ignore=shutil.ignore_patterns(".git", "target", "*.log", "state", "__pycache__"))
-        for path in vendored.rglob("*"):
-            if not path.is_file():
-                continue
-            rel = path.relative_to(vendored)
-            text = text_or_none(path)
-            if text is None:
-                continue
-            source_file = fork / rel
-            if is_legal_file(rel):
-                output = text
-            else:
-                output = sanitize_text(text, tokens, code=is_code_config(rel))
-            path.write_text(output, encoding="utf-8")
-        create_notice(source, fork, vendored, tokens)
+    # форк Leviculum в публикацию не вендорится: CI берёт его по коммиту из deploy/leviculum.ref
+    create_notice(source, fork, destination, tokens)
 
-    report, valid = audit_tree(source, destination, fork, tokens)
+    report, valid = audit_tree(source, destination, tokens)
     print("DIFF AUDIT (изменённые строки кода/конфигов):")
     if report:
         for name, count in sorted(report.items()):
@@ -445,14 +439,15 @@ def main() -> int:
     parser.add_argument("destination", type=Path)
     parser.add_argument("--scan", action="store_true")
     parser.add_argument("--audit-only", action="store_true")
-    parser.add_argument("--leviculum-fork", type=Path, default=None)
+    parser.add_argument("--leviculum-fork", type=Path, default=None,
+                        help="checkout форка: проверить, что HEAD совпадает с deploy/leviculum.ref и дерево чистое")
     args = parser.parse_args()
     if args.scan:
         return scan(args.destination.resolve(), args.source.resolve(), args.leviculum_fork)
     if args.audit_only:
         source, destination = args.source.resolve(), args.destination.resolve()
         tokens = collect_private_tokens(source, args.leviculum_fork)
-        report, valid = audit_tree(source, destination, args.leviculum_fork, tokens)
+        report, valid = audit_tree(source, destination, tokens)
         print("DIFF AUDIT (изменённые строки кода/конфигов):")
         for name, count in sorted(report.items()):
             print(f"  {name}: {count}")

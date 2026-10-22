@@ -1918,10 +1918,16 @@ mod tests {
         let own = Invite { admin: a.public_key_bytes(), root_pk: None, pin: [0x11; 16], rights: USE, created: 1_800_000_000, addrs: vec![], nodes: vec![] };
         let delegated = Invite { admin: a.public_key_bytes(), root_pk: Some(root.public_key_bytes()), pin: [0x22; 16], rights: USE | ADD,
             created: 1_800_000_001, addrs: vec![], nodes: vec![] };
-        let path = Path::new("/tmp/opencode/jvm-check/vectors.txt");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let content = format!("own\t{}\ndelegated\t{}\n", own.encode().unwrap(), delegated.encode().unwrap());
-        std::fs::write(path, content).unwrap();
+        assert_eq!(Invite::parse(&own.encode().unwrap()).unwrap(), own);
+        assert_eq!(Invite::parse(&delegated.encode().unwrap()).unwrap(), delegated);
+        // Экспорт синтетических векторов нужен только внешней JVM-проверке.
+        // Обычный тест не зависит от доступности каталога конкретной сессии агента.
+        if let Some(path) = std::env::var_os("RAWG_JVM_VECTORS") {
+            let path = Path::new(&path);
+            if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).unwrap(); }
+            std::fs::write(path, content).unwrap();
+        }
     }
 
     #[test]
