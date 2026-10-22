@@ -36,7 +36,7 @@ jobs:
           cargo test --lib
           --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ github.workspace }}/third_party/leviculum/leviculum-std"'
       - name: Python-тесты
-        run: python3 -m pytest -q deploy/test_push.py
+        run: python3 -m unittest deploy/test_push.py deploy/test_sanitize_public.py
       - name: Проверка Bash и ShellCheck
         run: |
           sudo apt-get update
