@@ -12,12 +12,12 @@ for crate in rns-iroh-node android-native; do
     | python3 -I -c '
 import json, sys
 fork = sys.argv[1].rstrip("/") + "/"
-packages = [p for p in json.load(sys.stdin)["packages"] if p["name"].startswith("leviculum")]
+packages = [p for p in json.load(sys.stdin)["packages"] if p["name"].startswith("leviculum") or p["name"] == "lnpnd"]
 names = [p["name"] for p in packages]
 bad = [p["name"] for p in packages if p["source"] is not None or not p["manifest_path"].startswith(fork)]
 if names.count("leviculum-core") != 1:
     sys.exit("leviculum-core: %d копий вместо одной" % names.count("leviculum-core"))
-for need in ("leviculum-std", "leviculum-lxmf"):
+for need in ("leviculum-std", "leviculum-lxmf", "lnpnd"):
     if names.count(need) != 1:
         sys.exit("%s: %d копий вместо одной" % (need, names.count(need)))
 if bad:

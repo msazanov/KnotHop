@@ -2246,6 +2246,12 @@ impl TunState {
         disallow_link(&self.host_access, &self.allowed, &self.routes, link_id);
     }
 
+    /// IP-пакеты TUN в обе стороны: клиент по росту счётчика отличает занятый выход от простаивающего.
+    pub(crate) fn traffic_pkts(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.c.from_tun_pkts.load(Relaxed).wrapping_add(self.c.to_tun_pkts.load(Relaxed))
+    }
+
     fn stats(&self) -> serde_json::Value {
         use std::sync::atomic::Ordering::Relaxed;
         serde_json::json!({

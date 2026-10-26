@@ -6,7 +6,7 @@
 //!             таблица соседей (забывает потерявшихся), реестр клиентов (синхронизируется), выход в интернет (TUN + NAT);
 //!   client  - клиент: профиль-строка, закреплённые серверы, выбор выхода, смена выхода при отказе.
 //!
-//! Управляющие сообщения идут по Channel Link: [тип u8][тело]. Пакеты туннеля - датаграммы Link (контекст Tunnel), как раньше.
+//! Записи прав и политики идут по LXMF; оставшееся Link-управление — Channel [тип u8][тело]. Пакеты туннеля — datagrams Link.
 //! Секреты не попадают в журнал и в аргументы: серверный секрет читается из файла, профиль - из файла.
 
 use super::*;
@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 mod path;
 #[path = "lxmf_admin.rs"]
 mod lxmf_admin;
+#[path = "lxmf_sync.rs"]
+mod lxmf_sync;
 
 #[cfg(test)]
 #[path = "../../tests/client_inbox13_tests.rs"]
@@ -597,15 +599,12 @@ const T_SRV1: u8 = 1;
 const T_SRV2: u8 = 2;
 const T_SRV3: u8 = 3;
 const T_SRV4: u8 = 4;
-const T_PING: u8 = 5;
-const T_PONG: u8 = 6;
 const T_TABLE: u8 = 7;
 const T_REGISTRY: u8 = 8;
 const T_AUTH_OK: u8 = 9;
 const T_AUTH_FAIL: u8 = 10;
 // модель прав (решение 0013): записи о правах, зачисление по приглашению
-const T_REC: u8 = 11;      // одна подписанная запись о правах (171 Б)
-const T_PAIR1: u8 = 12;    // нода -> админ: holder pub(64) | mac32(pin); ответ админа - обычная T_REC с записью новой ноды
+const T_PAIR1: u8 = 12;    // нода -> админ: holder pub(64) | mac32(pin); цепочка ответа — LXMF
 const T_PAIR_NO: u8 = 13;  // админ -> нода: отказ в зачислении (тело - причина)
 const T_USE: u8 = 14;      // клиент -> сервер: «я пришёл за выходом» (иначе Link - сосед-транзит)
 const T_PAIRQ: u8 = 15;    // новичок -> нода-посредник -> (соседи) -> админ: root(16) | inviter(16) | holder pub(64) | mac32(pin)
@@ -632,7 +631,6 @@ static BOOK_LAST: Mutex<String> = Mutex::new(String::new());
 const DIR_CHUNK: usize = 700;
 /// 0015: подписанная политика ноды (`trust::Policy`, 163 Б). Принимается только на допущенном Link (сосед или клиент); верна по подписи самой ноды,
 /// поэтому путь доставки не важен. Ничего не расширяет: действующие права = выдача ∩ политика.
-const T_POL: u8 = 20;
 /// R10: бенч. T_BENCH по Channel: запрос {"id","n","sz"}, ответы {"id","busy"|"rate"|"done"}. T_BENCH_DATA - датаграмма Link
 /// [19][id u32 LE][seq u32 LE][t_ms u64 LE][заполнение]: первый байт не совпадает с IPv4 (0x4_) и с RGP ('R').
 const T_BENCH: u8 = 18;
@@ -1687,6 +1685,9 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
     let mut nb = NodeBuilder::new()
         .storage_path(store)
         .enable_transport(transport)
+        // Единый интервал также для отдельных LXMF Links: иначе server-initiated
+        // LXMF будил бы телефон штатными RTT-derived keepalive каждые 5 с.
+        .link_keepalive(CLIENT_KEEPALIVE_S)
         .proof_binding_policy(leviculum_std::api::ProofBindingPolicy::ByCipher)
         .data_channel_capacity(cli.data_cap)
         .link_cipher(leviculum_std::api::LinkCipher::Gcm)
@@ -1695,9 +1696,15 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
     if let Some(tp) = tcp {
         nb = nb.add_tcp_server(SocketAddr::from(([0, 0, 0, 0], tp)));
     }
+    let pn_identity = transport.then(|| admin_identity.clone()).flatten();
     let admin_lxmf = admin_identity.map(lxmf_admin::AdminProcessor::new);
     let (admin_lxmf, nb) = match admin_lxmf {
-        Some((processor, runtime)) => (Some(runtime), nb.core_processor(processor)),
+        Some((processor, runtime)) => {
+            let nb = if let Some(identity) = pn_identity {
+                nb.core_processor(lxmf_sync::Processors(processor, lxmf_sync::propagation_processor(state, identity)?))
+            } else { nb.core_processor(processor) };
+            (Some(runtime), nb)
+        }
         None => (None, nb),
     };
     let mut node = nb.build().context("build node")?;
@@ -3086,6 +3093,19 @@ async fn tcp_return(e: &RetEnv) -> RetStep {
 }
 
 impl ClientCtx {
+    fn sync_to(&self, link: LinkId, recs: Vec<trust::Record>, pols: Vec<trust::Policy>) -> bool {
+        let Some(c) = &self.c13 else { return false };
+        let pk = c.peers.lock().unwrap().get(&link).copied()
+            .or_else(|| c.enrollees.lock().unwrap().get(&link).copied());
+        let Some(pk) = pk else { return false };
+        // inbox13 уже держит Trust, но передаёт только одну проверенную запись.
+        let pols = if pols.is_empty() { pols } else {
+            let tr = c.trust.lock().unwrap();
+            pols.into_iter().filter(|p| lxmf_sync::policy_visible(&tr, p, &pk)).collect()
+        };
+        lxmf_sync::queue(&self.state, c.trust.clone(), pk, recs, pols)
+    }
+
     /// Link выхода `dest`, который сейчас основной и привязан к интерфейсу `iface`.
     fn main_link_on(&self, dest: &[u8; 16], iface: usize) -> Option<LinkId> {
         let (d, id, _) = (*self.cur.lock().unwrap())?;
@@ -3275,21 +3295,19 @@ impl Drop for ConnectTicket {
     }
 }
 
-/// Байты T_POL (тип + тело) с запуска: отправлено / принято. Для замера издержек синхронизации политик (0015), видны в status.json.
+/// Байты подписанных Policy с запуска (без обёртки); sync_* отдельно считает LXMF-конверты, включая ACK/повторы, но не RNS/носитель.
 static POL_TX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static POL_RX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static POL_TX_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static POL_RX_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn pol_counters() -> serde_json::Value {
-    serde_json::json!({"tx_b": POL_TX.load(Relaxed), "tx_n": POL_TX_N.load(Relaxed), "rx_b": POL_RX.load(Relaxed), "rx_n": POL_RX_N.load(Relaxed)})
+    serde_json::json!({"tx_b": POL_TX.load(Relaxed), "tx_n": POL_TX_N.load(Relaxed), "rx_b": POL_RX.load(Relaxed), "rx_n": POL_RX_N.load(Relaxed),
+        "sync_tx_lxmf_b":lxmf_sync::TX_BYTES.load(Relaxed), "sync_rx_lxmf_b":lxmf_sync::RX_BYTES.load(Relaxed),
+        "sync_tx_n":lxmf_sync::TX_MESSAGES.load(Relaxed), "sync_rx_n":lxmf_sync::RX_MESSAGES.load(Relaxed)})
 }
 
 async fn send_ctl(node: &Arc<Node>, link: LinkId, ty: u8, body: &[u8]) {
-    if ty == T_POL {
-        POL_TX.fetch_add(1 + body.len() as u64, Relaxed);
-        POL_TX_N.fetch_add(1, Relaxed);
-    }
     let mut m = Vec::with_capacity(1 + body.len());
     m.push(ty);
     m.extend_from_slice(body);
@@ -3310,6 +3328,102 @@ fn dgram_ping(seq: u32, ts: u64, kind: u8) -> Vec<u8> {
 
 fn is_rgp(d: &[u8]) -> bool {
     d.len() == 16 && &d[..3] == b"RGP" && (d[3] == b'P' || d[3] == b'R')
+}
+
+/// Keepalive RNS клиентских Link в секундах (ADR 0019 §11): ставят оба конца, клиент при подключении, сервер при допуске.
+/// Одинаковое значение обязательно: ответчик с коротким окном stale закрыл бы Link клиента, молчащего между keepalive.
+const CLIENT_KEEPALIVE_S: u64 = 25;
+/// Запас сверх keepalive на задержку ответа, прежде чем пропуск считается потерей контакта.
+const KEEPALIVE_SLACK_MS: u64 = 3_000;
+/// Сколько после последнего IP-пакета выход считается занятым: пока занят, пингуем RGP раз в секунду.
+const PING_ACTIVE_HOLD_MS: u64 = 10_000;
+
+/// Решение клиента о живости выхода (ADR 0019 §11): без трафика телефон не будится пингами и полагается на keepalive RNS
+/// (каждые `CLIENT_KEEPALIVE_S`). При трафике, а также после пропущенного keepalive, идут RGP-пинги раз в секунду;
+/// `fail_ms` без любого ответа - выход мёртв. Для пропуска keepalive это три проверки по секунде.
+/// Чистое состояние: время и счётчики приходят аргументами.
+#[derive(Default)]
+struct Pacer {
+    last_pkts: u64,
+    active_until: u64,
+    active_since: Option<u64>,
+    probing_since: Option<u64>,
+    last_ping: u64,
+    last_acked: u64,
+}
+
+struct PaceStep {
+    /// отправить RGP-пинг сейчас
+    ping: bool,
+    /// молчание выхода в мс; 0, пока ответа никто не ждёт
+    silent_ms: u64,
+    /// ответ keepalive RNS пришёл с прошлого шага: это контакт
+    keepalive_ack: bool,
+    /// окно, в пределах которого последний контакт ещё считается свежим (для индикации)
+    contact_window_ms: u64,
+}
+
+impl Pacer {
+    /// `pkts` - счётчик IP-пакетов TUN в обе стороны, `last_contact` - время (мс) последнего пакета от выхода,
+    /// `acked` - число ответов keepalive RNS по Link.
+    fn step(&mut self, now: u64, pkts: u64, last_contact: u64, acked: u64, keepalive_ms: u64, fail_ms: u64) -> PaceStep {
+        let keepalive_ack = acked > self.last_acked;
+        self.last_acked = acked;
+        let contact = if keepalive_ack { now } else { last_contact };
+        if pkts != self.last_pkts {
+            self.last_pkts = pkts;
+            self.active_until = now + PING_ACTIVE_HOLD_MS;
+        }
+        if self.probing_since.is_some_and(|since| contact >= since) {
+            self.probing_since = None; // ответ пришёл
+        }
+        let lapse = keepalive_ms + KEEPALIVE_SLACK_MS;
+        if self.probing_since.is_none() && now.saturating_sub(contact) > lapse {
+            self.probing_since = Some(now); // keepalive пропущен: три быстрые проверки
+        }
+        let active = now < self.active_until || self.probing_since.is_some();
+        if !active {
+            self.active_since = None;
+            return PaceStep { ping: false, silent_ms: 0, keepalive_ack, contact_window_ms: lapse };
+        }
+        let since = *self.active_since.get_or_insert(now);
+        let ping = now.saturating_sub(self.last_ping) >= 1_000;
+        if ping {
+            self.last_ping = now;
+        }
+        PaceStep { ping, silent_ms: now.saturating_sub(contact.max(since)), keepalive_ack, contact_window_ms: fail_ms }
+    }
+}
+
+#[cfg(test)]
+mod keepalive_pacer_tests {
+    use super::*;
+
+    #[test]
+    fn idle_uses_rns_and_missing_keepalive_gets_three_fast_probes() {
+        let mut p = Pacer::default();
+        for now in (1_000..=28_000).step_by(250) {
+            let s = p.step(now, 0, 1_000, 0, 25_000, 3_000);
+            assert!(!s.ping && s.silent_ms == 0, "no RGP wakeup while idle");
+        }
+        for now in [29_250, 30_250, 31_250] {
+            let s = p.step(now, 0, 1_000, 0, 25_000, 3_000);
+            assert!(s.ping && s.silent_ms < 3_000);
+        }
+        assert_eq!(p.step(32_250, 0, 1_000, 0, 25_000, 3_000).silent_ms, 3_000);
+    }
+
+    #[test]
+    fn rns_ack_and_payload_recover_contact_but_ack_is_not_a_grant() {
+        let mut p = Pacer::default();
+        assert!(p.step(29_250, 0, 1_000, 0, 25_000, 3_000).ping);
+        let s = p.step(29_500, 0, 1_000, 1, 25_000, 3_000);
+        assert!(s.keepalive_ack && !s.ping && s.silent_ms == 0);
+        assert!(!p.step(30_000, 0, 29_500, 1, 25_000, 3_000).ping);
+        assert!(p.step(30_500, 1, 29_500, 1, 25_000, 3_000).ping, "active traffic");
+        assert_eq!(p.step(31_000, 1, 30_900, 1, 25_000, 3_000).silent_ms, 100);
+        assert!(!p.step(41_000, 1, 40_500, 1, 25_000, 3_000).ping, "return to idle");
+    }
 }
 
 fn spawn_dgram(node: &Arc<Node>, link: LinkId, data: Vec<u8>) {
@@ -4664,6 +4778,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         t13,
         bench_sess: Mutex::new(None), bench_serving: AtomicBool::new(false), bench_rate: Mutex::new(HashMap::new()),
     });
+    let _sync_guard = admin_lxmf.as_ref().map(|r| lxmf_sync::register(&a.state, r.sync.clone()));
     if let Some(runtime) = admin_lxmf {
         lxmf_admin::spawn_node_worker(runtime, ctx.clone());
     }
@@ -4752,11 +4867,16 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     Ok(())
 }
 
+fn vpn_incoming_destination(ours: &[u8;16], target: &DestinationHash) -> bool { target.as_bytes() == ours }
+
 async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::EventReceiver) {
     while let Some(ev) = events.recv().await {
         match ev {
             NodeEvent::AnnounceReceived { announce, .. } => on_announce(&ctx, &announce),
-            NodeEvent::LinkEstablished { link_id, is_initiator, .. } => {
+            NodeEvent::LinkEstablished { link_id, is_initiator, destination_hash } => {
+                // LXMF delivery/PN — отдельные назначения. Их identify не
+                // должен продвигать Link в VPN-соседа или вытеснять mesh Link.
+                if !is_initiator && !vpn_incoming_destination(&ctx.my_dest, &destination_hash) { continue; }
                 ctx.sh.established.lock().unwrap().insert(hex(link_id.as_bytes()));
                 if !is_initiator {
                     if std::env::var("KNOTHOP_DEBUG").is_ok() {
@@ -5107,6 +5227,7 @@ fn on_identified(ctx: &Arc<NodeCtx>, link: LinkId, idh: [u8; 16]) {
         if !admit_into_tun(ctx, t, link, ip, &|| t.set_host_access(&link, false)) { return; }
     }
     ctx.sh.note(format!("client {} ({}) admitted on {}", rec.name, &idhex[..8], &hex(link.as_bytes())[..8]));
+    ctx.node.engine().set_link_keepalive(&link, Some(CLIENT_KEEPALIVE_S));
     let ok = serde_json::json!({"name": ctx.name, "ip": ip_str(ip), "cc": REGION.get().cloned().unwrap_or_default(), "pl": platform()});
     let c2 = ctx.clone();
     let body = ok.to_string().into_bytes();
@@ -5181,7 +5302,7 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
         l.last_heard = Instant::now();
     }
     // Стандартный CBC-Link несёт только зачисление (записи прав, каталог, отказ, просьба через посредника); админ, политика, допуск и данные ему недоступны
-    if ctx.link_is_cbc(&link) && !matches!(ty, T_REC | T_DIR | T_PAIR_NO | T_PAIRQ) {
+    if ctx.link_is_cbc(&link) && !matches!(ty, T_DIR | T_PAIR_NO | T_PAIRQ) {
         return;
     }
     match ty {
@@ -5296,24 +5417,6 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
             drop(l);
             ctx.admit_neighbor(link, d, &pr);
         }
-        T_PING => {
-            let is_ok = matches!(ctx.links.lock().unwrap().get(&link).map(|l| &l.role), Some(Role::Server { .. }) | Some(Role::Client { .. }));
-            if is_ok {
-                spawn_ctl(&ctx.node, link, T_PONG, body.to_vec());
-            }
-        }
-        T_PONG if body.len() >= 12 => {
-            let ts = u64::from_le_bytes(body[4..12].try_into().unwrap());
-            let rtt = now_us().saturating_sub(ts) as f64 / 1000.0;
-            let l = ctx.links.lock().unwrap();
-            if let Some(Role::Server { dest }) = l.get(&link).map(|x| &x.role) {
-                if let Some(nb) = ctx.neigh.lock().unwrap().get_mut(dest) {
-                    nb.rtt_ms = Some(rtt);
-                    nb.last_heard = Instant::now();
-                    nb.loss.ack(u32::from_le_bytes(body[..4].try_into().unwrap()));
-                }
-            }
-        }
         T_REGISTRY => {
             let is_srv = matches!(ctx.links.lock().unwrap().get(&link).map(|l| &l.role), Some(Role::Server { .. }));
             if !is_srv {
@@ -5331,8 +5434,6 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
                 }
             }
         }
-        T_REC => on_rec(ctx, link, body),
-        T_POL => on_pol(ctx, link, body),
         T_DIR => on_dir_node(ctx, link, body),
         T_BENCH => on_bench_ctl(ctx, link, body),
         T_PAIR1 => {
@@ -6533,50 +6634,24 @@ impl NodeCtx {
         let sending = handle.send(&message);
         tokio::pin!(sending);
         let result = std::future::poll_fn(|cx| {
-            poll_authorized_link(&t.trust, &self.links, link, pk, kind, |tr| {
-                // A Client may retain USE while losing administrative visibility in one root.
-                // Do not transmit its old privileged snapshot merely because USE still holds.
-                if kind == OrdinaryAdmission::Client {
-                    if ty == T_REC && !trust::Record::parse(body).is_some_and(|r| tr.record_visible_to(&r, pk)) {
-                        return Poll::Ready(false);
-                    }
-                    if ty == T_POL && !trust::Policy::parse(body).is_some_and(|p| tr.export_policies_for(trust::USE, pk, now_ms() as u64).contains(&p)) {
-                        return Poll::Ready(false);
-                    }
-                }
+            poll_authorized_link(&t.trust, &self.links, link, pk, kind, |_tr| {
                 sending.as_mut().poll(cx).map(|r| r.is_ok())
             })
         }).await;
-        if result == Some(true) {
-            if ty == T_POL {
-                POL_TX.fetch_add(message.len() as u64, Relaxed);
-                POL_TX_N.fetch_add(1, Relaxed);
-            }
-            true
-        } else { false }
+        result == Some(true)
     }
 
-    /// Live T_REC/T_POL push: the same per-poll model as `send_admitted_ctl`, but the payload
-    /// predicate (not USE/TRANSIT alone) decides, so a rights-0 peer still gets its own revoke.
-    /// The Link, peer key, role and predicate are rechecked at EVERY poll, including after
-    /// Busy/pacing/backpressure wakes; a denied poll drops the send future uncommitted.
-    async fn send_live_ctl(self: &Arc<Self>, link: LinkId, pk: &trust::Pk, kind: OrdinaryAdmission, ty: u8, body: &[u8],
+    /// Первичная постановка live push требует прежнего Link/ключа/роли. Затем
+    /// LXMF адресует identity независимо от этого Link; процессор повторно
+    /// проверяет видимость перед enqueue/retry и отменяет запрещённую очередь.
+    async fn send_live_sync(self: &Arc<Self>, link: LinkId, pk: &trust::Pk, kind: OrdinaryAdmission, recs: Vec<trust::Record>, pols: Vec<trust::Policy>,
         allowed: impl Fn(&trust::Trust, u64) -> bool) -> bool {
         let Some(t) = &self.t13 else { return false };
-        let mut message = Vec::with_capacity(1 + body.len());
-        message.push(ty);
-        message.extend_from_slice(body);
-        let handle = self.node.engine().link_handle(&link);
-        let sending = handle.send(&message);
-        tokio::pin!(sending);
         let sent = std::future::poll_fn(|cx| {
+            let _ = cx;
             poll_live_forward(&t.trust, &self.links, link, pk, kind, |tr| allowed(tr, now_ms() as u64),
-                || sending.as_mut().poll(cx).map(|r| r.is_ok()))
+                || Poll::Ready(lxmf_sync::queue(&self.state, t.trust.clone(), *pk, recs.clone(), pols.clone())))
         }).await;
-        if sent && ty == T_POL {
-            POL_TX.fetch_add(message.len() as u64, Relaxed);
-            POL_TX_N.fetch_add(1, Relaxed);
-        }
         sent
     }
 
@@ -6585,19 +6660,11 @@ impl NodeCtx {
         let Some((recs, pols)) = with_authorized_link(&t.trust, &self.links, link, &pk, kind, false, |tr, _| {
             match kind {
                 // root-scoped as well: TRANSIT in root R gives all of R (and of every other root where the peer holds rights), never a foreign root
-                OrdinaryAdmission::Server => (tr.records_visible_to(&pk), tr.export_policies_for(trust::TRANSIT, &pk, now_ms() as u64)),
-                OrdinaryAdmission::Client => (tr.records_visible_to(&pk), tr.export_policies_for(trust::USE, &pk, now_ms() as u64)),
+                OrdinaryAdmission::Server => (tr.records_visible_to(&pk), tr.export_policies_for(trust::TRANSIT, &pk, now_ms() as u64).into_iter().filter(|p| lxmf_sync::policy_visible(tr, p, &pk)).collect()),
+                OrdinaryAdmission::Client => (tr.records_visible_to(&pk), tr.export_policies_for(trust::USE, &pk, now_ms() as u64).into_iter().filter(|p| lxmf_sync::policy_visible(tr, p, &pk)).collect()),
             }
         }) else { return };
-        let ctx = self.clone();
-        tokio::spawn(async move {
-            for r in recs {
-                if !ctx.send_admitted_ctl(link, &pk, kind, T_REC, &r.wire()).await { return; }
-            }
-            for p in pols {
-                if !ctx.send_admitted_ctl(link, &pk, kind, T_POL, &p.wire()).await { return; }
-            }
-        });
+        lxmf_sync::queue(&self.state, t.trust.clone(), pk, recs, pols);
     }
 
     /// (нужен ли сосед, наша ли очередь открывать Link). Нужны: админ приглашения (открываем мы), соседи-транзиты по записям
@@ -6682,15 +6749,9 @@ impl NodeCtx {
         if recs.is_empty() && pols.is_empty() {
             return;
         }
-        let node = self.node.clone();
-        tokio::spawn(async move {
-            for r in recs {
-                send_ctl(&node, link, T_REC, &r.wire()).await;
-            }
-            for p in pols {
-                send_ctl(&node, link, T_POL, &p.wire()).await;
-            }
-        });
+        let Some(t) = &self.t13 else { return };
+        let Some(pk) = peer_of(self, &link) else { return };
+        lxmf_sync::queue(&self.state, t.trust.clone(), pk, recs, pols);
     }
 
     /// Принять запись (от пира или из inbox13). Новая: сохранить, переслать, пересчитать роли открытых Link.
@@ -6795,7 +6856,7 @@ impl NodeCtx {
 
     /// Соседям-серверам и клиентам - root-scoped выгрузка по их действующим правам в корне записи: TRANSIT в корне R даёт весь R,
     /// но не записи корня, где у соседа прав нет. Клиентская роль сама по себе не делает администратора USE-only и не объединяет права
-    /// разных корней. Видимость проверяется при постановке и ещё раз на каждом poll отправки (`send_live_ctl`).
+    /// разных корней. Видимость проверяется при постановке и перед LXMF enqueue/retry.
     fn forward_rec(self: &Arc<Self>, rec: &trust::Record, except: Option<LinkId>) {
         let Some(t) = &self.t13 else { return };
         let targets = live_forward_targets(&self.links, except);
@@ -6809,8 +6870,7 @@ impl NodeCtx {
         for (l, pk, kind) in send {
             let (ctx, rec) = (self.clone(), rec.clone());
             tokio::spawn(async move {
-                let body = rec.wire();
-                ctx.send_live_ctl(l, &pk, kind, T_REC, &body, |tr, _now| live_rec_allowed(tr, &rec, &pk)).await;
+                ctx.send_live_sync(l, &pk, kind, vec![rec.clone()], vec![], |tr, _now| live_rec_allowed(tr, &rec, &pk)).await;
             });
         }
     }
@@ -6842,8 +6902,7 @@ impl NodeCtx {
         for (l, pk, kind) in send {
             let (ctx, pol) = (self.clone(), pol.clone());
             tokio::spawn(async move {
-                let body = pol.wire();
-                ctx.send_live_ctl(l, &pk, kind, T_POL, &body, |tr, now| live_pol_allowed(tr, kind, &pol, &pk, now)).await;
+                ctx.send_live_sync(l, &pk, kind, vec![], vec![pol.clone()], |tr, now| live_pol_allowed(tr, kind, &pol, &pk, now)).await;
             });
         }
     }
@@ -6929,9 +6988,7 @@ impl NodeCtx {
                         let pols = t.trust.lock().unwrap().export_policies_for(trust::USE, &pk, now);
                         let c = self.clone();
                         tokio::spawn(async move {
-                            for p in pols {
-                                send_ctl(&c.node, link, T_POL, &p.wire()).await;
-                            }
+                            c.send_recs_pols(link, vec![], pols);
                             send_ctl(&c.node, link, T_AUTH_FAIL, b"exit disabled by node policy").await;
                             tokio::time::sleep(Duration::from_millis(300)).await;
                             c.close_link(link, "политика ноды: выход выключен");
@@ -7079,6 +7136,7 @@ impl NodeCtx {
         let (idh, ip) = (admission.id, admission.ip);
         let pl = self.client_info.lock().unwrap().get(&link).map(|(_, p)| *p).unwrap_or("?");
         self.sh.note(format!("client {} ({pl}) admitted on {}", &hex(&idh)[..8], &hex(link.as_bytes())[..8]));
+        self.node.engine().set_link_keepalive(&link, Some(CLIENT_KEEPALIVE_S));
         let ok = serde_json::json!({"name": self.name, "ip": ip_str(ip), "cc": REGION.get().cloned().unwrap_or_default(), "pl": platform()}).to_string().into_bytes();
         let c = self.clone();
         tokio::spawn(async move {
@@ -7437,8 +7495,7 @@ fn on_peer_ready(ctx: &Arc<NodeCtx>, link: LinkId, pk: [u8; 64]) {
         // direct pairing Link into a persistent Server neighbor.
         i.enroll_only |= direct_enrollment;
     }
-    let chain = t.trust.lock().unwrap().chain_for(&ctx.my_pk);
-    ctx.send_recs(link, chain);
+    lxmf_sync::queue_proof(&ctx.state, t.trust.clone(), ctx.my_pk, pk);
     if let Some(inv) = inv {
         if inv.admin == pk && t.pair_sent.lock().unwrap().insert(link) {
             let mut body = ctx.my_pk.to_vec();
@@ -7458,16 +7515,64 @@ fn on_peer_ready(ctx: &Arc<NodeCtx>, link: LinkId, pk: [u8; 64]) {
     ctx.evaluate(link);
 }
 
-/// T_POL: политика приходит только по допущенному Link (сосед или клиент). Проверки - в `Trust::offer_policy`; число политик ограничено числом
+/// LXMF sync принимается только после независимой проверки source-подписи.
+/// Владение ключом не даёт прав: записи и политики по-прежнему проверяет Trust.
+fn on_sync_node(ctx: &Arc<NodeCtx>, message: &leviculum_lxmf::Message) {
+    let Some(wire) = lxmf_sync::Wire::decode(message) else { return };
+    let Some(t) = &ctx.t13 else { return };
+    let peers: Vec<_> = ctx.links.lock().unwrap().values().filter_map(|l| l.peer_pk).collect();
+    let invited = t.invite.lock().unwrap().as_ref().map(|i| i.admin);
+    let pk = lxmf_sync::source_key(message, &t.trust.lock().unwrap(), peers, invited);
+    let Some(pk) = pk.filter(|pk| lxmf_sync::authenticated(message, &ctx.my_id, pk)) else { return };
+    lxmf_sync::RX_BYTES.fetch_add(message.pack().len() as u64, Relaxed);
+    lxmf_sync::RX_MESSAGES.fetch_add(1, Relaxed);
+    if let Some(digest) = wire.ack { lxmf_sync::received_ack(&ctx.state, message.source_hash, digest); return; }
+    let Some((recs, pols)) = lxmf_sync::parsed(&wire) else { return };
+    let link = ctx.links.lock().unwrap().iter().find(|(_, l)| l.peer_pk == Some(pk)).map(|(l, _)| *l)
+        .unwrap_or_else(|| LinkId::new(*lxmf_sync::public_identity(&pk).unwrap().hash()));
+    // LXMF может переставить разные Resources: повтор до фиксированной точки,
+    // максимум 16 записей в одной пачке; неизвестный issuer не получает ACK.
+    for _ in 0..recs.len().max(1) { for rec in &recs { on_rec(ctx, link, &rec.wire()); } }
+    for pol in &pols { on_pol(ctx, link, &pol.wire()); }
+    let durable = {
+        let mut tr = t.trust.lock().unwrap();
+        recs.iter().all(|r| !matches!(tr.offer(r.clone()), trust::Offer::Rejected(_)))
+            && pols.iter().all(|p| !matches!(tr.offer_policy(p.clone(), now_ms() as u64), trust::Offer::Rejected(_)))
+            && tr.save().is_ok()
+    };
+    if durable { lxmf_sync::acknowledge(&ctx.state, message, pk); }
+}
+
+fn on_sync_client(ctx: &Arc<ClientCtx>, message: &leviculum_lxmf::Message) {
+    let Some(wire) = lxmf_sync::Wire::decode(message) else { return };
+    let Some(c) = &ctx.c13 else { return };
+    let peers: Vec<_> = c.peers.lock().unwrap().values().copied().collect();
+    let invited = c.invite.lock().unwrap().as_ref().map(|i| i.admin);
+    let pk = lxmf_sync::source_key(message, &c.trust.lock().unwrap(), peers, invited);
+    let Some(pk) = pk.filter(|pk| lxmf_sync::authenticated(message, ctx.identity.hash(), pk)) else { return };
+    lxmf_sync::RX_BYTES.fetch_add(message.pack().len() as u64, Relaxed);
+    lxmf_sync::RX_MESSAGES.fetch_add(1, Relaxed);
+    if let Some(digest) = wire.ack { lxmf_sync::received_ack(&ctx.state, message.source_hash, digest); return; }
+    let Some((recs, pols)) = lxmf_sync::parsed(&wire) else { return };
+    let link = c.peers.lock().unwrap().iter().find(|(_, p)| **p == pk).map(|(l, _)| *l)
+        .unwrap_or_else(|| LinkId::new(*lxmf_sync::public_identity(&pk).unwrap().hash()));
+    for _ in 0..recs.len().max(1) { for rec in &recs { on_rec_client(ctx, link, &rec.wire()); } }
+    for pol in &pols { on_pol_client(ctx, link, &pol.wire()); }
+    let durable = {
+        let mut tr = c.trust.lock().unwrap();
+        recs.iter().all(|r| !matches!(tr.offer(r.clone()), trust::Offer::Rejected(_)))
+            && pols.iter().all(|p| !matches!(tr.offer_policy(p.clone(), now_ms() as u64), trust::Offer::Rejected(_)))
+            && tr.save().is_ok()
+    };
+    if durable { lxmf_sync::acknowledge(&ctx.state, message, pk); }
+}
+
+/// Политику принимает LXMF worker. Проверки - в `Trust::offer_policy`; число политик ограничено числом
 /// держателей с выдачей, частота - ведром `CtrlBucket`.
 fn on_pol(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
-    POL_RX.fetch_add(1 + body.len() as u64, Relaxed);
+    POL_RX.fetch_add(body.len() as u64, Relaxed);
     POL_RX_N.fetch_add(1, Relaxed);
     if ctx.t13.is_none() || body.len() != trust::POL_LEN {
-        return;
-    }
-    let admitted = matches!(ctx.links.lock().unwrap().get(&link).map(|l| &l.role), Some(Role::Server { .. } | Role::Client { .. }));
-    if !admitted {
         return;
     }
     let Some(pol) = trust::Policy::parse(body) else { return };
@@ -7479,9 +7584,6 @@ fn on_pol(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
 fn on_rec(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
     let Some(t) = &ctx.t13 else { return };
     if body.len() != trust::REC_LEN {
-        return;
-    }
-    if peer_of(ctx, &link).is_none() {
         return;
     }
     let Some(rec) = trust::Record::parse(body) else { return };
@@ -8907,6 +9009,8 @@ struct ClientCtx {
     drain: Mutex<DrainState>,
     cur: Mutex<Option<([u8; 16], LinkId, Instant)>>,
     last_pong: std::sync::atomic::AtomicU64,
+    /// Окно свежести контакта для индикации: `fail_ms` при трафике, keepalive с запасом в простое (выставляет `Pacer`).
+    contact_window_ms: std::sync::atomic::AtomicU64,
     rtt_pong: std::sync::atomic::AtomicU64,
     rtt_ms: Mutex<Option<f64>>,
     failovers: Mutex<Vec<serde_json::Value>>,
@@ -8959,9 +9063,32 @@ struct QStat {
     ok: u32,
     fail: u32,
     last_ok: Option<Instant>,
+    rns_rtt: Option<(Instant, f64)>,
 }
 
 impl ClientCtx {
+    fn native_rtt(&self, id: &LinkId) -> Option<f64> {
+        let s = self.node.engine().link_stats(id)?;
+        s.keepalive_rtt_ms().map(|r| r as f64).or(s.srtt_ms()).or_else(|| s.rtt_ms().map(|r| r as f64))
+            .filter(|r| r.is_finite() && *r > 0.0)
+    }
+
+    fn remember_rns_rtt(&self, dest: [u8;16], id: &LinkId) {
+        if let Some(rtt) = self.native_rtt(id) {
+            let mut q = self.qstat.lock().unwrap();
+            if q.contains_key(&dest) || q.len() < 32 { q.entry(dest).or_default().rns_rtt = Some((Instant::now(), rtt)); }
+        }
+    }
+
+    /// RTT полного RNS Link, не RTT соседнего QUIC-сокета. Закрытые Links
+    /// оставляют короткий кэш для сравнения выходов без новых фоновых проб.
+    fn rns_rtt(&self, dest: &[u8;16]) -> Option<f64> {
+        let current = self.cur.lock().unwrap().filter(|c| &c.0 == dest).map(|c| c.1);
+        let id = current.or_else(|| self.tun.extra.read().unwrap().get(dest).map(|x| x.id));
+        id.and_then(|id| self.native_rtt(&id)).or_else(|| self.qstat.lock().unwrap().get(dest)
+            .and_then(|q| q.rns_rtt).filter(|(at, _)| at.elapsed() < Duration::from_secs(600)).map(|(_, r)| r))
+    }
+
     /// Runs only from the existing 4 s policy maintenance; no new phone wakeup.
     fn take_local_inbox13(&self, progress: &mut ClientInboxProgress) {
         let Some(c) = &self.c13 else { return };
@@ -8976,8 +9103,7 @@ impl ClientCtx {
                     || c.peers.lock().unwrap().get(&id) != peer.as_ref() {
                     return false;
                 }
-                spawn_ctl(&self.node, id, T_REC, rec.wire());
-                true // best-effort Channel send, never a remote application ACK.
+                self.sync_to(id, vec![rec.clone()], vec![]) // очередь LXMF; не удалённый ACK.
             })
         };
         match result {
@@ -9278,7 +9404,7 @@ impl ClientCtx {
             };
             // RNS path/carrier caches are not proof of a live node. Missing observations
             // cannot establish global death: another (unobserved) neighbour may see it.
-            let contact = is_cur && (now_ms() as u64).saturating_sub(self.last_pong.load(Relaxed)) <= self.fail_ms;
+            let contact = is_cur && (now_ms() as u64).saturating_sub(self.last_pong.load(Relaxed)) <= self.contact_window_ms.load(Relaxed).max(self.fail_ms);
             let presence = crate::observations::presence(contact, ra);
             serde_json::json!({"n": self.shown_name(e), "d": hex(&e.dest), "h": hops.or(e.hops), "r": e.rtt_ms, "s": if is_cur { "current" } else { e.state.as_str() }, "pinned": e.pinned, "pl": self.platforms.lock().unwrap().get(&e.dest).copied(), "presence": presence,
                 "v": carrier != "none", "c": carrier, "lk": lk, "why": why,
@@ -9389,7 +9515,7 @@ pub async fn run_client(a: ClientArgs) -> Result<()> {
         bail!("в профиле нет серверов");
     }
     let ctx = Arc::new(ClientCtx { node: node.clone(), sh: sh.clone(), ep: ep.clone(), identity, group: prof.group.clone(), ip: ip_str(prof.ip), servers: Mutex::new(servers.clone()), tun,
-        auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), probe_wait: Mutex::new(HashMap::new()), drain: Mutex::new(DrainState::default()), cur: Mutex::new(None), last_pong: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
+        auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), probe_wait: Mutex::new(HashMap::new()), drain: Mutex::new(DrainState::default()), cur: Mutex::new(None), last_pong: Default::default(), contact_window_ms: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
         state: a.state.clone(), status: Mutex::new("подключаюсь".into()), dialers: Mutex::new(HashMap::new()),
         carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), hints: Mutex::new(HashMap::new()), platforms: Mutex::new(HashMap::new()), books: Mutex::new(HashMap::new()), table_acc: Mutex::new(HashSet::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
         c13, path_gate: path::PathGate::default(), nbrs: Mutex::new(HashMap::new()), admitted_exits: Mutex::new(HashMap::new()), ctrl: Mutex::new(HashMap::new()), lk_fail: Mutex::new(HashMap::new()), vis: Mutex::new(HashMap::new()), qstat: Mutex::new(HashMap::new()),
@@ -9398,8 +9524,9 @@ pub async fn run_client(a: ClientArgs) -> Result<()> {
     let _admin_client_guard = if let (Some(runtime), Some(c13)) = (admin_lxmf, ctx.c13.as_ref()) {
         let guard = lxmf_admin::register_client_runtime(&a.state, &runtime);
         let trust = c13.trust.clone();
-        lxmf_admin::spawn_client_worker(runtime, a.state.clone(), ctx.identity.clone(), trust);
-        Some(guard)
+        let sync_guard = lxmf_sync::register(&a.state, runtime.sync.clone());
+        lxmf_admin::spawn_client_worker(runtime, ctx.clone(), trust);
+        Some((guard, sync_guard))
     } else { None };
     if ctx.c13.is_some() {
         // (а) админ без приглашения объявляет свой корень: destination только для анонса, Link к нему не принимаем
@@ -9719,12 +9846,12 @@ fn on_nbrs_client(ctx: &ClientCtx, link: LinkId, body: &[u8]) {
     }
 }
 
-/// T_POL у клиента: политика выхода (выключил EXIT - в кандидаты не берём). Принимается только на Link, где мы знаем собеседника.
-fn on_pol_client(ctx: &Arc<ClientCtx>, link: LinkId, body: &[u8]) {
-    POL_RX.fetch_add(1 + body.len() as u64, Relaxed);
+/// LXMF Policy у клиента: source проверен worker-ом; полномочия и срок проверяет Trust.
+fn on_pol_client(ctx: &Arc<ClientCtx>, _link: LinkId, body: &[u8]) {
+    POL_RX.fetch_add(body.len() as u64, Relaxed);
     POL_RX_N.fetch_add(1, Relaxed);
     let Some(c) = &ctx.c13 else { return };
-    if body.len() != trust::POL_LEN || !c.peers.lock().unwrap().contains_key(&link) {
+    if body.len() != trust::POL_LEN {
         return;
     }
     let Some(pol) = trust::Policy::parse(body) else { return };
@@ -9740,9 +9867,6 @@ fn on_pol_client(ctx: &Arc<ClientCtx>, link: LinkId, body: &[u8]) {
 fn on_rec_client(ctx: &Arc<ClientCtx>, link: LinkId, body: &[u8]) {
     let Some(c) = &ctx.c13 else { return };
     if body.len() != trust::REC_LEN {
-        return;
-    }
-    if !c.peers.lock().unwrap().contains_key(&link) {
         return;
     }
     let Some(rec) = trust::Record::parse(body) else { return };
@@ -10079,14 +10203,11 @@ async fn on_pair1_client(ctx: Arc<ClientCtx>, link: LinkId, body: Vec<u8>) {
         return;
     };
     let (chain, rest) = enrollment_export(&c.trust.lock().unwrap(), &holder);
-    for r in chain { send_ctl(&ctx.node, link, T_REC, &r.wire()).await; }
-    for r in rest {
-        send_ctl(&ctx.node, link, T_REC, &r.wire()).await;
-    }
+    ctx.sync_to(link, chain.into_iter().chain(rest).collect(), vec![]);
     // текущий выход узнаёт о новой ноде сразу (иначе - при следующем подключении к нему), дальше он разнесёт запись соседям
     let cur = ctx.cur.lock().unwrap().map(|x| x.1);
     if let Some(cur) = cur {
-        send_ctl(&ctx.node, cur, T_REC, &rec.wire()).await;
+        ctx.sync_to(cur, vec![rec.clone()], vec![]);
     }
     // новая нода не знает адресов остальных (анонс их не несёт): отдаём ей известные нам выходы; это подсказки, допуск по записям
     send_catalog(&ctx, link, &holder).await;
@@ -10177,12 +10298,11 @@ async fn on_pairq_client(ctx: Arc<ClientCtx>, link: LinkId, body: Vec<u8>) {
     };
     if rec.is_none() { return }
     let (chain, rest) = enrollment_export(&c.trust.lock().unwrap(), &holder);
-    for r in chain { send_ctl(&ctx.node, link, T_REC, &r.wire()).await; }
-    for r in rest { send_ctl(&ctx.node, link, T_REC, &r.wire()).await; }
+    ctx.sync_to(link, chain.into_iter().chain(rest).collect(), vec![]);
     let cur = ctx.cur.lock().unwrap().map(|x| x.1);
     if let Some(cur) = cur.filter(|x| *x != link) {
         let chain = c.trust.lock().unwrap().chain_for(&holder);
-        for r in chain { send_ctl(&ctx.node, cur, T_REC, &r.wire()).await; }
+        ctx.sync_to(cur, chain, vec![]);
     }
 }
 
@@ -10377,8 +10497,6 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                             let _ = tx.send(reply);
                         }
                     }
-                    T_REC => on_rec_client(&ctx, link_id, body),
-                    T_POL => on_pol_client(&ctx, link_id, body),
                     T_DIR => {
                         if ctx.c13.is_some() {
                             on_dir_client(&ctx, link_id, body);
@@ -10414,16 +10532,6 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                             } else if c.peers.lock().unwrap().contains_key(&link_id) {
                                 ctx.sh.note("T_PAIR_NO не от админа приглашения: проигнорирован".to_string());
                             }
-                        }
-                    }
-                    T_PONG if body.len() >= 12 => {
-                        let cur = ctx.cur.lock().unwrap().map(|c| c.1);
-                        if cur == Some(link_id) {
-                            ctx.last_pong.store(now_ms() as u64, Relaxed);
-                            ctx.loss.lock().unwrap().ack(u32::from_le_bytes(body[..4].try_into().unwrap()));
-                            let ts = u64::from_le_bytes(body[4..12].try_into().unwrap());
-                            *ctx.rtt_ms.lock().unwrap() = Some(now_us().saturating_sub(ts) as f64 / 1000.0);
-                            ctx.rtt_pong.store(now_ms() as u64, Relaxed);
                         }
                     }
                     _ => {}
@@ -10713,10 +10821,7 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     }
     ctx.node.identify_link(&id, &ctx.identity).await.map_err(|e| anyhow::anyhow!("identify: {e:?}"))?;
     if let Some(c) = &ctx.c13 {
-        let chain = c.trust.lock().unwrap().chain_for(&ctx.identity.public_key_bytes());
-        for r in chain {
-            send_ctl(&ctx.node, id, T_REC, &r.wire()).await;
-        }
+        if let Some(pk) = cand.pk { lxmf_sync::queue_proof(&ctx.state, c.trust.clone(), ctx.identity.public_key_bytes(), pk); }
         // повтор T_USE после identify: если первый пакет отстал, узел уже увидит намерение стать клиентом
         send_ctl(&ctx.node, id, T_USE, &client_info_body(&ctx.identity)).await;
     }
@@ -10757,24 +10862,14 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
         // 0015: своя политика (например, «только USE») - выходу и дальше соседям, чтобы они не предлагали наш телефон как выход или транзит
         let pols = c.trust.lock().unwrap().my_policies(now_ms() as u64);
         if !pols.is_empty() {
-            let node = ctx.node.clone();
-            tokio::spawn(async move {
-                for p in pols {
-                    send_ctl(&node, id, T_POL, &p.wire()).await;
-                }
-            });
+            ctx.sync_to(id, vec![], pols);
         }
         let recs = {
             let tr = c.trust.lock().unwrap();
-            if tr.my_rights_in(&tr.me_hash) & trust::ADD != 0 { tr.export_all() } else { vec![] }
+            cand.pk.map(|pk| tr.records_visible_to(&pk)).unwrap_or_default()
         };
         if !recs.is_empty() {
-            let node = ctx.node.clone();
-            tokio::spawn(async move {
-                for r in recs {
-                    send_ctl(&node, id, T_REC, &r.wire()).await;
-                }
-            });
+            ctx.sync_to(id, recs, vec![]);
         }
     }
     if let Some(t) = reply.get("table") {
@@ -10827,6 +10922,8 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
         });
     }
     ctx.sh.note(format!("выход {} принял клиента за {} мс (хопов {:?})", cand.name, t0.elapsed().as_millis(), ctx.node.hops_to(&dest)));
+    ctx.node.engine().set_link_keepalive(&id, Some(CLIENT_KEEPALIVE_S));
+    ctx.remember_rns_rtt(cand.dest, &id);
     Ok((id, handle))
 }
 
@@ -10838,11 +10935,10 @@ fn candidates(ctx: &Arc<ClientCtx>, banned: &path::ExitBackoff, only: Option<[u8
         v.retain(|s| s.dest == o);
         return v;
     }
-    // «Авто»: сначала узлы, до которых у телефона есть своё измеренное QUIC-соединение, по его RTT; затем остальные по хопам и RTT из таблицы сервера
+    // «Авто»: сначала узлы с измеренным RTT полного RNS Link; затем остальные по хопам и RTT из таблицы сервера
     // (это RTT между сервером и узлом, а не телефоном, поэтому как главный критерий не годится). Равные в пределах 15% и 3 мс считаются равными: тогда решает число хопов.
     let phone_rtt = |d: &[u8; 16]| -> Option<f64> {
-        let us = ctx.carriers.lock().unwrap().get(d).map(|c| c.rtt_us.load(Relaxed)).unwrap_or(0);
-        if us > 0 { Some(us as f64 / 1000.0) } else { None }
+        ctx.rns_rtt(d)
     };
     v.sort_by(|a, b| {
         let (ra, rb) = (phone_rtt(&a.dest), phone_rtt(&b.dest));
@@ -10893,7 +10989,7 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
         [cfg_path.clone(), rules.join("geoip.dat"), rules.join("geosite.dat")].iter().map(|p| std::fs::metadata(p).ok().and_then(|m| Some((m.modified().ok()?, m.len())))).collect()
     };
     let mut stamp = Vec::new();
-    let mut last_ping = Instant::now();
+    let mut pacers: HashMap<LinkId, Pacer> = HashMap::new();
     let mut seq = 0u32;
     while !fin.exists() {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -10924,21 +11020,23 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
         let have: Vec<([u8; 16], ExtraLink)> = ctx.tun.extra.read().unwrap().iter().map(|(d, x)| (*d, x.clone())).collect();
         for (d, x) in &have {
             let closed = ctx.sh.closed.lock().unwrap().contains_key(&hex(x.id.as_bytes()));
-            let silent = (now_ms() as u64).saturating_sub(x.last_rx_ms.load(Relaxed));
-            let why = if !wanted.contains(d) { Some("не нужен") } else if closed { Some("закрыт") } else if silent > ctx.fail_ms.max(3000) { Some("нет ответа") } else { None };
+            let now = now_ms() as u64;
+            let acked = ctx.node.engine().link_stats(&x.id).map(|s| s.keepalives_acked()).unwrap_or(0);
+            let pkts = ctx.tun.traffic_pkts();
+            let step = pacers.entry(x.id).or_insert_with(|| Pacer { last_pkts: pkts, ..Default::default() })
+                .step(now, pkts, x.last_rx_ms.load(Relaxed), acked, CLIENT_KEEPALIVE_S * 1000, ctx.fail_ms.max(3000));
+            if step.keepalive_ack { x.last_rx_ms.store(now, Relaxed); }
+            let why = if !wanted.contains(d) { Some("не нужен") } else if closed { Some("закрыт") } else if step.silent_ms >= ctx.fail_ms.max(3000) { Some("нет ответа") } else { None };
             if let Some(why) = why {
                 ctx.tun.extra.write().unwrap().remove(d);
+                pacers.remove(&x.id);
                 let _ = ctx.node.engine().close_link(&x.id).await;
                 if why != "не нужен" {
                     ctx.sh.note(format!("доп. выход {}: {why}", hex(&d[..4])));
                     ctx.rback.lock().unwrap().insert(*d, Instant::now() + Duration::from_secs(10));
                 }
-            }
-        }
-        if last_ping.elapsed() >= Duration::from_secs(1) {
-            last_ping = Instant::now();
-            seq = seq.wrapping_add(1);
-            for (_, x) in ctx.tun.extra.read().unwrap().iter() {
+            } else if step.ping {
+                seq = seq.wrapping_add(1);
                 spawn_dgram(&ctx.node, x.id, dgram_ping(seq, now_us(), b'P'));
             }
         }
@@ -10996,9 +11094,7 @@ async fn client_policy_loop(ctx: Arc<ClientCtx>) {
         }
         let cur = ctx.cur.lock().unwrap().as_ref().map(|x| x.1);
         if let Some(id) = cur {
-            for p in pols {
-                send_ctl(&ctx.node, id, T_POL, &p.wire()).await;
-            }
+            ctx.sync_to(id, vec![], pols);
         }
         ctx.refresh_servers13();
     }
@@ -11051,23 +11147,8 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             }
             *ctx.status.lock().unwrap() = format!("подключаюсь к {}", c.name);
             let av = avoid.get(&c.dest).copied();
-            let result = {
-                let attempt = connect_exit(&ctx, &c, av);
-                tokio::pin!(attempt);
-                loop {
-                    tokio::select! {
-                        result = &mut attempt => break result,
-                        _ = tokio::time::sleep(Duration::from_secs(1)), if active.is_some() => {
-                            // Пинги старого Link не прерываются длительным поиском/авторизацией нового.
-                            if let Some((_, id, _)) = &active {
-                                seq = seq.wrapping_add(1);
-                                spawn_dgram(&ctx.node, *id, dgram_ping(seq, now_us(), b'P'));
-                                ctx.loss.lock().unwrap().sent(seq);
-                            }
-                        }
-                    }
-                }
-            };
+            // Старый Link обслуживает штатный keepalive RNS и во время подключения нового.
+            let result = connect_exit(&ctx, &c, av).await;
             match result {
                 Ok((id, h)) => {
                     avoid.remove(&c.dest);
@@ -11163,7 +11244,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         }
 
         // обслуживание: пинг раз в секунду, смена по просьбе пользователя, отказ -> следующий выход
-        let mut last_ping = Instant::now() - Duration::from_secs(5);
+        let mut pacer = Pacer { last_pkts: ctx.tun.traffic_pkts(), ..Default::default() };
         let mut better_since: Option<Instant> = None;
         let mut last_eval = Instant::now();
         let mut direct_since: Option<Instant> = None;
@@ -11187,10 +11268,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             // are unchanged; legacy user ranking never reorders candidate exits.
             if want.is_none() && last_eval.elapsed() >= Duration::from_secs(3) {
                 last_eval = Instant::now();
-                let rtt_of = |d: &[u8; 16]| -> Option<f64> {
-                    let us = ctx.carriers.lock().unwrap().get(d).map(|c| c.rtt_us.load(Relaxed)).unwrap_or(0);
-                    if us > 0 { Some(us as f64 / 1000.0) } else { None }
-                };
+                let rtt_of = |d: &[u8; 16]| ctx.rns_rtt(d);
                 let cur_rtt = rtt_of(&cand.dest);
                 let best = candidates(&ctx, &banned, None).into_iter().find(|c| c.dest != cand.dest && rtt_of(&c.dest).is_some());
                 let better = match (cur_rtt, best.as_ref().and_then(|b| rtt_of(&b.dest))) {
@@ -11227,9 +11305,23 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             if let Some(r) = ctx.sh.closed.lock().unwrap().get(&k) {
                 break format!("link закрыт: {r}");
             }
-            let silent = (now_ms() as u64).saturating_sub(ctx.last_pong.load(Relaxed));
-            if silent > ctx.fail_ms {
-                break format!("нет ответа {silent} мс");
+            let (acked, ka_rtt) = ctx.node.engine().link_stats(&id).map(|s| (s.keepalives_acked(), s.keepalive_rtt_ms())).unwrap_or((0, None));
+            let now = now_ms() as u64;
+            let step = pacer.step(now, ctx.tun.traffic_pkts(), ctx.last_pong.load(Relaxed), acked, CLIENT_KEEPALIVE_S * 1000, ctx.fail_ms);
+            if step.keepalive_ack {
+                ctx.remember_rns_rtt(cand.dest, &id);
+                // ответ keepalive RNS - контакт; его RTT нужен индикации, если свежих RGP нет
+                ctx.last_pong.store(now, Relaxed);
+                if now.saturating_sub(ctx.rtt_pong.load(Relaxed)) >= 5_000 {
+                    if let Some(r) = ka_rtt {
+                        *ctx.rtt_ms.lock().unwrap() = Some(r as f64);
+                        ctx.rtt_pong.store(now, Relaxed);
+                    }
+                }
+            }
+            ctx.contact_window_ms.store(step.contact_window_ms, Relaxed);
+            if step.silent_ms >= ctx.fail_ms.max(3000) {
+                break format!("нет ответа {} мс", step.silent_ms);
             }
             // Возврат TCP -> QUIC (этап B): QUIC уже привязан к RNS рядом с TCP, а Link выхода сидит на TCP - поднимаем новый вне TCP, старый держим
             let ret_cc = ctx.carriers.lock().unwrap().get(&cand.dest).cloned().filter(|c| matches!(c.ret_get(), Ret::Standby { .. }));
@@ -11259,8 +11351,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                     break "выбор пользователя".to_string();
                 }
             }
-            if last_ping.elapsed() >= Duration::from_secs(1) {
-                last_ping = Instant::now();
+            if step.ping {
                 seq = seq.wrapping_add(1);
                 spawn_dgram(&ctx.node, id, dgram_ping(seq, now_us(), b'P'));
                 ctx.loss.lock().unwrap().sent(seq);
@@ -11787,9 +11878,20 @@ mod qreturn_tests {
     // согласование: тела T_PROBEQ/T_PROBER строгие; старый узел (on_control: `_ => {}`) тип 23 просто игнорирует
     #[test]
     fn probe_types_are_unused_by_older_message_types() {
-        let all = [T_SRV1, T_SRV2, T_SRV3, T_SRV4, T_PING, T_PONG, T_TABLE, T_REGISTRY, T_AUTH_OK, T_AUTH_FAIL, T_REC, T_PAIR1, T_PAIR_NO, T_USE, T_PAIRQ, T_NBRS, T_DIR, T_BENCH, T_BENCH_DATA, T_POL, T_OBSERVE, T_CINFO];
+        let all = [T_SRV1, T_SRV2, T_SRV3, T_SRV4, T_TABLE, T_REGISTRY, T_AUTH_OK, T_AUTH_FAIL, T_PAIR1, T_PAIR_NO, T_USE, T_PAIRQ, T_NBRS, T_DIR, T_BENCH, T_BENCH_DATA, T_OBSERVE, T_CINFO];
         assert!(!all.contains(&T_PROBEQ) && !all.contains(&T_PROBER) && T_PROBEQ != T_PROBER);
         assert_ne!(T_PROBEQ, 0x45, "не похож на IPv4-датаграмму");
+    }
+
+    #[test]
+    fn lxmf_and_pn_destinations_never_enter_incoming_vpn_admission() {
+        let identity = leviculum_std::api::generate_identity();
+        let vpn = dest_from_pub_tag(&identity.public_key_bytes(), T13_TAG);
+        let delivery = DestinationHash::new(lxmf_admin::lxmf_destination(identity.hash()));
+        let pn = leviculum_lxmf::PropagationTransport::destination(identity).unwrap();
+        assert!(vpn_incoming_destination(&vpn, &DestinationHash::new(vpn)));
+        assert!(!vpn_incoming_destination(&vpn, &delivery));
+        assert!(!vpn_incoming_destination(&vpn, pn.hash()));
     }
 
     // эхо получает только допущенный клиент: сервер, зачисляемый, неопознанный и безымянный пир - нет

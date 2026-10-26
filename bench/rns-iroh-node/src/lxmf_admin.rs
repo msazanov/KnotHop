@@ -87,6 +87,7 @@ pub struct AdminRuntime {
     pub outbound: SyncSender<AdminOutbound>,
     pub transport_events: Receiver<TransportEvent>,
     pub ready: Arc<AtomicBool>,
+    pub sync: super::lxmf_sync::Sender,
 }
 
 struct RegisteredClient {
@@ -131,6 +132,14 @@ pub struct AdminProcessor {
     resource_results: Receiver<ResourceBuildResult>,
     last_announce_ms: u64,
     state: ProcessorState,
+    sync: Receiver<super::lxmf_sync::Command>,
+    sync_pending: HashMap<String, PendingSync>,
+}
+
+struct PendingSync {
+    request: super::lxmf_sync::Outbound,
+    last_try: Option<u64>,
+    transport: Option<[u8;32]>,
 }
 
 enum ResourceBuildResult { Ready(Box<BuiltResource>), Failed([u8;32]) }
@@ -149,6 +158,7 @@ struct TrackedDelivery { requestid: String, exp: u64 }
 
 impl AdminProcessor {
     pub fn new(identity: Identity) -> (Self, AdminRuntime) {
+        let (sync_tx, sync_rx) = mpsc::sync_channel(super::lxmf_sync::LIMIT);
         let (out_tx, out_rx) = mpsc::sync_channel(MAX_ADMIN_QUEUE);
         let (in_tx, in_rx) = mpsc::sync_channel(MAX_ADMIN_QUEUE);
         let (event_tx, event_rx) = mpsc::sync_channel(MAX_ADMIN_QUEUE);
@@ -173,8 +183,10 @@ impl AdminProcessor {
             resource_results:result_rx,
             last_announce_ms: 0,
             state: ProcessorState::Unregistered,
+            sync: sync_rx,
+            sync_pending: HashMap::new(),
         };
-        (processor, AdminRuntime { inbound: in_rx, outbound: out_tx, transport_events: event_rx, ready })
+        (processor, AdminRuntime { inbound: in_rx, outbound: out_tx, transport_events: event_rx, ready, sync:sync_tx })
     }
 
     fn register(&mut self, core: &mut StdNodeCore, out: &mut TickOutput) -> Result<ProcessorState> {
@@ -270,6 +282,7 @@ impl AdminProcessor {
         if run_scheduler {
             let mut outputs = Vec::new();
             if let ProcessorState::Ready { router, outbound_ids } = &mut state {
+                self.sync_tick(core, router, out);
                 for result in self.resource_results.try_iter() {
                     match result {
                         ResourceBuildResult::Ready(built) => if let Ok(output)=router.commit_resource_build(core,*built) { outputs.push(output); },
@@ -321,6 +334,75 @@ impl AdminProcessor {
         }
         self.state = state;
     }
+
+    fn sync_tick(&mut self, core: &mut StdNodeCore, router: &mut LxmfRouter, out: &mut TickOutput) {
+        use super::lxmf_sync::{self, Command};
+        let now = super::now_ms() as u64 / 1000;
+        for command in self.sync.try_iter().take(lxmf_sync::LIMIT) {
+            match command {
+                Command::Send(request) => {
+                    let id = format!("{}:{}", super::hex(&request.pk), lxmf_sync::digest(&request.content));
+                    if self.sync_pending.len() < lxmf_sync::LIMIT && !self.sync_pending.contains_key(&id) {
+                        self.sync_pending.insert(id, PendingSync { request, last_try:None, transport:None });
+                    }
+                }
+                Command::Acknowledged { source, digest } => {
+                    self.sync_pending.retain(|_, p| {
+                        let matched = lxmf_sync::public_identity(&p.request.pk)
+                            .is_some_and(|i| lxmf_destination(i.hash()) == source) && lxmf_sync::digest(&p.request.content) == digest;
+                        if matched {
+                            if let Some(transport) = p.transport {
+                                if let Ok(output) = router.cancel(core, &transport) { out.merge(output.core); }
+                            }
+                        }
+                        !matched
+                    });
+                }
+            }
+        }
+        let mut remove = Vec::new();
+        // Не более одной новой передачи за tick; retry ограничен пятью секундами.
+        let mut enqueued = false;
+        for (id, pending) in &mut self.sync_pending {
+            let permission = (pending.request.gate)();
+            if pending.request.exp <= now || permission == Some(false) {
+                if let Some(transport) = pending.transport.take() {
+                    if let Ok(output) = router.cancel(core, &transport) { out.merge(output.core); }
+                }
+                remove.push(id.clone());
+                continue;
+            }
+            if permission.is_none() || enqueued || pending.last_try.is_some_and(|t| now.saturating_sub(t) < 5) { continue; }
+            // Повторы и бюджет незавершённой доставки принадлежат LXMF/RNS.
+            // Прикладной retry не обрывает ещё идущий Resource/поиск пути.
+            if pending.transport.is_some_and(|id| router.outbound().contains_key(&id)) { continue; }
+            if let Some(transport) = pending.transport.take() {
+                if let Ok(output) = router.cancel(core, &transport) { out.merge(output.core); }
+            }
+            let Some(identity) = lxmf_sync::public_identity(&pending.request.pk) else { remove.push(id.clone()); continue };
+            let destination = lxmf_destination(identity.hash());
+            core.remember_identity(DestinationHash::new(destination), identity);
+            if let Ok(message) = router.create_message(core, destination, lxmf_sync::TITLE.to_vec(), pending.request.content.clone(), Vec::new(), DeliveryMethod::Direct) {
+                let transport = message.message_id;
+                let bytes = message.pack().len() as u64;
+                if let Ok(output) = router.enqueue(core, message) {
+                    lxmf_sync::TX_BYTES.fetch_add(bytes, Ordering::Relaxed);
+                    lxmf_sync::TX_MESSAGES.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(wire) = serde_json::from_slice::<serde_json::Value>(&pending.request.content) {
+                        let n = wire["policies"].as_array().map_or(0, |p| p.len()) as u64;
+                        super::POL_TX.fetch_add(n * crate::trust::POL_LEN as u64, Ordering::Relaxed);
+                        super::POL_TX_N.fetch_add(n, Ordering::Relaxed);
+                    }
+                    out.merge(output.core);
+                    pending.transport = Some(transport);
+                    if pending.request.ack { remove.push(id.clone()); }
+                }
+            }
+            pending.last_try = Some(now);
+            enqueued = true;
+        }
+        for id in remove { self.sync_pending.remove(&id); }
+    }
 }
 
 impl CoreProcessor for AdminProcessor {
@@ -347,7 +429,7 @@ pub fn lxmf_destination(identity_hash: &[u8; 16]) -> [u8; 16] {
 }
 
 /// Не полагаться только на identity cache транспорта: полномочия привязаны к ключу из Trust.
-fn signed_by_trusted_source(message: &Message, pk: &crate::trust::Pk) -> bool {
+pub(super) fn signed_by_trusted_source(message: &Message, pk: &crate::trust::Pk) -> bool {
     let Some(hash) = crate::trust::hash_of(pk) else { return false };
     if message.source_hash != lxmf_destination(&hash) { return false; }
     let Ok(source) = Identity::from_public_key_bytes(pk) else { return false };
@@ -579,6 +661,10 @@ pub fn spawn_node_worker(runtime: AdminRuntime, ctx: Arc<super::NodeCtx>) {
         loop {
             match inbound.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(message) => {
+                    if message.title == super::lxmf_sync::TITLE {
+                        super::on_sync_node(&ctx, &message);
+                        continue;
+                    }
                     if !admin_rate_allowed(&ctx,&message,&mut global,&mut per_actor) { continue; }
                     if let Some(reply) = handle_node_message(&state, &ctx, &message) {
                         let content = serde_json::to_vec(&reply).unwrap_or_default();
@@ -950,14 +1036,18 @@ fn handle_node_message(state: &Path, ctx: &Arc<super::NodeCtx>, message: &Messag
     mutation_effect(&mut reply, prepared.before, after, want_allow);
     emit(reply, Some(journal))
 }
-pub fn spawn_client_worker(runtime: AdminRuntime, state: PathBuf, identity: Identity, trust: Arc<Mutex<crate::trust::Trust>>) {
-    std::thread::Builder::new().name("knothop-lxmf-admin-client".into()).spawn(move || {
+pub fn spawn_client_worker(runtime: AdminRuntime, ctx: Arc<super::ClientCtx>, trust: Arc<Mutex<crate::trust::Trust>>) {
+    spawn_runtime_worker("knothop-lxmf-admin-client", move || {
+        let (state, identity) = (ctx.state.clone(), ctx.identity.clone());
         let AdminRuntime { inbound, outbound, transport_events, .. } = runtime;
         requeue_pending(&state,&outbound);
         let mut retry_after=std::time::Instant::now()+std::time::Duration::from_secs(5);
         loop {
             match inbound.recv_timeout(std::time::Duration::from_millis(200)) {
-                Ok(message) => { handle_client_reply(&state, &identity, &trust, &message); }
+                Ok(message) => {
+                    if message.title == super::lxmf_sync::TITLE { super::on_sync_client(&ctx, &message); }
+                    else { handle_client_reply(&state, &identity, &trust, &message); }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }

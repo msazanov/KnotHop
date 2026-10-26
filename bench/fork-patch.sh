@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Общий патч локального форка Leviculum для всех сборок KnotHop (подключается через source).
 #
-# Манифесты rns-iroh-node берут leviculum-std и leviculum-lxmf с публичного Codeberg на ОДНОЙ ревизии
+# Манифесты rns-iroh-node берут leviculum-std, leviculum-lxmf и lnpnd с публичного Codeberg на ОДНОЙ ревизии
 # (merge-base форка с upstream, она там есть). Коммита форка на Codeberg нет и не должно быть, поэтому
 # фактические исходники подставляет Cargo [patch]: оба пакета берутся из одного checkout форка.
 # leviculum-core тогда приходит из этого же checkout по path-зависимостям std и lxmf: один пакет,
@@ -19,7 +19,7 @@
 # URL должен совпадать с git-зависимостью в Cargo.toml буква в букву: по нему Cargo сопоставляет патч.
 FORK_PATCH_SOURCE="https://codeberg.org/Lew_Palm/Leviculum"
 # Ожидаемые пакеты рабочего пространства форка. Другие пакеты не патчатся.
-FORK_PATCH_PACKAGES=(leviculum-std leviculum-lxmf)
+FORK_PATCH_PACKAGES=(leviculum-std leviculum-lxmf lnpnd)
 
 fork_patch_init() {
   local fork="${1:?нужен путь checkout форка}" pkg

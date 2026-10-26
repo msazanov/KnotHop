@@ -1,12 +1,13 @@
 # NOTICE для Leviculum (зависимость KnotHop)
 
 Первоисточник: https://codeberg.org/Lew_Palm/Leviculum (автор Lew_Palm).
-Используется изменённый форк https://github.com/msazanov/leviculum на коммите `85d136de71e12f42c39bc6d5b7f4543f56500d63` (см. deploy/leviculum.ref).
+Используется изменённый форк https://github.com/msazanov/leviculum на коммите `5938c438aa1012bce89aaa950cce8f22aef7ab7d` (см. deploy/leviculum.ref).
 База в Cargo.toml: `77c4ff13f59116adaf0190d455b83c286c135066`.
 Лицензия Leviculum и форка: AGPL-3.0-or-later; см. LICENSE.
 
 ## Коммиты форка поверх базы
 
+- 5938c438 Per-link keepalive override and keepalive telemetry in LinkStats
 - 85d136de Guard discovery expiry with worker-side record version check
 - ea41ea5c Serialize discovery expiry with local announce generations
 - ce13e3e0 Use cipher-aware proofs in Python CBC interop tests

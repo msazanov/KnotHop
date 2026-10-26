@@ -1960,6 +1960,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
+name = "lnpnd"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "leviculum-announce-policy",
+ "leviculum-core",
+ "leviculum-lxmf",
+ "leviculum-std",
+ "rand_core 0.6.4",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3012,6 +3027,7 @@ dependencies = [
  "leviculum-lxmf",
  "leviculum-std",
  "libc",
+ "lnpnd",
  "noq-proto",
  "noq-udp",
  "rand_core 0.6.4",
