@@ -10,6 +10,8 @@ use crate::trust::{self, Record, Policy, Pk};
 pub const TITLE: &[u8] = b"trust.sync/1";
 pub const LIMIT: usize = 32;
 pub const TTL: u64 = 600;
+/// Записей каталога в одном сообщении (как прежний DIR_MAX).
+pub const DIR_LIMIT: usize = 16;
 pub static TX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TX_MESSAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -22,17 +24,22 @@ pub struct Wire {
     pub records: Vec<String>,
     pub policies: Vec<String>,
     pub ack: Option<String>,
+    /// Приватный каталог нод (бывший T_DIR): адреса — только подсказки для дозвона, не права; в анонс они не попадают (ADR 0016).
+    /// Взаимоисключимо с записями и политиками; разбор и фильтр адресов — `parse_dir` на приёме.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dir: Vec<serde_json::Value>,
 }
 
 impl Wire {
     pub fn decode(message: &Message) -> Option<Self> {
         if message.title != TITLE || message.verification != Verification::Valid
-            || message.method != DeliveryMethod::Direct || message.content.len() > super::lxmf_admin::MAX_ADMIN_CONTENT { return None; }
+            || !matches!(message.method, DeliveryMethod::Direct | DeliveryMethod::Propagated) || message.content.len() > super::lxmf_admin::MAX_ADMIN_CONTENT { return None; }
         let wire: Self = serde_json::from_slice(&message.content).ok()?;
-        if wire.v != 1 || wire.records.len() + wire.policies.len() > 16 { return None; }
+        if wire.v != 1 || wire.records.len() + wire.policies.len() > 16 || wire.dir.len() > DIR_LIMIT { return None; }
+        if !wire.dir.is_empty() && (!wire.records.is_empty() || !wire.policies.is_empty() || wire.ack.is_some() || !wire.dir.iter().all(|e| e.is_object())) { return None; }
         if let Some(ack) = &wire.ack {
             if ack.len() != 64 || !ack.bytes().all(|b| b.is_ascii_hexdigit()) || !wire.records.is_empty() || !wire.policies.is_empty() { return None; }
-        } else if wire.records.is_empty() && wire.policies.is_empty() { return None; }
+        } else if wire.records.is_empty() && wire.policies.is_empty() && wire.dir.is_empty() { return None; }
         Some(wire)
     }
 }
@@ -71,9 +78,22 @@ pub fn digest(content: &[u8]) -> String { super::hex(&Sha256::digest(content)) }
 pub fn send(state: &Path, pk: Pk, records: &[Record], policies: &[Policy], gate: Gate) -> bool {
     if records.len() + policies.len() > 16 || (records.is_empty() && policies.is_empty()) { return false; }
     let wire = Wire { v:1, records:records.iter().map(|r| super::hex(&r.wire())).collect(),
-        policies:policies.iter().map(|p| super::hex(&p.wire())).collect(), ack:None };
+        policies:policies.iter().map(|p| super::hex(&p.wire())).collect(), ack:None, dir:vec![] };
     let Ok(content) = serde_json::to_vec(&wire) else { return false };
     if content.len() > super::lxmf_admin::MAX_ADMIN_CONTENT { return false; }
+    submit(state, Command::Send(Outbound { pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
+}
+
+/// Каталог нод одним сообщением. Gate проверяет, что получатель всё ещё допустимый адресат: без ожидания mutex, как у записей.
+pub fn send_dir(state: &Path, pk: Pk, mut dir: Vec<serde_json::Value>, gate: Gate) -> bool {
+    dir.truncate(DIR_LIMIT);
+    // хвост каталога отбрасываем, пока сообщение не уложится в лимит администрирования
+    let content = loop {
+        if dir.is_empty() { return false; }
+        let Ok(content) = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:None, dir:dir.clone() }) else { return false };
+        if content.len() <= super::lxmf_admin::MAX_ADMIN_CONTENT { break content; }
+        dir.pop();
+    };
     submit(state, Command::Send(Outbound { pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
 }
 
@@ -116,7 +136,7 @@ pub fn authenticated(message: &Message, me: &[u8;16], pk: &Pk) -> bool {
 }
 
 pub fn acknowledge(state: &Path, message: &Message, pk: Pk) {
-    let content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some(digest(&message.content)) }).unwrap();
+    let content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some(digest(&message.content)), dir:vec![] }).unwrap();
     submit(state, Command::Send(Outbound { pk, content, gate:Arc::new(|| Some(true)), exp:super::now_ms() as u64/1000+TTL, ack:true }));
 }
 pub fn received_ack(state: &Path, source: [u8;16], digest: String) {
@@ -196,7 +216,7 @@ pub fn propagation_processor(state: &Path, identity: Identity) -> anyhow::Result
         identity, store,
         node_config: PropagationNodeConfig { transfer_limit_kb:16, sync_limit_kb:64,
             serve_cap_bytes:Some(64*1024), name:None, ..Default::default() },
-        announce_interval_secs:600, announce_delay_secs:20, announce_at_start:false,
+        announce_interval_secs:600, announce_delay_secs:if cfg!(test) {2} else {20}, announce_at_start:false,
         peering:PeeringConfig { max_peers:8, max_inbound_syncs:2, ..Default::default() },
         peer_store:Box::new(MemoryPeerStore::default()), control_allowed:vec![], auth_allowed:None,
         mailbox:None, store_limit_bytes:8*1024*1024, delivery_limit_kb:8,
@@ -226,7 +246,7 @@ mod tests {
     #[test]
     fn sync_codec_signature_and_scope_are_not_authority() {
         let (actor, target, attacker) = (generate_identity(), generate_identity(), generate_identity());
-        let wire = Wire { v:1, records:vec![], policies:vec![], ack:Some("11".repeat(32)) };
+        let wire = Wire { v:1, records:vec![], policies:vec![], ack:Some("11".repeat(32)), dir:vec![] };
         let make = |identity:&Identity| Message::create(super::super::lxmf_admin::lxmf_destination(target.hash()),
             super::super::lxmf_admin::lxmf_destination(actor.hash()), identity, 1.0,
             TITLE.to_vec(), serde_json::to_vec(&wire).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
@@ -237,6 +257,28 @@ mod tests {
         let mut malformed = make(&actor);
         malformed.content = serde_json::to_vec(&Wire { ack:Some("not-a-digest".into()), ..wire }).unwrap();
         assert!(Wire::decode(&malformed).is_none());
+    }
+
+    #[test]
+    fn directory_wire_is_exclusive_bounded_and_object_only() {
+        let (actor, target) = (generate_identity(), generate_identity());
+        let make = |wire: &Wire| Message::create(super::super::lxmf_admin::lxmf_destination(target.hash()),
+            super::super::lxmf_admin::lxmf_destination(actor.hash()), &actor, 1.0,
+            TITLE.to_vec(), serde_json::to_vec(wire).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
+        let entry = serde_json::json!({"d": "00", "k": "00", "a": ["203.0.113.7:47001"], "n": "x"});
+        let base = Wire { v:1, records:vec![], policies:vec![], ack:None, dir:vec![entry.clone()] };
+        let decoded = Wire::decode(&make(&base)).expect("каталог из объектов");
+        assert_eq!(decoded.dir, vec![entry.clone()]);
+        // каталог не смешивается с записями, политиками и ACK
+        assert!(Wire::decode(&make(&Wire { records:vec!["00".into()], ..base.clone() })).is_none());
+        assert!(Wire::decode(&make(&Wire { policies:vec!["00".into()], ..base.clone() })).is_none());
+        assert!(Wire::decode(&make(&Wire { ack:Some("11".repeat(32)), ..base.clone() })).is_none());
+        // не больше DIR_LIMIT и только объекты
+        assert!(Wire::decode(&make(&Wire { dir:vec![entry.clone(); DIR_LIMIT], ..base.clone() })).is_some());
+        assert!(Wire::decode(&make(&Wire { dir:vec![entry.clone(); DIR_LIMIT + 1], ..base.clone() })).is_none());
+        assert!(Wire::decode(&make(&Wire { dir:vec![serde_json::json!("203.0.113.7:47001")], ..base.clone() })).is_none());
+        // пустое сообщение по-прежнему не принимается
+        assert!(Wire::decode(&make(&Wire { dir:vec![], ..base })).is_none());
     }
 
     #[test]
@@ -288,7 +330,7 @@ mod tests {
         let mut tr = trust::Trust::new(sender.clone(), None);
         let rec = tr.issue(*sender.hash(), target.public_key_bytes(), trust::TRANSIT).unwrap();
         for n in [1, 16] {
-            let content = serde_json::to_vec(&Wire { v:1, records:vec![super::super::hex(&rec.wire());n], policies:vec![], ack:None }).unwrap();
+            let content = serde_json::to_vec(&Wire { v:1, records:vec![super::super::hex(&rec.wire());n], policies:vec![], ack:None, dir:vec![] }).unwrap();
             let message = Message::create(super::super::lxmf_admin::lxmf_destination(target.hash()),
                 super::super::lxmf_admin::lxmf_destination(sender.hash()), &sender, 1.0,
                 TITLE.to_vec(), content, vec![], DeliveryMethod::Direct).unwrap();
@@ -296,11 +338,61 @@ mod tests {
                 n*(trust::REC_LEN+1), message.pack().len(), message.content.len());
             assert!(message.pack().len() <= super::super::lxmf_admin::MAX_ADMIN_CONTENT);
         }
-        let ack_content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some("00".repeat(32)) }).unwrap();
+        let ack_content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some("00".repeat(32)), dir:vec![] }).unwrap();
         let ack = Message::create(super::super::lxmf_admin::lxmf_destination(sender.hash()),
             super::super::lxmf_admin::lxmf_destination(target.hash()), &target, 1.0,
             TITLE.to_vec(), ack_content, vec![], DeliveryMethod::Direct).unwrap();
         println!("LXMF_SYNC_ACK_BYTES lxmf_signed={} content={} (без Link/Resource/носителя)", ack.pack().len(), ack.content.len());
+    }
+
+    /// Офлайн-доставка: адресат подключается к сети уже после отправки, письмо ждёт на PN доверенного сервера.
+    #[tokio::test(flavor="multi_thread", worker_threads=4)]
+    async fn pn_delivers_signed_records_to_recipient_that_connects_later() {
+        let (sender, recipient, server) = (generate_identity(), generate_identity(), generate_identity());
+        let base = std::env::temp_dir().join(format!("kh-pn-offline-{}", super::super::hex(sender.hash())));
+        let _ = std::fs::remove_dir_all(&base);
+        let (pa, ra) = super::super::lxmf_admin::AdminProcessor::new(sender.clone());
+        let (pb, rb) = super::super::lxmf_admin::AdminProcessor::new(recipient.clone());
+        let (ps, rs) = super::super::lxmf_admin::AdminProcessor::new(server.clone());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let pn = propagation_processor(&base.join("server"), server.clone()).unwrap();
+        let mut srv = NodeBuilder::new().storage_path(base.join("server")).add_tcp_server(addr).core_processor(Processors(ps, pn)).build().unwrap();
+        srv.start().await.unwrap();
+        // отправитель: сервер получает TRANSIT, поэтому его PN - выбираемый; адресат получает TRANSIT, но PN у него нет
+        let mut tr_a = trust::Trust::new(sender.clone(), None);
+        tr_a.issue(*sender.hash(), server.public_key_bytes(), trust::TRANSIT).unwrap();
+        tr_a.issue(*sender.hash(), recipient.public_key_bytes(), trust::TRANSIT).unwrap();
+        let rec = tr_a.issue(*sender.hash(), generate_identity().public_key_bytes(), trust::USE).unwrap();
+        let authority = Arc::new(Mutex::new(tr_a));
+        ra.pn.set_source(authority.clone());
+        let mut a = NodeBuilder::new().storage_path(base.join("a")).add_tcp_client(addr).core_processor(pa).build().unwrap();
+        a.start().await.unwrap();
+        let _guard = register(&base, ra.sync.clone());
+        assert!(queue(&base, authority, recipient.public_key_bytes(), vec![rec.clone()], vec![]));
+        // адресат ещё не в сети: прямая доставка невозможна, письмо должно уйти на PN
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert!(rb.inbound.try_recv().is_err());
+        let mut tr_b = trust::Trust::new(recipient.clone(), None);
+        tr_b.issue(*recipient.hash(), server.public_key_bytes(), trust::TRANSIT).unwrap();
+        tr_b.issue(*recipient.hash(), sender.public_key_bytes(), trust::USE).unwrap();
+        rb.pn.set_source(Arc::new(Mutex::new(tr_b)));
+        let mut b = NodeBuilder::new().storage_path(base.join("b")).add_tcp_client(addr).core_processor(pb).build().unwrap();
+        b.start().await.unwrap();
+        let until = Instant::now() + Duration::from_secs(90);
+        let message = loop {
+            if let Ok(message) = rb.inbound.try_recv() { break message; }
+            assert!(Instant::now() < until, "письмо с PN не дошло до адресата");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(message.method, DeliveryMethod::Propagated);
+        assert!(authenticated(&message, recipient.hash(), &sender.public_key_bytes()));
+        assert_eq!(parsed(&Wire::decode(&message).unwrap()).unwrap().0, vec![rec]);
+        a.stop().await.unwrap();
+        b.stop().await.unwrap();
+        srv.stop().await.unwrap();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test(flavor="multi_thread", worker_threads=2)]

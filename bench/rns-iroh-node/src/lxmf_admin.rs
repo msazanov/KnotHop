@@ -4,7 +4,7 @@
 //! CoreProcessor tap. Application work and filesystem commits run on a bounded
 //! worker outside the core lock; replies return through a bounded channel.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,8 +13,8 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
 
 use anyhow::{Context, Result, bail};
-use leviculum_lxmf::router::{LxmfRouter, RouterConfig, RouterEvent, RouterOutput};
-use leviculum_lxmf::{BuiltResource, DeliveryMethod, LxmfNode, LxmfNodeConfig, Message, PendingResourceBuild, Verification, announce};
+use leviculum_lxmf::router::{LxmfRouter, PropagationClientConfig, RouterConfig, RouterEvent, RouterOutput};
+use leviculum_lxmf::{BuiltResource, CooperativeStamper, DeliveryMethod, LxmfNode, LxmfNodeConfig, Message, PendingResourceBuild, PropagationStampRequest, PropagationTransport, StampCancel, Verification, announce};
 use leviculum_std::api::{CoreProcessor, Destination, DestinationHash, Identity, NodeEvent, StdNodeCore, TickOutput};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -82,7 +82,52 @@ pub enum TransportEvent {
     ReceiverUnavailable,
 }
 
+/// Прямая доставка без ответа дольше этого срока дублируется через PN сети (офлайн-доставка).
+const PN_FALLBACK_SECS: u64 = if cfg!(test) { 3 } else { 30 };
+/// Плановая выборка почты с PN: по расписанию анонса, без новых пробуждений телефона.
+const PN_FETCH_MS: u64 = 600_000;
+/// Не чаще раза в 30 с, как бы ни менялся выбор PN.
+const PN_FETCH_SPACING_MS: u64 = 30_000;
+const PN_REFRESH_MS: u64 = 5_000;
+/// Стоимость stamp, которую готовы майнить: чужой анонс не должен сжигать CPU (особенно телефона).
+const PN_MAX_STAMP_COST: u8 = 16;
+const PN_KEYS_MAX: usize = 256;
+
+/// PN этой сети и известные ключи сети. Анонс PN сам по себе не полномочие: выбирается только
+/// `lxmf.propagation` ключей, которым Trust даёт TRANSIT; подписи LXMF по-прежнему проверяются в Trust.
+#[derive(Default)]
+pub struct PnShared {
+    trust: Mutex<Option<Arc<Mutex<crate::trust::Trust>>>>,
+}
+
+pub struct PnView { pub nodes: BTreeSet<DestinationHash>, pub keys: Vec<crate::trust::Pk> }
+
+impl PnShared {
+    pub fn set_source(&self, trust: Arc<Mutex<crate::trust::Trust>>) { *self.trust.lock().unwrap() = Some(trust); }
+
+    /// `None`, пока Trust занят: прежний выбор остаётся (без ожидания mutex в потоке ядра).
+    fn view(&self, now_ms: u64) -> Option<PnView> {
+        let source = self.trust.lock().ok()?.clone()?;
+        let tr = source.try_lock().ok()?;
+        let nodes = tr.holders_with(crate::trust::TRANSIT).into_iter()
+            .filter(|pk| tr.effective(pk, now_ms) & crate::trust::TRANSIT != 0)
+            .filter_map(|pk| pn_destination(&pk)).map(DestinationHash::new).take(32).collect();
+        // ключи сети нужны, чтобы проверить подпись сообщения, полученного с PN, когда отправителя в сети давно не слышно
+        let mut keys: Vec<_> = tr.anchors().into_iter().map(|(_, pk)| pk).collect();
+        keys.extend(tr.holders_with(u16::MAX));
+        keys.truncate(PN_KEYS_MAX);
+        Some(PnView { nodes, keys })
+    }
+}
+
+/// Назначение `lxmf.propagation` identity с ключом `pk`.
+pub fn pn_destination(pk: &crate::trust::Pk) -> Option<[u8; 16]> {
+    let hash = crate::trust::hash_of(pk)?;
+    Some(*Destination::compute_destination_hash(&Destination::compute_name_hash("lxmf", &["propagation"]), &hash).as_bytes())
+}
+
 pub struct AdminRuntime {
+    pub pn: Arc<PnShared>,
     pub inbound: Receiver<Message>,
     pub outbound: SyncSender<AdminOutbound>,
     pub transport_events: Receiver<TransportEvent>,
@@ -134,12 +179,22 @@ pub struct AdminProcessor {
     state: ProcessorState,
     sync: Receiver<super::lxmf_sync::Command>,
     sync_pending: HashMap<String, PendingSync>,
+    pn: Arc<PnShared>,
+    pn_nodes: BTreeSet<DestinationHash>,
+    pn_checked_ms: u64,
+    pn_fetch_due: bool,
+    last_fetch_ms: u64,
+    stamp_jobs: SyncSender<PropagationStampRequest>,
+    stamp_results: Receiver<(PropagationStampRequest, [u8; 32])>,
 }
 
 struct PendingSync {
     request: super::lxmf_sync::Outbound,
     last_try: Option<u64>,
+    first_try: Option<u64>,
     transport: Option<[u8;32]>,
+    /// копия для офлайн-доставки через PN (только если нужен прикладной ACK)
+    pn_copy: Option<[u8;32]>,
 }
 
 enum ResourceBuildResult { Ready(Box<BuiltResource>), Failed([u8;32]) }
@@ -172,6 +227,20 @@ impl AdminProcessor {
                 if result_tx.send(item).is_err(){break}
             }
         }).ok();
+        let (stamp_tx, stamp_rx) = mpsc::sync_channel::<PropagationStampRequest>(4);
+        let (stamp_out_tx, stamp_out_rx) = mpsc::sync_channel::<(PropagationStampRequest, [u8; 32])>(4);
+        // Майнинг stamp - чистый CPU: отдельный поток со своим однопоточным runtime, вне блокировки ядра.
+        std::thread::Builder::new().name("knothop-lxmf-pn-stamp".into()).spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            while let Ok(request) = stamp_rx.recv() {
+                let mut executor = CooperativeStamper::cooperative(rand_core::OsRng);
+                let cancel = StampCancel::new();
+                if let Ok(stamp) = runtime.block_on(request.generate_with(&mut executor, &cancel)) {
+                    if stamp_out_tx.send((request, stamp)).is_err() { break }
+                }
+            }
+        }).ok();
+        let pn = Arc::new(PnShared::default());
         let ready = Arc::new(AtomicBool::new(false));
         let processor = Self {
             identity,
@@ -185,8 +254,15 @@ impl AdminProcessor {
             state: ProcessorState::Unregistered,
             sync: sync_rx,
             sync_pending: HashMap::new(),
+            pn: pn.clone(),
+            pn_nodes: BTreeSet::new(),
+            pn_checked_ms: 0,
+            pn_fetch_due: false,
+            last_fetch_ms: 0,
+            stamp_jobs: stamp_tx,
+            stamp_results: stamp_out_rx,
         };
-        (processor, AdminRuntime { inbound: in_rx, outbound: out_tx, transport_events: event_rx, ready, sync:sync_tx })
+        (processor, AdminRuntime { pn, inbound: in_rx, outbound: out_tx, transport_events: event_rx, ready, sync:sync_tx })
     }
 
     fn register(&mut self, core: &mut StdNodeCore, out: &mut TickOutput) -> Result<ProcessorState> {
@@ -205,6 +281,18 @@ impl AdminProcessor {
             defer_resource_builds: true,
             ..RouterConfig::default()
         });
+        // PN-клиент: то же назначение `lxmf.propagation`, что у встроенного PN сервера. Есть оно уже в ядре - присоединяемся
+        // и возвращаем приём Link серверу; нет - регистрируем (PN-движок позже заменит запись, хеш тот же).
+        let pn_destination = PropagationTransport::destination(self.identity.clone()).map_err(|e| anyhow::anyhow!("LXMF propagation destination: {e:?}"))?;
+        let pn_hash = *pn_destination.hash();
+        let transport = if core.destination_mut(&pn_hash).is_some() {
+            let transport = PropagationTransport::attach(core, pn_hash).map_err(|e| anyhow::anyhow!("attach PN client: {e:?}"))?;
+            if let Some(existing) = core.destination_mut(&pn_hash) { existing.set_accepts_links(true); }
+            transport
+        } else {
+            PropagationTransport::register(core, pn_destination).map_err(|e| anyhow::anyhow!("register PN client: {e:?}"))?
+        };
+        router.enable_propagation_client(transport, PropagationClientConfig::default()).map_err(|e| anyhow::anyhow!("enable PN client: {e:?}"))?;
         let app_data = announce::DeliveryAnnounce::new(None, None).map_err(|e| anyhow::anyhow!("LXMF announce: {e}"))?.encode();
         match core.announce_destination(&destination_hash, Some(&app_data)) {
             Ok(output) => self.absorb(&mut router, &mut HashMap::new(), core, RouterOutput { core: output, events: Vec::new() }, out),
@@ -227,11 +315,15 @@ impl AdminProcessor {
                 match event {
                     RouterEvent::MessageReceived(message) => {
                         let message = *message;
-                        if message.verification != Verification::Valid || message.method != DeliveryMethod::Direct
+                        // Propagated - почта с PN сети; подпись и права всё равно проверяет Trust
+                        if message.verification != Verification::Valid || !matches!(message.method, DeliveryMethod::Direct | DeliveryMethod::Propagated)
                             || message.content.len() > MAX_ADMIN_CONTENT {
                             continue;
                         }
                         let _ = self.inbound.try_send(message);
+                    }
+                    RouterEvent::PropagationStampPending(request) => {
+                        if request.target_cost <= PN_MAX_STAMP_COST { let _ = self.stamp_jobs.try_send(request); }
                     }
                     RouterEvent::MessageState { message_id, state } => {
                         if let Some(tracked) = outbound_ids.get(&message_id).cloned() {
@@ -282,7 +374,8 @@ impl AdminProcessor {
         if run_scheduler {
             let mut outputs = Vec::new();
             if let ProcessorState::Ready { router, outbound_ids } = &mut state {
-                self.sync_tick(core, router, out);
+                self.pn_tick(core, router, &mut outputs);
+                self.sync_tick(core, router, out, &mut outputs);
                 for result in self.resource_results.try_iter() {
                     match result {
                         ResourceBuildResult::Ready(built) => if let Ok(output)=router.commit_resource_build(core,*built) { outputs.push(output); },
@@ -335,7 +428,46 @@ impl AdminProcessor {
         self.state = state;
     }
 
-    fn sync_tick(&mut self, core: &mut StdNodeCore, router: &mut LxmfRouter, out: &mut TickOutput) {
+    /// Выбор PN из доверенных серверов, stamp для загрузки на PN и выборка почты. Без новых таймеров: идёт в штатный tick.
+    fn pn_tick(&mut self, core: &mut StdNodeCore, router: &mut LxmfRouter, outputs: &mut Vec<RouterOutput>) {
+        let now = core.now_ms();
+        if self.pn_checked_ms == 0 || now.saturating_sub(self.pn_checked_ms) >= PN_REFRESH_MS {
+            if let Some(view) = self.pn.view(super::now_ms() as u64) {
+                self.pn_checked_ms = now.max(1);
+                for pk in &view.keys {
+                    if let Some(identity) = super::lxmf_sync::public_identity(pk) {
+                        core.remember_identity(DestinationHash::new(lxmf_destination(identity.hash())), identity);
+                    }
+                }
+                self.pn_nodes = view.nodes;
+            }
+        }
+        router.retain_known_propagation_nodes(&self.pn_nodes);
+        // выбранный вслепую узел (анонса не слышали) уступает узлу с услышанным анонсом PN
+        let blind = router.outbound_propagation_node().is_some_and(|c| router.known_propagation_node(&c).is_none())
+            && router.known_propagation_nodes().next().is_some();
+        if blind || router.outbound_propagation_node().is_some_and(|c| !self.pn_nodes.contains(&c)) {
+            if let Ok(output) = router.set_outbound_propagation_node(core, None) { outputs.push(output); }
+        }
+        if router.outbound_propagation_node().is_none() && !self.pn_nodes.is_empty() {
+            // сначала услышанный анонс PN; иначе первый доверенный (путь запросит сам роутер)
+            let chosen = router.select_outbound_propagation_node(core, None)
+                .or_else(|_| router.select_outbound_propagation_node(core, self.pn_nodes.iter().next().copied()));
+            if let Ok(output) = chosen { outputs.push(output); self.pn_fetch_due = true; }
+        }
+        for (request, stamp) in self.stamp_results.try_iter().take(4) {
+            if let Ok(output) = router.set_outbound_propagation_stamp_result(&request, stamp, now) { outputs.push(output); }
+        }
+        let periodic = now.saturating_sub(self.last_fetch_ms) >= PN_FETCH_MS;
+        if router.outbound_propagation_node().is_some() && (self.pn_fetch_due || periodic)
+            && (self.last_fetch_ms == 0 || now.saturating_sub(self.last_fetch_ms) >= PN_FETCH_SPACING_MS) {
+            if let Ok(output) = router.request_messages_from_propagation_node(core, None) { outputs.push(output); }
+            self.pn_fetch_due = false;
+            self.last_fetch_ms = now.max(1);
+        }
+    }
+
+    fn sync_tick(&mut self, core: &mut StdNodeCore, router: &mut LxmfRouter, out: &mut TickOutput, outputs: &mut Vec<RouterOutput>) {
         use super::lxmf_sync::{self, Command};
         let now = super::now_ms() as u64 / 1000;
         for command in self.sync.try_iter().take(lxmf_sync::LIMIT) {
@@ -343,7 +475,7 @@ impl AdminProcessor {
                 Command::Send(request) => {
                     let id = format!("{}:{}", super::hex(&request.pk), lxmf_sync::digest(&request.content));
                     if self.sync_pending.len() < lxmf_sync::LIMIT && !self.sync_pending.contains_key(&id) {
-                        self.sync_pending.insert(id, PendingSync { request, last_try:None, transport:None });
+                        self.sync_pending.insert(id, PendingSync { request, last_try:None, first_try:None, transport:None, pn_copy:None });
                     }
                 }
                 Command::Acknowledged { source, digest } => {
@@ -351,7 +483,7 @@ impl AdminProcessor {
                         let matched = lxmf_sync::public_identity(&p.request.pk)
                             .is_some_and(|i| lxmf_destination(i.hash()) == source) && lxmf_sync::digest(&p.request.content) == digest;
                         if matched {
-                            if let Some(transport) = p.transport {
+                            for transport in [p.transport, p.pn_copy].into_iter().flatten() {
                                 if let Ok(output) = router.cancel(core, &transport) { out.merge(output.core); }
                             }
                         }
@@ -363,14 +495,32 @@ impl AdminProcessor {
         let mut remove = Vec::new();
         // Не более одной новой передачи за tick; retry ограничен пятью секундами.
         let mut enqueued = false;
+        let mut pn_enqueued = false;
         for (id, pending) in &mut self.sync_pending {
             let permission = (pending.request.gate)();
             if pending.request.exp <= now || permission == Some(false) {
-                if let Some(transport) = pending.transport.take() {
+                for transport in [pending.transport.take(), pending.pn_copy.take()].into_iter().flatten() {
                     if let Ok(output) = router.cancel(core, &transport) { out.merge(output.core); }
                 }
                 remove.push(id.clone());
                 continue;
+            }
+            // Прямая доставка без ACK дольше PN_FALLBACK_SECS: кладём копию на PN сети, адресат заберёт её при подключении.
+            if !pending.request.ack && pending.pn_copy.is_none() && !pn_enqueued && permission == Some(true)
+                && pending.first_try.is_some_and(|t| now.saturating_sub(t) >= PN_FALLBACK_SECS)
+                && router.outbound_propagation_node().is_some() {
+                if let Some(identity) = lxmf_sync::public_identity(&pending.request.pk) {
+                    let destination = lxmf_destination(identity.hash());
+                    core.remember_identity(DestinationHash::new(destination), identity);
+                    if let Ok(message) = router.create_message(core, destination, lxmf_sync::TITLE.to_vec(), pending.request.content.clone(), Vec::new(), DeliveryMethod::Propagated) {
+                        let copy = message.message_id;
+                        if let Ok(output) = router.enqueue(core, message) {
+                            outputs.push(output);
+                            pending.pn_copy = Some(copy);
+                            pn_enqueued = true;
+                        }
+                    }
+                }
             }
             if permission.is_none() || enqueued || pending.last_try.is_some_and(|t| now.saturating_sub(t) < 5) { continue; }
             // Повторы и бюджет незавершённой доставки принадлежат LXMF/RNS.
@@ -399,6 +549,7 @@ impl AdminProcessor {
                 }
             }
             pending.last_try = Some(now);
+            pending.first_try.get_or_insert(now);
             enqueued = true;
         }
         for id in remove { self.sync_pending.remove(&id); }
@@ -1228,6 +1379,31 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PN этой сети выбираются только из ключей с эффективным TRANSIT; USE-держатель и чужая identity не дают PN
+    #[test]
+    fn pn_candidates_are_only_trusted_transit_holders() {
+        use crate::trust;
+        let me = leviculum_std::api::generate_identity();
+        let (transit, user, stranger) = (leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity());
+        let mut tr = trust::Trust::new(me.clone(), None);
+        tr.issue(*me.hash(), transit.public_key_bytes(), trust::TRANSIT).unwrap();
+        tr.issue(*me.hash(), user.public_key_bytes(), trust::USE).unwrap();
+        let shared = PnShared::default();
+        assert!(shared.view(crate::now_ms() as u64).is_none(), "без источника Trust выбора нет");
+        shared.set_source(Arc::new(Mutex::new(tr)));
+        let view = shared.view(crate::now_ms() as u64).unwrap();
+        let pn = |i: &Identity| DestinationHash::new(pn_destination(&i.public_key_bytes()).unwrap());
+        assert_eq!(view.nodes, BTreeSet::from([pn(&transit)]));
+        assert!(!view.nodes.contains(&pn(&user)) && !view.nodes.contains(&pn(&stranger)));
+        // ключи сети для проверки подписи с PN: держатели и якоря, но не чужие
+        assert!(view.keys.contains(&user.public_key_bytes()) && !view.keys.contains(&stranger.public_key_bytes()));
+        // Trust занят: прежний выбор остаётся
+        let busy = Arc::new(Mutex::new(trust::Trust::new(me.clone(), None)));
+        shared.set_source(busy.clone());
+        let _held = busy.lock().unwrap();
+        assert!(shared.view(crate::now_ms() as u64).is_none());
+    }
     use leviculum_std::api::generate_identity;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -39,20 +39,16 @@ pub struct VpnCli {
 
 #[derive(Subcommand, Clone)]
 pub enum VpnCmd {
-    /// сервер группы (выход, сосед, реестр клиентов)
+    /// узел сети (выход, сосед, транзит; права по подписанным записям)
     Node(NodeArgs),
-    /// ретранслятор RNS без группы (лабораторная «публичная сеть»)
+    /// ретранслятор RNS (лабораторная «публичная сеть»)
     Hub(HubArgs),
     /// клиент VPN (читает профиль из файла)
     Client(ClientArgs),
-    /// выдать профиль клиента (локальная админ-команда сервера, работающего с этим каталогом состояния)
-    Issue(IssueArgs),
-    /// отозвать клиента
+    /// отозвать держателя (запись с пустыми правами)
     Revoke(RevokeArgs),
-    /// показать реестр клиентов и таблицу соседей
+    /// показать права, приглашения и таблицу соседей
     List(StateArg),
-    /// создать серверный секрет группы (>= 128 бит) и записать в файл
-    Keygen(KeygenArgs),
     /// выпустить приглашение `kh-…` для новой ноды (локальная команда админа)
     Invite(InviteArgs),
     /// выдать или изменить права ноды (запись подписывается identity из --state)
@@ -111,25 +107,13 @@ pub struct StateArg {
     pub state: PathBuf,
 }
 
-#[derive(Args, Clone)]
-pub struct KeygenArgs {
-    #[arg(long)]
-    pub out: PathBuf,
-}
-
 #[derive(Args, Clone, Default)]
 pub struct NodeArgs {
-    /// JSON-файл настроек узла (поля как в флагах ниже, кроме --state); при его наличии флаги name/group/secret-file/advertise/seed игнорируются
+    /// JSON-файл настроек узла (поля как в флагах ниже, кроме --state); при его наличии флаги name/advertise/seed игнорируются
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long, default_value = "-")]
     pub state: PathBuf,
-    /// имя группы (тег группы выводится из него; не секрет)
-    #[arg(long, default_value = "")]
-    pub group: String,
-    /// файл серверного секрета группы (knothopd keygen)
-    #[arg(long, default_value = "-")]
-    pub secret_file: PathBuf,
     /// имя узла для таблиц и интерфейса; по умолчанию - имя хоста (так один и тот же конфиг годится для всех узлов)
     #[arg(long, default_value = "")]
     pub name: String,
@@ -177,13 +161,11 @@ pub struct NodeArgs {
     pub invite_file: Option<PathBuf>,
 }
 
-/// Файл настроек узла: имя, группа и файл секрета обязательны, остальное по умолчанию.
+/// Файл настроек узла: всё по умолчанию.
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct NodeConf {
     name: String,
-    group: String,
-    secret_file: PathBuf,
     port: Option<u16>,
     advertise: Vec<String>,
     advertise_private: bool,
@@ -514,25 +496,10 @@ pub struct ClientArgs {
 }
 
 #[derive(Args, Clone)]
-pub struct IssueArgs {
-    #[arg(long)]
-    pub state: PathBuf,
-    /// метка клиента (для списка; не секрет)
-    #[arg(long)]
-    pub client_name: String,
-    /// сколько серверов положить в профиль (закреплённые); остальных клиент узнает от них сам
-    #[arg(long, default_value_t = 3)]
-    pub servers: usize,
-    /// не больше стольких адресов на сервер (профиль короче)
-    #[arg(long)]
-    pub max_addrs: Option<usize>,
-}
-
-#[derive(Args, Clone)]
 pub struct RevokeArgs {
     #[arg(long)]
     pub state: PathBuf,
-    /// идентификатор клиента (из `list`)
+    /// префикс хеша держателя (из `list`)
     #[arg(long)]
     pub id: String,
 }
@@ -595,12 +562,6 @@ pub struct BenchArgs {
 
 // ------------------------------------------------------------------------------------------------ вспомогательное
 
-const T_SRV1: u8 = 1;
-const T_SRV2: u8 = 2;
-const T_SRV3: u8 = 3;
-const T_SRV4: u8 = 4;
-const T_TABLE: u8 = 7;
-const T_REGISTRY: u8 = 8;
 const T_AUTH_OK: u8 = 9;
 const T_AUTH_FAIL: u8 = 10;
 // модель прав (решение 0013): записи о правах, зачисление по приглашению
@@ -609,7 +570,7 @@ const T_PAIR_NO: u8 = 13;  // админ -> нода: отказ в зачисл
 const T_USE: u8 = 14;      // клиент -> сервер: «я пришёл за выходом» (иначе Link - сосед-транзит)
 const T_PAIRQ: u8 = 15;    // новичок -> нода-посредник -> (соседи) -> админ: root(16) | inviter(16) | holder pub(64) | mac32(pin)
 const T_NBRS: u8 = 16;     // выход -> клиент: соседи с живым Link {"n":[{"d","r"}]} (0014 R3); список выходов не меняет
-const T_DIR: u8 = 17;      // посредник -> новичок: каталог нод {"n":[{"d","k","e","a","n"}]} (0014 R6); только подсказки адресов
+// 17 свободен: каталог нод (бывший T_DIR) идёт по LXMF, см. lxmf_sync::send_dir
 /// Advisory observations are bounded by both count and negotiated Channel MDU.
 const NBRS_MAX: usize = crate::observations::MAX_NEIGHBORS;
 const T_OBSERVE: u8 = 21; // admitted client -> exit: UI visible (one byte 0/1), request fresh T_NBRS
@@ -623,12 +584,11 @@ const CINFO_TTL: Duration = Duration::from_secs(60);
 const T_PROBEQ: u8 = 23;
 const T_PROBER: u8 = 24;
 const CINFO_MAX: usize = 64;
-/// T_DIR: не более DIR_MAX записей каталога, кусками не длиннее DIR_CHUNK Б
-const DIR_MAX: usize = 16;
+/// Каталог нод: не более DIR_MAX записей в одном LXMF-сообщении
+const DIR_MAX: usize = lxmf_sync::DIR_LIMIT;
 /// книга адресов нод с правами (addr-book.json): не больше стольких записей
 const BOOK_MAX: usize = 32;
 static BOOK_LAST: Mutex<String> = Mutex::new(String::new());
-const DIR_CHUNK: usize = 700;
 /// 0015: подписанная политика ноды (`trust::Policy`, 163 Б). Принимается только на допущенном Link (сосед или клиент); верна по подписи самой ноды,
 /// поэтому путь доставки не важен. Ничего не расширяет: действующие права = выдача ∩ политика.
 /// R10: бенч. T_BENCH по Channel: запрос {"id","n","sz"}, ответы {"id","busy"|"rate"|"done"}. T_BENCH_DATA - датаграмма Link
@@ -669,7 +629,6 @@ const CLIENT_CTRL_LINKS: usize = 64;
 const MAX_NEIGHBORS: usize = 64;
 /// S2/S3: записи соседей без TRANSIT по записям и без живого Link. Отдельный лимит, чтобы публичные анонсы не заняли таблицу.
 const MAX_UNTRUSTED_NEIGHBORS: usize = 32;
-const MAX_REGISTRY: usize = 4096;
 /// H9: буфер `early` - всего и на один Link; новые запросы на pairq - на один Link за 60 с. Мусор одного пира не вытесняет чужое.
 const EARLY_MAX: usize = 64;
 const EARLY_PER_LINK: usize = EARLY_MAX;
@@ -691,40 +650,10 @@ fn mac32(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     m.finalize().into_bytes().into()
 }
 
-fn mac_ok(key: &[u8], parts: &[&[u8]], tag: &[u8]) -> bool {
-    let mut m = <HmacSha as Mac>::new_from_slice(key).expect("hmac key");
-    for p in parts {
-        m.update(p);
-    }
-    m.verify_slice(tag).is_ok() // постоянное время
-}
-
 fn rand16() -> [u8; 16] {
     let mut b = [0u8; 16];
     rand_core::OsRng.fill_bytes(&mut b);
     b
-}
-
-/// Тег группы: не секрет, по нему узлы группы отличают свои анонсы.
-fn group_tag(group: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(b"knothop-group-v1\0");
-    h.update(group.as_bytes());
-    hex(&h.finalize()[..8])
-}
-
-/// Ключ серверной аутентификации: выводится из серверного секрета и имени группы; клиентам не передаётся.
-fn server_auth_key(secret: &[u8], group: &str) -> [u8; 32] {
-    mac32(secret, &[b"knothop-server-auth-v1\0", group.as_bytes()])
-}
-
-fn read_secret(path: &Path) -> Result<Vec<u8>> {
-    let raw = std::fs::read_to_string(path).with_context(|| format!("read secret {}", path.display()))?;
-    let secret = b64d(raw.trim())?;
-    if secret.len() < 16 {
-        bail!("серверный секрет слишком короткий (нужно >= 128 бит, knothopd keygen)");
-    }
-    Ok(secret)
 }
 
 /// Подсеть адресов клиентов (одна на всю группу: клиент сохраняет адрес при смене выхода). Задаётся в конфиге узла (`client_net`),
@@ -1563,84 +1492,6 @@ mod tests {
     }
 }
 
-
-// ------------------------------------------------------------------------------------------------ реестр клиентов
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct ClientRec {
-    /// хеш identity клиента (16 Б, hex) - ключ записи
-    id: String,
-    /// публичный ключ (64 Б, hex)
-    pk: String,
-    name: String,
-    /// кто выдал (хеш назначения сервера)
-    issuer: String,
-    /// active | revoked (revoked необратим: иначе отставший сервер вернул бы запись)
-    status: String,
-    ts: u64,
-}
-
-#[derive(Default)]
-struct Registry {
-    recs: HashMap<String, ClientRec>,
-}
-
-impl Registry {
-    fn load(path: &Path) -> Self {
-        let mut r = Registry::default();
-        if let Ok(b) = std::fs::read(path) {
-            if let Ok(v) = serde_json::from_slice::<Vec<ClientRec>>(&b) {
-                for x in v {
-                    r.recs.insert(x.id.clone(), x);
-                }
-            }
-        }
-        r
-    }
-
-    fn save(&self, path: &Path) {
-        let v: Vec<&ClientRec> = self.recs.values().collect();
-        // реестр содержит имена клиентов: 0600, как и остальное состояние узла
-        let tmp = path.with_extension("tmp");
-        if secure_write(&tmp, &serde_json::to_vec(&v).unwrap()).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
-    }
-
-    /// Слияние как у 2P-set: новая запись добавляется, active -> revoked переходит, обратного пути нет. Возвращает, изменилось ли что-то.
-    fn merge(&mut self, incoming: &[ClientRec]) -> bool {
-        let mut changed = false;
-        for r in incoming {
-            if r.id.len() != 32 || r.pk.len() != 128 || r.name.len() > 64 {
-                continue;
-            }
-            match self.recs.get_mut(&r.id) {
-                None => {
-                    if self.recs.len() >= MAX_REGISTRY {
-                        continue;
-                    }
-                    self.recs.insert(r.id.clone(), r.clone());
-                    changed = true;
-                }
-                Some(have) => {
-                    if have.status == "active" && r.status == "revoked" {
-                        have.status = "revoked".into();
-                        changed = true;
-                    }
-                }
-            }
-        }
-        changed
-    }
-
-    fn active(&self, id: &str) -> Option<&ClientRec> {
-        self.recs.get(id).filter(|r| r.status == "active")
-    }
-
-    fn all(&self) -> Vec<ClientRec> {
-        self.recs.values().cloned().collect()
-    }
-}
 
 // ------------------------------------------------------------------------------------------------ общий запуск
 
@@ -3990,10 +3841,6 @@ async fn client_bench(ctx: Arc<ClientCtx>) {
 enum Role {
     /// только что пришёл, ещё не доказал себя
     Unknown,
-    /// мы инициатор серверного рукопожатия
-    SrvInit { dest: [u8; 16], nonce_i: [u8; 16], pub_i: [u8; 64], mac_sent: bool },
-    /// мы отвечаем в серверном рукопожатии
-    SrvResp { nonce_i: [u8; 16], nonce_r: [u8; 16], pub_i: [u8; 64] },
     /// взаимно проверенный сервер
     Server { dest: [u8; 16] },
     /// клиент из реестра
@@ -4152,9 +3999,7 @@ struct NodeCtx {
     ep: Endpoint,
     state: PathBuf,
     name: String,
-    group: String,
     tag: String,
-    akey: [u8; 32],
     /// полная RNS identity узла (для identify_link в модели 0012)
     identity: Identity,
     my_pk: [u8; 64],
@@ -4174,12 +4019,7 @@ struct NodeCtx {
     /// клиенты-узлы соседей по T_CINFO: dest -> (имя, тип, когда); не больше CINFO_MAX, живут CINFO_TTL
     peer_clients: Mutex<HashMap<[u8; 16], (String, &'static str, Instant)>>,
     links: Mutex<HashMap<LinkId, LinkInfo>>,
-    /// Legacy registry admission serialization. Model 0013 instead holds Trust -> links across
-    /// role/TUN publication; close shares links, so neither model can resurrect a removed Link.
-    tun_admission: Mutex<()>,
-    pending_nr: Mutex<HashMap<LinkId, [u8; 16]>>,
     neigh: Mutex<HashMap<[u8; 16], Neighbor>>,
-    reg: Mutex<Registry>,
     tun: Option<Arc<TunState>>,
     started: Instant,
     /// когда (мс unix) выдать внеочередной анонс; 0 - не нужно. Внеочередной анонс не чаще раза в минуту.
@@ -4323,71 +4163,28 @@ impl NodeCtx {
     }
 
     fn announce_data(&self) -> Vec<u8> {
-        if self.t13.is_some() {
-            // ADR 0016: как у обычного узла RNS - только теги корней ("r": по пересечению с моими якорями сосед узнаёт знакомую сеть).
-            // Адресов, имени и endpoint id нет: они приходят по допущенному Link (T_DIR) и из приглашения.
-            serde_json::to_vec(&serde_json::json!({"r": self.t13_tags()})).unwrap()
-        } else {
-            serde_json::to_vec(&serde_json::json!({"v": 1, "t": self.tag, "n": self.name, "e": self.ep_id, "a": self.adv()})).unwrap()
-        }
+        // ADR 0016: как у обычного узла RNS - только теги корней ("r": по пересечению с моими якорями сосед узнаёт знакомую сеть).
+        // Адресов, имени и endpoint id нет: они приходят приватным каталогом по LXMF и из приглашения.
+        serde_json::to_vec(&serde_json::json!({"r": self.t13_tags()})).unwrap()
     }
 
     fn self_json(&self) -> serde_json::Value {
-        serde_json::json!({"n": self.name, "d": hex(&self.my_dest), "k": hex(&self.my_key), "e": self.ep_id, "a": self.adv(), "g": self.group, "t": self.tag, "cn": net_str()})
+        serde_json::json!({"n": self.name, "d": hex(&self.my_dest), "k": hex(&self.my_key), "e": self.ep_id, "a": self.adv(), "t": self.tag, "cn": net_str()})
     }
 
-    /// Таблица для клиента и для файла neighbors.json: только живые серверы + мы сами.
-    fn table(&self, for_client: bool) -> serde_json::Value {
+    /// Диагностика для файла neighbors.json: мы сами и соседи (живые и просто виденные).
+    fn table(&self) -> serde_json::Value {
         let now = Instant::now();
         let mut ex = vec![serde_json::json!({"n": self.name, "d": hex(&self.my_dest), "k": hex(&self.my_key), "e": self.ep_id, "a": self.adv(),
             "h": 0, "r": 0.0, "s": "up", "self": true})];
         let n = self.neigh.lock().unwrap();
         for nb in n.values() {
             let up = nb.link.is_some() && now.duration_since(nb.last_heard) < self.dead;
-            if for_client && !up {
-                continue;
-            }
             let hops = self.node.hops_to(&DestinationHash::new(nb.dest));
-            if for_client {
-                ex.push(serde_json::json!({"n": nb.name, "d": hex(&nb.dest), "k": hex(&nb.key), "e": nb.ep, "a": nb.addrs.get(), "h": hops, "r": nb.rtt_ms, "c": *nb.ctl.mode.lock().unwrap(), "s": "up"}));
-            } else {
-                ex.push(serde_json::json!({"n": nb.name, "d": hex(&nb.dest), "k": hex(&nb.key), "e": nb.ep, "a": nb.addrs.get(), "h": hops, "r": nb.rtt_ms,
-                    "c": *nb.ctl.mode.lock().unwrap(), "sw": nb.ctl.switches.load(Relaxed), "s": if up { "up" } else { "seen" }, "age_s": now.duration_since(nb.last_announce).as_secs(), "heard_s": now.duration_since(nb.last_heard).as_secs()}));
-            }
+            ex.push(serde_json::json!({"n": nb.name, "d": hex(&nb.dest), "k": hex(&nb.key), "e": nb.ep, "a": nb.addrs.get(), "h": hops, "r": nb.rtt_ms,
+                "c": *nb.ctl.mode.lock().unwrap(), "sw": nb.ctl.switches.load(Relaxed), "s": if up { "up" } else { "seen" }, "age_s": now.duration_since(nb.last_announce).as_secs(), "heard_s": now.duration_since(nb.last_heard).as_secs()}));
         }
         serde_json::json!({"exits": ex, "ts": now_ms() as u64})
-    }
-
-    /// Таблица для клиента кусками (одна запись на ~330 Б; вся таблица на 6 узлов ~2 КБ и не помещается в одно сообщение Link, W30).
-    /// Каждый кусок: {"exits":[...], "i":номер, "n":всего}. Клиент применяет «забыть отсутствующих» только после последнего куска.
-    fn table_chunks(&self) -> Vec<Vec<u8>> {
-        let t = self.table(true);
-        let ex = t["exits"].as_array().cloned().unwrap_or_default();
-        let mut groups: Vec<Vec<serde_json::Value>> = Vec::new();
-        let mut cur: Vec<serde_json::Value> = Vec::new();
-        for e in ex {
-            cur.push(e);
-            if cur.len() > 1 && serde_json::to_vec(&serde_json::json!({"exits": cur, "i": 99, "n": 99})).map(|v| v.len()).unwrap_or(0) > 700 {
-                let last = cur.pop().unwrap();
-                groups.push(std::mem::take(&mut cur));
-                cur.push(last);
-            }
-        }
-        if !cur.is_empty() {
-            groups.push(cur);
-        }
-        let n = groups.len();
-        groups.into_iter().enumerate().map(|(i, g)| serde_json::to_vec(&serde_json::json!({"exits": g, "i": i, "n": n})).unwrap()).collect()
-    }
-
-    fn send_table(self: &Arc<Self>, link: LinkId) {
-        let chunks = self.table_chunks();
-        let node = self.node.clone();
-        tokio::spawn(async move {
-            for c in chunks {
-                send_ctl(&node, link, T_TABLE, &c).await;
-            }
-        });
     }
 
     /// Соседи с живым Link (роль Server) для клиента, 0013 (0014 R3): {"n":[{"d","r"}]}, по порядку dest, не более `NBRS_MAX` записей.
@@ -4491,52 +4288,6 @@ impl NodeCtx {
         });
     }
 
-    /// Реестр кусками: каждый кусок - отдельное сообщение Link (JSON-массив записей) не длиннее `CHUNK_BYTES`.
-    /// Одним сообщением реестр перестаёт помещаться в MDU Link уже при ~5 клиентах (W27): синхронизация молча ломалась.
-    fn registry_chunks(&self) -> Vec<Vec<u8>> {
-        const CHUNK_BYTES: usize = 900;
-        let mut all = self.reg.lock().unwrap().all();
-        all.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut cur: Vec<ClientRec> = Vec::new();
-        for r in all {
-            cur.push(r);
-            if serde_json::to_vec(&cur).map(|v| v.len()).unwrap_or(0) > CHUNK_BYTES && cur.len() > 1 {
-                let last = cur.pop().unwrap();
-                out.push(serde_json::to_vec(&cur).unwrap());
-                cur = vec![last];
-            }
-        }
-        if !cur.is_empty() {
-            out.push(serde_json::to_vec(&cur).unwrap());
-        }
-        out
-    }
-
-    /// Отправить реестр по Link всем кусками по порядку (одна задача, чтобы порядок не терялся).
-    fn send_registry(self: &Arc<Self>, link: LinkId, delay_ms: u64) {
-        if self.t13.is_some() {
-            return; // в модели 0013 реестра клиентов нет: права ходят записями T_REC
-        }
-        let chunks = self.registry_chunks();
-        let node = self.node.clone();
-        tokio::spawn(async move {
-            if delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-            for c in chunks {
-                send_ctl(&node, link, T_REGISTRY, &c).await;
-            }
-        });
-    }
-
-    fn broadcast_registry(self: &Arc<Self>) {
-        let links: Vec<LinkId> = self.links.lock().unwrap().iter().filter(|(_, l)| matches!(l.role, Role::Server { .. })).map(|(k, _)| *k).collect();
-        for l in links {
-            self.send_registry(l, 0);
-        }
-    }
-
     fn close_link(self: &Arc<Self>, link: LinkId, why: &str) {
         self.sh.note(format!("close link {} ({why})", &hex(link.as_bytes())[..8]));
         self.drop_link_state(&link);
@@ -4602,12 +4353,6 @@ impl NodeCtx {
             t.dir_sent.lock().unwrap().remove(link);
         }
         if let Some(l) = removed {
-            // неудавшееся серверное рукопожатие: следующий анонс соседа запустит новую попытку
-            if let Role::SrvInit { dest, .. } = l.role {
-                if let Some(nb) = self.neigh.lock().unwrap().get_mut(&dest) {
-                    nb.connecting = false;
-                }
-            }
             if let Role::Server { dest } = l.role {
                 if let Some(nb) = self.neigh.lock().unwrap().get_mut(&dest) {
                     if nb.link == Some(*link) {
@@ -4620,15 +4365,11 @@ impl NodeCtx {
     }
 }
 
-fn mac_srv(akey: &[u8; 32], label: &[u8], id_i: &[u8; 16], id_r: &[u8; 16], ni: &[u8; 16], nr: &[u8; 16], link: &LinkId) -> [u8; 32] {
-    mac32(akey, &[label, id_i, id_r, ni, nr, link.as_bytes()])
-}
-
 fn id_of_pub(pk: &[u8; 64]) -> Option<[u8; 16]> {
     Identity::from_public_key_bytes(pk).ok().map(|i| *i.hash())
 }
 
-/// Запуск узла: модель допуска определяется --secret-file (legacy) или его отсутствием (0013).
+/// Запуск узла (модель допуска 0013: права и якоря доверия).
 pub async fn run_node(a: NodeArgs) -> Result<()> {
     node_main(a).await
 }
@@ -4638,8 +4379,6 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     if let Some(cf) = a.config.clone() {
         let c: NodeConf = serde_json::from_slice(&std::fs::read(&cf).with_context(|| format!("config {}", cf.display()))?).context("разбор конфига узла")?;
         a.name = c.name;
-        a.group = c.group;
-        a.secret_file = c.secret_file;
         a.port = c.port.unwrap_or(a.port);
         a.advertise = c.advertise.join(",");
         a.advertise_private = c.advertise_private;
@@ -4665,13 +4404,8 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         let suffix = std::env::var("KNOTHOP_NAME_SUFFIX").ok().filter(|v| !v.is_empty()).unwrap_or_else(hostname);
         a.name = format!("knothop-{region}-{suffix}").chars().take(48).collect();
     }
-    // Модель допуска: 0013 (права и якоря доверия; без --secret-file) или legacy (общий серверный секрет). Смешивать нельзя.
-    let legacy = a.secret_file.as_os_str() != "-" && a.secret_file.as_os_str().to_str() != Some("");
     if a.state == Path::new("-") {
         bail!("нужен --state (флагом или в --config)");
-    }
-    if legacy && a.group.is_empty() {
-        bail!("для --secret-file (legacy) нужна group");
     }
     let invite_raw = match &a.invite_file {
         // отсутствующий файл приглашения - не ошибка: нода уже зачислена и pin погашен (0013: приглашение после зачисления не используется)
@@ -4682,21 +4416,14 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         },
         None => a.invite.clone(),
     };
-    if legacy && !invite_raw.trim().is_empty() {
-        bail!("нельзя смешивать --invite и --secret-file: у ноды одна модель допуска");
-    }
-    let secret = if legacy { read_secret(&a.secret_file)? } else { Vec::new() };
-    if !legacy {
-        // тег назначения един для всей модели: нода находит соседей по тегам корней в анонсе, а не по имени группы
-        a.group = String::new();
-    }
     let identity = load_or_create_identity(&a.state)?;
     let key = iroh_key_from_identity(&identity)?;
     let exit_args = ["--tun-mtu", "1327", "--tun-ip", "10.99.0.1/24", "--tun-txqlen", "10240", "--tun-qdisc", "fq_codel", "--tun-name", a.tun_name.as_str()];
-    let b = start_base("n", &a.state, true, Some(a.port), key, (!legacy).then(|| identity.clone()), a.quic_cc_mbit, if a.no_exit { &[] } else { &exit_args[..] }, None).await?;
+    let b = start_base("n", &a.state, true, Some(a.port), key, Some(identity.clone()), a.quic_cc_mbit, if a.no_exit { &[] } else { &exit_args[..] }, None).await?;
     let (node, sh, ep, cli, events, admin_lxmf) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events, b.admin_lxmf);
 
-    let tag = if legacy { group_tag(&a.group) } else { T13_TAG.to_string() };
+    // тег назначения един для всей сети: нода находит соседей по тегам корней в анонсе
+    let tag = T13_TAG.to_string();
     let my_pk = identity.public_key_bytes();
     let my_key = identity.ed25519_verifying().to_bytes();
     let my_id = *identity.hash();
@@ -4706,9 +4433,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     node.register_destination(dest);
 
     // модель 0013: права, якоря доверия и (до зачисления) приглашение
-    let t13 = if legacy {
-        None
-    } else {
+    let t13 = {
         let tr = trust::Trust::load(node_identity.clone(), &a.state).context("trust.json")?;
         let mut inv = None;
         if !invite_raw.trim().is_empty() {
@@ -4769,10 +4494,10 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     // узел стационарный: что не работает на его путях, помним и после перезапуска (клиент хранит только в памяти)
     sh.health.init(a.state.join("carrier_health.json"));
     let ctx = Arc::new(NodeCtx {
-        node: node.clone(), sh: sh.clone(), ep: ep.clone(), state: a.state.clone(), name: a.name.clone(), group: a.group.clone(), tag: tag.clone(),
-        identity: node_identity, akey: server_auth_key(&secret, &a.group), my_pk, my_id, my_dest, my_key, ep_id: ep.id().to_string(), advertise: Mutex::new(advertise), adv_auto,
+        node: node.clone(), sh: sh.clone(), ep: ep.clone(), state: a.state.clone(), name: a.name.clone(), tag: tag.clone(),
+        identity: node_identity, my_pk, my_id, my_dest, my_key, ep_id: ep.id().to_string(), advertise: Mutex::new(advertise), adv_auto,
         announce_s: a.announce_s, dead: Duration::from_secs(a.dead_s), path_gate: path::PathGate::default(), client_info: Mutex::new(HashMap::new()), peer_clients: Mutex::new(HashMap::new()),
-        links: Mutex::new(HashMap::new()), tun_admission: Mutex::new(()), pending_nr: Mutex::new(HashMap::new()), neigh: Mutex::new(HashMap::new()), reg: Mutex::new(Registry::load(&a.state.join("clients.json"))),
+        links: Mutex::new(HashMap::new()), neigh: Mutex::new(HashMap::new()),
         tun, started: Instant::now(), announce_at: Default::default(), last_trigger: Mutex::new(Instant::now() - Duration::from_secs(3600)),
         ours_online: Default::default(), listen_port: a.port, public_ids: Mutex::new(HashSet::new()),
         t13,
@@ -4780,6 +4505,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     });
     let _sync_guard = admin_lxmf.as_ref().map(|r| lxmf_sync::register(&a.state, r.sync.clone()));
     if let Some(runtime) = admin_lxmf {
+        if let Some(t) = &ctx.t13 { runtime.pn.set_source(t.trust.clone()); }
         lxmf_admin::spawn_node_worker(runtime, ctx.clone());
     }
     if let Some(t) = &ctx.t13 {
@@ -4800,7 +4526,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     }
     ctx.book_load();
     write_atomic(&a.state.join("server.json"), ctx.self_json().to_string().as_bytes());
-    sh.note(format!("node {} group {} tag {} dest {} iroh {}", ctx.name, ctx.group, tag, hex(&my_dest), ctx.ep_id));
+    sh.note(format!("node {} tag {} dest {} iroh {}", ctx.name, tag, hex(&my_dest), ctx.ep_id));
 
     tokio::spawn(accept_loop(ep.clone(), node.clone(), sh.clone()));
     tokio::spawn(tcpc::listen(node.clone(), sh.clone(), a.port));
@@ -4941,7 +4667,7 @@ fn on_announce(ctx: &Arc<NodeCtx>, ann: &leviculum_std::ReceivedAnnounce) {
     let pk = *ann.public_key();
     let mut key = [0u8; 32];
     key.copy_from_slice(&pk[32..64]);
-    // 0013 (ADR 0016): имени и endpoint id в анонсе нет; EndpointId QUIC = ключ подписи identity, имя придёт по T_DIR
+    // 0013 (ADR 0016): имени и endpoint id в анонсе нет; EndpointId QUIC = ключ подписи identity, имя придёт приватным каталогом по LXMF
     let name: Option<String> = v["n"].as_str().and_then(|n| norm_peer_name(n, ""));
     let ep = match v["e"].as_str() {
         Some(e) => e.to_string(),
@@ -5087,28 +4813,17 @@ async fn connect_neighbor(ctx: Arc<NodeCtx>, dest: [u8; 16]) {
     .await;
     match res {
         Ok(id) => {
-            if ctx.t13.is_some() {
-                // 0013: роль не зависит от инициативы. Сначала identify (ответчик узнаёт нас), затем обе стороны обмениваются цепочками прав
-                ctx.links.lock().unwrap().insert(id, LinkInfo { role: Role::Unknown, since: Instant::now(), last_heard: Instant::now(), peer_pk: Some(pk), want_use: false, enroll_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 });
-                let c = ctx.clone();
-                tokio::spawn(async move {
-                    let my_id = c.identity.clone();
-                    if c.node.identify_link(&id, &my_id).await.is_err() {
-                        c.close_link(id, "identify не завершён");
-                        return;
-                    }
-                    on_peer_ready(&c, id, pk);
-                });
-            } else {
-                let nonce_i = rand16();
-                ctx.links.lock().unwrap().insert(id, LinkInfo { role: Role::SrvInit { dest, nonce_i, pub_i: ctx.my_pk, mac_sent: false }, since: Instant::now(), last_heard: Instant::now(), peer_pk: None, want_use: false, enroll_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 });
-                let mut body = Vec::new();
-                body.extend_from_slice(&nonce_i);
-                body.extend_from_slice(&ctx.my_pk);
-                send_ctl(&ctx.node, id, T_SRV1, &body).await;
-                // _pk закреплён анонсом: сверяется в SRV2
-                let _ = pk;
-            }
+            // 0013: роль не зависит от инициативы. Сначала identify (ответчик узнаёт нас), затем обе стороны обмениваются цепочками прав
+            ctx.links.lock().unwrap().insert(id, LinkInfo { role: Role::Unknown, since: Instant::now(), last_heard: Instant::now(), peer_pk: Some(pk), want_use: false, enroll_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 });
+            let c = ctx.clone();
+            tokio::spawn(async move {
+                let my_id = c.identity.clone();
+                if c.node.identify_link(&id, &my_id).await.is_err() {
+                    c.close_link(id, "identify не завершён");
+                    return;
+                }
+                on_peer_ready(&c, id, pk);
+            });
         }
         Err(e) => {
             ctx.sh.note(format!("neighbor {label}: {e:#}"));
@@ -5139,102 +4854,17 @@ fn admission_outcome(result: Result<Admission, AdmissionError>) -> AdmitOutcome 
     }
 }
 
-/// Legacy admission only. The live Client role stays locked through allow/permission publication;
-/// model 0013 uses promote_client_link with current ordinary Trust authority as well.
-fn admit_into_tun(ctx: &Arc<NodeCtx>, tun: &Arc<TunState>, link: LinkId, ip: u32, publish_host_access: &dyn Fn() -> bool) -> bool {
-    let handle = Arc::new(ctx.node.engine().link_handle(&link));
-    let outcome = {
-        let live = ctx.links.lock().unwrap();
-        if !live.get(&link).is_some_and(|i| matches!(i.role, Role::Client { ip: p, .. } if p == ip)) { return false; }
-        match admission_outcome(tun.allow_with_handle(link, ip, handle)) {
-            AdmitOutcome::SendAuthOk if publish_host_access() => AdmitOutcome::SendAuthOk,
-            AdmitOutcome::SendAuthOk => AdmitOutcome::Refuse { reason: b"admission failed", note: "допуск в TUN не завершён" },
-            refusal => refusal,
-        }
-    };
-    if let AdmitOutcome::Refuse { reason, note } = outcome {
-        spawn_ctl(&ctx.node, link, T_AUTH_FAIL, reason.to_vec());
-        ctx.close_link(link, note);
-        return false;
-    }
-    true
-}
-
 fn on_identified(ctx: &Arc<NodeCtx>, link: LinkId, idh: [u8; 16]) {
     let ok = matches!(ctx.links.lock().unwrap().get(&link).map(|l| &l.role), Some(Role::Unknown));
     if !ok {
         return;
     }
-    // модель 0013: допуск решают записи о правах (on_peer_ready -> evaluate); реестра клиентов нет
-    if ctx.t13.is_some() {
-        if let Some(i) = ctx.node.get_remote_identity(&link) {
-            if *i.hash() == idh {
-                on_peer_ready(ctx, link, i.public_key_bytes());
-            }
+    // допуск решают записи о правах (on_peer_ready -> evaluate)
+    if let Some(i) = ctx.node.get_remote_identity(&link) {
+        if *i.hash() == idh {
+            on_peer_ready(ctx, link, i.public_key_bytes());
         }
-        return;
     }
-    let _tun_admission = ctx.tun_admission.lock().unwrap();
-    let idhex = hex(&idh);
-    let rec = ctx.reg.lock().unwrap().active(&idhex).cloned();
-    let Some(rec) = rec else {
-        spawn_ctl(&ctx.node, link, T_AUTH_FAIL, b"unknown or revoked identity".to_vec());
-        let c = ctx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            c.close_link(link, "клиент не в реестре или отозван");
-        });
-        return;
-    };
-    // identify подтверждает владение ключом; сверяем ещё и с записью реестра
-    let pk_ok = ctx.node.get_remote_identity(&link).map(|i| hex(&i.public_key_bytes()) == rec.pk).unwrap_or(false);
-    if !pk_ok {
-        ctx.close_link(link, "ключ не совпал с реестром");
-        return;
-    }
-    if ctx.link_is_public(&link) {
-        ctx.close_link(link, "клиент через публичную сеть RNS");
-        return;
-    }
-    let ip = client_ip(&idh);
-    // один адрес - один активный клиент: чужой Link с тем же адресом не вытесняется
-    let (clash, full) = {
-        let links=ctx.links.lock().unwrap();
-        (links.iter().any(|(k, l)| *k != link && matches!(l.role, Role::Client { ip: p, id, .. } if p == ip && id != idh)),
-         links.values().filter(|l|matches!(l.role,Role::Client{..})).count()>=256)
-    };
-    if full {
-        spawn_ctl(&ctx.node, link, T_AUTH_FAIL, b"exit client capacity".to_vec());
-        ctx.close_link(link, "exit client capacity");
-        return;
-    }
-    if clash {
-        spawn_ctl(&ctx.node, link, T_AUTH_FAIL, b"address clash".to_vec());
-        ctx.close_link(link, "конфликт адреса клиента");
-        return;
-    }
-    // та же identity с нового Link (смена маршрута): старый Link закрываем
-    let old: Vec<LinkId> = ctx.links.lock().unwrap().iter().filter(|(k, l)| **k != link && matches!(l.role, Role::Client { id, .. } if id == idh)).map(|(k, _)| *k).collect();
-    for o in old {
-        ctx.close_link(o, "новый Link той же identity");
-    }
-    if let Some(l) = ctx.links.lock().unwrap().get_mut(&link) {
-        l.role = Role::Client { id: idh, ip };
-    }
-    if let Some(t) = &ctx.tun {
-        // авторитетен результат allow(), а не проверки выше: при отказе - AUTH_FAIL, очистка и никакого AUTH_OK.
-        // Легаси-модель не выдаёт HOST_ACCESS.
-        if !admit_into_tun(ctx, t, link, ip, &|| t.set_host_access(&link, false)) { return; }
-    }
-    ctx.sh.note(format!("client {} ({}) admitted on {}", rec.name, &idhex[..8], &hex(link.as_bytes())[..8]));
-    ctx.node.engine().set_link_keepalive(&link, Some(CLIENT_KEEPALIVE_S));
-    let ok = serde_json::json!({"name": ctx.name, "ip": ip_str(ip), "cc": REGION.get().cloned().unwrap_or_default(), "pl": platform()});
-    let c2 = ctx.clone();
-    let body = ok.to_string().into_bytes();
-    tokio::spawn(async move {
-        send_ctl(&c2.node, link, T_AUTH_OK, &body).await;
-        c2.send_table(link);   // таблица сразу после допуска, кусками
-    });
 }
 
 fn on_rgp(ctx: &Arc<NodeCtx>, link: LinkId, d: &[u8]) {
@@ -5302,7 +4932,7 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
         l.last_heard = Instant::now();
     }
     // Стандартный CBC-Link несёт только зачисление (записи прав, каталог, отказ, просьба через посредника); админ, политика, допуск и данные ему недоступны
-    if ctx.link_is_cbc(&link) && !matches!(ty, T_DIR | T_PAIR_NO | T_PAIRQ) {
+    if ctx.link_is_cbc(&link) && !matches!(ty, T_PAIR_NO | T_PAIRQ) {
         return;
     }
     match ty {
@@ -5317,124 +4947,6 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
             }
             ctx.send_nbrs(link);
         }
-        T_SRV1 if body.len() == 16 + 64 => {
-            // в модели 0013 T_SRV (общий секрет) не используется: молча игнорировать нечестно - вежливо закрываем
-            if ctx.t13.is_some() {
-                ctx.close_link(link, "узел на старой модели допуска (общий секрет); нужны права/0013");
-                return;
-            }
-            // мы отвечаем: нонс шлём сразу, MAC - только после доказательства контрагента
-            let mut l = ctx.links.lock().unwrap();
-            let Some(info) = l.get_mut(&link) else { return };
-            if !matches!(info.role, Role::Unknown) {
-                return;
-            }
-            let (mut ni, mut pi) = ([0u8; 16], [0u8; 64]);
-            ni.copy_from_slice(&body[..16]);
-            pi.copy_from_slice(&body[16..]);
-            let nr = rand16();
-            info.role = Role::SrvResp { nonce_i: ni, nonce_r: nr, pub_i: pi };
-            drop(l);
-            let mut out = Vec::new();
-            out.extend_from_slice(&nr);
-            out.extend_from_slice(&ctx.my_pk);
-            spawn_ctl(&ctx.node, link, T_SRV2, out);
-        }
-        T_SRV2 if body.len() == 16 + 64 => {
-            let mut l = ctx.links.lock().unwrap();
-            let Some(info) = l.get_mut(&link) else { return };
-            let (d, ni, pi) = match &info.role {
-                Role::SrvInit { dest, nonce_i, pub_i, mac_sent: false } => (*dest, *nonce_i, *pub_i),
-                _ => return,
-            };
-            let mut nr = [0u8; 16];
-            nr.copy_from_slice(&body[..16]);
-            let mut pr = [0u8; 64];
-            pr.copy_from_slice(&body[16..]);
-            let (Some(id_r), Some(id_i)) = (id_of_pub(&pr), id_of_pub(&pi)) else { return };
-            // identity ответчика должна совпасть с закреплённой в анонсе
-            let announced_ok = ctx.neigh.lock().unwrap().get(&d).map(|n| n.pk == pr).unwrap_or(false);
-            if !announced_ok {
-                drop(l);
-                ctx.close_link(link, "identity ответчика не совпала с анонсом");
-                return;
-            }
-            let mac = mac_srv(&ctx.akey, b"initiator", &id_i, &id_r, &ni, &nr, &link);
-            info.role = Role::SrvInit { dest: d, nonce_i: ni, pub_i: pi, mac_sent: true };
-            ctx.pending_nr.lock().unwrap().insert(link, nr);
-            drop(l);
-            spawn_ctl(&ctx.node, link, T_SRV3, mac.to_vec());
-        }
-        T_SRV3 if body.len() == 32 => {
-            let mut l = ctx.links.lock().unwrap();
-            let Some(info) = l.get_mut(&link) else { return };
-            let Role::SrvResp { nonce_i, nonce_r, pub_i } = &info.role else { return };
-            let (ni, nr, pi) = (*nonce_i, *nonce_r, *pub_i);
-            let (Some(id_i), Some(id_r)) = (id_of_pub(&pi), id_of_pub(&ctx.my_pk)) else { return };
-            if !mac_ok(&ctx.akey, &[b"initiator", &id_i, &id_r, &ni, &nr, link.as_bytes()], body) {
-                drop(l);
-                ctx.sh.note("серверное рукопожатие: доказательство инициатора неверно, link закрыт".to_string());
-                ctx.close_link(link, "неверный серверный секрет");
-                return;
-            }
-            let mac = mac_srv(&ctx.akey, b"responder", &id_i, &id_r, &ni, &nr, &link);
-            // кто это: по identity ищем соседа из анонсов (может ещё не быть - тогда создадим с его ключом)
-            let dest = {
-                let n = ctx.neigh.lock().unwrap();
-                n.values().find(|x| x.pk == pi).map(|x| x.dest)
-            };
-            let dest = dest.unwrap_or_else(|| {
-                let mut d = [0u8; 16];
-                if let Ok(idn) = Identity::from_public_key_bytes(&pi) {
-                    if let Ok(dd) = new_dest(idn, Direction::Out, &ctx.tag) {
-                        d = *dd.hash().as_bytes();
-                    }
-                }
-                d
-            });
-            info.role = Role::Server { dest };
-            drop(l);
-            ctx.admit_neighbor(link, dest, &pi);
-            spawn_ctl(&ctx.node, link, T_SRV4, mac.to_vec());
-        }
-        T_SRV4 if body.len() == 32 => {
-            let mut l = ctx.links.lock().unwrap();
-            let Some(info) = l.get_mut(&link) else { return };
-            let (d, ni, pi) = match &info.role {
-                Role::SrvInit { dest, nonce_i, pub_i, mac_sent: true } => (*dest, *nonce_i, *pub_i),
-                _ => return,
-            };
-            let Some(nr) = ctx.pending_nr.lock().unwrap().remove(&link) else { return };
-            let pr = ctx.neigh.lock().unwrap().get(&d).map(|n| n.pk);
-            let (Some(id_i), Some(pr)) = (id_of_pub(&pi), pr) else { return };
-            let Some(id_r) = id_of_pub(&pr) else { return };
-            if !mac_ok(&ctx.akey, &[b"responder", &id_i, &id_r, &ni, &nr, link.as_bytes()], body) {
-                drop(l);
-                ctx.close_link(link, "ответчик не доказал знание серверного секрета");
-                return;
-            }
-            info.role = Role::Server { dest: d };
-            drop(l);
-            ctx.admit_neighbor(link, d, &pr);
-        }
-        T_REGISTRY => {
-            let is_srv = matches!(ctx.links.lock().unwrap().get(&link).map(|l| &l.role), Some(Role::Server { .. }));
-            if !is_srv {
-                return; // реестр принимается только от взаимно проверенного сервера
-            }
-            if ctx.t13.is_some() {
-                return; // в модели 0013 реестра нет: права ходят записями T_REC
-            }
-            if let Ok(v) = serde_json::from_slice::<Vec<ClientRec>>(body) {
-                let changed = ctx.reg.lock().unwrap().merge(&v);
-                if changed {
-                    ctx.reg.lock().unwrap().save(&ctx.state.join("clients.json"));
-                    ctx.enforce_revocations();
-                    ctx.sh.note(format!("реестр клиентов обновлён от соседа ({} записей)", ctx.reg.lock().unwrap().recs.len()));
-                }
-            }
-        }
-        T_DIR => on_dir_node(ctx, link, body),
         T_BENCH => on_bench_ctl(ctx, link, body),
         T_PAIR1 => {
             let b = body.to_vec();
@@ -5828,6 +5340,44 @@ mod ordinary_admission_tests {
         fn sizes(&self) -> (usize, usize, usize) {
             (self.host.read().unwrap().len(), self.allowed.read().unwrap().len(), self.routes.read().unwrap().len())
         }
+    }
+
+    fn link_info(role: Role, enroll_only: bool, pk: Option<[u8; 64]>) -> LinkInfo {
+        LinkInfo { role, since: Instant::now(), last_heard: Instant::now(), peer_pk: pk, want_use: false, enroll_only, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 }
+    }
+
+    // каталог по LXMF: подпись опознаёт ключ, но принять его можно только по роли Link, записи о зачислении, приглашению или эффективному TRANSIT
+    #[test]
+    fn dir_sender_and_recipient_need_role_or_transit_not_just_a_valid_key() {
+        let mut f = fixture(false);
+        let now = now_ms() as u64;
+        let use_only = leviculum_std::api::generate_identity().public_key_bytes();
+        let rec = f.issuer.issue(f.root, use_only, trust::USE).unwrap();
+        assert_eq!(f.authority.lock().unwrap().offer(rec), trust::Offer::Added);
+        let stranger = leviculum_std::api::generate_identity().public_key_bytes();
+        let tr = f.authority.lock().unwrap();
+        let (none, mut links) = (HashSet::new(), HashMap::new());
+        // TRANSIT в записях достаточно и без живого Link
+        assert!(dir_sender_ok(&links, &none, None, &tr, &f.pk, now) && dir_recipient_ok(&links, None, &tr, &f.pk, now));
+        // чужой ключ и держатель только с USE: ни отправитель, ни адресат
+        for pk in [&stranger, &use_only] {
+            assert!(!dir_sender_ok(&links, &none, None, &tr, pk, now), "ключ без роли и TRANSIT каталог не присылает");
+            assert!(!dir_recipient_ok(&links, None, &tr, pk, now));
+        }
+        // админ ожидающего приглашения
+        assert!(dir_sender_ok(&links, &none, Some(stranger), &tr, &stranger, now) && dir_recipient_ok(&links, Some(stranger), &tr, &stranger, now));
+        // Link без роли: адресат (новичок) - да, отправитель - только если мы сами просились через него
+        let l = LinkId::new([9; 16]);
+        links.insert(l, link_info(Role::Unknown, false, Some(stranger)));
+        assert!(dir_recipient_ok(&links, None, &tr, &stranger, now));
+        assert!(!dir_sender_ok(&links, &none, None, &tr, &stranger, now));
+        assert!(dir_sender_ok(&links, &HashSet::from([l]), None, &tr, &stranger, now));
+        // Link клиента не делает его ни отправителем, ни адресатом каталога
+        links.insert(l, link_info(Role::Client { id: [1; 16], ip: 1 }, false, Some(stranger)));
+        assert!(!dir_sender_ok(&links, &none, None, &tr, &stranger, now) && !dir_recipient_ok(&links, None, &tr, &stranger, now));
+        // сосед-сервер: обе стороны
+        links.insert(l, link_info(Role::Server { dest: [2; 16] }, false, Some(stranger)));
+        assert!(dir_sender_ok(&links, &none, None, &tr, &stranger, now) && dir_recipient_ok(&links, None, &tr, &stranger, now));
     }
 
     #[test]
@@ -6767,12 +6317,27 @@ impl NodeCtx {
         off
     }
 
-    /// Посредник (R6, T_DIR): каталог нод новичку - соседи с правом TRANSIT и адресом, не более DIR_MAX записей, кусками по DIR_CHUNK Б.
+    /// Посредник (R6): каталог нод новичку или соседу - соседи с правом TRANSIT и адресом, не более DIR_MAX записей, одним LXMF-сообщением.
     /// Не чаще раза в 60 с на Link (инвариант 6). Адреса - подсказки: допуск по-прежнему по записям.
     fn send_dir(self: &Arc<Self>, link: LinkId) {
         let server = self.links.lock().unwrap().get(&link)
             .filter(|i| matches!(i.role, Role::Server { .. })).and_then(|i| i.peer_pk);
         self.send_dir_checked(link, server);
+    }
+
+    /// Адресат каталога допустим, пока он: живой Link (новичок или сосед-сервер), админ ожидающего приглашения или ключ с эффективным TRANSIT.
+    /// Без ожидания mutex (None - повторить позже); слабая ссылка не удерживает узел.
+    fn dir_gate(self: &Arc<Self>, pk: trust::Pk) -> lxmf_sync::Gate {
+        let me = Arc::downgrade(self);
+        Arc::new(move || {
+            use std::sync::TryLockError::WouldBlock;
+            let ctx = me.upgrade()?;
+            let Some(t) = &ctx.t13 else { return Some(false) };
+            let tr = match t.trust.try_lock() { Ok(g) => g, Err(WouldBlock) => return None, Err(_) => return Some(false) };
+            let links = match ctx.links.try_lock() { Ok(g) => g, Err(WouldBlock) => return None, Err(_) => return Some(false) };
+            let inv = match t.invite.try_lock() { Ok(g) => g, Err(WouldBlock) => return None, Err(_) => return Some(false) };
+            Some(dir_recipient_ok(&links, inv.as_ref().map(|i| i.admin), &tr, &pk, now_ms() as u64))
+        })
     }
 
     /// Server callers retain the expected identity even after close: never fall back to the
@@ -6807,38 +6372,16 @@ impl NodeCtx {
                 }));
             v
         };
-        let list = if let Some(pk) = expected_server {
+        let (pk, list) = if let Some(pk) = expected_server {
             let Some(list) = with_authorized_link(&t.trust, &self.links, link, &pk, OrdinaryAdmission::Server, false, |tr, _| build(tr)) else { return };
-            list
+            (pk, list)
         } else {
-            build(&t.trust.lock().unwrap())
+            let Some(pk) = peer_of(self, &link) else { return };
+            (pk, build(&t.trust.lock().unwrap()))
         };
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        let mut cur: Vec<serde_json::Value> = Vec::new();
-        for e in list {
-            cur.push(e);
-            if cur.len() > 1 && serde_json::json!({"n": cur}).to_string().len() > DIR_CHUNK {
-                let last = cur.pop().unwrap();
-                chunks.push(serde_json::json!({"n": cur}).to_string().into_bytes());
-                cur = vec![last];
-            }
+        if !list.is_empty() {
+            lxmf_sync::send_dir(&self.state, pk, list, self.dir_gate(pk));
         }
-        if !cur.is_empty() {
-            chunks.push(serde_json::json!({"n": cur}).to_string().into_bytes());
-        }
-        if chunks.is_empty() {
-            return;
-        }
-        let ctx = self.clone();
-        tokio::spawn(async move {
-            for c in chunks {
-                if let Some(pk) = expected_server {
-                    if !ctx.send_admitted_ctl(link, &pk, OrdinaryAdmission::Server, T_DIR, &c).await { return; }
-                } else {
-                    send_ctl(&ctx.node, link, T_DIR, &c).await;
-                }
-            }
-        });
     }
 
     /// Посредник: запись о новичке пришла от админа. Новичку (его Link без прав, ключ известен по identify) - сразу запись и каталог.
@@ -6944,7 +6487,6 @@ impl NodeCtx {
                 Role::Unknown => 0,
                 Role::Server { .. } => 1,
                 Role::Client { .. } => 2,
-                _ => return,
             };
             (pk, kind, i.want_use, i.enroll_only)
         };
@@ -7400,7 +6942,7 @@ async fn relay_pairq(ctx: Arc<NodeCtx>, link: LinkId, inv: trust::Invite) {
     }
 }
 
-/// Запись каталога T_DIR: подсказка адреса (недоверенная). Допуск - только по записям о правах.
+/// Запись каталога: подсказка адреса (недоверенная). Допуск - только по записям о правах.
 struct DirEnt {
     dest: [u8; 16],
     pk: [u8; 64],
@@ -7411,14 +6953,18 @@ struct DirEnt {
     pl: Option<String>,
 }
 
-/// Разбор T_DIR: не более DIR_MAX записей; dest обязан совпасть с ключом (тег `tag`); без адресов запись бесполезна.
+/// Разбор каталога: не более DIR_MAX записей; dest обязан совпасть с ключом (тег `tag`); без адресов запись бесполезна.
+#[cfg(test)]
 fn parse_dir(body: &[u8], tag: &str) -> Vec<DirEnt> {
     parse_dir_max(body, tag, DIR_MAX)
 }
 
 fn parse_dir_max(body: &[u8], tag: &str, max: usize) -> Vec<DirEnt> {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else { return vec![] };
-    let arr = v["n"].as_array().cloned().unwrap_or_default();
+    parse_dir_values(v["n"].as_array().map(Vec::as_slice).unwrap_or_default(), tag, max)
+}
+
+fn parse_dir_values(arr: &[serde_json::Value], tag: &str, max: usize) -> Vec<DirEnt> {
     let mut out = Vec::new();
     for x in arr.iter().take(max) {
         let Some(pk) = x["k"].as_str().and_then(|k| <[u8; 64]>::try_from(unhex(k)).ok()) else { continue };
@@ -7438,15 +6984,38 @@ fn parse_dir_max(body: &[u8], tag: &str, max: usize) -> Vec<DirEnt> {
     out
 }
 
-/// T_DIR от посредника зачисления (R6): адреса нод каталога - подсказки для диалера. Принимаем только от Link, через который сами просимся.
-fn on_dir_node(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
-    let Some(t) = &ctx.t13 else { return };
-    // Принимаем от посредника, к которому сами просимся, и от допущенного соседа-сервера (роль Server даётся только за взаимный TRANSIT).
-    let sender = ctx.links.lock().unwrap().get(&link).and_then(|i| if matches!(i.role, Role::Server { .. }) { i.peer_pk } else { None });
-    if body.len() > 1024 || !(sender.is_some() || t.pair_sent.lock().unwrap().contains(&link)) {
-        return;
+/// Узел принимает каталог от `sender`, если тот: допущенный сосед-сервер, ответчик нашей просьбы о зачислении, админ ожидающего приглашения
+/// или ключ с эффективным TRANSIT. Подпись LXMF лишь опознаёт ключ; права и роли берутся из Trust и таблицы Link.
+fn dir_sender_ok(links: &HashMap<LinkId, LinkInfo>, pair_sent: &HashSet<LinkId>, admin: Option<trust::Pk>, tr: &trust::Trust, sender: &trust::Pk, now: u64) -> bool {
+    links.iter().any(|(k, l)| l.peer_pk == Some(*sender) && (matches!(l.role, Role::Server { .. }) || pair_sent.contains(k)))
+        || admin == Some(*sender)
+        || tr.effective(sender, now) & trust::TRANSIT != 0
+}
+
+/// Каталог ещё нужен адресату `pk`: у него живой Link (новичок или сосед-сервер), он админ ожидающего приглашения или имеет эффективный TRANSIT.
+fn dir_recipient_ok(links: &HashMap<LinkId, LinkInfo>, admin: Option<trust::Pk>, tr: &trust::Trust, pk: &trust::Pk, now: u64) -> bool {
+    links.values().any(|l| l.peer_pk == Some(*pk) && matches!(l.role, Role::Unknown | Role::Server { .. }))
+        || admin == Some(*pk)
+        || tr.effective(pk, now) & trust::TRANSIT != 0
+}
+
+/// Каталог от посредника зачисления (R6), админа приглашения или соседа: адреса нод - подсказки для диалера.
+/// Отправитель опознан по ключу LXMF-подписи (`source_key`); подпись не право, поэтому нужно ещё одно из: роль Server (взаимный TRANSIT),
+/// Link, через который сами просимся, админ ожидающего приглашения или эффективный TRANSIT в записях. Истина - `true`, если адресата можно подтвердить.
+fn on_dir_node(ctx: &Arc<NodeCtx>, sender: trust::Pk, dir: &[serde_json::Value]) -> bool {
+    let Some(t) = &ctx.t13 else { return false };
+    let allowed = {
+        // порядок блокировок: Trust -> links; pair_sent и invite - листовые
+        let tr = t.trust.lock().unwrap();
+        let links = ctx.links.lock().unwrap();
+        let sent = t.pair_sent.lock().unwrap();
+        let admin = t.invite.lock().unwrap().as_ref().map(|i| i.admin);
+        dir_sender_ok(&links, &sent, admin, &tr, &sender, now_ms() as u64)
+    };
+    if !allowed {
+        return false;
     }
-    for e in parse_dir(body, &ctx.tag) {
+    for e in parse_dir_values(dir, &ctx.tag, DIR_MAX) {
         if e.pk == ctx.my_pk {
             continue;
         }
@@ -7454,8 +7023,8 @@ fn on_dir_node(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
         {
             let mut n = ctx.neigh.lock().unwrap();
             if let Some(nb) = n.get_mut(&e.dest) {
-                // адрес ноды, пришедший от неё самой по её Link, актуальнее прежнего; о третьих лицах - только если своего нет
-                let own = sender == Some(e.pk);
+                // адрес ноды, пришедший от неё самой, актуальнее прежнего; о третьих лицах - только если своего нет
+                let own = sender == e.pk;
                 if nb.addrs.is_empty() || own {
                     nb.addrs.set(e.addrs);
                 }
@@ -7480,6 +7049,7 @@ fn on_dir_node(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
             link: None, last_heard: Instant::now() - Duration::from_secs(3600), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(),
             last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: LossWin::default(), ping_seq: 0, admitted_at: Instant::now(), seen_gen: 0 });
     }
+    true
 }
 
 /// Пир доказал свой ключ (identify): предъявляем свою цепочку прав, при ожидающем приглашении просимся к его админу, оцениваем роль.
@@ -7527,6 +7097,10 @@ fn on_sync_node(ctx: &Arc<NodeCtx>, message: &leviculum_lxmf::Message) {
     lxmf_sync::RX_BYTES.fetch_add(message.pack().len() as u64, Relaxed);
     lxmf_sync::RX_MESSAGES.fetch_add(1, Relaxed);
     if let Some(digest) = wire.ack { lxmf_sync::received_ack(&ctx.state, message.source_hash, digest); return; }
+    if !wire.dir.is_empty() {
+        if message.content.len() <= lxmf_admin::MAX_ADMIN_CONTENT && on_dir_node(ctx, pk, &wire.dir) { lxmf_sync::acknowledge(&ctx.state, message, pk); }
+        return;
+    }
     let Some((recs, pols)) = lxmf_sync::parsed(&wire) else { return };
     let link = ctx.links.lock().unwrap().iter().find(|(_, l)| l.peer_pk == Some(pk)).map(|(l, _)| *l)
         .unwrap_or_else(|| LinkId::new(*lxmf_sync::public_identity(&pk).unwrap().hash()));
@@ -7546,13 +7120,19 @@ fn on_sync_node(ctx: &Arc<NodeCtx>, message: &leviculum_lxmf::Message) {
 fn on_sync_client(ctx: &Arc<ClientCtx>, message: &leviculum_lxmf::Message) {
     let Some(wire) = lxmf_sync::Wire::decode(message) else { return };
     let Some(c) = &ctx.c13 else { return };
-    let peers: Vec<_> = c.peers.lock().unwrap().values().copied().collect();
+    // зачисляемая нода тоже присылает админу каталог (с собственным адресом), поэтому её ключ - допустимый отправитель подписи
+    let mut peers: Vec<_> = c.peers.lock().unwrap().values().copied().collect();
+    peers.extend(c.enrollees.lock().unwrap().values().copied());
     let invited = c.invite.lock().unwrap().as_ref().map(|i| i.admin);
     let pk = lxmf_sync::source_key(message, &c.trust.lock().unwrap(), peers, invited);
     let Some(pk) = pk.filter(|pk| lxmf_sync::authenticated(message, ctx.identity.hash(), pk)) else { return };
     lxmf_sync::RX_BYTES.fetch_add(message.pack().len() as u64, Relaxed);
     lxmf_sync::RX_MESSAGES.fetch_add(1, Relaxed);
     if let Some(digest) = wire.ack { lxmf_sync::received_ack(&ctx.state, message.source_hash, digest); return; }
+    if !wire.dir.is_empty() {
+        if message.content.len() <= lxmf_admin::MAX_ADMIN_CONTENT && on_dir_client(ctx, pk, &wire.dir) { lxmf_sync::acknowledge(&ctx.state, message, pk); }
+        return;
+    }
     let Some((recs, pols)) = lxmf_sync::parsed(&wire) else { return };
     let link = c.peers.lock().unwrap().iter().find(|(_, p)| **p == pk).map(|(l, _)| *l)
         .unwrap_or_else(|| LinkId::new(*lxmf_sync::public_identity(&pk).unwrap().hash()));
@@ -7795,47 +7375,11 @@ fn on_pairq(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
     }
 }
 
-impl NodeCtx {
-    fn admit_neighbor(self: &Arc<Self>, link: LinkId, dest: [u8; 16], pk: &[u8; 64]) {
-        if self.link_is_public(&link) {
-            self.sh.note("серверный Link пришёл через публичную сеть RNS: отклонён (пути между нашими узлами только через наши узлы)".to_string());
-            self.close_link(link, "link через публичную сеть");
-            return;
-        }
-        let duplicate = {
-            let live = self.links.lock().unwrap();
-            if !live.get(&link).is_some_and(|i| matches!(i.role, Role::Server { dest: d } if d == dest)) { return; }
-            admit_neighbor_state(&mut self.neigh.lock().unwrap(), link, dest, pk)
-        };
-        if let Some(drop_id) = duplicate {
-            self.close_link(drop_id, "дубликат серверного link");
-            self.broadcast_registry();
-            return;
-        }
-        self.sh.note(format!("сосед {} допущен (серверный секрет подтверждён взаимно)", name_of(self, &dest)));
-        // с задержкой: реестр не должен обогнать SRV4 на стороне инициатора (там сообщение принимается только от допущенного сервера)
-        self.send_registry(link, 400);
-    }
-
-    /// Отозванных клиентов отключаем сразу: закрываем их открытые Link.
-    fn enforce_revocations(self: &Arc<Self>) {
-        let revoked: Vec<LinkId> = {
-            let reg = self.reg.lock().unwrap();
-            self.links.lock().unwrap().iter().filter(|(_, l)| matches!(l.role, Role::Client { id, .. } if reg.active(&hex(&id)).is_none())).map(|(k, _)| *k).collect()
-        };
-        for l in revoked {
-            self.close_link(l, "клиент отозван");
-        }
-    }
-}
-
 async fn node_housekeeping(ctx: Arc<NodeCtx>) {
     let mut tick = 0u64;
     let mut lost_listener = 0u32;
     let mut last_ping = Instant::now();
     let mut last_table = Instant::now();
-    let inbox = ctx.state.join("inbox");
-    let _ = std::fs::create_dir_all(&inbox);
     let _ = std::fs::create_dir_all(ctx.state.join("bench"));
     let fin = ctx.state.join("fin");
     while !fin.exists() {
@@ -7963,38 +7507,6 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
             ctx.flush_trust();
         }
 
-        // очередь админ-команд (issue/revoke кладут файлы)
-        if tick % 2 == 0 {
-            let mut changed = false;
-            if let Ok(rd) = std::fs::read_dir(&inbox) {
-                for e in rd.flatten() {
-                    if let Ok(b) = std::fs::read(e.path()) {
-                        if let Ok(v) = serde_json::from_slice::<Vec<ClientRec>>(&b) {
-                            let mut reg = ctx.reg.lock().unwrap();
-                            // отзыв из inbox применяется напрямую (merge не повышает active->revoked для чужого issuer, но здесь это локальная админ-операция)
-                            for r in &v {
-                                if r.status == "revoked" {
-                                    if let Some(h) = reg.recs.get_mut(&r.id) {
-                                        if h.status != "revoked" {
-                                            h.status = "revoked".into();
-                                            changed = true;
-                                        }
-                                    }
-                                }
-                            }
-                            changed |= reg.merge(&v);
-                        }
-                    }
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-            if changed {
-                ctx.reg.lock().unwrap().save(&ctx.state.join("clients.json"));
-                ctx.enforce_revocations();
-                ctx.broadcast_registry();
-            }
-        }
-
         // R10: бенч по файлу-запросу (`knothopd bench`); итог - bench/res-<id>.json
         if tick % 2 == 0 {
             take_bench_req(&ctx);
@@ -8065,20 +7577,13 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
             ctx.sh.note(format!("сосед {name} не виден: забыт"));
         }
 
-        // таблица клиентам и в файл
+        // соседи в файл (диагностика)
         if now.duration_since(last_table) >= Duration::from_secs(2) {
             last_table = now;
-            let t = ctx.table(false);
+            let t = ctx.table();
             // диагностика, не состояние: из отдельного потока и редко (W48). Проверка свежести деплоя требует ts не старше 10 с
             crate::bgwrite::put(&ctx.state.join("neighbors.json"), t.to_string().into_bytes(), Duration::from_secs(5));
             let n_clients = ctx.links.lock().unwrap().values().filter(|l| matches!(l.role, Role::Client { .. })).count();
-            if ctx.t13.is_none() {
-                // legacy: сырая таблица клиенту (0013: клиент строит список выходов сам по записям)
-                let clients: Vec<LinkId> = ctx.links.lock().unwrap().iter().filter(|(_, l)| matches!(l.role, Role::Client { .. })).map(|(k, _)| *k).collect();
-                for c in clients {
-                    ctx.send_table(c);
-                }
-            }
             // Только допущенные соседи, без адресов: Link может работать по старому
             // интерфейсу, пока таблица RNS уже выбрала для новых Link другой путь.
             let private_ifaces = own_carrier_ifaces(&ctx.node);
@@ -8091,8 +7596,8 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
                     "nh": p.and_then(|p| p.next_hop).map(|h| hex(&h))})
             }).collect();
             let st = serde_json::json!({"uptime_s": ctx.started.elapsed().as_secs(), "links": ctx.links.lock().unwrap().len(), "vpn_paths": vpn_paths,
-                "clients": n_clients, "tun": ctx.tun.as_ref().map(|t| t.stats()), "registry": ctx.reg.lock().unwrap().recs.len(),
-                "model": if ctx.t13.is_some() { "0013" } else { "legacy" }, "pol": pol_counters(),
+                "clients": n_clients, "tun": ctx.tun.as_ref().map(|t| t.stats()),
+                "pol": pol_counters(),
                 "policy": ctx.t13.as_ref().map(|t| t.trust.lock().unwrap().policy_view(now_ms() as u64).iter()
                     .map(|(r, g, o, e)| serde_json::json!({"tag": trust::root_tag(r), "grant": g, "offer": o, "eff": e})).collect::<Vec<_>>())});
             crate::bgwrite::put(&ctx.state.join("status.json"), st.to_string().into_bytes(), Duration::from_secs(20));
@@ -8636,15 +8141,6 @@ fn admin_list(state: &Path) -> Result<()> {
             println!("  {p}  {st}  {l}");
         }
     }
-    let reg = Registry::load(&state.join("clients.json"));
-    let mut v = reg.all();
-    if !v.is_empty() {
-        v.sort_by_key(|r| r.ts);
-        println!("легаси-клиенты ({}):", v.len());
-        for r in v {
-            println!("  {}  {:8}  {}  выдал {}", r.id, r.status, r.name, &r.issuer.chars().take(8).collect::<String>());
-        }
-    }
     if let Ok(b) = std::fs::read(state.join("neighbors.json")) {
         println!("таблица соседей: {}", String::from_utf8_lossy(&b));
     }
@@ -8656,60 +8152,9 @@ pub fn run_admin(cmd: VpnCmd) -> Result<()> {
         VpnCmd::AdminSubmit(a) => { println!("{}", admin_submit(a)?); Ok(()) },
         VpnCmd::AdminStatus(a) => { println!("{}", admin_status(a)?); Ok(()) },
         VpnCmd::AdminView(a) => { println!("{}", admin_view(a)?); Ok(()) },
-        VpnCmd::Keygen(k) => {
-            let mut s = [0u8; 32];
-            rand_core::OsRng.fill_bytes(&mut s);
-            secure_write(&k.out, b64e(&s).as_bytes())?;
-            println!("серверный секрет записан в {} (не публиковать, передавать файлом)", k.out.display());
-            Ok(())
-        }
-        VpnCmd::Issue(a) => {
-            let me: serde_json::Value = serde_json::from_slice(&std::fs::read(a.state.join("server.json")).context("server.json: узел не запускался с этим каталогом")?)?;
-            let mut seed = [0u8; 32];
-            rand_core::OsRng.fill_bytes(&mut seed);
-            if let Some(cn) = me["cn"].as_str() {
-                let _ = CLIENT_NET.set(parse_net(cn)?);
-            }
-            let id = client_identity(&seed)?;
-            let idh = *id.hash();
-            let rec = ClientRec { id: hex(&idh), pk: hex(&id.public_key_bytes()), name: a.client_name.chars().take(64).collect(), issuer: me["d"].as_str().unwrap_or("").into(),
-                status: "active".into(), ts: now_ms() as u64 / 1000 };
-            let inbox = a.state.join("inbox");
-            std::fs::create_dir_all(&inbox)?;
-            write_atomic(&inbox.join(format!("{}.json", rec.id)), &serde_json::to_vec(&vec![rec.clone()])?);
-            let from_json = |x: &serde_json::Value| -> Option<ProfServer> {
-                let addrs: Vec<String> = x["a"].as_array()?.iter().filter_map(|y| y.as_str().map(String::from)).collect();
-                Some(ProfServer { n: x["n"].as_str()?.chars().take(32).collect(), d: dest32(x["d"].as_str()?)?, k: unhex(x["k"].as_str()?).try_into().ok()?, a: addrs })
-            };
-            let mut servers: Vec<ProfServer> = from_json(&me).into_iter().collect();
-            if let Ok(b) = std::fs::read(a.state.join("neighbors.json")) {
-                if let Ok(t) = serde_json::from_slice::<serde_json::Value>(&b) {
-                    for x in t["exits"].as_array().cloned().unwrap_or_default() {
-                        if servers.len() >= a.servers || x["self"] == true || x["s"] != "up" {
-                            continue;
-                        }
-                        servers.extend(from_json(&x));
-                    }
-                }
-            }
-            servers.sort_by_key(|s| s.a.is_empty()); // достижимые напрямую вперёд: клиент входит в сеть через них
-            if servers.iter().all(|s| s.a.is_empty()) {
-                eprintln!("ВНИМАНИЕ: ни у одного сервера в профиле нет адреса (узел за NAT?): клиент не сможет войти. Выдавайте профиль на узле с публичным адресом.");
-            }
-            if let Some(max) = a.max_addrs {
-                for s in servers.iter_mut() {
-                    s.a.truncate(max);
-                }
-            }
-            let prof = Profile { group: me["g"].as_str().unwrap_or("").into(), seed, ip: client_ip(&idh), s: servers };
-            let text = encode_profile(&prof);
-            eprintln!("клиент {} ({}) внесён в реестр; адрес в туннеле {}; серверов в профиле: {}; длина строки {} символов", rec.name, &rec.id[..8], ip_str(prof.ip), prof.s.len(), text.len());
-            println!("{text}");
-            Ok(())
-        }
         VpnCmd::Revoke(a) => {
             let id = a.id.to_lowercase();
-            // модель 0013: держатель по префиксу хеша -> запись с пустыми правами; иначе легаси-реестр
+            // держатель по префиксу хеша -> запись с пустыми правами
             if a.state.join("identity.key").exists() {
                 if let Ok(me) = load_identity_strict(&a.state) {
                     let tr = trust::Trust::load(me, &a.state)?;
@@ -8720,15 +8165,7 @@ pub fn run_admin(cmd: VpnCmd) -> Result<()> {
                     }
                 }
             }
-            let inbox = a.state.join("inbox");
-            std::fs::create_dir_all(&inbox)?;
-            let reg = Registry::load(&a.state.join("clients.json"));
-            let full = reg.recs.keys().find(|k| k.starts_with(&id)).cloned().ok_or_else(|| anyhow::anyhow!("такого держателя или клиента нет"))?;
-            let mut rec = reg.recs[&full].clone();
-            rec.status = "revoked".into();
-            write_atomic(&inbox.join(format!("revoke-{full}.json")), &serde_json::to_vec(&vec![rec])?);
-            println!("клиент {full} отозван (применится за ~1 с, откроется синхронизация с соседями)");
-            Ok(())
+            bail!("такого держателя нет")
         }
         VpnCmd::Whoami(a) => {
             std::fs::create_dir_all(&a.state)?;
@@ -9028,7 +8465,6 @@ struct ClientCtx {
     platforms: Mutex<HashMap<[u8; 16], &'static str>>,
     /// адреса выходов для диалеров (dest -> общее хранилище): анонс обновляет, диалер читает на каждой попытке (0014 R4)
     books: Mutex<HashMap<[u8; 16], Arc<Addrs>>>,
-    table_acc: Mutex<HashSet<[u8; 16]>>,
     loss: Mutex<LossWin>,
     fail_ms: u64,
     path_gate: path::PathGate,
@@ -9259,53 +8695,6 @@ impl ClientCtx {
         }
     }
 
-    fn merge_table(&self, t: &serde_json::Value) {
-        let Some(arr) = t["exits"].as_array() else { return };
-        let mut s = self.servers.lock().unwrap();
-        for x in arr {
-            let (Some(d), Some(k)) = (x["d"].as_str().and_then(dest32), x["k"].as_str().and_then(|k| unhex(k).try_into().ok())) else { continue };
-            let name = x["n"].as_str().unwrap_or("?").chars().take(32).collect::<String>();
-            let ep = x["e"].as_str().unwrap_or("").to_string();
-            let addrs: Vec<String> = x["a"].as_array().map(|a| a.iter().filter_map(|y| y.as_str().map(String::from)).take(3).collect()).unwrap_or_default();
-            let rtt = x["r"].as_f64();
-            if let Some(e) = s.iter_mut().find(|e| e.dest == d) {
-                e.name = name;
-                e.seen = Instant::now();
-                e.rtt_ms = rtt;
-                e.state = x["s"].as_str().unwrap_or("up").into();
-                if e.ep.is_empty() {
-                    e.ep = ep;
-                }
-                if e.addrs.is_empty() {
-                    e.addrs = addrs;
-                }
-            } else if s.len() < 32 {
-                // сервер, внесённый закреплённым сервером по аутентифицированному Link: доверяем транзитивно (план 4.2)
-                s.push(CServer { dest: d, key: k, name, ep, addrs, hops: None, rtt_ms: rtt, state: x["s"].as_str().unwrap_or("up").into(), seen: Instant::now(), pinned: false, pk: None });
-            }
-        }
-        // записи из таблицы, которых нет в свежей таблице, считаются потерянными; закреплённые остаются в списке.
-        // Таблица приходит кусками (i из n): собираем присутствующих и «забываем» отсутствующих только после последнего куска.
-        let (i, n) = (t["i"].as_u64(), t["n"].as_u64());
-        let mut acc = self.table_acc.lock().unwrap();
-        if i.unwrap_or(0) == 0 {
-            acc.clear();
-        }
-        acc.extend(arr.iter().filter_map(|x| x["d"].as_str().and_then(dest32)));
-        if let (Some(i), Some(n)) = (i, n) {
-            if i + 1 < n {
-                return;
-            }
-        }
-        let present: HashSet<[u8; 16]> = std::mem::take(&mut *acc);
-        s.retain(|e| e.pinned || present.contains(&e.dest) || e.seen.elapsed() < Duration::from_secs(15));
-        for e in s.iter_mut() {
-            if !present.contains(&e.dest) {
-                e.state = "lost".into();
-            }
-        }
-    }
-
     fn publish_service(&self) {
         let cur = *self.cur.lock().unwrap();
         let current = cur.map(|c| {
@@ -9517,13 +8906,14 @@ pub async fn run_client(a: ClientArgs) -> Result<()> {
     let ctx = Arc::new(ClientCtx { node: node.clone(), sh: sh.clone(), ep: ep.clone(), identity, group: prof.group.clone(), ip: ip_str(prof.ip), servers: Mutex::new(servers.clone()), tun,
         auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), probe_wait: Mutex::new(HashMap::new()), drain: Mutex::new(DrainState::default()), cur: Mutex::new(None), last_pong: Default::default(), contact_window_ms: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
         state: a.state.clone(), status: Mutex::new("подключаюсь".into()), dialers: Mutex::new(HashMap::new()),
-        carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), hints: Mutex::new(HashMap::new()), platforms: Mutex::new(HashMap::new()), books: Mutex::new(HashMap::new()), table_acc: Mutex::new(HashSet::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
+        carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), hints: Mutex::new(HashMap::new()), platforms: Mutex::new(HashMap::new()), books: Mutex::new(HashMap::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
         c13, path_gate: path::PathGate::default(), nbrs: Mutex::new(HashMap::new()), admitted_exits: Mutex::new(HashMap::new()), ctrl: Mutex::new(HashMap::new()), lk_fail: Mutex::new(HashMap::new()), vis: Mutex::new(HashMap::new()), qstat: Mutex::new(HashMap::new()),
         bench_sess: Mutex::new(None), bench_last: Mutex::new(None),
          rcfg: std::sync::RwLock::new(Arc::new(route::Cfg::default())), rreport: Mutex::new(serde_json::Value::Null), rpending: Mutex::new(HashSet::new()), rback: Mutex::new(HashMap::new()) });
     let _admin_client_guard = if let (Some(runtime), Some(c13)) = (admin_lxmf, ctx.c13.as_ref()) {
         let guard = lxmf_admin::register_client_runtime(&a.state, &runtime);
         let trust = c13.trust.clone();
+        runtime.pn.set_source(trust.clone());
         let sync_guard = lxmf_sync::register(&a.state, runtime.sync.clone());
         lxmf_admin::spawn_client_worker(runtime, ctx.clone(), trust);
         Some((guard, sync_guard))
@@ -9964,7 +9354,7 @@ fn maybe_enroll(ctx: &Arc<ClientCtx>, pk: &[u8; 64], v: &serde_json::Value, dest
     }
     let ep = v["e"].as_str().unwrap_or("").to_string();
     if !addrs.is_empty() {
-        ctx.remember_addrs(&dest, &addrs); // легаси-анонс с адресом; в 0013 адрес придёт по T_DIR на Link зачисления
+        ctx.remember_addrs(&dest, &addrs); // адрес придёт приватным каталогом по LXMF
     }
     let (ctx2, pk2) = (ctx.clone(), *pk);
     ctx.sh.note(format!("нода {name} ({}) ждёт приглашения: открываю Link по пути RNS", &hex(&dest)[..8]));
@@ -10216,29 +9606,28 @@ async fn on_pair1_client(ctx: Arc<ClientCtx>, link: LinkId, body: Vec<u8>) {
     start_dialers(&ctx);
 }
 
-/// Админ -> только что зачисленная нода: адреса известных нам нод (до DIR_MAX, кусками по DIR_CHUNK Б).
-async fn send_catalog(ctx: &Arc<ClientCtx>, link: LinkId, except: &[u8; 64]) {
+/// Админ -> только что зачисленная нода: адреса известных нам нод (до DIR_MAX) приватным каталогом по LXMF.
+/// Подсказки адресов, не права; адресат остаётся допустимым, пока у него есть действующие права в наших записях.
+async fn send_catalog(ctx: &Arc<ClientCtx>, _link: LinkId, except: &[u8; 64]) {
+    let Some(c) = &ctx.c13 else { return };
     let list: Vec<serde_json::Value> = ctx.servers.lock().unwrap().iter()
         .filter(|x| x.pk.is_some() && x.pk.as_ref() != Some(except) && !x.addrs.is_empty())
         .take(DIR_MAX)
         .map(|x| serde_json::json!({"d": hex(&x.dest), "k": hex(&x.pk.unwrap()), "e": x.ep, "a": x.addrs.iter().take(3).collect::<Vec<_>>(), "n": x.name, "pl": platform()}))
         .collect();
-    let mut cur: Vec<serde_json::Value> = Vec::new();
-    let mut chunks: Vec<Vec<u8>> = Vec::new();
-    for e in list {
-        cur.push(e);
-        if cur.len() > 1 && serde_json::json!({"n": cur}).to_string().len() > DIR_CHUNK {
-            let last = cur.pop().unwrap();
-            chunks.push(serde_json::json!({"n": cur}).to_string().into_bytes());
-            cur = vec![last];
-        }
+    if list.is_empty() {
+        return;
     }
-    if !cur.is_empty() {
-        chunks.push(serde_json::json!({"n": cur}).to_string().into_bytes());
-    }
-    for c in chunks {
-        send_ctl(&ctx.node, link, T_DIR, &c).await;
-    }
+    let (holder, authority) = (*except, c.trust.clone());
+    let gate: lxmf_sync::Gate = Arc::new(move || {
+        let tr = match authority.try_lock() {
+            Ok(tr) => tr,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(_) => return Some(false),
+        };
+        Some(tr.effective(&holder, now_ms() as u64) != 0)
+    });
+    lxmf_sync::send_dir(&ctx.state, holder, list, gate);
 }
 
 /// Админ-режим: пользователь просится по нашему приглашению через ноду-посредника (Link к ноде - наш, пришёл T_PAIRQ). pin гасится за ключом
@@ -10331,16 +9720,20 @@ async fn client_announce(ctx: Arc<ClientCtx>, dest: [u8; 16]) {
     }
 }
 
-/// T_DIR от посредника зачисления (R6): адреса выходов - подсказки (hints и диалер). Допуск - по записям о правах.
-fn on_dir_client(ctx: &Arc<ClientCtx>, link: LinkId, body: &[u8]) {
-    let Some(c) = &ctx.c13 else { return };
-    // Link зачисления: от ожидавшей ноды принимаем только запись о ней самой
-    let enrollee = c.enrollees.lock().unwrap().get(&link).copied();
-    if body.len() > 1024 || !(enrollee.is_some() || c.peers.lock().unwrap().contains_key(&link)) {
-        return;
+/// Каталог по LXMF (R6): адреса выходов - подсказки (hints и диалер). Допуск - по записям о правах.
+/// Отправитель опознан по ключу подписи; принимаем от допущенных серверов, от зачисляемой ноды (только запись о ней самой)
+/// и от ключа с эффективным TRANSIT/EXIT. `true` - адресата можно подтвердить.
+fn on_dir_client(ctx: &Arc<ClientCtx>, sender: trust::Pk, dir: &[serde_json::Value]) -> bool {
+    let Some(c) = &ctx.c13 else { return false };
+    let enrollee = c.enrollees.lock().unwrap().values().any(|p| *p == sender);
+    let peer = c.peers.lock().unwrap().values().any(|p| *p == sender);
+    let rights = c.trust.lock().unwrap().effective(&sender, now_ms() as u64) & (trust::TRANSIT | trust::EXIT) != 0;
+    if !(enrollee || peer || rights) {
+        return false;
     }
-    for e in parse_dir(body, T13_TAG) {
-        if enrollee.map(|pk| pk != e.pk).unwrap_or(false) {
+    let own_only = !(peer || rights);
+    for e in parse_dir_values(dir, T13_TAG, DIR_MAX) {
+        if own_only && sender != e.pk {
             continue;
         }
         ctx.remember_addrs(&e.dest, &e.addrs);
@@ -10373,6 +9766,7 @@ fn on_dir_client(ctx: &Arc<ClientCtx>, link: LinkId, body: &[u8]) {
     }
     ctx.refresh_servers13();
     start_dialers(ctx);
+    true
 }
 
 fn start_dialer(ctx: &Arc<ClientCtx>, s: &CServer) {
@@ -10484,22 +9878,9 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                             let _ = tx.send(Err(String::from_utf8_lossy(body).into()));
                         }
                     }
-                    T_TABLE => {
-                        // в модели 0013 таблицу выходов клиент строит сам по записям о правах
-                        if ctx.c13.is_none() {
-                            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
-                                ctx.merge_table(&v);
-                            }
-                        }
-                    }
                     T_PROBER => {
                         if let (Some(reply), Some(tx)) = (qprobe::parse_prober_ttl(body), ctx.probe_wait.lock().unwrap().remove(&link_id)) {
                             let _ = tx.send(reply);
-                        }
-                    }
-                    T_DIR => {
-                        if ctx.c13.is_some() {
-                            on_dir_client(&ctx, link_id, body);
                         }
                     }
                     T_BENCH => {
@@ -10871,9 +10252,6 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
         if !recs.is_empty() {
             ctx.sync_to(id, recs, vec![]);
         }
-    }
-    if let Some(t) = reply.get("table") {
-        ctx.merge_table(t);
     }
     // Лабораторная точка отказа B (QAB-M2): сервер уже вытеснил прежний Link (допуск идёт до AUTH_OK), а новый Link не доходит до рабочего состояния.
     // Существует только в отладочной сборке (`cfg(debug_assertions)`, лабораторные снимки): в release-бинарниках (deploy/build.sh, ci-build.sh, android build.sh)
@@ -11878,7 +11256,7 @@ mod qreturn_tests {
     // согласование: тела T_PROBEQ/T_PROBER строгие; старый узел (on_control: `_ => {}`) тип 23 просто игнорирует
     #[test]
     fn probe_types_are_unused_by_older_message_types() {
-        let all = [T_SRV1, T_SRV2, T_SRV3, T_SRV4, T_TABLE, T_REGISTRY, T_AUTH_OK, T_AUTH_FAIL, T_PAIR1, T_PAIR_NO, T_USE, T_PAIRQ, T_NBRS, T_DIR, T_BENCH, T_BENCH_DATA, T_OBSERVE, T_CINFO];
+        let all = [T_AUTH_OK, T_AUTH_FAIL, T_PAIR1, T_PAIR_NO, T_USE, T_PAIRQ, T_NBRS, T_BENCH, T_BENCH_DATA, T_OBSERVE, T_CINFO];
         assert!(!all.contains(&T_PROBEQ) && !all.contains(&T_PROBER) && T_PROBEQ != T_PROBER);
         assert_ne!(T_PROBEQ, 0x45, "не похож на IPv4-датаграмму");
     }

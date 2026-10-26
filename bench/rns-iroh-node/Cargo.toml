@@ -20,7 +20,7 @@ path = "src/main.rs"
 # (bench/fork-patch.sh, used by bench/cargo_fork.sh and the build scripts), so leviculum-core is a single
 # package. Do not point one of them at a different rev or source.
 leviculum-std = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "77c4ff13f59116adaf0190d455b83c286c135066" }
-leviculum-lxmf = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "77c4ff13f59116adaf0190d455b83c286c135066", default-features = false }
+leviculum-lxmf = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "77c4ff13f59116adaf0190d455b83c286c135066", default-features = false, features = ["pow"] }
 # Штатный встраиваемый PN engine того же форка; AGPL-3.0-or-later, без BLE/serial.
 lnpnd = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "77c4ff13f59116adaf0190d455b83c286c135066", default-features = false }
 iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }

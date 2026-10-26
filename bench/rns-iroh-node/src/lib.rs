@@ -1919,6 +1919,7 @@ type RouteMap<H> = std::sync::RwLock<HashMap<u32, (leviculum_std::api::LinkId, H
 /// Единый порядок блокировок для всех записей: host_access -> allowed -> routes. Пакетный путь берёт каждую
 /// отдельно и не вкладывает, поэтому взаимной блокировки с этим порядком нет.
 /// Допуск атомарный (all-or-nothing): все проверки под тремя write-блокировками, до первой вставки.
+#[cfg(test)]
 fn admit_link<H>(
     host_access: &HostAccessSet, allowed: &AllowedMap, routes: &RouteMap<H>,
     link_id: leviculum_std::api::LinkId, ip: u32, handle: H,
