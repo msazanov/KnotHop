@@ -1,15 +1,15 @@
 # секреты и ключи никогда не в репозиторий
 deploy-pilot/group.key
-deploy-pilot/rawgd
+deploy-pilot/knothopd
 *.key
 *.keystore
 *.profile
 *.p12
 *.pem
 bench/results/android/
-deploy-0013/rawgd
-deploy-0013/rawgd-u2204
-deploy-0013/rawgvpn.apk
+deploy-0013/knothopd
+deploy-0013/knothopd-u2204
+deploy-0013/knothop.apk
 deploy-0013/node.json
 deploy-0013/public_rns.txt
 deploy-0013/SHA256SUMS
@@ -42,7 +42,7 @@ identity.key
 **/target/
 bench/results*/
 deploy/dist/
-deploy-pilot/rawgd*
+deploy-pilot/knothopd*
 deploy-pilot/*.apk
 deploy-pilot/*.keystore
 deploy-pilot/*.key
@@ -51,8 +51,8 @@ deploy-pilot/known_hosts*
 deploy-pilot/*.env.*
 deploy-pilot/node.json
 deploy-pilot/public_rns.txt
-deploy-pilot/rawgd-pilot.nft
-deploy-pilot/rawgd-pilot.service
+deploy-pilot/knothop.nft
+deploy-pilot/knothopd.service
 deploy-pilot/SHA256SUMS
 bench/android/exits.txt
 bench/vendor/lnsd

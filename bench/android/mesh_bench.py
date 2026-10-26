@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-ACTIVITY = "com.rawg.vpn/.MainActivity"
+ACTIVITY = "com.knothop.vpn/.MainActivity"
 HERE = Path(__file__).resolve().parent
 EXITS_FILE = HERE / "exits.txt"
 MB = 100
@@ -64,7 +64,7 @@ def parse_result_logs(text, dest, after_epoch, expected_name=None):
     result = None
     for line in text.splitlines():
         stamp = log_epoch(line)
-        payload = line.split("rawgui", 1)[-1]
+        payload = line.split("knothopui", 1)[-1]
         q = QUEUED.search(payload)
         if q and q.group(1).lower() == dest.lower() and stamp is not None and stamp >= after_epoch:
             queued_epoch = stamp
@@ -157,7 +157,7 @@ def main(argv=None):
     ap.add_argument("--run", action="store_true", help="явно подтвердить запуск ручного теста 100 МБ на каждом выбранном выходе")
     ap.add_argument("--exits", default="RU", help="метки через запятую (по умолчанию только RU)")
     ap.add_argument("--serial", help="adb serial; без него adb должен видеть ровно одно устройство")
-    ap.add_argument("--out", help="JSON; по умолчанию ~/.cache/rawg-bench/mesh-<время>.json")
+    ap.add_argument("--out", help="JSON; по умолчанию ~/.cache/knothop-bench/mesh-<время>.json")
     ap.add_argument("--check-ip", action="store_true", help="перед тестом проверить внешний IPv4 через ifconfig.me")
     args = ap.parse_args(argv)
     try:
@@ -172,7 +172,7 @@ def main(argv=None):
         ap.error("неизвестные выходы: " + ", ".join(unknown))
     exits = [catalog[n] for n in names]
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = args.out or str(Path.home() / ".cache/rawg-bench" / f"mesh-{stamp}.json")
+    out = args.out or str(Path.home() / ".cache/knothop-bench" / f"mesh-{stamp}.json")
     doc = {"started": dt.datetime.now().astimezone().isoformat(), "mode": "run" if args.run else "dry-run",
            "requested_mb_each": MB, "planned_mb": MB * len(exits), "serial": args.serial,
            "results": []}
@@ -204,7 +204,7 @@ def main(argv=None):
                 selected = False
                 selected_name = None
                 while time.monotonic() < deadline:
-                    _, logs, _ = adb(args.serial, "logcat", "-d", "-v", "epoch", "-s", "rawgui",
+                    _, logs, _ = adb(args.serial, "logcat", "-d", "-v", "epoch", "-s", "knothopui",
                                      timeout=min(10, max(1, deadline - time.monotonic())))
                     row["vis"] = last_edges(logs)
                     selected_name = find_current(logs, ex["dest"][:8])
@@ -246,7 +246,7 @@ def main(argv=None):
                     continue
                 deadline = time.monotonic() + BENCH_TIMEOUT
                 while time.monotonic() < deadline:
-                    _, logs, _ = adb(args.serial, "logcat", "-d", "-v", "epoch", "-s", "rawgui",
+                    _, logs, _ = adb(args.serial, "logcat", "-d", "-v", "epoch", "-s", "knothopui",
                                      timeout=min(10, max(1, deadline - time.monotonic())))
                     row["vis"] = last_edges(logs) or row["vis"]
                     low = logs.lower()

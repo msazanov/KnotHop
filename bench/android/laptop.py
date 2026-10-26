@@ -5,7 +5,7 @@
 
 HTTP (для телефона, только локальная сеть):
   GET  /               страница со ссылкой на APK
-  GET  /rawgmeas.apk   установочный файл
+  GET  /knothop-meas.apk   установочный файл
   GET  /e.json         адрес и ключи выхода (меняются при каждом запуске E)
   POST /result         результат замера от телефона -> bench/results/android/<время>-<модель>.json
 Носитель - QUIC/UDP на --quic-port: прямой путь по Wi-Fi, без relay и без внешних серверов.
@@ -27,8 +27,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 RESULTS = HERE.parent / "results" / "android"
-BIN = Path(os.environ.get("RNS_IROH_BIN", str(Path.home() / ".cache/rawg-target/dgram/release/rns-iroh-node")))
-APK = Path(os.environ.get("APK", str(Path.home() / ".cache/rawg-android/rawgmeas.apk")))
+BIN = Path(os.environ.get("RNS_IROH_BIN", str(Path.home() / ".cache/knothop-target/dgram/release/rns-iroh-node")))
+APK = Path(os.environ.get("APK", str(Path.home() / ".cache/knothop-android/knothop-meas.apk")))
 
 
 def default_ip():
@@ -68,10 +68,10 @@ def make_handler(state):
         def do_GET(self):
             if self.path in ("/", "/index.html"):
                 size = APK.stat().st_size if APK.exists() else 0
-                html = (f"<meta name=viewport content='width=device-width'><h2>rawg замер</h2>"
+                html = (f"<meta name=viewport content='width=device-width'><h2>KnotHop замер</h2>"
                         f"<p><a href='/{APK.name}'>{APK.name}</a> ({size/1e6:.1f} МБ).</p>")
                 self._send(200, html.encode(), "text/html; charset=utf-8")
-            elif self.path.endswith(".apk") and self.path.startswith("/rawg") and APK.exists():
+            elif self.path.endswith(".apk") and self.path.startswith("/knothop") and APK.exists():
                 self._send(200, APK.read_bytes(), "application/vnd.android.package-archive",
                            {"Content-Disposition": f"attachment; filename={APK.name}"})
             elif self.path == "/e.json" and (state / "e.json").exists():
@@ -107,7 +107,7 @@ def main():
     for p in (BIN, APK):
         if not p.exists():
             sys.exit(f"нет файла: {p}")
-    state = Path(tempfile.mkdtemp(prefix="rawg-android-", dir="/tmp/opencode" if Path("/tmp/opencode").is_dir() else None))
+    state = Path(tempfile.mkdtemp(prefix="knothop-android-", dir="/tmp/opencode" if Path("/tmp/opencode").is_dir() else None))
     os.chmod(state, 0o755)
     cmd = [str(BIN), "--role", "e", "--ip", a.ip, "--port", str(a.quic_port), "--relay", "none", "--mode", "meas",
            "--carrier", "datagram", "--dgram-mtu", "1400", "--cipher", "gcm", "--data-cap", "4096", "--chan-buf", "4096",
@@ -121,7 +121,7 @@ def main():
         time.sleep(0.2)
     srv = ThreadingHTTPServer(("0.0.0.0", a.http_port), make_handler(state))
     print(f"выход E: UDP {a.ip}:{a.quic_port}; состояние {state}; журнал {state/'e.log'}")
-    print(f"APK:     http://{a.ip}:{a.http_port}/   (прямая: http://{a.ip}:{a.http_port}/rawgmeas.apk)")
+    print(f"APK:     http://{a.ip}:{a.http_port}/   (прямая: http://{a.ip}:{a.http_port}/knothop-meas.apk)")
     print("Ctrl+C - остановить.", flush=True)
 
     def stop(*_):

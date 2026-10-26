@@ -19,8 +19,8 @@ from awg_backbone import cmd, dex, put, cpu, awg_setup, SECRETS, redact
 from measure import process_memory, rtt_summary
 
 HERE = Path(__file__).resolve().parent
-IMAGE = "rawg-bench:compare"
-BIN = Path(os.environ.get("TCP_LOAD_BIN", str(Path.home() / ".cache/rawg-target/fork-win256/release/tcp-load")))
+IMAGE = "knothop-bench:compare"
+BIN = Path(os.environ.get("TCP_LOAD_BIN", str(Path.home() / ".cache/knothop-target/fork-win256/release/tcp-load")))
 
 
 def config(name, value):
@@ -128,12 +128,12 @@ def main():
     # Same single logical CPU per node as lev_cell.py (relay 2, e 3, c 4, a 5): one core for
     # every server and one for the client, load generator and checker included.
     cpusets = {"e": "3", "c": "4", "a": "5"}
-    names = {r: f"rawg-compare-{a.tag}-{r}" for r in roles}
-    net = "rawg-compare-" + a.tag
+    names = {r: f"knothop-compare-{a.tag}-{r}" for r in roles}
+    net = "knothop-compare-" + a.tag
     made, network, interrupted = [], False, False
     result = {"cell": vars(a), "success": False, "cpusets": {r: cpusets[r] for r in roles},
               "load_start": os.getloadavg(), "note": "synthetic application stream, not HTTPS; Vision TLS passthrough not exercised"}
-    with tempfile.TemporaryDirectory(prefix="rawg-compare-", dir="/tmp/opencode") as sd:
+    with tempfile.TemporaryDirectory(prefix="knothop-compare-", dir="/tmp/opencode") as sd:
         shared = Path(sd); os.chmod(shared, 0o777)
         try:
             result["image"] = cmd("docker", "image", "inspect", IMAGE, "--format", "{{.Id}}")

@@ -27,7 +27,7 @@ HERE = Path(__file__).resolve().parent
 BENCH = Path(os.environ.get("IROH_BENCH_BIN", HERE / "iroh-bench/target/release/iroh-bench"))
 RELAY = Path(os.environ.get("IROH_RELAY_BIN", "/tmp/opencode/iroh-src/target/release/iroh-relay"))
 IMAGE = "archlinux:base"
-IPERF_IMAGE = "rawg-bench:awg31"  # Debian + iperf3 (для базового TCP)
+IPERF_IMAGE = "knothop-bench:awg31"  # Debian + iperf3 (для базового TCP)
 OUT = HERE / "results" / "iroh"
 
 
@@ -65,7 +65,7 @@ def main():
         if not b.exists():
             sys.exit(f"missing binary {b}")
 
-    net = f"rawg-iroh-{a.tag}"
+    net = f"knothop-iroh-{a.tag}"
     names = {r: f"{net}-{r}" for r in ("relay", "server", "client")}
     created = []
     res = {"cell": vars(a), "success": False, "events": []}
@@ -74,7 +74,7 @@ def main():
     def ev(msg):
         res["events"].append({"t": round(time.monotonic() - t_zero, 2), "event": msg})
 
-    with tempfile.TemporaryDirectory(prefix="rawg-iroh-", dir="/tmp/opencode") as shared_s:
+    with tempfile.TemporaryDirectory(prefix="knothop-iroh-", dir="/tmp/opencode") as shared_s:
         shared = Path(shared_s)
         os.chmod(shared, 0o777)
         try:

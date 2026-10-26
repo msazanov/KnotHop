@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Сборка rns-iroh-node против локального форка leviculum ($HOME/dev/leviculum, ветка rawg/tuning).
-# Результат: $CARGO_TARGET_DIR/release/rns-iroh-node (по умолчанию ~/.cache/rawg-target/fork;
+# Сборка rns-iroh-node против локального форка leviculum ($HOME/dev/leviculum, ветка knothop/tuning).
+# Результат: $CARGO_TARGET_DIR/release/rns-iroh-node (по умолчанию ~/.cache/knothop-target/fork;
 # в /tmp на этой машине не хватает места под таргеты)
 set -eu
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -22,10 +22,14 @@ if [ "$target" = "aarch64-linux-android" ]; then
 else
   export RUSTFLAGS="${RUSTFLAGS:--C link-arg=-fuse-ld=bfd}"
 fi
-if [ "${RAWG_NATIVE:-0}" = "1" ]; then
+if [ "${KNOTHOP_NATIVE:-0}" = "1" ]; then
   export RUSTFLAGS="$RUSTFLAGS -C target-cpu=native"
 fi
 FORK=${LEVICULUM_FORK:-$HOME/dev/leviculum}
-cd "$(dirname "$0")/rns-iroh-node"
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/rawg-target/fork}" cargo build --release \
-  --config "patch.\"https://codeberg.org/Lew_Palm/Leviculum\".leviculum-std.path=\"$FORK/leviculum-std\"" "$@"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=bench/fork-patch.sh
+source "$HERE/fork-patch.sh"
+fork_patch_init "$FORK"
+cd "$HERE/rns-iroh-node"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/knothop-target/fork}" cargo build --release \
+  "${FORK_PATCH_ARGS[@]}" "$@"

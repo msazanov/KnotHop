@@ -19,7 +19,7 @@ import sys
 import time
 import urllib.parse
 
-ACTIVITY = "com.rawg.vpn/.MainActivity"
+ACTIVITY = "com.knothop.vpn/.MainActivity"
 DEV_FILE = "/data/local/tmp/speed100.bin"
 DEV_RC = "/data/local/tmp/speed100.rc"
 DEV_PID = "/data/local/tmp/speed100.pid"
@@ -65,7 +65,7 @@ def choose(serial, dest):
     deadline = time.monotonic() + SELECT_WAIT_S
     while True:
         try:
-            out = adb(serial, "logcat", "-d", "-s", "rawgui")[1]
+            out = adb(serial, "logcat", "-d", "-s", "knothopui")[1]
         except subprocess.TimeoutExpired:
             out = ""
         cur = [m for m in RE_CUR.finditer(out) if m.group(2) == dest8]
@@ -249,7 +249,7 @@ def main():
     ap.add_argument("--bytes", type=int, default=DEFAULT_BYTES, help="сколько байт скачать")
     ap.add_argument("--stall", type=float, default=10, help="секунд без прироста = остановка")
     ap.add_argument("--timeout", type=float, default=300, help="секунд на выход")
-    ap.add_argument("--out", help="JSON с результатами (по умолчанию ~/.cache/rawg-bench/speed100-<время>.json)")
+    ap.add_argument("--out", help="JSON с результатами (по умолчанию ~/.cache/knothop-bench/speed100-<время>.json)")
     args = ap.parse_args()
     if args.bytes <= 0 or args.stall <= 0 or args.timeout <= 0:
         ap.error("--bytes, --stall и --timeout должны быть > 0")
@@ -265,7 +265,7 @@ def main():
         exits = [e for e in exits if e["label"] in wanted]
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_path = args.out or os.path.join(os.path.expanduser("~/.cache/rawg-bench"), f"speed100-{stamp}.json")
+    out_path = args.out or os.path.join(os.path.expanduser("~/.cache/knothop-bench"), f"speed100-{stamp}.json")
     results, interrupted = [], False
     try:
         for ex in exits:

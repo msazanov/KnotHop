@@ -20,7 +20,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 BENCH = Path(os.environ.get("IROH_BENCH_BIN", "/tmp/opencode/iroh-target-exp/release/iroh-bench"))
 RELAY = Path(os.environ.get("IROH_RELAY_BIN", "/tmp/opencode/iroh-src/target/release/iroh-relay"))
-IMAGE = "rawg-bench:iroh-rns"
+IMAGE = "knothop-bench:iroh-rns"
 OUT = HERE / "results" / "iroh-rns"
 
 
@@ -53,14 +53,14 @@ def main():
     for b in (BENCH, RELAY):
         if not b.exists():
             sys.exit(f"missing {b}")
-    net = f"rawg-ir-{a.tag}"
+    net = f"knothop-ir-{a.tag}"
     names = {r: f"{net}-{r}" for r in ("relay", "server", "client")}
     created, res = [], {"cell": vars(a), "success": False, "events": []}
 
     def ev(msg):
         res["events"].append({"unix": round(time.time(), 3), "event": msg})
 
-    with tempfile.TemporaryDirectory(prefix="rawg-ir-", dir="/tmp/opencode") as sd:
+    with tempfile.TemporaryDirectory(prefix="knothop-ir-", dir="/tmp/opencode") as sd:
         shared = Path(sd); os.chmod(shared, 0o777)
         try:
             sh("docker", "network", "create", "--internal", net)

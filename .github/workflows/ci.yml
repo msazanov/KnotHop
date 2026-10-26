@@ -46,23 +46,25 @@ jobs:
           restore-keys: tests-${{ runner.os }}-
       - name: Настроить Rust
         run: rustup toolchain install stable --profile minimal
-      - name: Тесты библиотеки Rust
-        working-directory: bench/rns-iroh-node
+      - name: Граф Leviculum (один leviculum-core, оба Cargo.lock актуальны)
         env:
+          LEVICULUM_FORK: ${{ github.workspace }}/leviculum
+        run: bash bench/check_fork_graph.sh
+      - name: Тесты библиотеки Rust
+        env:
+          LEVICULUM_FORK: ${{ github.workspace }}/leviculum
           CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/test
-        run: >-
-          cargo test --lib
-          --config 'patch."https://codeberg.org/Lew_Palm/Leviculum".leviculum-std.path="${{ github.workspace }}/leviculum/leviculum-std"'
+        run: bash bench/cargo_fork.sh rns-iroh-node test --locked --lib
       - name: Python-тесты
         run: python3 -m unittest deploy/test_push.py deploy/test_sanitize_public.py
       - name: Проверка Bash и ShellCheck
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          for script in deploy/*.sh bench/android/build.sh; do bash -n "$script"; shellcheck -S warning -x "$script"; done
+          for script in deploy/*.sh bench/android/build.sh bench/build_fork.sh bench/cargo_fork.sh bench/check_fork_graph.sh bench/fork-patch.sh; do bash -n "$script"; shellcheck -S warning -x "$script"; done
 
   host:
-    name: rawgd (Ubuntu 24.04)
+    name: knothopd (Ubuntu 24.04)
     needs: tests
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
@@ -93,7 +95,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev binutils
       - name: Настроить Rust
         run: rustup toolchain install stable --profile minimal
-      - name: Собрать rawgd и FORK-MANIFEST
+      - name: Собрать knothopd и FORK-MANIFEST
         env:
           LEVICULUM_FORK: ${{ github.workspace }}/leviculum
           CI_TARGET: ${{ runner.temp }}/knothop-target
@@ -105,7 +107,7 @@ jobs:
           if-no-files-found: error
 
   u2204:
-    name: rawgd-u2204 (контейнер ubuntu:22.04)
+    name: knothopd-u2204 (контейнер ubuntu:22.04)
     needs: tests
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
@@ -125,7 +127,7 @@ jobs:
           ref: ${{ steps.pin.outputs.sha }}
           path: leviculum
           persist-credentials: false
-      - name: Собрать rawgd-u2204 в ubuntu:22.04
+      - name: Собрать knothopd-u2204 в ubuntu:22.04
         env:
           LEVICULUM_FORK: ${{ github.workspace }}/leviculum
           CI_TARGET: ${{ runner.temp }}/knothop-target
@@ -195,7 +197,7 @@ jobs:
           KNOTHOP_KEY_ALIAS: ${{ secrets.KNOTHOP_KEY_ALIAS }}
           KNOTHOP_VERSION_CODE: ${{ github.run_number }}
           KNOTHOP_VERSION_NAME: 0.1.${{ github.run_number }}
-          RAWG_LAB: '0'
+          KNOTHOP_LAB: '0'
           LEVICULUM_FORK: ${{ github.workspace }}/leviculum
           OUT: ${{ runner.temp }}/apk-out
           CARGO_TARGET_DIR: ${{ runner.temp }}/android-target
@@ -205,7 +207,7 @@ jobs:
           ./build.sh vpn
       - name: Проверить подпись APK
         run: |
-          apk="$RUNNER_TEMP/apk-out/rawgvpn.apk"
+          apk="$RUNNER_TEMP/apk-out/knothop.apk"
           # SHA-256 сертификата подписи публичен: печатаем в журнал для сверки релиза
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk"
       - name: Удалить ключ подписи
@@ -214,7 +216,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4
         with:
           name: apk
-          path: ${{ runner.temp }}/apk-out/rawgvpn.apk
+          path: ${{ runner.temp }}/apk-out/knothop.apk
           if-no-files-found: error
 
   release:
@@ -239,7 +241,7 @@ jobs:
       - name: SHA256SUMS и описание релиза
         run: |
           cd dist
-          sha256sum rawgd rawgd-u2204 rawgvpn.apk > SHA256SUMS
+          sha256sum knothopd knothopd-u2204 knothop.apk > SHA256SUMS
           fork="$(sed -n 's/^head=//p' FORK-MANIFEST.txt)"
           {
             echo "Сборка из коммита \`${GITHUB_SHA:0:9}\`, версия 0.1.${{ github.run_number }} (versionCode ${{ github.run_number }})."
@@ -252,13 +254,13 @@ jobs:
             cat SHA256SUMS
             echo '```'
             echo
-            echo "rawgd собран на Ubuntu 24.04, rawgd-u2204 - в контейнере ubuntu:22.04 (glibc 2.35)."
-            echo "rawgvpn.apk подписан релизным ключом; SHA-256 сертификата - в журнале job apk."
+            echo "knothopd собран на Ubuntu 24.04, knothopd-u2204 - в контейнере ubuntu:22.04 (glibc 2.35)."
+            echo "knothop.apk подписан релизным ключом; SHA-256 сертификата - в журнале job apk."
           } > "$RUNNER_TEMP/notes.md"
           ls -l
       - name: Создать релиз
         run: |
           gh release create "$TAG" \
-            dist/rawgd dist/rawgd-u2204 dist/rawgvpn.apk dist/SHA256SUMS dist/FORK-MANIFEST.txt \
+            dist/knothopd dist/knothopd-u2204 dist/knothop.apk dist/SHA256SUMS dist/FORK-MANIFEST.txt \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "KnotHop $TAG (${GITHUB_SHA:0:9})" --notes-file "$RUNNER_TEMP/notes.md"

@@ -1,0 +1,758 @@
+1F600	😀	E1.0	face-smiling	grinning face
+1F603	😃	E0.6	face-smiling	grinning face with big eyes
+1F604	😄	E0.6	face-smiling	grinning face with smiling eyes
+1F601	😁	E0.6	face-smiling	beaming face with smiling eyes
+1F606	😆	E0.6	face-smiling	grinning squinting face
+1F605	😅	E0.6	face-smiling	grinning face with sweat
+1F923	🤣	E3.0	face-smiling	rolling on the floor laughing
+1F602	😂	E0.6	face-smiling	face with tears of joy
+1F642	🙂	E1.0	face-smiling	slightly smiling face
+1F643	🙃	E1.0	face-smiling	upside-down face
+1F609	😉	E0.6	face-smiling	winking face
+1F60A	😊	E0.6	face-smiling	smiling face with smiling eyes
+1F607	😇	E1.0	face-smiling	smiling face with halo
+1F60D	😍	E0.6	face-affection	smiling face with heart-eyes
+1F929	🤩	E5.0	face-affection	star-struck
+1F618	😘	E0.6	face-affection	face blowing a kiss
+1F617	😗	E1.0	face-affection	kissing face
+1F61A	😚	E0.6	face-affection	kissing face with closed eyes
+1F619	😙	E1.0	face-affection	kissing face with smiling eyes
+1F60B	😋	E0.6	face-tongue	face savoring food
+1F61B	😛	E1.0	face-tongue	face with tongue
+1F61C	😜	E0.6	face-tongue	winking face with tongue
+1F92A	🤪	E5.0	face-tongue	zany face
+1F61D	😝	E0.6	face-tongue	squinting face with tongue
+1F911	🤑	E1.0	face-tongue	money-mouth face
+1F917	🤗	E1.0	face-hand	smiling face with open hands
+1F92D	🤭	E5.0	face-hand	face with hand over mouth
+1F92B	🤫	E5.0	face-hand	shushing face
+1F914	🤔	E1.0	face-hand	thinking face
+1F910	🤐	E1.0	face-neutral-skeptical	zipper-mouth face
+1F928	🤨	E5.0	face-neutral-skeptical	face with raised eyebrow
+1F610	😐	E0.7	face-neutral-skeptical	neutral face
+1F611	😑	E1.0	face-neutral-skeptical	expressionless face
+1F636	😶	E1.0	face-neutral-skeptical	face without mouth
+1F60F	😏	E0.6	face-neutral-skeptical	smirking face
+1F612	😒	E0.6	face-neutral-skeptical	unamused face
+1F644	🙄	E1.0	face-neutral-skeptical	face with rolling eyes
+1F62C	😬	E1.0	face-neutral-skeptical	grimacing face
+1F925	🤥	E3.0	face-neutral-skeptical	lying face
+1F60C	😌	E0.6	face-sleepy	relieved face
+1F614	😔	E0.6	face-sleepy	pensive face
+1F62A	😪	E0.6	face-sleepy	sleepy face
+1F924	🤤	E3.0	face-sleepy	drooling face
+1F634	😴	E1.0	face-sleepy	sleeping face
+1F637	😷	E0.6	face-unwell	face with medical mask
+1F912	🤒	E1.0	face-unwell	face with thermometer
+1F915	🤕	E1.0	face-unwell	face with head-bandage
+1F922	🤢	E3.0	face-unwell	nauseated face
+1F92E	🤮	E5.0	face-unwell	face vomiting
+1F927	🤧	E3.0	face-unwell	sneezing face
+1F635	😵	E0.6	face-unwell	face with crossed-out eyes
+1F92F	🤯	E5.0	face-unwell	exploding head
+1F920	🤠	E3.0	face-hat	cowboy hat face
+1F60E	😎	E1.0	face-glasses	smiling face with sunglasses
+1F913	🤓	E1.0	face-glasses	nerd face
+1F9D0	🧐	E5.0	face-glasses	face with monocle
+1F615	😕	E1.0	face-concerned	confused face
+1F61F	😟	E1.0	face-concerned	worried face
+1F641	🙁	E1.0	face-concerned	slightly frowning face
+1F62E	😮	E1.0	face-concerned	face with open mouth
+1F62F	😯	E1.0	face-concerned	hushed face
+1F632	😲	E0.6	face-concerned	astonished face
+1F633	😳	E0.6	face-concerned	flushed face
+1F626	😦	E1.0	face-concerned	frowning face with open mouth
+1F627	😧	E1.0	face-concerned	anguished face
+1F628	😨	E0.6	face-concerned	fearful face
+1F630	😰	E0.6	face-concerned	anxious face with sweat
+1F625	😥	E0.6	face-concerned	sad but relieved face
+1F622	😢	E0.6	face-concerned	crying face
+1F62D	😭	E0.6	face-concerned	loudly crying face
+1F631	😱	E0.6	face-concerned	face screaming in fear
+1F616	😖	E0.6	face-concerned	confounded face
+1F623	😣	E0.6	face-concerned	persevering face
+1F61E	😞	E0.6	face-concerned	disappointed face
+1F613	😓	E0.6	face-concerned	downcast face with sweat
+1F629	😩	E0.6	face-concerned	weary face
+1F62B	😫	E0.6	face-concerned	tired face
+1F624	😤	E0.6	face-negative	face with steam from nose
+1F621	😡	E0.6	face-negative	enraged face
+1F620	😠	E0.6	face-negative	angry face
+1F92C	🤬	E5.0	face-negative	face with symbols on mouth
+1F608	😈	E1.0	face-negative	smiling face with horns
+1F47F	👿	E0.6	face-negative	angry face with horns
+1F480	💀	E0.6	face-negative	skull
+1F4A9	💩	E0.6	face-costume	pile of poo
+1F921	🤡	E3.0	face-costume	clown face
+1F479	👹	E0.6	face-costume	ogre
+1F47A	👺	E0.6	face-costume	goblin
+1F47B	👻	E0.6	face-costume	ghost
+1F47D	👽	E0.6	face-costume	alien
+1F47E	👾	E0.6	face-costume	alien monster
+1F916	🤖	E1.0	face-costume	robot
+1F63A	😺	E0.6	cat-face	grinning cat
+1F638	😸	E0.6	cat-face	grinning cat with smiling eyes
+1F63D	😽	E0.6	cat-face	kissing cat
+1F640	🙀	E0.6	cat-face	weary cat
+1F63F	😿	E0.6	cat-face	crying cat
+1F63E	😾	E0.6	cat-face	pouting cat
+1F648	🙈	E0.6	monkey-face	see-no-evil monkey
+1F48C	💌	E0.6	heart	love letter
+1F49E	💞	E0.6	heart	revolving hearts
+1F495	💕	E0.6	heart	two hearts
+1F48B	💋	E0.6	emotion	kiss mark
+1F4AF	💯	E0.6	emotion	hundred points
+1F4A2	💢	E0.6	emotion	anger symbol
+1F4A5	💥	E0.6	emotion	collision
+1F4AB	💫	E0.6	emotion	dizzy
+1F4A6	💦	E0.6	emotion	sweat droplets
+1F4A8	💨	E0.6	emotion	dashing away
+1F4AC	💬	E0.6	emotion	speech balloon
+1F4AD	💭	E1.0	emotion	thought balloon
+1F4A4	💤	E0.6	emotion	ZZZ
+1F9E0	🧠	E5.0	body-parts	brain
+1F440	👀	E0.6	body-parts	eyes
+1F445	👅	E0.6	body-parts	tongue
+1F444	👄	E0.6	body-parts	mouth
+1F9DE	🧞	E5.0	person-fantasy	genie
+1F9DF	🧟	E5.0	person-fantasy	zombie
+1F93A	🤺	E3.0	person-sport	person fencing
+1F464	👤	E0.6	person-symbol	bust in silhouette
+1F465	👥	E1.0	person-symbol	busts in silhouette
+1F463	👣	E0.6	person-symbol	footprints
+1F98D	🦍	E3.0	animal-mammal	gorilla
+1F436	🐶	E0.6	animal-mammal	dog face
+1F415	🐕	E0.7	animal-mammal	dog
+1F429	🐩	E0.6	animal-mammal	poodle
+1F43A	🐺	E0.6	animal-mammal	wolf
+1F98A	🦊	E3.0	animal-mammal	fox
+1F408	🐈	E0.7	animal-mammal	cat
+1F981	🦁	E1.0	animal-mammal	lion
+1F42F	🐯	E0.6	animal-mammal	tiger face
+1F405	🐅	E1.0	animal-mammal	tiger
+1F406	🐆	E1.0	animal-mammal	leopard
+1F434	🐴	E0.6	animal-mammal	horse face
+1F40E	🐎	E0.6	animal-mammal	horse
+1F984	🦄	E1.0	animal-mammal	unicorn
+1F993	🦓	E5.0	animal-mammal	zebra
+1F98C	🦌	E3.0	animal-mammal	deer
+1F42E	🐮	E0.6	animal-mammal	cow face
+1F402	🐂	E1.0	animal-mammal	ox
+1F403	🐃	E1.0	animal-mammal	water buffalo
+1F404	🐄	E1.0	animal-mammal	cow
+1F437	🐷	E0.6	animal-mammal	pig face
+1F416	🐖	E1.0	animal-mammal	pig
+1F417	🐗	E0.6	animal-mammal	boar
+1F43D	🐽	E0.6	animal-mammal	pig nose
+1F40F	🐏	E1.0	animal-mammal	ram
+1F411	🐑	E0.6	animal-mammal	ewe
+1F410	🐐	E1.0	animal-mammal	goat
+1F42A	🐪	E1.0	animal-mammal	camel
+1F42B	🐫	E0.6	animal-mammal	two-hump camel
+1F992	🦒	E5.0	animal-mammal	giraffe
+1F418	🐘	E0.6	animal-mammal	elephant
+1F98F	🦏	E3.0	animal-mammal	rhinoceros
+1F42D	🐭	E0.6	animal-mammal	mouse face
+1F401	🐁	E1.0	animal-mammal	mouse
+1F400	🐀	E1.0	animal-mammal	rat
+1F439	🐹	E0.6	animal-mammal	hamster
+1F430	🐰	E0.6	animal-mammal	rabbit face
+1F407	🐇	E1.0	animal-mammal	rabbit
+1F994	🦔	E5.0	animal-mammal	hedgehog
+1F987	🦇	E3.0	animal-mammal	bat
+1F43B	🐻	E0.6	animal-mammal	bear
+1F428	🐨	E0.6	animal-mammal	koala
+1F43C	🐼	E0.6	animal-mammal	panda
+1F43E	🐾	E0.6	animal-mammal	paw prints
+1F983	🦃	E1.0	animal-bird	turkey
+1F414	🐔	E0.6	animal-bird	chicken
+1F413	🐓	E1.0	animal-bird	rooster
+1F423	🐣	E0.6	animal-bird	hatching chick
+1F424	🐤	E0.6	animal-bird	baby chick
+1F425	🐥	E0.6	animal-bird	front-facing baby chick
+1F426	🐦	E0.6	animal-bird	bird
+1F427	🐧	E0.6	animal-bird	penguin
+1F985	🦅	E3.0	animal-bird	eagle
+1F986	🦆	E3.0	animal-bird	duck
+1F989	🦉	E3.0	animal-bird	owl
+1F438	🐸	E0.6	animal-amphibian	frog
+1F40A	🐊	E1.0	animal-reptile	crocodile
+1F422	🐢	E0.6	animal-reptile	turtle
+1F98E	🦎	E3.0	animal-reptile	lizard
+1F40D	🐍	E0.6	animal-reptile	snake
+1F432	🐲	E0.6	animal-reptile	dragon face
+1F409	🐉	E1.0	animal-reptile	dragon
+1F995	🦕	E5.0	animal-reptile	sauropod
+1F996	🦖	E5.0	animal-reptile	T-Rex
+1F433	🐳	E0.6	animal-marine	spouting whale
+1F40B	🐋	E1.0	animal-marine	whale
+1F42C	🐬	E0.6	animal-marine	dolphin
+1F41F	🐟	E0.6	animal-marine	fish
+1F420	🐠	E0.6	animal-marine	tropical fish
+1F421	🐡	E0.6	animal-marine	blowfish
+1F988	🦈	E3.0	animal-marine	shark
+1F419	🐙	E0.6	animal-marine	octopus
+1F41A	🐚	E0.6	animal-marine	spiral shell
+1F980	🦀	E1.0	animal-marine	crab
+1F990	🦐	E3.0	animal-marine	shrimp
+1F991	🦑	E3.0	animal-marine	squid
+1F40C	🐌	E0.6	animal-bug	snail
+1F98B	🦋	E3.0	animal-bug	butterfly
+1F41B	🐛	E0.6	animal-bug	bug
+1F41C	🐜	E0.6	animal-bug	ant
+1F41D	🐝	E0.6	animal-bug	honeybee
+1F41E	🐞	E0.6	animal-bug	lady beetle
+1F997	🦗	E5.0	animal-bug	cricket
+1F982	🦂	E1.0	animal-bug	scorpion
+1F490	💐	E0.6	plant-flower	bouquet
+1F338	🌸	E0.6	plant-flower	cherry blossom
+1F4AE	💮	E0.6	plant-flower	white flower
+1F339	🌹	E0.6	plant-flower	rose
+1F940	🥀	E3.0	plant-flower	wilted flower
+1F33A	🌺	E0.6	plant-flower	hibiscus
+1F33B	🌻	E0.6	plant-flower	sunflower
+1F33C	🌼	E0.6	plant-flower	blossom
+1F337	🌷	E0.6	plant-flower	tulip
+1F331	🌱	E0.6	plant-other	seedling
+1F332	🌲	E1.0	plant-other	evergreen tree
+1F333	🌳	E1.0	plant-other	deciduous tree
+1F334	🌴	E0.6	plant-other	palm tree
+1F335	🌵	E0.6	plant-other	cactus
+1F33E	🌾	E0.6	plant-other	sheaf of rice
+1F33F	🌿	E0.6	plant-other	herb
+1F340	🍀	E0.6	plant-other	four leaf clover
+1F341	🍁	E0.6	plant-other	maple leaf
+1F342	🍂	E0.6	plant-other	fallen leaf
+1F343	🍃	E0.6	plant-other	leaf fluttering in wind
+1F344	🍄	E0.6	plant-other	mushroom
+1F347	🍇	E0.6	food-fruit	grapes
+1F348	🍈	E0.6	food-fruit	melon
+1F349	🍉	E0.6	food-fruit	watermelon
+1F34A	🍊	E0.6	food-fruit	tangerine
+1F34B	🍋	E1.0	food-fruit	lemon
+1F34C	🍌	E0.6	food-fruit	banana
+1F34D	🍍	E0.6	food-fruit	pineapple
+1F34E	🍎	E0.6	food-fruit	red apple
+1F34F	🍏	E0.6	food-fruit	green apple
+1F350	🍐	E1.0	food-fruit	pear
+1F351	🍑	E0.6	food-fruit	peach
+1F352	🍒	E0.6	food-fruit	cherries
+1F353	🍓	E0.6	food-fruit	strawberry
+1F95D	🥝	E3.0	food-fruit	kiwi fruit
+1F345	🍅	E0.6	food-fruit	tomato
+1F965	🥥	E5.0	food-fruit	coconut
+1F951	🥑	E3.0	food-vegetable	avocado
+1F346	🍆	E0.6	food-vegetable	eggplant
+1F954	🥔	E3.0	food-vegetable	potato
+1F955	🥕	E3.0	food-vegetable	carrot
+1F33D	🌽	E0.6	food-vegetable	ear of corn
+1F952	🥒	E3.0	food-vegetable	cucumber
+1F966	🥦	E5.0	food-vegetable	broccoli
+1F95C	🥜	E3.0	food-vegetable	peanuts
+1F330	🌰	E0.6	food-vegetable	chestnut
+1F35E	🍞	E0.6	food-prepared	bread
+1F950	🥐	E3.0	food-prepared	croissant
+1F956	🥖	E3.0	food-prepared	baguette bread
+1F968	🥨	E5.0	food-prepared	pretzel
+1F95E	🥞	E3.0	food-prepared	pancakes
+1F9C0	🧀	E1.0	food-prepared	cheese wedge
+1F356	🍖	E0.6	food-prepared	meat on bone
+1F357	🍗	E0.6	food-prepared	poultry leg
+1F969	🥩	E5.0	food-prepared	cut of meat
+1F953	🥓	E3.0	food-prepared	bacon
+1F354	🍔	E0.6	food-prepared	hamburger
+1F35F	🍟	E0.6	food-prepared	french fries
+1F355	🍕	E0.6	food-prepared	pizza
+1F32D	🌭	E1.0	food-prepared	hot dog
+1F96A	🥪	E5.0	food-prepared	sandwich
+1F32E	🌮	E1.0	food-prepared	taco
+1F32F	🌯	E1.0	food-prepared	burrito
+1F959	🥙	E3.0	food-prepared	stuffed flatbread
+1F95A	🥚	E3.0	food-prepared	egg
+1F373	🍳	E0.6	food-prepared	cooking
+1F958	🥘	E3.0	food-prepared	shallow pan of food
+1F372	🍲	E0.6	food-prepared	pot of food
+1F963	🥣	E5.0	food-prepared	bowl with spoon
+1F957	🥗	E3.0	food-prepared	green salad
+1F37F	🍿	E1.0	food-prepared	popcorn
+1F96B	🥫	E5.0	food-prepared	canned food
+1F371	🍱	E0.6	food-asian	bento box
+1F358	🍘	E0.6	food-asian	rice cracker
+1F359	🍙	E0.6	food-asian	rice ball
+1F35A	🍚	E0.6	food-asian	cooked rice
+1F35B	🍛	E0.6	food-asian	curry rice
+1F35C	🍜	E0.6	food-asian	steaming bowl
+1F35D	🍝	E0.6	food-asian	spaghetti
+1F360	🍠	E0.6	food-asian	roasted sweet potato
+1F362	🍢	E0.6	food-asian	oden
+1F363	🍣	E0.6	food-asian	sushi
+1F364	🍤	E0.6	food-asian	fried shrimp
+1F365	🍥	E0.6	food-asian	fish cake with swirl
+1F361	🍡	E0.6	food-asian	dango
+1F95F	🥟	E5.0	food-asian	dumpling
+1F960	🥠	E5.0	food-asian	fortune cookie
+1F961	🥡	E5.0	food-asian	takeout box
+1F366	🍦	E0.6	food-sweet	soft ice cream
+1F367	🍧	E0.6	food-sweet	shaved ice
+1F368	🍨	E0.6	food-sweet	ice cream
+1F369	🍩	E0.6	food-sweet	doughnut
+1F36A	🍪	E0.6	food-sweet	cookie
+1F382	🎂	E0.6	food-sweet	birthday cake
+1F370	🍰	E0.6	food-sweet	shortcake
+1F967	🥧	E5.0	food-sweet	pie
+1F36B	🍫	E0.6	food-sweet	chocolate bar
+1F36C	🍬	E0.6	food-sweet	candy
+1F36D	🍭	E0.6	food-sweet	lollipop
+1F36E	🍮	E0.6	food-sweet	custard
+1F36F	🍯	E0.6	food-sweet	honey pot
+1F37C	🍼	E1.0	drink	baby bottle
+1F95B	🥛	E3.0	drink	glass of milk
+2615	☕	E0.6	drink	hot beverage
+1F375	🍵	E0.6	drink	teacup without handle
+1F376	🍶	E0.6	drink	sake
+1F37E	🍾	E1.0	drink	bottle with popping cork
+1F377	🍷	E0.6	drink	wine glass
+1F378	🍸	E0.6	drink	cocktail glass
+1F379	🍹	E0.6	drink	tropical drink
+1F37A	🍺	E0.6	drink	beer mug
+1F37B	🍻	E0.6	drink	clinking beer mugs
+1F942	🥂	E3.0	drink	clinking glasses
+1F943	🥃	E3.0	drink	tumbler glass
+1F964	🥤	E5.0	drink	cup with straw
+1F962	🥢	E5.0	dishware	chopsticks
+1F374	🍴	E0.6	dishware	fork and knife
+1F944	🥄	E3.0	dishware	spoon
+1F52A	🔪	E0.6	dishware	kitchen knife
+1F3FA	🏺	E1.0	dishware	amphora
+1F30D	🌍	E0.7	place-map	globe showing Europe-Africa
+1F30E	🌎	E0.7	place-map	globe showing Americas
+1F30F	🌏	E0.6	place-map	globe showing Asia-Australia
+1F310	🌐	E1.0	place-map	globe with meridians
+1F5FE	🗾	E0.6	place-map	map of Japan
+1F30B	🌋	E0.6	place-geographic	volcano
+1F5FB	🗻	E0.6	place-geographic	mount fuji
+1F3E0	🏠	E0.6	place-building	house
+1F3E1	🏡	E0.6	place-building	house with garden
+1F3E2	🏢	E0.6	place-building	office building
+1F3E3	🏣	E0.6	place-building	Japanese post office
+1F3E4	🏤	E1.0	place-building	post office
+1F3E5	🏥	E0.6	place-building	hospital
+1F3E6	🏦	E0.6	place-building	bank
+1F3E8	🏨	E0.6	place-building	hotel
+1F3E9	🏩	E0.6	place-building	love hotel
+1F3EA	🏪	E0.6	place-building	convenience store
+1F3EB	🏫	E0.6	place-building	school
+1F3EC	🏬	E0.6	place-building	department store
+1F3ED	🏭	E0.6	place-building	factory
+1F3EF	🏯	E0.6	place-building	Japanese castle
+1F3F0	🏰	E0.6	place-building	castle
+1F492	💒	E0.6	place-building	wedding
+1F5FC	🗼	E0.6	place-building	Tokyo tower
+1F5FD	🗽	E0.6	place-building	Statue of Liberty
+26EA	⛪	E0.6	place-religious	church
+1F54C	🕌	E1.0	place-religious	mosque
+1F54D	🕍	E1.0	place-religious	synagogue
+1F54B	🕋	E1.0	place-religious	kaaba
+26F2	⛲	E0.6	place-other	fountain
+26FA	⛺	E0.6	place-other	tent
+1F301	🌁	E0.6	place-other	foggy
+1F303	🌃	E0.6	place-other	night with stars
+1F304	🌄	E0.6	place-other	sunrise over mountains
+1F305	🌅	E0.6	place-other	sunrise
+1F306	🌆	E0.6	place-other	cityscape at dusk
+1F307	🌇	E0.6	place-other	sunset
+1F309	🌉	E0.6	place-other	bridge at night
+1F3A0	🎠	E0.6	place-other	carousel horse
+1F3A1	🎡	E0.6	place-other	ferris wheel
+1F3A2	🎢	E0.6	place-other	roller coaster
+1F488	💈	E0.6	place-other	barber pole
+1F3AA	🎪	E0.6	place-other	circus tent
+1F682	🚂	E1.0	transport-ground	locomotive
+1F683	🚃	E0.6	transport-ground	railway car
+1F684	🚄	E0.6	transport-ground	high-speed train
+1F685	🚅	E0.6	transport-ground	bullet train
+1F686	🚆	E1.0	transport-ground	train
+1F687	🚇	E0.6	transport-ground	metro
+1F688	🚈	E1.0	transport-ground	light rail
+1F689	🚉	E0.6	transport-ground	station
+1F68A	🚊	E1.0	transport-ground	tram
+1F69D	🚝	E1.0	transport-ground	monorail
+1F69E	🚞	E1.0	transport-ground	mountain railway
+1F68B	🚋	E1.0	transport-ground	tram car
+1F68C	🚌	E0.6	transport-ground	bus
+1F68D	🚍	E0.7	transport-ground	oncoming bus
+1F68E	🚎	E1.0	transport-ground	trolleybus
+1F690	🚐	E1.0	transport-ground	minibus
+1F691	🚑	E0.6	transport-ground	ambulance
+1F692	🚒	E0.6	transport-ground	fire engine
+1F693	🚓	E0.6	transport-ground	police car
+1F694	🚔	E0.7	transport-ground	oncoming police car
+1F695	🚕	E0.6	transport-ground	taxi
+1F696	🚖	E1.0	transport-ground	oncoming taxi
+1F697	🚗	E0.6	transport-ground	automobile
+1F698	🚘	E0.7	transport-ground	oncoming automobile
+1F699	🚙	E0.6	transport-ground	sport utility vehicle
+1F69A	🚚	E0.6	transport-ground	delivery truck
+1F69B	🚛	E1.0	transport-ground	articulated lorry
+1F69C	🚜	E1.0	transport-ground	tractor
+1F6F5	🛵	E3.0	transport-ground	motor scooter
+1F6B2	🚲	E0.6	transport-ground	bicycle
+1F6F4	🛴	E3.0	transport-ground	kick scooter
+1F68F	🚏	E0.6	transport-ground	bus stop
+26FD	⛽	E0.6	transport-ground	fuel pump
+1F6A8	🚨	E0.6	transport-ground	police car light
+1F6A5	🚥	E0.6	transport-ground	horizontal traffic light
+1F6A6	🚦	E1.0	transport-ground	vertical traffic light
+1F6D1	🛑	E3.0	transport-ground	stop sign
+1F6A7	🚧	E0.6	transport-ground	construction
+2693	⚓	E0.6	transport-water	anchor
+26F5	⛵	E0.6	transport-water	sailboat
+1F6F6	🛶	E3.0	transport-water	canoe
+1F6A4	🚤	E0.6	transport-water	speedboat
+1F6A2	🚢	E0.6	transport-water	ship
+1F6EB	🛫	E1.0	transport-air	airplane departure
+1F6EC	🛬	E1.0	transport-air	airplane arrival
+1F4BA	💺	E0.6	transport-air	seat
+1F681	🚁	E1.0	transport-air	helicopter
+1F69F	🚟	E1.0	transport-air	suspension railway
+1F6A0	🚠	E1.0	transport-air	mountain cableway
+1F6A1	🚡	E1.0	transport-air	aerial tramway
+1F680	🚀	E0.6	transport-air	rocket
+1F6F8	🛸	E5.0	transport-air	flying saucer
+231B	⌛	E0.6	time	hourglass done
+23F3	⏳	E0.6	time	hourglass not done
+231A	⌚	E0.6	time	watch
+23F0	⏰	E0.6	time	alarm clock
+1F55B	🕛	E0.6	time	twelve o’clock
+1F311	🌑	E0.6	sky & weather	new moon
+1F31E	🌞	E1.0	sky & weather	sun with face
+2B50	⭐	E0.6	sky & weather	star
+1F31F	🌟	E0.6	sky & weather	glowing star
+1F320	🌠	E0.6	sky & weather	shooting star
+1F30C	🌌	E0.6	sky & weather	milky way
+26C5	⛅	E0.6	sky & weather	sun behind cloud
+1F300	🌀	E0.6	sky & weather	cyclone
+1F308	🌈	E0.6	sky & weather	rainbow
+1F302	🌂	E0.6	sky & weather	closed umbrella
+2614	☔	E0.6	sky & weather	umbrella with rain drops
+26A1	⚡	E0.6	sky & weather	high voltage
+26C4	⛄	E0.6	sky & weather	snowman without snow
+1F525	🔥	E0.6	sky & weather	fire
+1F4A7	💧	E0.6	sky & weather	droplet
+1F30A	🌊	E0.6	sky & weather	water wave
+1F383	🎃	E0.6	event	jack-o-lantern
+1F384	🎄	E0.6	event	Christmas tree
+1F386	🎆	E0.6	event	fireworks
+1F387	🎇	E0.6	event	sparkler
+2728	✨	E0.6	event	sparkles
+1F388	🎈	E0.6	event	balloon
+1F389	🎉	E0.6	event	party popper
+1F38A	🎊	E0.6	event	confetti ball
+1F38B	🎋	E0.6	event	tanabata tree
+1F38D	🎍	E0.6	event	pine decoration
+1F38E	🎎	E0.6	event	Japanese dolls
+1F38F	🎏	E0.6	event	carp streamer
+1F390	🎐	E0.6	event	wind chime
+1F380	🎀	E0.6	event	ribbon
+1F381	🎁	E0.6	event	wrapped gift
+1F3AB	🎫	E0.6	event	ticket
+1F3C6	🏆	E0.6	award-medal	trophy
+1F3C5	🏅	E1.0	award-medal	sports medal
+1F947	🥇	E3.0	award-medal	1st place medal
+1F948	🥈	E3.0	award-medal	2nd place medal
+1F949	🥉	E3.0	award-medal	3rd place medal
+26BD	⚽	E0.6	sport	soccer ball
+26BE	⚾	E0.6	sport	baseball
+1F3C0	🏀	E0.6	sport	basketball
+1F3D0	🏐	E1.0	sport	volleyball
+1F3C8	🏈	E0.6	sport	american football
+1F3C9	🏉	E1.0	sport	rugby football
+1F3BE	🎾	E0.6	sport	tennis
+1F3B3	🎳	E0.6	sport	bowling
+1F3CF	🏏	E1.0	sport	cricket game
+1F3D1	🏑	E1.0	sport	field hockey
+1F3D2	🏒	E1.0	sport	ice hockey
+1F3D3	🏓	E1.0	sport	ping pong
+1F3F8	🏸	E1.0	sport	badminton
+1F94A	🥊	E3.0	sport	boxing glove
+1F94B	🥋	E3.0	sport	martial arts uniform
+1F945	🥅	E3.0	sport	goal net
+26F3	⛳	E0.6	sport	flag in hole
+1F3A3	🎣	E0.6	sport	fishing pole
+1F3BD	🎽	E0.6	sport	running shirt
+1F3BF	🎿	E0.6	sport	skis
+1F6F7	🛷	E5.0	sport	sled
+1F94C	🥌	E5.0	sport	curling stone
+1F3AF	🎯	E0.6	game	bullseye
+1F52B	🔫	E0.6	game	water pistol
+1F3B1	🎱	E0.6	game	pool 8 ball
+1F52E	🔮	E0.6	game	crystal ball
+1F3AE	🎮	E0.6	game	video game
+1F3B0	🎰	E0.6	game	slot machine
+1F3B2	🎲	E0.6	game	game die
+1F0CF	🃏	E0.6	game	joker
+1F004	🀄	E0.6	game	mahjong red dragon
+1F3B4	🎴	E0.6	game	flower playing cards
+1F3AD	🎭	E0.6	arts & crafts	performing arts
+1F3A8	🎨	E0.6	arts & crafts	artist palette
+1F453	👓	E0.6	clothing	glasses
+1F454	👔	E0.6	clothing	necktie
+1F455	👕	E0.6	clothing	t-shirt
+1F456	👖	E0.6	clothing	jeans
+1F9E3	🧣	E5.0	clothing	scarf
+1F9E4	🧤	E5.0	clothing	gloves
+1F9E5	🧥	E5.0	clothing	coat
+1F9E6	🧦	E5.0	clothing	socks
+1F457	👗	E0.6	clothing	dress
+1F458	👘	E0.6	clothing	kimono
+1F459	👙	E0.6	clothing	bikini
+1F45A	👚	E0.6	clothing	woman’s clothes
+1F45B	👛	E0.6	clothing	purse
+1F45C	👜	E0.6	clothing	handbag
+1F45D	👝	E0.6	clothing	clutch bag
+1F392	🎒	E0.6	clothing	backpack
+1F45E	👞	E0.6	clothing	man’s shoe
+1F45F	👟	E0.6	clothing	running shoe
+1F460	👠	E0.6	clothing	high-heeled shoe
+1F461	👡	E0.6	clothing	woman’s sandal
+1F462	👢	E0.6	clothing	woman’s boot
+1F451	👑	E0.6	clothing	crown
+1F452	👒	E0.6	clothing	woman’s hat
+1F3A9	🎩	E0.6	clothing	top hat
+1F393	🎓	E0.6	clothing	graduation cap
+1F9E2	🧢	E5.0	clothing	billed cap
+1F4FF	📿	E1.0	clothing	prayer beads
+1F484	💄	E0.6	clothing	lipstick
+1F48D	💍	E0.6	clothing	ring
+1F48E	💎	E0.6	clothing	gem stone
+1F507	🔇	E1.0	sound	muted speaker
+1F508	🔈	E0.7	sound	speaker low volume
+1F509	🔉	E1.0	sound	speaker medium volume
+1F50A	🔊	E0.6	sound	speaker high volume
+1F4E2	📢	E0.6	sound	loudspeaker
+1F4E3	📣	E0.6	sound	megaphone
+1F4EF	📯	E1.0	sound	postal horn
+1F514	🔔	E0.6	sound	bell
+1F515	🔕	E1.0	sound	bell with slash
+1F3BC	🎼	E0.6	music	musical score
+1F3B5	🎵	E0.6	music	musical note
+1F3B6	🎶	E0.6	music	musical notes
+1F3A4	🎤	E0.6	music	microphone
+1F3A7	🎧	E0.6	music	headphone
+1F4FB	📻	E0.6	music	radio
+1F3B7	🎷	E0.6	musical-instrument	saxophone
+1F3BA	🎺	E0.6	musical-instrument	trumpet
+1F3B8	🎸	E0.6	musical-instrument	guitar
+1F3B9	🎹	E0.6	musical-instrument	musical keyboard
+1F3BB	🎻	E0.6	musical-instrument	violin
+1F941	🥁	E3.0	musical-instrument	drum
+1F4F1	📱	E0.6	phone	mobile phone
+1F4F2	📲	E0.6	phone	mobile phone with arrow
+1F4DE	📞	E0.6	phone	telephone receiver
+1F4DF	📟	E0.6	phone	pager
+1F4E0	📠	E0.6	phone	fax machine
+1F50B	🔋	E0.6	computer	battery
+1F50C	🔌	E0.6	computer	electric plug
+1F4BB	💻	E0.6	computer	laptop
+1F4BD	💽	E0.6	computer	computer disk
+1F4BE	💾	E0.6	computer	floppy disk
+1F4BF	💿	E0.6	computer	optical disk
+1F4C0	📀	E0.6	computer	dvd
+1F3A5	🎥	E0.6	light & video	movie camera
+1F3AC	🎬	E0.6	light & video	clapper board
+1F4FA	📺	E0.6	light & video	television
+1F4F7	📷	E0.6	light & video	camera
+1F4F8	📸	E1.0	light & video	camera with flash
+1F4F9	📹	E0.6	light & video	video camera
+1F4FC	📼	E0.6	light & video	videocassette
+1F50D	🔍	E0.6	light & video	magnifying glass tilted left
+1F50E	🔎	E0.6	light & video	magnifying glass tilted right
+1F4A1	💡	E0.6	light & video	light bulb
+1F526	🔦	E0.6	light & video	flashlight
+1F3EE	🏮	E0.6	light & video	red paper lantern
+1F4D4	📔	E0.6	book-paper	notebook with decorative cover
+1F4D5	📕	E0.6	book-paper	closed book
+1F4D6	📖	E0.6	book-paper	open book
+1F4D7	📗	E0.6	book-paper	green book
+1F4D8	📘	E0.6	book-paper	blue book
+1F4D9	📙	E0.6	book-paper	orange book
+1F4DA	📚	E0.6	book-paper	books
+1F4D3	📓	E0.6	book-paper	notebook
+1F4D2	📒	E0.6	book-paper	ledger
+1F4C3	📃	E0.6	book-paper	page with curl
+1F4DC	📜	E0.6	book-paper	scroll
+1F4C4	📄	E0.6	book-paper	page facing up
+1F4F0	📰	E0.6	book-paper	newspaper
+1F4D1	📑	E0.6	book-paper	bookmark tabs
+1F516	🔖	E0.6	book-paper	bookmark
+1F4B0	💰	E0.6	money	money bag
+1F4B4	💴	E0.6	money	yen banknote
+1F4B5	💵	E0.6	money	dollar banknote
+1F4B6	💶	E1.0	money	euro banknote
+1F4B7	💷	E1.0	money	pound banknote
+1F4B8	💸	E0.6	money	money with wings
+1F4B3	💳	E0.6	money	credit card
+1F4B9	💹	E0.6	money	chart increasing with yen
+1F4E7	📧	E0.6	mail	e-mail
+1F4E8	📨	E0.6	mail	incoming envelope
+1F4E9	📩	E0.6	mail	envelope with arrow
+1F4E4	📤	E0.6	mail	outbox tray
+1F4E5	📥	E0.6	mail	inbox tray
+1F4E6	📦	E0.6	mail	package
+1F4EB	📫	E0.6	mail	closed mailbox with raised flag
+1F4EA	📪	E0.6	mail	closed mailbox with lowered flag
+1F4EC	📬	E0.7	mail	open mailbox with raised flag
+1F4ED	📭	E0.7	mail	open mailbox with lowered flag
+1F4EE	📮	E0.6	mail	postbox
+1F4DD	📝	E0.6	writing	memo
+1F4BC	💼	E0.6	office	briefcase
+1F4C1	📁	E0.6	office	file folder
+1F4C2	📂	E0.6	office	open file folder
+1F4C5	📅	E0.6	office	calendar
+1F4C6	📆	E0.6	office	tear-off calendar
+1F4C7	📇	E0.6	office	card index
+1F4C8	📈	E0.6	office	chart increasing
+1F4C9	📉	E0.6	office	chart decreasing
+1F4CA	📊	E0.6	office	bar chart
+1F4CB	📋	E0.6	office	clipboard
+1F4CC	📌	E0.6	office	pushpin
+1F4CD	📍	E0.6	office	round pushpin
+1F4CE	📎	E0.6	office	paperclip
+1F4CF	📏	E0.6	office	straight ruler
+1F4D0	📐	E0.6	office	triangular ruler
+1F512	🔒	E0.6	lock	locked
+1F513	🔓	E0.6	lock	unlocked
+1F50F	🔏	E0.6	lock	locked with pen
+1F510	🔐	E0.6	lock	locked with key
+1F511	🔑	E0.6	lock	key
+1F528	🔨	E0.6	tool	hammer
+1F4A3	💣	E0.6	tool	bomb
+1F3F9	🏹	E1.0	tool	bow and arrow
+1F527	🔧	E0.6	tool	wrench
+1F529	🔩	E0.6	tool	nut and bolt
+1F517	🔗	E0.6	tool	link
+1F52C	🔬	E1.0	science	microscope
+1F52D	🔭	E1.0	science	telescope
+1F4E1	📡	E0.6	science	satellite antenna
+1F489	💉	E0.6	medical	syringe
+1F48A	💊	E0.6	medical	pill
+1F6AA	🚪	E0.6	household	door
+1F6BD	🚽	E0.6	household	toilet
+1F6BF	🚿	E1.0	household	shower
+1F6C1	🛁	E1.0	household	bathtub
+1F6D2	🛒	E3.0	household	shopping cart
+1F6AC	🚬	E0.6	other-object	cigarette
+1F5FF	🗿	E0.6	other-object	moai
+1F3E7	🏧	E0.6	transport-sign	ATM sign
+1F6AE	🚮	E1.0	transport-sign	litter in bin sign
+1F6B0	🚰	E1.0	transport-sign	potable water
+267F	♿	E0.6	transport-sign	wheelchair symbol
+1F6B9	🚹	E0.6	transport-sign	men’s room
+1F6BA	🚺	E0.6	transport-sign	women’s room
+1F6BB	🚻	E0.6	transport-sign	restroom
+1F6BC	🚼	E0.6	transport-sign	baby symbol
+1F6BE	🚾	E0.6	transport-sign	water closet
+1F6C2	🛂	E1.0	transport-sign	passport control
+1F6C3	🛃	E1.0	transport-sign	customs
+1F6C4	🛄	E1.0	transport-sign	baggage claim
+1F6C5	🛅	E1.0	transport-sign	left luggage
+1F6B8	🚸	E1.0	warning	children crossing
+26D4	⛔	E0.6	warning	no entry
+1F6AB	🚫	E0.6	warning	prohibited
+1F6B3	🚳	E1.0	warning	no bicycles
+1F6AD	🚭	E0.6	warning	no smoking
+1F6AF	🚯	E1.0	warning	no littering
+1F6B1	🚱	E1.0	warning	non-potable water
+1F6B7	🚷	E1.0	warning	no pedestrians
+1F4F5	📵	E1.0	warning	no mobile phones
+1F51E	🔞	E0.6	warning	no one under eighteen
+1F503	🔃	E0.6	arrow	clockwise vertical arrows
+1F504	🔄	E1.0	arrow	counterclockwise arrows button
+1F519	🔙	E0.6	arrow	BACK arrow
+1F51A	🔚	E0.6	arrow	END arrow
+1F51B	🔛	E0.6	arrow	ON! arrow
+1F51C	🔜	E0.6	arrow	SOON arrow
+1F51D	🔝	E0.6	arrow	TOP arrow
+1F6D0	🛐	E1.0	religion	place of worship
+1F54E	🕎	E1.0	religion	menorah
+1F52F	🔯	E0.6	religion	dotted six-pointed star
+2648	♈	E0.6	zodiac	Aries
+2649	♉	E0.6	zodiac	Taurus
+264A	♊	E0.6	zodiac	Gemini
+264B	♋	E0.6	zodiac	Cancer
+264C	♌	E0.6	zodiac	Leo
+264D	♍	E0.6	zodiac	Virgo
+264E	♎	E0.6	zodiac	Libra
+264F	♏	E0.6	zodiac	Scorpio
+2650	♐	E0.6	zodiac	Sagittarius
+2651	♑	E0.6	zodiac	Capricorn
+2652	♒	E0.6	zodiac	Aquarius
+2653	♓	E0.6	zodiac	Pisces
+26CE	⛎	E0.6	zodiac	Ophiuchus
+1F500	🔀	E1.0	av-symbol	shuffle tracks button
+1F501	🔁	E1.0	av-symbol	repeat button
+1F502	🔂	E1.0	av-symbol	repeat single button
+23E9	⏩	E0.6	av-symbol	fast-forward button
+23EA	⏪	E0.6	av-symbol	fast reverse button
+1F53C	🔼	E0.6	av-symbol	upwards button
+23EB	⏫	E0.6	av-symbol	fast up button
+1F53D	🔽	E0.6	av-symbol	downwards button
+23EC	⏬	E0.6	av-symbol	fast down button
+1F3A6	🎦	E0.6	av-symbol	cinema
+1F505	🔅	E1.0	av-symbol	dim button
+1F506	🔆	E1.0	av-symbol	bright button
+1F4F6	📶	E0.6	av-symbol	antenna bars
+1F4F3	📳	E0.6	av-symbol	vibration mode
+1F4F4	📴	E0.6	av-symbol	mobile phone off
+2795	➕	E0.6	math	plus
+2796	➖	E0.6	math	minus
+2797	➗	E0.6	math	divide
+2753	❓	E0.6	punctuation	red question mark
+2754	❔	E0.6	punctuation	white question mark
+2755	❕	E0.6	punctuation	white exclamation mark
+2757	❗	E0.6	punctuation	red exclamation mark
+1F4B1	💱	E0.6	currency	currency exchange
+1F4B2	💲	E0.6	currency	heavy dollar sign
+1F531	🔱	E0.6	other-symbol	trident emblem
+1F4DB	📛	E0.6	other-symbol	name badge
+1F530	🔰	E0.6	other-symbol	Japanese symbol for beginner
+2B55	⭕	E0.6	other-symbol	hollow red circle
+2705	✅	E0.6	other-symbol	check mark button
+274C	❌	E0.6	other-symbol	cross mark
+274E	❎	E0.6	other-symbol	cross mark button
+27B0	➰	E0.6	other-symbol	curly loop
+27BF	➿	E1.0	other-symbol	double curly loop
+1F51F	🔟	E0.6	keycap	keycap: 10
+1F520	🔠	E0.6	alphanum	input latin uppercase
+1F521	🔡	E0.6	alphanum	input latin lowercase
+1F522	🔢	E0.6	alphanum	input numbers
+1F523	🔣	E0.6	alphanum	input symbols
+1F524	🔤	E0.6	alphanum	input latin letters
+1F18E	🆎	E0.6	alphanum	AB button (blood type)
+1F191	🆑	E0.6	alphanum	CL button
+1F192	🆒	E0.6	alphanum	COOL button
+1F193	🆓	E0.6	alphanum	FREE button
+1F194	🆔	E0.6	alphanum	ID button
+1F195	🆕	E0.6	alphanum	NEW button
+1F196	🆖	E0.6	alphanum	NG button
+1F197	🆗	E0.6	alphanum	OK button
+1F198	🆘	E0.6	alphanum	SOS button
+1F199	🆙	E0.6	alphanum	UP! button
+1F19A	🆚	E0.6	alphanum	VS button
+1F201	🈁	E0.6	alphanum	Japanese “here” button
+1F236	🈶	E0.6	alphanum	Japanese “not free of charge” button
+1F22F	🈯	E0.6	alphanum	Japanese “reserved” button
+1F250	🉐	E0.6	alphanum	Japanese “bargain” button
+1F239	🈹	E0.6	alphanum	Japanese “discount” button
+1F21A	🈚	E0.6	alphanum	Japanese “free of charge” button
+1F232	🈲	E0.6	alphanum	Japanese “prohibited” button
+1F251	🉑	E0.6	alphanum	Japanese “acceptable” button
+1F238	🈸	E0.6	alphanum	Japanese “application” button
+1F234	🈴	E0.6	alphanum	Japanese “passing grade” button
+1F233	🈳	E0.6	alphanum	Japanese “vacancy” button
+1F23A	🈺	E0.6	alphanum	Japanese “open for business” button
+1F235	🈵	E0.6	alphanum	Japanese “no vacancy” button
+1F536	🔶	E0.6	geometric	large orange diamond
+1F53A	🔺	E0.6	geometric	red triangle pointed up
+1F53B	🔻	E0.6	geometric	red triangle pointed down
+1F518	🔘	E0.6	geometric	radio button

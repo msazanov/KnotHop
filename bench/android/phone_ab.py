@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 
-PKG = "com.rawg.vpn"
+PKG = "com.knothop.vpn"
 HOST = "10.99.0.1:8099"
 
 

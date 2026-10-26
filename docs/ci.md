@@ -4,7 +4,7 @@
 
 - **Тесты** (`tests`) - на каждом `push`, `pull_request` и ручном запуске: `cargo test --lib`, Python-тесты `deploy/test_push.py` и `deploy/test_sanitize_public.py` (unittest), `bash -n` и ShellCheck (уровень warning) для `deploy/*.sh` и `bench/android/build.sh`.
 - **Сборки** (`host`, `u2204`, `apk`) - только на `main` (push или ручной запуск с `main`) и только после успешных тестов.
-- **Релиз** (`release`) - только на `main`. Тег `v0.1.<номер запуска>`, релиз с `rawgd`, `rawgd-u2204`, `rawgvpn.apk`, `SHA256SUMS` и `FORK-MANIFEST.txt`. Это единственная job с правом `contents: write`.
+- **Релиз** (`release`) - только на `main`. Тег `v0.1.<номер запуска>`, релиз с `knothopd`, `knothopd-u2204`, `knothop.apk`, `SHA256SUMS` и `FORK-MANIFEST.txt`. Это единственная job с правом `contents: write`.
 
 Права по умолчанию - `contents: read`. Секреты подписи читаются только в job `apk` и только на `main`; `pull_request` их не получает.
 
@@ -16,16 +16,16 @@
 
 ## Сборка бинарников
 
-- `deploy/ci-build.sh host КАТАЛОГ` - `rawgd` на хосте раннера (Ubuntu 24.04); пишет также `FORK-MANIFEST.txt`.
-- `deploy/ci-build.sh u2204 КАТАЛОГ` - `rawgd-u2204` в контейнере `ubuntu:22.04` из `deploy/Dockerfile.u2204`. Toolchain ставит `rustup-init`, который проверяется по SHA-256 с `static.rust-lang.org`.
+- `deploy/ci-build.sh host КАТАЛОГ` - `knothopd` на хосте раннера (Ubuntu 24.04); пишет также `FORK-MANIFEST.txt`.
+- `deploy/ci-build.sh u2204 КАТАЛОГ` - `knothopd-u2204` в контейнере `ubuntu:22.04` из `deploy/Dockerfile.u2204`. Toolchain ставит `rustup-init`, который проверяется по SHA-256 с `static.rust-lang.org`.
 
-Скрипт проверяет, что `rawgd-u2204` требует glibc не новее 2.35.
+Скрипт проверяет, что `knothopd-u2204` требует glibc не новее 2.35.
 
 Бинарники CI не совпадают побайтово с локальными сборками `deploy/build.sh`: другой toolchain и другой путь исходников. Совпадение достигается только при одинаковом окружении.
 
 ## APK
 
-`bench/android/build.sh vpn` собирает обычную сборку (без лабораторных режимов). В CI `RAWG_LAB` и `RAWG_PROFILEABLE` запрещены: при `CI=true` скрипт завершается с ошибкой.
+`bench/android/build.sh vpn` собирает обычную сборку (без лабораторных режимов). В CI `KNOTHOP_LAB` и `KNOTHOP_PROFILEABLE` запрещены: при `CI=true` скрипт завершается с ошибкой.
 
 Подпись: если задан `KNOTHOP_KS` (путь к PKCS12), `apksigner` берёт пароли через `env:`, не через argv. Без него используется локальный `debug.keystore`. Ручная сборка релизным ключом: `KNOTHOP_RELEASE=1 ./build.sh vpn`.
 

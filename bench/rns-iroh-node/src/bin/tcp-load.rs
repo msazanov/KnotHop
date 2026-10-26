@@ -21,7 +21,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
 };
-const ALPN: &[u8] = b"rawg/transport-bench/1";
+const ALPN: &[u8] = b"knothop/transport-bench/1";
 trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
 type Io = Box<dyn Duplex>;
@@ -243,7 +243,7 @@ fn proc_mem_kb() -> (u64, u64) {
 }
 async fn echo_roundtrip(echo: &mut Io, seq: u64) -> Result<f64> {
     let mut packet = [0u8; 16];
-    packet[..8].copy_from_slice(b"RAWGECHO");
+    packet[..8].copy_from_slice(b"KNOTECHO");
     packet[8..].copy_from_slice(&seq.to_le_bytes());
     let start = Instant::now();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -372,7 +372,7 @@ async fn main() -> Result<()> {
         eprintln!("bulk accepted");
         let mut hello = [0; 8];
         socket.read_exact(&mut hello).await?;
-        if &hello != b"RAWGDATA" {
+        if &hello != b"KNOTDATA" {
             bail!("invalid benchmark greeting");
         }
         socket.write_all(&[1]).await?;
@@ -436,11 +436,11 @@ async fn main() -> Result<()> {
             None,
         )
     };
-    data.write_all(b"RAWGDATA").await?;
+    data.write_all(b"KNOTDATA").await?;
     if data.read_u8().await? != 1 {
         bail!("data warmup failed");
     }
-    let hello = *b"RAWGECHO01234567";
+    let hello = *b"KNOTECHO01234567";
     echo.write_all(&hello).await?;
     let mut reply = [0; 16];
     echo.read_exact(&mut reply).await?;

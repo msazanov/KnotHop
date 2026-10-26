@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Диагностика пилота rawgd на живых узлах (только чтение, по ssh).
+"""Диагностика пилота knothopd на живых узлах (только чтение, по ssh).
 
   diag.py [--hosts FILE] state          сервис, соседи, статус, слушатель UDP, счётчики nft, нагрузка, свежий журнал
   diag.py paths                         качество UDP/ICMP между всеми парами узлов: потери и RTT (пинг и пакеты на порт пилота не отправляются, только ICMP)
-  diag.py journal [--n 60] [--grep RE]  журнал rawgd-pilot со всех узлов
+  diag.py journal [--n 60] [--grep RE]  журнал knothopd со всех узлов
   diag.py udp A B [--secs 20] [--pps 50]  АКТИВНАЯ проба UDP A->B->A по размерам пакетов (на B на ~30 с поднимается эхо на порту 47099; файлов и правил нет)
   diag.py cmd 'КОМАНДА'                 произвольная команда только чтения на всех узлах (проверяется список разрешённых начал)
 
-Список узлов - JSON-файл вне репозитория (по умолчанию ~/.cache/rawg-lab/diag_hosts.json): {"имя": {"ssh": "user@host", "pub": "адрес для пинга", "sudo": "sudo -n "}}.
+Список узлов - JSON-файл вне репозитория (по умолчанию ~/.cache/knothop-lab/diag_hosts.json): {"имя": {"ssh": "user@host", "pub": "адрес для пинга", "sudo": "sudo -n "}}.
 Ничего не меняет на узлах: никаких записей, рестартов, правил.
 """
 import argparse
@@ -18,7 +18,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-SAFE = ("sha256sum /opt/rawgd-pilot", "systemctl is-active", "systemctl status", "journalctl", "ss ", "cat /opt/rawgd-pilot/state/", "nft list", "ip ", "uptime", "ping ", "mtr ", "df ", "free ", "uname", "ps ", "top -bn1")
+SAFE = ("sha256sum /opt/knothop", "systemctl is-active", "systemctl status", "journalctl", "ss ", "cat /opt/knothop/state/", "nft list", "ip ", "uptime", "ping ", "mtr ", "df ", "free ", "uname", "ps ", "top -bn1")
 
 
 def ssh(h, cmd, t=40):
@@ -37,17 +37,17 @@ def par(hosts, fn):
 
 def cmd_state(a):
     hosts = load(a)
-    st = "/opt/rawgd-pilot/state"
+    st = "/opt/knothop/state"
 
     def one(n, h):
         s = h["sudo"]
-        script = (f"echo '[unit]'; systemctl is-active rawgd-pilot; systemctl show rawgd-pilot -p NRestarts -p ActiveEnterTimestamp -p MemoryCurrent | tr '\\n' ' '; echo; "
+        script = (f"echo '[unit]'; systemctl is-active knothopd; systemctl show knothopd -p NRestarts -p ActiveEnterTimestamp -p MemoryCurrent | tr '\\n' ' '; echo; "
                   f"echo '[udp]'; {s}ss -ulpn 2>/dev/null | grep -E ':47001\\b' | head -3; "
-                  f"echo '[load]'; uptime; {s}ps -o pcpu,rss,etime,cmd -C rawgd | cut -c1-110; "
+                  f"echo '[load]'; uptime; {s}ps -o pcpu,rss,etime,cmd -C knothopd | cut -c1-110; "
                   f"echo '[neighbors]'; {s}cat {st}/neighbors.json 2>&1 | head -c 3000; echo; "
                   f"echo '[status]'; {s}cat {st}/status.json 2>&1 | head -c 600; echo; "
-                  f"echo '[nft rawgd_pilot]'; {s}nft list table inet rawgd_pilot 2>&1 | grep -E 'counter|packets' | head; {s}nft list table ip rawgd_pilot_nat 2>&1 | grep -E 'packets|masq' | head -3; "
-                  f"echo '[journal]'; {s}journalctl -u rawgd-pilot -n 14 --no-pager -o cat 2>&1 | cut -c1-170")
+                  f"echo '[nft knothop]'; {s}nft list table inet knothop 2>&1 | grep -E 'counter|packets' | head; {s}nft list table ip knothop_nat 2>&1 | grep -E 'packets|masq' | head -3; "
+                  f"echo '[journal]'; {s}journalctl -u knothopd -n 14 --no-pager -o cat 2>&1 | cut -c1-170")
         return ssh(h, script)
 
     for n, out in par(hosts, one).items():
@@ -65,7 +65,7 @@ def cmd_state(a):
             except Exception:
                 print("[neighbors]", d.get("neighbors", "").strip()[:300])
             print("[status]", d.get("status", "").strip()[:500])
-            print("[nft]", d.get("nft rawgd_pilot", "").strip())
+            print("[nft]", d.get("nft knothop", "").strip())
             print("[journal]\n" + d.get("journal", "").rstrip())
         else:
             print(out)
@@ -89,13 +89,13 @@ def cmd_paths(a):
     for n, res in par(hosts, one).items():
         for y, v in res.items():
             print(f"{n:4s} -> {y:4s}  ICMP: {v}")
-    print("\n(UDP-потери на порту пилота показывает сам rawgd: RTT соседей в neighbors.json; ICMP только ориентир: DPI режет по портам)")
+    print("\n(UDP-потери на порту пилота показывает сам knothopd: RTT соседей в neighbors.json; ICMP только ориентир: DPI режет по портам)")
 
 
 def cmd_journal(a):
     hosts = load(a)
     g = f" | grep -E {json.dumps(a.grep)}" if a.grep else ""
-    for n, o in par(hosts, lambda n, h: ssh(h, f"{h['sudo']}journalctl -u rawgd-pilot -n {a.n} --no-pager -o cat 2>&1{g} | cut -c1-200")).items():
+    for n, o in par(hosts, lambda n, h: ssh(h, f"{h['sudo']}journalctl -u knothopd -n {a.n} --no-pager -o cat 2>&1{g} | cut -c1-200")).items():
         print(f"\n################ {n} ################\n{o}")
 
 
@@ -196,7 +196,7 @@ def cmd_cmd(a):
 
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-ap.add_argument("--hosts", default="~/.cache/rawg-lab/diag_hosts.json")
+ap.add_argument("--hosts", default="~/.cache/knothop-lab/diag_hosts.json")
 sp = ap.add_subparsers(dest="c", required=True)
 sp.add_parser("state").set_defaults(f=cmd_state)
 x = sp.add_parser("tcp"); x.add_argument("a"); x.add_argument("b"); x.add_argument("--secs", type=int, default=8); x.set_defaults(f=cmd_tcp)

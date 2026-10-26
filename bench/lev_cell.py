@@ -18,7 +18,7 @@ from measure import process_memory, rtt_summary
 
 HERE = Path(__file__).resolve().parent
 # По умолчанию - бинарь форка на диске: /tmp на этой машине переполняется каталогами сборки.
-BIN = Path(os.environ.get("RNS_IROH_BIN", str(Path.home() / ".cache/rawg-target/bin/rns-iroh-node")))
+BIN = Path(os.environ.get("RNS_IROH_BIN", str(Path.home() / ".cache/knothop-target/bin/rns-iroh-node")))
 RELAY = Path(os.environ.get("IROH_RELAY_BIN", "/tmp/opencode/iroh-src/target/release/iroh-relay"))
 # Per-role override, for live cross-build interoperability checks (e.g. client on one AEAD backend, exit on the other):
 # RNS_IROH_BIN_E / RNS_IROH_BIN_C / RNS_IROH_BIN_A. Unset -> the role uses RNS_IROH_BIN.
@@ -38,7 +38,7 @@ def sample_stacks(name, stop, out, interval=0.25):
     """Снимает eu-stack у rns-iroh-node в контейнере `name` в его PID namespace.
 
     Инструмент берётся с хоста (в образе его нет), поэтому заходим внутрь через nsenter.
-    Процесс должен быть запущен с RAWG_PTRACE_ANY=1 - тогда ptrace_scope его не закроет.
+    Процесс должен быть запущен с KNOTHOP_PTRACE_ANY=1 - тогда ptrace_scope его не закроет.
     Копятся только RUN-кадры: WAIT-строки показывают, кто ждёт, а не кто тратит CPU.
     """
     per_thread = collections.Counter(); leaf = collections.Counter(); states = collections.Counter()
@@ -134,11 +134,11 @@ def main():
             ap.error(f"unavailable CPU set for {role}: {selected}")
         cpusets[role] = str(selected[0]) if len(selected) == 1 else f"{selected[0]}-{selected[-1]}"
         next_core += counts[role]
-    net = f"rawg-lev-{a.tag}"
+    net = f"knothop-lev-{a.tag}"
     names = {r: f"{net}-{r}" for r in roles}
     created, res = [], {"cell": vars(a), "success": False, "events": [], "cpusets": cpusets}
     ev = lambda m: res["events"].append({"unix": round(time.time(), 3), "event": m})
-    with tempfile.TemporaryDirectory(prefix="rawg-lev-", dir="/tmp/opencode") as sd:
+    with tempfile.TemporaryDirectory(prefix="knothop-lev-", dir="/tmp/opencode") as sd:
         shared = Path(sd); os.chmod(shared, 0o777)
         try:
             sh("docker", "network", "create", "--internal", net)
@@ -185,7 +185,7 @@ def main():
             if a.proof_binding:
                 tune += f" --proof-binding {a.proof_binding}"
             tune += f" --cipher {a.cipher}"
-            # RAWG_PTRACE_ANY нужен, чтобы eu-stack с хоста видел процесс в контейнере
+            # KNOTHOP_PTRACE_ANY нужен, чтобы eu-stack с хоста видел процесс в контейнере
             tune_e = tune
             if a.cipher_e:
                 parts = tune_e.split()
@@ -200,7 +200,7 @@ def main():
                     del parts[i : i + 2]
                 # ведущий пробел обязателен: строка подставляется сразу после --relay
                 tune_e = " " + " ".join(parts) + f" --proof-binding {a.proof_binding_e}"
-            base = lambda role, extra: (f"export RAWG_PTRACE_ANY=1; exec rns-iroh-node --role {role} --ip {ip[role]} "
+            base = lambda role, extra: (f"export KNOTHOP_PTRACE_ANY=1; exec rns-iroh-node --role {role} --ip {ip[role]} "
                                         f"--relay {relay_url}{tune if role != 'e' else tune_e} {extra} > /shared/{role}.log 2>&1")
             ex("e", base("e", ""))
             for _ in range(150):

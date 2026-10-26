@@ -10,12 +10,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent / "results" / "l3"
 CONDS = [("lan", "локальная сеть"), ("d25", "RTT 50 мс"), ("l05", "RTT 50 мс, потери 0,5%"), ("l2", "RTT 50 мс, потери 2%")]
-STACKS = [("rawg", "rawg (RNS, датаграммы QUIC)"), ("rawg-hop", "rawg через узел A (2 звена)"), ("awg", "AmneziaWG 3.1 userspace"), ("direct", "без туннеля")]
+STACKS = [("knothop", "knothop (RNS, датаграммы QUIC)"), ("knothop-hop", "knothop через узел A (2 звена)"), ("awg", "AmneziaWG 3.1 userspace"), ("direct", "без туннеля")]
 
 
 def load(cond, stack):
-    key = "hop" if stack == "rawg-hop" else stack
-    return [json.loads(p.read_text()) for p in sorted(ROOT.glob(f"g1-{key}-{cond}-*.json" if stack == "rawg-hop" else f"g1-{cond}-{key}-*.json"))
+    key = "hop" if stack == "knothop-hop" else stack
+    return [json.loads(p.read_text()) for p in sorted(ROOT.glob(f"g1-{key}-{cond}-*.json" if stack == "knothop-hop" else f"g1-{cond}-{key}-*.json"))
             if json.loads(p.read_text()).get("success")]
 
 

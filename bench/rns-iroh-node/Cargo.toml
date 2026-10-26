@@ -14,8 +14,13 @@ name = "rns-iroh-node"
 path = "src/main.rs"
 
 [dependencies]
-# Pinned revision studied in research notes (Codeberg master of 2026-10-08, AGPL-3.0-or-later).
-leviculum-std = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "cb814c8513fb59d991c96106f1dcdd5d070cb423" }
+# Both Leviculum crates MUST stay on the same public upstream revision (Codeberg master, AGPL-3.0-or-later;
+# 77c4ff13 is the merge-base of the KnotHop fork, deploy/leviculum.ref). The fork commit itself is not on
+# Codeberg: real builds substitute the local fork checkout for BOTH crates through Cargo [patch]
+# (bench/fork-patch.sh, used by bench/cargo_fork.sh and the build scripts), so leviculum-core is a single
+# package. Do not point one of them at a different rev or source.
+leviculum-std = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "77c4ff13f59116adaf0190d455b83c286c135066" }
+leviculum-lxmf = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "77c4ff13f59116adaf0190d455b83c286c135066", default-features = false }
 iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util", "sync", "net", "signal"] }
 clap = { version = "4", features = ["derive"] }
@@ -30,8 +35,10 @@ noq-proto = "=1.3.0"
 hmac = "0.12"
 base64 = "0.22"
 rand_core = { version = "0.6", features = ["std", "getrandom"] }
-# только для диагностики (счётчики sendmsg/recvmmsg), нужен локальный patch noq-udp: bench/android/build.sh с RAWG_UDPSTATS=1
+# только для диагностики (счётчики sendmsg/recvmmsg), нужен локальный patch noq-udp: bench/android/build.sh с KNOTHOP_UDPSTATS=1
 noq-udp = { version = "=1.3.0", optional = true }
 
 [features]
 udp-stats = ["dep:noq-udp"]
+# Лабораторный обход enforce роли `e` (бинарник rns-iroh-node для стендов замеров l3_cell/laptop/lev_cell). Не включать в knothopd и APK.
+lab-exit-no-enforce = []

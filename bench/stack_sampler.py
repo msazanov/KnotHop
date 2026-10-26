@@ -3,7 +3,7 @@
 
 Запускает пару E/C нативно (как lev_native.py), во время передачи N раз снимает `eu-stack -p <pid>`
 у выбранной роли и агрегирует: по потокам (имя, состояние) и по верхним «осмысленным» кадрам.
-Требует RAWG_PTRACE_ANY=1 (узел сам разрешает ptrace, см. main.rs) и eu-stack (elfutils).
+Требует KNOTHOP_PTRACE_ANY=1 (узел сам разрешает ptrace, см. main.rs) и eu-stack (elfutils).
 Бинарь должен быть собран с debuginfo (line-tables-only).
 
   python3 stack_sampler.py <tag> --role e|c [--samples 60] [--bin ...] [--hw-mtu N] ...
@@ -12,7 +12,7 @@ import argparse, collections, json, os, re, subprocess, sys, tempfile, time, shu
 from pathlib import Path
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "results" / "lev-native"
-BIN = str(Path.home() / ".cache/rawg-target/bin/rns-iroh-node-prof")
+BIN = str(Path.home() / ".cache/knothop-target/bin/rns-iroh-node-prof")
 
 def thread_state(pid, tid):
     try:
@@ -30,8 +30,8 @@ def main():
     ap.add_argument("--hw-mtu", type=int, default=0); ap.add_argument("--extra", default="")
     ap.add_argument("--client-extra", default="", help="доп. аргументы клиента (например --mode stream --chunk 16000)")
     a = ap.parse_args()
-    work = Path(tempfile.mkdtemp(prefix="rawg-stk-", dir="/tmp/opencode")); state = work / "state"; state.mkdir()
-    env = dict(os.environ, RAWG_PTRACE_ANY="1")
+    work = Path(tempfile.mkdtemp(prefix="knothop-stk-", dir="/tmp/opencode")); state = work / "state"; state.mkdir()
+    env = dict(os.environ, KNOTHOP_PTRACE_ANY="1")
     tun = (["--hw-mtu", str(a.hw_mtu)] if a.hw_mtu else []) + (a.extra.split() if a.extra else [])
     procs = {}
     try:

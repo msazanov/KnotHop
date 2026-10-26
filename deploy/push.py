@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Allowlisted, guarded rawgd-pilot binary rollout. Dry-run is the default."""
+"""Allowlisted, guarded knothopd binary rollout. Dry-run is the default."""
 from __future__ import annotations
 
 import argparse
@@ -21,22 +21,22 @@ HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist"
 IDENTITY = Path.home() / ".ssh" / "id_ed25519"
 KH = Path.home() / ".ssh" / "known_hosts"
-INV = Path(os.environ.get("RAWG_INVENTORY", Path.home() / ".config/rawg/inventory"))
+INV = Path(os.environ.get("KNOTHOP_INVENTORY", Path.home() / ".config/knothop/inventory"))
 # (ssh target, binary variant, known_hosts: "known_hosts" = KH, иначе имя файла в INV, jump через de)
 ALLOWLIST = {
-    "es": ("<user@node-ip>", "rawgd", "es.known_hosts", None),
-    "uae": ("<user@node-ip>", "rawgd", "known_hosts", None),
-    "by": ("<user@node-ip>", "rawgd", "known_hosts", None),
-    "ru1": ("<user@node-ip>", "rawgd", "known_hosts", None),
-    "nl1": ("<user@node-ip>", "rawgd", "known_hosts", "de"),
-    "de": ("<user@node-ip>", "rawgd-u2204", "known_hosts", None),
-    "fin1": ("<user@node-ip>", "rawgd", "known_hosts", "de"),
-    "us": ("<user@node-ip>", "rawgd", "us.known_hosts", None),
+    "es": ("<user@node-ip>", "knothopd", "es.known_hosts", None),
+    "uae": ("<user@node-ip>", "knothopd", "known_hosts", None),
+    "by": ("<user@node-ip>", "knothopd", "known_hosts", None),
+    "ru1": ("<user@node-ip>", "knothopd", "known_hosts", None),
+    "nl1": ("<user@node-ip>", "knothopd", "known_hosts", "de"),
+    "de": ("<user@node-ip>", "knothopd-u2204", "known_hosts", None),
+    "fin1": ("<user@node-ip>", "knothopd", "fin1.known_hosts", "de"),
+    "us": ("<user@node-ip>", "knothopd", "us.known_hosts", None),
 }
 HEX = re.compile(r"^[0-9a-f]{64}$")
 SSH_TIMEOUT_SECONDS = 300
 # Всё, что уходит на узел, обязано быть в dist/SHA256SUMS: бинарники и helper, который выполняется от root.
-PAYLOAD_NAMES = ("rawgd", "rawgd-u2204", "push-remote.sh")
+PAYLOAD_NAMES = ("knothopd", "knothopd-u2204", "push-remote.sh")
 UNKNOWN_TRANSPORT_DETAIL = (
     "remote outcome UNKNOWN: SSH ended without a complete trustworthy result. The helper's HUP/INT/TERM/EXIT "
     "traps attempt rollback if replacement began, but transport loss may terminate the remote process before "
@@ -93,9 +93,9 @@ def ensure_current(name: str, data: bytes, expected: dict[str, str]) -> None:
 
 def ssh_args(node: str) -> list[str]:
     default_target, _, kh_name, jump = ALLOWLIST[node]
-    target = os.environ.get(f"RAWG_SSH_TARGET_{node.upper()}", default_target)
+    target = os.environ.get(f"KNOTHOP_SSH_TARGET_{node.upper()}", default_target)
     if not target or "<" in target or ">" in target:
-        raise RolloutError(f"set RAWG_SSH_TARGET_{node.upper()} outside the repository")
+        raise RolloutError(f"set KNOTHOP_SSH_TARGET_{node.upper()} outside the repository")
     kh = KH if kh_name == "known_hosts" else INV / kh_name
     if not IDENTITY.is_file() or not kh.is_file():
         raise RolloutError(f"required SSH identity/known_hosts path missing for {node}")
@@ -103,7 +103,7 @@ def ssh_args(node: str) -> list[str]:
             "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={kh}", "-o", "ConnectTimeout=15",
             "-o", "ServerAliveInterval=10"]
     if jump:
-        jump_env = f"RAWG_SSH_TARGET_{jump.upper()}"
+        jump_env = f"KNOTHOP_SSH_TARGET_{jump.upper()}"
         jump_target = os.environ.get(jump_env, ALLOWLIST[jump][0])
         if not jump_target or "<" in jump_target or ">" in jump_target:
             raise RolloutError(f"set {jump_env} outside the repository")
@@ -118,7 +118,7 @@ def ssh_args(node: str) -> list[str]:
 def bundle(binary: bytes, helper: bytes) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for arcname, data, mode in (("rawgd.new", binary, 0o755), ("push-remote.sh", helper, 0o755)):
+        for arcname, data, mode in (("knothopd.new", binary, 0o755), ("push-remote.sh", helper, 0o755)):
             info = tarfile.TarInfo(arcname)
             info.size = len(data)
             info.mode = mode
@@ -153,7 +153,7 @@ def invoke(node: str, binary_name: str, apply: bool, payloads: dict[str, bytes],
         row["duration_seconds"] = round(time.monotonic() - started, 3)
         return row
     argv = ssh_args(node)
-    remote = "set -eu; d=$(mktemp -d /opt/rawgd-pilot/.push.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xzf - -C \"$d\"; bash \"$d/push-remote.sh\" \"$d/rawgd.new\" " + expected_sha
+    remote = "set -eu; d=$(mktemp -d /opt/knothop/.push.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xzf - -C \"$d\"; bash \"$d/push-remote.sh\" \"$d/knothopd.new\" " + expected_sha
     if node == "ru1":
         remote = "sudo -n bash -c " + shlex.quote(remote)
     cmd = argv + [remote]

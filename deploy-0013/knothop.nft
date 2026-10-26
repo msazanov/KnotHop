@@ -1,0 +1,56 @@
+# knothopd: отдельные таблицы, не затрагивают существующие (nftables уже в этой цепочке на всех узлах).
+# Применить:  nft -f knothop.nft      Откатить:  nft delete table inet knothop; nft delete table ip knothop_nat
+# Параметры (имя TUN khd0, порт 47001/udp, адреса клиентов 198.18.0.0/15 = client_net в node.json) должны совпадать с node.json.
+# Метки comment используются node-hostfix.sh для проверки загруженной таблицы: не переименовывать без правки скрипта.
+#
+# ВАЖНО: эта таблица только ЗАПРЕЩАЕТ лишнее клиентам и делает NAT. Разрешить пересылку khd0 <-> внешний интерфейс
+# нужно в вашей собственной цепочке forward (там policy drop; accept в чужой таблице её не отменяет).
+# meta skuid "knothopd" разрешается в uid через passwd при загрузке: пользователь knothopd должен существовать до nft -f.
+#
+# Цикл носителя: QUIC-пакеты узла (udp sport 47001) и любые сокеты процесса knothopd (в т.ч. TCP-носитель) не должны
+# уходить на клиентскую подсеть. Туннельные данные это правило не задевает: knothopd пишет IP-пакеты в TUN через fd
+# (write на /dev/net/tun), а не через сокет; такие пакеты попадают в ядро как входящие на khd0 и проходят
+# input/forward, но не OUTPUT, поэтому правило OUTPUT по skuid их не видит.
+
+table inet knothop {
+    set own_public_v4 {
+        type ipv4_addr
+        flags interval
+    }
+    set own_public_v6 {
+        type ipv6_addr
+        flags interval
+    }
+    chain input {
+        type filter hook input priority -10; policy accept;
+        # клиенты туннеля не должны попадать на сервисы самого узла (Xray, AWG, бот, БД и т. п.): только ping
+        iifname "khd0" meta l4proto icmp counter accept
+        iifname "khd0" counter drop comment "client->node"
+    }
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        # kernel-assigned own addresses plus explicitly provisioned public/NAT endpoints;
+        # only TUN-originated traffic is blocked, so host WAN/KnotHop paths are unaffected.
+        iifname "khd0" fib daddr type local counter drop comment "client->own-endpoint-local"
+        iifname "khd0" ip daddr @own_public_v4 counter drop comment "client->own-endpoint-v4"
+        iifname "khd0" ip6 daddr @own_public_v6 counter drop comment "client->own-endpoint-v6"
+        # клиенты не должны попадать во внутренние сети (docker, провайдерская сеть ru1 10.130.0.0/24, AWG-подсети, link-local)
+        iifname "khd0" ip daddr { 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 } counter drop comment "client->internal"
+        # IPv6 из туннеля не поддерживается: TUN отбрасывает его до записи, это вторая линия защиты
+        meta nfproto ipv6 iifname "khd0" counter drop comment "client-ipv6"
+    }
+    chain output {
+        type filter hook output priority -10; policy accept;
+        # защита от зацикливания носителя: QUIC-пакеты узла не должны уходить в собственный туннель
+        ip daddr 198.18.0.0/15 udp sport 47001 counter drop comment "carrier-loop-guard"
+        # все остальные сокеты пользователя knothopd (TCP-носитель и прочие) тоже не уходят в клиентскую подсеть
+        meta skuid "knothopd" ip daddr 198.18.0.0/15 counter drop comment "knothop-user-no-tunnel"
+    }
+}
+
+table ip knothop_nat {
+    chain post {
+        type nat hook postrouting priority 100; policy accept;
+        ip saddr 198.18.0.0/15 oifname != "khd0" masquerade comment "knothopd"
+    }
+}

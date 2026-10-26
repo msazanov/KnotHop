@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Сервер-выход rawg VPN на ноутбуке: контейнер Docker (TUN + NAT в интернет) и HTTP-раздача профиля и APK.
+"""Сервер-выход KnotHop VPN на ноутбуке: контейнер Docker (TUN + NAT в интернет) и HTTP-раздача профиля и APK.
 
   python3 vpn_server.py [--ip 192.168.31.239] [--http-port 8081] [--quic-port 47001]
   python3 vpn_server.py --stop
 
-Контейнер `rawg-exit`: rns-iroh-node --role e --mode tun, UDP --quic-port опубликован на хост, исходящий трафик
+Контейнер `knothop-exit`: rns-iroh-node --role e --mode tun, UDP --quic-port опубликован на хост, исходящий трафик
 клиентов (10.99.0.0/24) выходит в интернет через NAT контейнера и далее хоста. Привилегии: только NET_ADMIN и /dev/net/tun
 в контейнере, хостовые сети и правила не трогаются. Тот же запуск без изменений годится для тестового сервера (там --ip - публичный адрес).
 
-HTTP (локальная сеть): GET / (ссылка на APK), /rawgvpn.apk, /e.json (профиль выхода: адрес и ключи), POST /result (отчёт приложения).
+HTTP (локальная сеть): GET / (ссылка на APK), /knothop.apk, /e.json (профиль выхода: адрес и ключи), POST /result (отчёт приложения).
 Профиль отдаётся без аутентификации: годится для лаборатории, для реального сервера нужен спаривание/ключ (см. журнал, O32).
 """
 import argparse
@@ -24,10 +24,10 @@ from pathlib import Path
 
 import laptop  # тот же каталог: обработчик HTTP и разбор отчёта
 
-NAME = "rawg-exit"
-IMAGE = "rawg-bench:l3"
+NAME = "knothop-exit"
+IMAGE = "knothop-bench:l3"
 BIN = laptop.BIN
-APK = Path(os.environ.get("APK", str(Path.home() / ".cache/rawg-android/rawgvpn.apk")))
+APK = Path(os.environ.get("APK", str(Path.home() / ".cache/knothop-android/knothop.apk")))
 
 
 def docker(*a, check=True):
@@ -49,7 +49,7 @@ def main():
         if not p.exists():
             sys.exit(f"нет файла: {p}")
     laptop.APK = APK
-    state = Path(tempfile.mkdtemp(prefix="rawg-vpn-", dir="/tmp/opencode" if Path("/tmp/opencode").is_dir() else None))
+    state = Path(tempfile.mkdtemp(prefix="knothop-vpn-", dir="/tmp/opencode" if Path("/tmp/opencode").is_dir() else None))
     os.chmod(state, 0o777)
     # Носитель не должен попадать в собственный туннель: iroh рассылает пирам все локальные адреса, и выход пробует путь к адресу
     # клиента в туннеле (10.99.0.2). QUIC уходит внутрь туннеля, путь рвётся при каждой смене сети (журнал N30).
@@ -71,7 +71,7 @@ def main():
         time.sleep(0.3)
     srv = laptop.ThreadingHTTPServer(("0.0.0.0", a.http_port), laptop.make_handler(state))
     print(f"выход: UDP {a.ip}:{a.quic_port} (контейнер {NAME}); состояние {state}")
-    print(f"APK:   http://{a.ip}:{a.http_port}/   (прямая: http://{a.ip}:{a.http_port}/rawgvpn.apk)")
+    print(f"APK:   http://{a.ip}:{a.http_port}/   (прямая: http://{a.ip}:{a.http_port}/knothop.apk)")
     print(f"журнал выхода: docker logs -f {NAME}\nCtrl+C - остановить.", flush=True)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=srv.shutdown, daemon=True).start())
     try:

@@ -7,7 +7,7 @@
 # Результат: bench/results/raw/<tag>.json
 set -u
 HOPS=${1:?hops}; IFACE=${2:?iface}; MTUMODE=${3:-default}; LOSS=${4:-0}; BYTES=${5:-4194304}; TAG=${6:?tag}
-IMAGE=${IMAGE:-rawg-bench:rns1.5.7}
+IMAGE=${IMAGE:-knothop-bench:rns1.5.7}
 IDLE=${IDLE:-30}
 ECHO_N=${ECHO_N:-200}
 BASE_CORE=${BASE_CORE:-4}

@@ -7,7 +7,7 @@ Topology (internal Docker network, nothing published):
                                            c  ==== carrier (netem here) ====  e  --NAT-->  srv (iperf3, QUIC server)
           VPN client, 1 core ------------/        VPN server, 1 core
 
-stacks:  rawg    RNS Link datagrams over QUIC DATAGRAM (this project)
+stacks:  KnotHop    RNS Link datagrams over QUIC DATAGRAM (this project)
          awg     AmneziaWG 3.1 userspace, the L3 reference
          direct  no tunnel: c talks to srv. Ceiling of the tools and of the host, not a VPN
 
@@ -34,9 +34,9 @@ from awg_backbone import SECRETS, cmd, dex, put, redact
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "results" / "l3"
-IMAGE = "rawg-bench:l3"
-RAWG_BIN = Path(os.environ.get("RNS_IROH_BIN", str(Path.home() / ".cache/rawg-target/dgram/release/rns-iroh-node")))
-AWG_DIR = Path.home() / ".cache/rawg-target/awgbin"
+IMAGE = "knothop-bench:l3"
+KNOTHOP_BIN = Path(os.environ.get("RNS_IROH_BIN", str(Path.home() / ".cache/knothop-target/dgram/release/rns-iroh-node")))
+AWG_DIR = Path.home() / ".cache/knothop-target/awgbin"
 CPUSETS = {"srv": "6-7", "e": "3", "c": "4-5", "a": "2", "b": "1"}
 VPN_CORE = {"c": "4", "e": "3", "a": "2", "b": "1"}
 GEN_CORE = "5"
@@ -47,7 +47,7 @@ def ensure_awg_bins():
     if (AWG_DIR / "amneziawg-go").exists() and (AWG_DIR / "awg").exists():
         return
     AWG_DIR.mkdir(parents=True, exist_ok=True)
-    cid = cmd("docker", "create", "rawg-bench:awg31")
+    cid = cmd("docker", "create", "knothop-bench:awg31")
     try:
         for name in ("amneziawg-go", "awg"):
             cmd("docker", "cp", f"{cid}:/usr/local/bin/{name}", str(AWG_DIR / name))
@@ -125,8 +125,8 @@ def percentile(sorted_vals, p):
 class Cell:
     def __init__(self, a):
         self.a = a
-        self.names = {r: f"rawg-l3-{a.tag}-{r}" for r in ("srv", "e", "c", "a", "b")}
-        self.net = f"rawg-l3-{a.tag}"
+        self.names = {r: f"knothop-l3-{a.tag}-{r}" for r in ("srv", "e", "c", "a", "b")}
+        self.net = f"knothop-l3-{a.tag}"
         self.ip = {}
         self.res = {"stack": a.stack, "netem": a.netem, "tests": {}, "meta": {"tun_mtu": TUN_MTU}, "success": False}
         self.created = []
@@ -138,10 +138,10 @@ class Cell:
         a = self.a
         cmd("docker", "network", "create", "--internal", self.net)
         self.network = True
-        roles = ("srv", "c") if a.stack == "direct" else (("srv", "e", "c", "a", "b") if a.stack == "rawg-multi" else (("srv", "e", "c", "a") if a.stack == "rawg-hop" else ("srv", "e", "c")))
+        roles = ("srv", "c") if a.stack == "direct" else (("srv", "e", "c", "a", "b") if a.stack == "knothop-multi" else (("srv", "e", "c", "a") if a.stack == "knothop-hop" else ("srv", "e", "c")))
         mounts = ["-v", f"{self.shared}:/shared"]
-        if a.stack in ("rawg", "rawg-hop", "rawg-multi"):
-            mounts += ["-v", f"{RAWG_BIN}:/usr/local/bin/rns-iroh-node:ro"]
+        if a.stack in ("knothop", "knothop-hop", "knothop-multi"):
+            mounts += ["-v", f"{KNOTHOP_BIN}:/usr/local/bin/rns-iroh-node:ro"]
         if a.stack == "awg":
             mounts += ["-v", f"{AWG_DIR}:/opt/awg:ro"]
         for r in roles:
@@ -160,19 +160,19 @@ class Cell:
         cmd("docker", "exec", "-d", self.names["srv"], "iperf3", "-s")
         cmd("docker", "exec", "-d", self.names["srv"], "sh", "-c", "exec python3 /shared/quic_probe.py server 4433 > /shared/quic-srv.log 2>&1")
 
-    def start_rawg(self):
+    def start_knothop(self):
         a = self.a
         tune = (f"--mode tun --carrier datagram --dgram-mtu 1400 --cipher gcm --data-cap 4096 --chan-buf 1024 "
-                f"--quic-initial-mtu 1452 --tun-mtu {TUN_MTU} --quic-cc {a.rawg_cc} --quic-cc-mbit {a.rawg_cc_mbit} "
+                f"--quic-initial-mtu 1452 --tun-mtu {TUN_MTU} --quic-cc {a.knothop_cc} --quic-cc-mbit {a.knothop_cc_mbit} "
                 f"--tun-txqlen {a.tun_txqlen}" + (f" --tun-qdisc {a.tun_qdisc}" if a.tun_qdisc else ""))
-        if a.rawg_buf_mb:
-            mb = a.rawg_buf_mb << 20
+        if a.knothop_buf_mb:
+            mb = a.knothop_buf_mb << 20
             # chan-buf counts packets: size it for the same number of full-size packets as the byte buffers hold
             tune = tune.replace("--chan-buf 1024", f"--chan-buf {max(1024, mb // 1400)}")
             tune += f" --quic-dg-send-buf {mb} --quic-dg-recv-buf {mb}"
         e, c = self.names["e"], self.names["c"]
-        multi = a.stack == "rawg-multi"
-        hop = a.stack in ("rawg-hop", "rawg-multi")
+        multi = a.stack == "knothop-multi"
+        hop = a.stack in ("knothop-hop", "knothop-multi")
         relays = ["a", "b"] if multi else ["a"]
         if multi:
             # Fast failure detection on every layer: QUIC path idle, and the client's own silence limit.
@@ -188,7 +188,7 @@ class Cell:
             tune_e = tune
         cmd("docker", "exec", "-d", e, "sh", "-c",
             # стенд: выход lib::run без допуска по записям (enforce) разрешён только явным флагом (H18)
-            f"RAWG_LAB_EXIT_NO_ENFORCE=1 exec taskset -c {VPN_CORE['e']} /usr/local/bin/rns-iroh-node --role e --ip {self.ip['e']} --relay none {tune_e} "
+            f"KNOTHOP_LAB_EXIT_NO_ENFORCE=1 exec taskset -c {VPN_CORE['e']} /usr/local/bin/rns-iroh-node --role e --ip {self.ip['e']} --relay none {tune_e} "
             f"--tun-ip 10.99.0.1/24 > /shared/e.log 2>&1")
         if hop:
             # A (and B): pure RNS transport nodes, no TUN; they dial E and accept C. Wait for E's peer file like lev_cell.py.
@@ -213,7 +213,7 @@ class Cell:
         deadline = time.monotonic() + 90
         while not (self.shared / "ready").exists():
             if time.monotonic() > deadline:
-                raise TimeoutError("rawg client never ready: " + (self.shared / "c.log").read_text()[-600:])
+                raise TimeoutError("KnotHop client never ready: " + (self.shared / "c.log").read_text()[-600:])
             for n in (e, c):
                 if cmd("docker", "inspect", n, "--format", "{{.State.Running}}") != "true":
                     raise RuntimeError(f"{n} stopped")
@@ -272,8 +272,8 @@ PersistentKeepalive = 25
 
     def start(self):
         self.vpn = {"c": None, "e": None}
-        if self.a.stack in ("rawg", "rawg-hop", "rawg-multi"):
-            self.start_rawg()
+        if self.a.stack in ("knothop", "knothop-hop", "knothop-multi"):
+            self.start_knothop()
         elif self.a.stack == "awg":
             self.start_awg()
         if self.a.stack != "direct":
@@ -283,7 +283,7 @@ PersistentKeepalive = 25
             if self.a.stack == "direct":
                 netem(self.names["c"], self.ip["srv"], self.a.netem)
                 netem(self.names["srv"], self.ip["c"], self.a.netem)
-            elif self.a.stack == "rawg-multi":
+            elif self.a.stack == "knothop-multi":
                 # Both relays carry the full condition on both legs (C<->relay, relay<->E).
                 for r in ("a", "b"):
                     (netem if r == "a" else netem_extra)(self.names["c"], self.ip[r], self.a.netem)
@@ -291,7 +291,7 @@ PersistentKeepalive = 25
                     netem_extra(self.names[r], self.ip["e"], self.a.netem)
                 netem(self.names["e"], self.ip["a"], self.a.netem)
                 netem_extra(self.names["e"], self.ip["b"], self.a.netem)
-            elif self.a.stack == "rawg-hop":
+            elif self.a.stack == "knothop-hop":
                 # Two carrier legs, each with the full condition: C<->A and A<->E. The e->srv leg stays clean.
                 netem(self.names["c"], self.ip["a"], self.a.netem)
                 netem(self.names["a"], self.ip["c"], self.a.netem)
@@ -388,10 +388,10 @@ PersistentKeepalive = 25
         return d
 
     def tun_dev(self):
-        return {"rawg": "tun0", "awg": "awg0"}.get(self.a.stack, "eth0")
+        return {"knothop": "tun0", "awg": "awg0"}.get(self.a.stack, "eth0")
 
     def client_tun_ip(self):
-        return {"rawg": "10.99.0.2", "awg": "10.201.0.1"}.get(self.a.stack, self.ip["c"])
+        return {"knothop": "10.99.0.2", "awg": "10.201.0.1"}.get(self.a.stack, self.ip["c"])
 
     def profile_during(self, role, fn, samples=140):
         """Run fn() while sampling the VPN process of `role` from inside its container. Frames are grouped so the
@@ -591,14 +591,14 @@ PersistentKeepalive = 25
             if self.vpn.get(r):
                 mem[r] = proc_rss_kb(self.vpn[r])
         self.res["meta"]["vpn_peak_rss_kb"] = mem
-        if self.a.stack in ("rawg", "rawg-multi"):
+        if self.a.stack in ("knothop", "knothop-multi"):
             (self.shared / "fin").touch()
             time.sleep(1.5)
             for r in ("c", "e"):
                 p = self.shared / f"result-{r}.json"
                 if p.exists():
                     d = json.loads(p.read_text())
-                    self.res["meta"][f"rawg_{r}"] = {"tun": d.get("tun"), "events_dropped": d.get("data_events_dropped"),
+                    self.res["meta"][f"knothop_{r}"] = {"tun": d.get("tun"), "events_dropped": d.get("data_events_dropped"),
                                                       "link_mdu": d.get("link_mdu"), "quic_stats": d.get("quic_stats"),
                                                       "pc_drops": d.get("pc_drops"),
                                                       "log_tail": [f"{x['t_ms']} {x['msg']}" for x in (d.get("log") or [])[-40:]]}
@@ -612,28 +612,28 @@ PersistentKeepalive = 25
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stack", choices=["rawg", "rawg-hop", "rawg-multi", "awg", "direct"])
+    ap.add_argument("stack", choices=["knothop", "knothop-hop", "knothop-multi", "awg", "direct"])
     ap.add_argument("tag")
     ap.add_argument("--netem", default="", help="tc netem on the carrier, e.g. 'delay 25ms loss 0.5%%'")
     ap.add_argument("--duration", type=int, default=8)
-    ap.add_argument("--rawg-cc", choices=["default", "bbr3", "tunnel"], default="default", help="rawg: outer QUIC congestion control")
-    ap.add_argument("--rawg-cc-mbit", type=int, default=1000, help="rawg: rate ceiling of the 'tunnel' controller, Mbit/s")
-    ap.add_argument("--tun-txqlen", type=int, default=1000, help="rawg: TUN transmit queue length, packets")
-    ap.add_argument("--tun-qdisc", default="", help="rawg: qdisc on the TUN (e.g. fq_codel); AWG gets the same one on awg0")
-    ap.add_argument("--rawg-buf-mb", type=int, default=0, help="rawg: QUIC datagram send/receive buffers (MiB) and packet-interface queue sized to match; 0 = defaults")
+    ap.add_argument("--knothop-cc", choices=["default", "bbr3", "tunnel"], default="default", help="knothop: outer QUIC congestion control")
+    ap.add_argument("--knothop-cc-mbit", type=int, default=1000, help="knothop: rate ceiling of the 'tunnel' controller, Mbit/s")
+    ap.add_argument("--tun-txqlen", type=int, default=1000, help="knothop: TUN transmit queue length, packets")
+    ap.add_argument("--tun-qdisc", default="", help="knothop: qdisc on the TUN (e.g. fq_codel); AWG gets the same one on awg0")
+    ap.add_argument("--knothop-buf-mb", type=int, default=0, help="knothop: QUIC datagram send/receive buffers (MiB) and packet-interface queue sized to match; 0 = defaults")
     ap.add_argument("--rmem-mb", type=int, default=0, help="net.core.rmem_default/max (MiB) on the VPN nodes: UDP receive buffer of the carrier")
     ap.add_argument("--profile", default="", choices=["", "c", "e", "a"], help="sample eu-stack of the VPN process on this node during the tcp_up test")
     ap.add_argument("--hold", type=int, default=0, help="debug: keep the cell alive N seconds after the tests so it can be inspected with docker exec")
-    ap.add_argument("--fault", choices=["pause", "cut-e", "cut-c"], default="pause", help="rawg-multi failover test: how the active relay is broken")
+    ap.add_argument("--fault", choices=["pause", "cut-e", "cut-c"], default="pause", help="knothop-multi failover test: how the active relay is broken")
     ap.add_argument("--fault-at", type=float, default=25.0, help="failover test: seconds after the start of the load")
     ap.add_argument("--fail-duration", type=int, default=50, help="failover test: length of the load, s")
-    ap.add_argument("--fail-ms", type=int, default=1000, help="rawg-multi: client declares the link dead after this much silence following its own sends")
-    ap.add_argument("--relink-ms", type=int, default=5000, help="rawg-multi: how long one new-link attempt may take")
-    ap.add_argument("--path-idle-ms", type=int, default=3000, help="rawg-multi: QUIC path idle timeout")
-    ap.add_argument("--conn-idle-ms", type=int, default=5000, help="rawg-multi: QUIC connection idle timeout (a silent relay is dropped after this)")
-    ap.add_argument("--announce-s", type=int, default=60, help="rawg-multi: how often the exit repeats its announce, s (frequent ones hit the relays' announce rate limiter)")
-    ap.add_argument("--relay-debug", action="store_true", help="rawg-multi: relays print transport counters every 3 s")
-    ap.add_argument("--link-keepalive-s", type=int, default=0, help="rawg-multi: RNS link keepalive override, s (0 = default)")
+    ap.add_argument("--fail-ms", type=int, default=1000, help="knothop-multi: client declares the link dead after this much silence following its own sends")
+    ap.add_argument("--relink-ms", type=int, default=5000, help="knothop-multi: how long one new-link attempt may take")
+    ap.add_argument("--path-idle-ms", type=int, default=3000, help="knothop-multi: QUIC path idle timeout")
+    ap.add_argument("--conn-idle-ms", type=int, default=5000, help="knothop-multi: QUIC connection idle timeout (a silent relay is dropped after this)")
+    ap.add_argument("--announce-s", type=int, default=60, help="knothop-multi: how often the exit repeats its announce, s (frequent ones hit the relays' announce rate limiter)")
+    ap.add_argument("--relay-debug", action="store_true", help="knothop-multi: relays print transport counters every 3 s")
+    ap.add_argument("--link-keepalive-s", type=int, default=0, help="knothop-multi: RNS link keepalive override, s (0 = default)")
     ap.add_argument("--tests", default="all", help="comma list of: mtu ping tcp tcp4 udp udp300 udpsmall loaded quic | all")
     a = ap.parse_args()
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", a.tag):
@@ -646,7 +646,7 @@ def main():
         ensure_awg_bins()
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     cell = Cell(a)
-    with tempfile.TemporaryDirectory(prefix="rawg-l3-", dir="/tmp/opencode") as sd:
+    with tempfile.TemporaryDirectory(prefix="knothop-l3-", dir="/tmp/opencode") as sd:
         cell.shared = Path(sd)
         os.chmod(sd, 0o777)
         try:

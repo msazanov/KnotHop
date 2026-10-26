@@ -31,7 +31,7 @@ static STARTED: Once = Once::new();
 fn queue() -> &'static Queue {
     let q = QUEUE.get_or_init(|| Queue { slots: Mutex::new(HashMap::new()), wake: Condvar::new() });
     STARTED.call_once(|| {
-        if std::thread::Builder::new().name("rawg-writer".into()).spawn(writer_loop).is_err() {
+        if std::thread::Builder::new().name("knothop-writer".into()).spawn(writer_loop).is_err() {
             eprintln!("bgwrite: не удалось создать поток записи");
         }
     });
@@ -102,7 +102,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("rawg-bgwrite-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("knothop-bgwrite-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

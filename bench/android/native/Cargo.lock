@@ -1804,6 +1804,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "knothopmeas"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jni 0.21.1",
+ "mimalloc",
+ "rns-iroh-node",
+ "tokio",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2883,18 +2895,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rawgmeas"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "jni 0.21.1",
- "mimalloc",
- "rns-iroh-node",
- "tokio",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3009,6 +3009,7 @@ dependencies = [
  "clap",
  "hmac",
  "iroh",
+ "leviculum-lxmf",
  "leviculum-std",
  "libc",
  "noq-proto",

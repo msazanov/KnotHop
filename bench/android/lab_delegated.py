@@ -15,7 +15,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 LAB = Path(os.environ.get("LAB13_ROOT", ""))
 PREFIX = os.environ.get("LAB13_PREFIX", "")
-BIN = Path(os.environ.get("RAWGD_BIN", str(Path.home() / ".cache/rawg-target/release/rawgd")))
+BIN = Path(os.environ.get("KNOTHOP_BIN", str(Path.home() / ".cache/knothop-target/release/knothopd")))
 REPORT = Path("/tmp/opencode/tests/lab-delegated.md")
 RESULTS = []
 KEY_EVENTS = []
@@ -26,16 +26,16 @@ def run(*args, ok=True, timeout=30, env=None):
     if ok and p.returncode:
         # stdout намеренно не включается в ошибку: он может содержать приглашение.
         detail = p.stderr.strip().splitlines()[-1:] or [""]
-        safe = re.sub(r"rawgi-[A-Za-z0-9_-]+", "rawgi-[СКРЫТО]", detail[0])
+        safe = re.sub(r"kh-[A-Za-z0-9_-]+", "kh-[СКРЫТО]", detail[0])
         raise RuntimeError(f"команда завершилась с кодом {p.returncode}: {args[0]}: {safe[:240]}")
     return p
 
 
 def lab(*args, ok=True):
-    if not re.fullmatch(r"rawg-v3-[0-9a-f]+", PREFIX) or LAB.parent != Path("/tmp/opencode"):
+    if not re.fullmatch(r"knothop-v3-[0-9a-f]+", PREFIX) or LAB.parent != Path("/tmp/opencode"):
         raise RuntimeError("запрет: нет валидного уникального префикса/каталога лаборатории")
     env = os.environ.copy()
-    env.update({"LAB13_PREFIX": PREFIX, "LAB13_ROOT": str(LAB), "RAWGD_BIN": str(BIN)})
+    env.update({"LAB13_PREFIX": PREFIX, "LAB13_ROOT": str(LAB), "KNOTHOP_BIN": str(BIN)})
     return run(sys.executable, str(HERE / "lab13.py"), *args, ok=ok, timeout=90, env=env)
 
 
@@ -43,17 +43,17 @@ def docker(*args, ok=True):
     return run("docker", *args, ok=ok)
 
 
-def rawgd(container, *args, ok=True):
-    return docker("exec", container, "rawgd", *args, ok=ok)
+def knothopd(container, *args, ok=True):
+    return docker("exec", container, "knothopd", *args, ok=ok)
 
 
 def identity(container):
-    value = rawgd(container, "whoami", "--state", "/state").stdout
+    value = knothopd(container, "whoami", "--state", "/state").stdout
     return json.loads(value)["hash"]
 
 
 def list_text(container):
-    return rawgd(container, "list", "--state", "/state").stdout
+    return knothopd(container, "list", "--state", "/state").stdout
 
 
 def wait_for(predicate, label, seconds=45):
@@ -94,7 +94,7 @@ def collect_safe_events(container, filename):
 
 
 def issue_file(container, root, path, rights="USE", nodes=""):
-    args = ["exec", container, "rawgd", "invite", "--state", "/state", "--rights", rights,
+    args = ["exec", container, "knothopd", "invite", "--state", "/state", "--rights", rights,
             "--label", "lab-v3", "--root", root, "--out", "/state/.scenario-invite"]
     if nodes:
         args.extend(["--nodes", nodes])
@@ -109,7 +109,7 @@ def main():
     if not BIN.is_file():
         raise RuntimeError(f"нет бинарника {BIN}")
     suffix = f"{os.getpid():x}"
-    PREFIX = f"rawg-v3-{suffix}"
+    PREFIX = f"knothop-v3-{suffix}"
     LAB = Path(f"/tmp/opencode/lab-delegated-{suffix}")
     LAB.mkdir(mode=0o700)
     os.chmod(LAB, 0o700)
@@ -191,16 +191,16 @@ def main():
         noadd_node = f"{PREFIX}-noadd"
         lab("client", noadd_node, "--from", root_node, "--rights", "USE")
         wait_for(lambda: f"якорь {root}" in list_text(noadd_node), "участник без ADD зачислен")
-        no_add = rawgd(noadd_node, "invite", "--state", "/state", "--rights", "USE", "--root", root,
+        no_add = knothopd(noadd_node, "invite", "--state", "/state", "--rights", "USE", "--root", root,
                        "--out", "/state/.negative", ok=False)
         record("S6 делегат без ADD", "--root отклонён по отсутствию ADD",
                "клиент с USE без ADD получил отказ «в корне нет права ADD»",
                no_add.returncode != 0 and "в корне нет права ADD" in no_add.stderr)
-        too_wide = rawgd(delegate, "invite", "--state", "/state", "--rights", "EXIT", "--root", root,
+        too_wide = knothopd(delegate, "invite", "--state", "/state", "--rights", "EXIT", "--root", root,
                          "--out", "/state/.negative", ok=False)
         record("S6 права шире своих", "EXIT не выдан при USE+ADD у D",
                "CLI: отказ «приглашение шире действующих прав»", too_wide.returncode != 0 and "шире действующих прав" in too_wide.stderr)
-        no_anchor = rawgd(delegate, "invite", "--state", "/state", "--rights", "USE", "--root", "00" * 16,
+        no_anchor = knothopd(delegate, "invite", "--state", "/state", "--rights", "USE", "--root", "00" * 16,
                           "--out", "/state/.negative", ok=False)
         record("S6 корень отсутствует среди якорей", "выдача отклонена",
                "CLI: отказ «корень отсутствует среди якорей доверия»", no_anchor.returncode != 0 and "корень отсутствует среди якорей доверия" in no_anchor.stderr)
@@ -228,7 +228,7 @@ def main():
         lab("down", ok=False)
         # Контейнерные файлы принадлежат root внутри Docker: shred выполняется в одноразовом контейнере как root.
         if LAB.exists():
-            docker("run", "--rm", "-v", f"{LAB}:/lab", "--entrypoint", "sh", "rawg-bench:l3", "-c",
+            docker("run", "--rm", "-v", f"{LAB}:/lab", "--entrypoint", "sh", "knothop-bench:l3", "-c",
                    "find /lab -type f -exec shred -u {} +", ok=False)
             for p in sorted(LAB.rglob("*"), reverse=True):
                 if p.is_dir():
@@ -236,14 +236,14 @@ def main():
             LAB.rmdir()
         rows = ["# Локальная лаборатория: делегированные приглашения v3", "",
                 "Только локальная изолированная Docker-сеть; секретные строки/ключи не сохраняются.",
-                "Инцидент harness: первая ошибка env вызвала `lab13 down` в старой `rawg-lab13`, удалив её контейнеры и сеть. State в `~/.cache/rawg-lab13/lab/` не удалялся; контейнеры автоматически не восстанавливались. Последующие прогоны шли в отдельной сети с защитой префикса.", "",
+                "Инцидент harness: первая ошибка env вызвала `lab13 down` в старой `knothop-lab13`, удалив её контейнеры и сеть. State в `~/.cache/knothop-lab13/lab/` не удалялся; контейнеры автоматически не восстанавливались. Последующие прогоны шли в отдельной сети с защитой префикса.", "",
                 "| Сценарий | Ожидание | Фактический результат | Статус |",
                 "|---|---|---|---|"]
         rows.extend(f"| {n} | {e} | {a} | **{s}** |" for n, e, a, s in RESULTS)
         rows.extend(["", "## Ключевые строки логов (нормализованы, без идентификаторов/секретов)", ""])
         rows.extend(f"- `{event}`" for event in KEY_EVENTS)
         if not KEY_EVENTS:
-            rows.append("- Подходящих событий pairing в кратких логах не найдено; фактические assertions выполнены по `rawgd list` и HTTP-ответам.")
+            rows.append("- Подходящих событий pairing в кратких логах не найдено; фактические assertions выполнены по `knothopd list` и HTTP-ответам.")
         REPORT.write_text("\n".join(rows) + "\n")
         os.chmod(REPORT, 0o600)
     print(f"Отчёт: {REPORT}")

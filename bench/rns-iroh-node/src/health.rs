@@ -170,6 +170,15 @@ mod tests {
         assert!(h.m.lock().unwrap().is_empty());
     }
 
+    /// Клиент (телефон) не вызывает `init`: запись о неработающем носителе живёт только в памяти процесса, файл не создаётся и поток записи не будится.
+    #[test]
+    fn uninitialised_health_stays_in_memory() {
+        let h = Health::default();
+        h.fail("p", Kind::Quic);
+        assert!(h.is_bad("p", Kind::Quic));
+        assert!(h.path.lock().unwrap().is_none(), "без init пути к файлу нет, save() ничего не пишет");
+    }
+
     #[test]
     fn repeated_failures_escalate() {
         let h = Health::default();
@@ -180,7 +189,7 @@ mod tests {
 
     #[test]
     fn entries_are_bounded_and_persist() {
-        let dir = std::env::temp_dir().join(format!("rawg-health-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("knothop-health-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("carrier_health.json");
         let _ = std::fs::remove_file(&p);
@@ -208,7 +217,7 @@ mod tests {
 
     #[test]
     fn broken_or_oversized_file_is_ignored() {
-        let dir = std::env::temp_dir().join(format!("rawg-health-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("knothop-health-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("carrier_health.json");
         std::fs::write(&p, b"{not json").unwrap();

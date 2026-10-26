@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Список публичных TCP-узлов RNS из каталога rns.moscow -> файл для `rawgd node --public-rns-file` (по строке host:порт).
+"""Список публичных TCP-узлов RNS из каталога rns.moscow -> файл для `knothopd node --public-rns-file` (по строке host:порт).
 
   rns_moscow_nodes.py [--url https://rns.moscow/nodelist/nodes.json] [--out FILE] [--only-ok]
 

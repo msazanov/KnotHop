@@ -2,7 +2,7 @@
 //!
 //! Один QUIC bidi-поток = один байтовый интерфейс RNS (`Node::spawn_byte_channel`, HDLC-кадры), как в Resilum,
 //! но без TCP-мостов. Роли:
-//!   e  выход: принимает QUIC, регистрирует destination `rawgbench.node`, анонсирует, принимает Resource;
+//!   e  выход: принимает QUIC, регистрирует destination `knothopbench.node`, анонсирует, принимает Resource;
 //!   a  промежуточный RNS-транспорт (enable_transport): принимает QUIC от клиента, сам звонит на E;
 //!   c  клиент: звонит на E и/или A, поднимает Link до E, шлёт Resource непрерывно, пишет результат.
 //!
@@ -40,22 +40,20 @@ mod bgwrite;
 pub mod mobile;
 mod observations;
 mod route;
-mod emoji_alphabet;
-/// Кодек «эмодзи» для приглашений (порт anybase из BaseEmoji): нужен и мобильной оболочке (JNI).
-pub mod emoji;
-
-/// Приглашение любой принятой формы -> эмодзи (мобильная оболочка).
-pub fn invite_to_emoji(s: &str) -> anyhow::Result<String> {
-    trust::Invite::to_emoji(s)
-}
-
-/// Приглашение любой принятой формы -> rawgi-… (мобильная оболочка).
+mod host_acl;
+mod qprobe;
+/// Приглашение любой принятой формы -> kh-… (мобильная оболочка).
 pub fn invite_to_base64(s: &str) -> anyhow::Result<String> {
     trust::Invite::to_base64(s)
 }
 pub use vpn::{VpnCli, VpnCmd, decode_profile, encode_profile};
 
-/// Точка входа rawgd (узел, хаб, клиент, админ-команды).
+/// Fixed non-shell admin CLI bridge used by the Android JNI wrapper.
+pub fn admin_cli_json(command: &str, state_dir: &str) -> String {
+    vpn::run_cli_json(command, state_dir)
+}
+
+/// Точка входа knothopd (узел, хаб, клиент, админ-команды).
 pub async fn run_vpn(cli: VpnCli) -> Result<()> {
     match cli.cmd {
         VpnCmd::Node(a) => vpn::run_node(a).await,
@@ -163,9 +161,10 @@ pub struct Cli {
     /// поэтому для замера скорости по умолчанию выключено - сверка идёт по шаблону.
     #[arg(long, default_value_t = false)]
     verify_sha: bool,
-    /// чему привязан proof данных: "tag" (быстро, только наш форк) или "hash"
-    /// (совместимо с ванильным Reticulum, но дороже - лишний SHA-256 на пакет)
-    #[arg(long, default_value = "tag")]
+    /// Proof binding: "cipher" (safe default: CBC=hash, GCM=tag), "hash"
+    /// (PacketHash for every Link), or explicit custom "tag" (both peers must agree;
+    /// KnotHop-only for CBC).
+    #[arg(long, default_value = "cipher", value_parser = ["cipher", "tag", "hash"])]
     proof_binding: String,
     /// Явный крипторежим Link; обе стороны должны совпадать.
     #[arg(long, default_value = "cbc", value_parser = ["cbc", "gcm"])]
@@ -240,6 +239,18 @@ pub struct Cli {
     port: u16,
 }
 
+fn parse_cli_proof_binding_policy(
+    value: &str,
+) -> anyhow::Result<leviculum_std::api::ProofBindingPolicy> {
+    use leviculum_std::api::{ProofBinding, ProofBindingPolicy};
+    match value {
+        "cipher" => Ok(ProofBindingPolicy::ByCipher),
+        "hash" => Ok(ProofBindingPolicy::Explicit(ProofBinding::PacketHash)),
+        "tag" => Ok(ProofBindingPolicy::Explicit(ProofBinding::TokenTag)),
+        other => bail!("unknown --proof-binding {other:?} (want cipher|hash|tag)"),
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct PeerInfo {
     id: String,
@@ -282,7 +293,7 @@ fn udp_stats() -> serde_json::Value {
 
 static LOG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-const DGRAM_MAGIC: &[u8; 8] = b"RAWGDGRM";
+const DGRAM_MAGIC: &[u8; 8] = b"KNOTDGRM";
 const DGRAM_HDR: usize = 24;
 const DGRAM_BUCKET_US: u64 = 50;
 const DGRAM_BUCKETS: usize = 20_001;
@@ -576,7 +587,7 @@ static LOG_QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<(PathBu
 fn append_log(p: &Path, line: &str) {
     let queue = LOG_QUEUE.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<(PathBuf, String)>(LOG_QUEUE_MAX);
-        match std::thread::Builder::new().name("rawg-log".into()).spawn(move || log_writer(rx)) {
+        match std::thread::Builder::new().name("knothop-log".into()).spawn(move || log_writer(rx)) {
             Ok(_) => Some(tx),
             Err(_) => None,
         }
@@ -694,26 +705,59 @@ fn carrier() -> (bool, u32) {
 }
 
 /// Приёмная половина носителя: датаграммы QUIC. `read_datagram` отменяем без потерь данных.
-struct QuicDgramSource(Connection);
+struct QuicDgramSource {
+    conn: Connection,
+    /// счётчики и лимит магических датаграмм этого соединения (QAB-M5)
+    filter: qprobe::Filter,
+}
+impl QuicDgramSource {
+    fn new(conn: Connection) -> Self {
+        Self { conn, filter: qprobe::Filter::new() }
+    }
+}
 impl PacketSource for QuicDgramSource {
     fn try_recv(&mut self) -> Option<std::io::Result<Vec<u8>>> {
         // Один опрос с пустым waker: готовая датаграмма забирается сразу, иначе будущее отбрасывается (read_datagram безопасно к отмене).
+        // Датаграммы теневого зонда (qprobe) обрабатываются здесь и в RNS не попадают. Работа за вызов ограничена `WORK_BUDGET`:
+        // исчерпав его, возвращаем None - вызывающий возвращается к `recv` с настоящим waker и не теряет ожидание (QAB-M5).
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        let mut fut = std::pin::pin!(self.0.read_datagram());
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(Ok(b)) => Some(Ok(b.to_vec())),
-            Poll::Ready(Err(e)) => Some(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))),
-            Poll::Pending => None,
+        loop {
+            let mut fut = std::pin::pin!(self.conn.read_datagram());
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(Ok(b)) => {
+                    if self.filter.intercept(&self.conn, &b) {
+                        if self.filter.ate() {
+                            return None;
+                        }
+                        continue;
+                    }
+                    self.filter.delivered();
+                    return Some(Ok(b.to_vec()));
+                }
+                Poll::Ready(Err(e)) => return Some(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))),
+                Poll::Pending => return None,
+            }
         }
     }
 
     fn recv(&mut self) -> impl std::future::Future<Output = std::io::Result<Vec<u8>>> + Send {
         async move {
-            self.0
-                .read_datagram()
-                .await
-                .map(|b| b.to_vec())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))
+            loop {
+                let b = self
+                    .conn
+                    .read_datagram()
+                    .await
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))?;
+                if self.filter.intercept(&self.conn, &b) {
+                    // поток magic не должен держать исполнителя и выбор между приёмом, исходящей очередью и остановом интерфейса
+                    if self.filter.ate() {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
+                self.filter.delivered();
+                return Ok(b.to_vec());
+            }
         }
     }
 }
@@ -912,7 +956,7 @@ async fn attach_datagrams_until_closed(node: Arc<Node>, sh: Arc<Shared>, name: S
             }
         })
     };
-    match node.spawn_packet_channel(&name, QuicDgramSource(conn.clone()), QuicDgramSink(conn.clone()), opts) {
+    match node.spawn_packet_channel(&name, QuicDgramSource::new(conn.clone()), QuicDgramSink(conn.clone()), opts) {
         Ok(handle) => {
             sh.note(format!("packet interface attached: {name} (hw_mtu {mtu})"));
             let _ = conn.closed().await;
@@ -1073,7 +1117,7 @@ async fn event_loop(node: Arc<Node>, mut events: leviculum_std::driver::EventRec
                 sh.note(format!("link closed {} reason={reason:?}", &k[..8]));
             }
             NodeEvent::MessageReceived { link_id, data, .. } => {
-                if data.len() == 16 && &data[..8] == b"RAWGECHO" {
+                if data.len() == 16 && &data[..8] == b"KNOTECHO" {
                     if auto_accept {
                         let handle = node.engine().link_handle(&link_id);
                         tokio::spawn(async move { let _ = handle.send(&data).await; });
@@ -1117,14 +1161,38 @@ async fn event_loop(node: Arc<Node>, mut events: leviculum_std::driver::EventRec
     }
 }
 
+/// Лабораторный обход enforce для роли `e` с `--mode tun` (`KNOTHOP_LAB_EXIT_NO_ENFORCE=1`) есть только в отладочной сборке
+/// либо в сборке с явным feature `lab-exit-no-enforce` (стенды замеров запускают release-бинарник `rns-iroh-node`).
+/// Штатные release-сборки (knothopd, APK) его не содержат: ни проверки переменной, ни её имени.
+///
+/// Выход tun без enforce принимает пакеты с любого Link (нет закрепления адреса): только лаборатория, по явной переменной.
+/// `env` - значение переменной обхода; в сборке без обхода игнорируется, роль `e` с tun отклоняется всегда.
+#[cfg(any(debug_assertions, feature = "lab-exit-no-enforce"))]
+fn exit_no_enforce_gate(role: &str, mode: &str, env: Option<&str>) -> std::result::Result<(), &'static str> {
+    if role == "e" && mode == "tun" && env != Some("1") {
+        return Err("роль e с --mode tun без enforce принимает трафик с любого Link; для лаборатории задайте KNOTHOP_LAB_EXIT_NO_ENFORCE=1 (VPN - knothopd, run_vpn)");
+    }
+    Ok(())
+}
+#[cfg(not(any(debug_assertions, feature = "lab-exit-no-enforce")))]
+fn exit_no_enforce_gate(role: &str, mode: &str, _env: Option<&str>) -> std::result::Result<(), &'static str> {
+    if role == "e" && mode == "tun" {
+        return Err("роль e с --mode tun в этой сборке недоступна (VPN - knothopd, run_vpn)");
+    }
+    Ok(())
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
-    // Выход tun без enforce принимает пакеты с любого Link (нет закрепления адреса): только лаборатория, по явной переменной.
-    if cli.role == "e" && cli.mode == "tun" && std::env::var("RAWG_LAB_EXIT_NO_ENFORCE").as_deref() != Ok("1") {
-        bail!("роль e с --mode tun без enforce принимает трафик с любого Link; для лаборатории задайте RAWG_LAB_EXIT_NO_ENFORCE=1 (VPN - rawgd, run_vpn)");
+    #[cfg(any(debug_assertions, feature = "lab-exit-no-enforce"))]
+    let no_enforce_env = std::env::var("KNOTHOP_LAB_EXIT_NO_ENFORCE").ok();
+    #[cfg(not(any(debug_assertions, feature = "lab-exit-no-enforce")))]
+    let no_enforce_env: Option<String> = None;
+    if let Err(why) = exit_no_enforce_gate(&cli.role, &cli.mode, no_enforce_env.as_deref()) {
+        bail!(why);
     }
     // Диагностика: разрешить `eu-stack -p` / gdb от любого процесса того же пользователя
-    // (yama ptrace_scope=1 иначе пускает только предков). Только при RAWG_PTRACE_ANY=1.
-    if std::env::var("RAWG_PTRACE_ANY").as_deref() == Ok("1") {
+    // (yama ptrace_scope=1 иначе пускает только предков). Только при KNOTHOP_PTRACE_ANY=1.
+    if std::env::var("KNOTHOP_PTRACE_ANY").as_deref() == Ok("1") {
         unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY as libc::c_ulong, 0, 0, 0) };
     }
     std::fs::create_dir_all(&cli.state).context("create state dir")?;
@@ -1153,12 +1221,8 @@ pub async fn run(cli: Cli) -> Result<()> {
     if cli.link_keepalive_s > 0 {
         nb = nb.link_keepalive(cli.link_keepalive_s);
     }
-    let binding = match cli.proof_binding.as_str() {
-        "tag" => leviculum_std::api::ProofBinding::TokenTag,
-        "hash" => leviculum_std::api::ProofBinding::PacketHash,
-        other => bail!("unknown --proof-binding {other:?} (want tag|hash)"),
-    };
-    nb = nb.proof_binding(binding);
+    let binding_policy = parse_cli_proof_binding_policy(&cli.proof_binding)?;
+    nb = nb.proof_binding_policy(binding_policy);
     if cli.data_cap > 0 {
         nb = nb.data_channel_capacity(cli.data_cap);
     }
@@ -1166,7 +1230,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         "gcm" => leviculum_std::api::LinkCipher::Gcm,
         _ => leviculum_std::api::LinkCipher::Cbc,
     });
-    eprintln!("[{}] proof binding: {:?}", now_ms(), binding);
+    eprintln!("[{}] proof binding policy: {:?}", now_ms(), binding_policy);
     let mut node = nb.build().context("build node")?;
     sh.note("node built");
     node.start().await.context("start node")?;
@@ -1225,7 +1289,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut dest_hash_opt: Option<DestinationHash> = None;
     if is_exit {
         let sk = identity.ed25519_verifying().to_bytes();
-        let dest = Destination::new(Some(identity), Direction::In, DestinationType::Single, "rawgbench", &["node"])
+        let dest = Destination::new(Some(identity), Direction::In, DestinationType::Single, "knothopbench", &["node"])
             .map_err(|e| anyhow::anyhow!("destination: {e:?}"))?;
         let h = *dest.hash();
         node.register_destination(dest);
@@ -1499,7 +1563,7 @@ async fn client_stream(cli: &Cli, node: Arc<Node>, sh: Arc<Shared>, dest: &Desti
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 sh.echo_pending.lock().unwrap().insert(seq, tx);
                 let mut data = [0u8; 16];
-                data[..8].copy_from_slice(b"RAWGECHO");
+                data[..8].copy_from_slice(b"KNOTECHO");
                 data[8..].copy_from_slice(&seq.to_le_bytes());
                 let start = Instant::now();
                 let result = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1517,7 +1581,7 @@ async fn client_stream(cli: &Cli, node: Arc<Node>, sh: Arc<Shared>, dest: &Desti
                             let (itx, irx) = tokio::sync::oneshot::channel();
                             sh.echo_pending.lock().unwrap().insert(seq, itx);
                             let mut d = [0u8; 16];
-                            d[..8].copy_from_slice(b"RAWGECHO");
+                            d[..8].copy_from_slice(b"KNOTECHO");
                             d[8..].copy_from_slice(&seq.to_le_bytes());
                             let t = Instant::now();
                             let ok = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1733,7 +1797,7 @@ struct TunCounters {
     unauth_drops: std::sync::atomic::AtomicU64,
 }
 
-struct TunState {
+pub struct TunState {
     afd: tokio::io::unix::AsyncFd<TunFd>,
     is_exit: bool,
     /// клиент: текущий Link к выходу (None, пока идёт смена маршрута)
@@ -1751,6 +1815,11 @@ struct TunState {
     /// выход в режиме VPN: пакеты принимаются только по Link из этой таблицы и только с закреплённого за Link адреса источника
     enforce: std::sync::atomic::AtomicBool,
     allowed: std::sync::RwLock<HashMap<leviculum_std::api::LinkId, u32>>,
+    host_access: std::sync::RwLock<HashSet<leviculum_std::api::LinkId>>,
+    host_inventory: Arc<std::sync::RwLock<Option<Arc<host_acl::Inventory>>>>,
+    host_acl_ready: Arc<std::sync::atomic::AtomicBool>,
+    host_acl_started: std::sync::atomic::AtomicBool,
+    health_echo_last: std::sync::Mutex<HashMap<leviculum_std::api::LinkId, Instant>>,
     c: TunCounters,
     /// клиент: раздельное туннелирование (route.rs); пока правил нет, `routing` = false и пакеты идут в основной Link без проверок
     routing: std::sync::atomic::AtomicBool,
@@ -1783,7 +1852,222 @@ struct RouteCounters {
     dot_dropped: std::sync::atomic::AtomicU64,
 }
 
+/// Bounded IPv4 header validation shared by both TUN directions. Fragments are accepted only
+/// when each fragment is structurally valid; no transport-header assumptions are made.
+fn valid_ipv4_packet(pkt: &[u8]) -> bool {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 { return false; }
+    let ihl = usize::from(pkt[0] & 0x0f) * 4;
+    if !(20..=60).contains(&ihl) || ihl > pkt.len() { return false; }
+    if pkt[8] == 0 { return false; }
+    let total = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
+    if total < ihl || total != pkt.len() { return false; }
+    let frag = u16::from_be_bytes([pkt[6], pkt[7]]);
+    if frag & 0x8000 != 0 || (frag & 0x4000 != 0 && frag & 0x3fff != 0) { return false; }
+    let payload = total - ihl;
+    if payload == 0 && (frag & 0x3fff != 0) { return false; }
+    if frag & 0x2000 != 0 && payload % 8 != 0 { return false; }
+    true
+}
+
+/// Верхняя граница числа допущенных клиентов (Link) и обратных маршрутов выхода.
+const MAX_ALLOWED_CLIENTS: usize = 256;
+
+/// Итог успешного допуска клиентского Link на выходе.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Link и обратный маршрут занесены этим вызовом.
+    Admitted,
+    /// Тот же Link с тем же адресом уже был допущен: вызов идемпотентен, права HOST_ACCESS не тронуты.
+    AlreadyAdmitted,
+}
+
+/// Устойчивая причина отказа `TunState::allow`; таблицы при отказе не меняются.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionError {
+    /// Выход принудительный, а inventory/конфигурация host ACL не готова (fail-closed).
+    AclNotReady,
+    /// Достигнут предел допущенных клиентов или обратных маршрутов.
+    Capacity,
+    /// Адрес уже закреплён за другим Link.
+    AddressInUse,
+    /// Этот Link уже допущен с другим адресом.
+    LinkAddressChanged,
+}
+
+impl AdmissionError {
+    /// Стабильный короткий код (без адресов) для статуса и причины AUTH_FAIL.
+    pub fn code(self) -> &'static str {
+        match self {
+            AdmissionError::AclNotReady => "host_acl_not_ready",
+            AdmissionError::Capacity => "exit_client_capacity",
+            AdmissionError::AddressInUse => "address_in_use",
+            AdmissionError::LinkAddressChanged => "link_address_changed",
+        }
+    }
+}
+
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.code()) }
+}
+
+impl std::error::Error for AdmissionError {}
+
+type HostAccessSet = std::sync::RwLock<HashSet<leviculum_std::api::LinkId>>;
+type AllowedMap = std::sync::RwLock<HashMap<leviculum_std::api::LinkId, u32>>;
+type RouteMap<H> = std::sync::RwLock<HashMap<u32, (leviculum_std::api::LinkId, H)>>;
+
+/// Единый порядок блокировок для всех записей: host_access -> allowed -> routes. Пакетный путь берёт каждую
+/// отдельно и не вкладывает, поэтому взаимной блокировки с этим порядком нет.
+/// Допуск атомарный (all-or-nothing): все проверки под тремя write-блокировками, до первой вставки.
+fn admit_link<H>(
+    host_access: &HostAccessSet, allowed: &AllowedMap, routes: &RouteMap<H>,
+    link_id: leviculum_std::api::LinkId, ip: u32, handle: H,
+) -> Result<Admission, AdmissionError> {
+    admit_link_replacing(host_access, allowed, routes, link_id, ip, handle, &[])
+}
+
+/// То же, но владельца адреса можно вытеснить: только если он входит в `replaces` (вызывающий вычислил список как
+/// живые Link той же аутентифицированной identity с тем же адресом) и таблица `allowed` подтверждает его адрес.
+/// Любой другой владелец - `AddressInUse`. Все проверки идут до первой мутации; вытеснение (права, допуск, маршрут
+/// прежнего Link) и вставка нового - в той же критической секции. Права HOST_ACCESS нового Link не наследуются.
+fn admit_link_replacing<H>(
+    host_access: &HostAccessSet, allowed: &AllowedMap, routes: &RouteMap<H>,
+    link_id: leviculum_std::api::LinkId, ip: u32, handle: H, replaces: &[leviculum_std::api::LinkId],
+) -> Result<Admission, AdmissionError> {
+    let mut permissions = host_access.write().unwrap();
+    let mut allowed = allowed.write().unwrap();
+    let mut routes = routes.write().unwrap();
+    if let Some(bound) = allowed.get(&link_id).copied() {
+        if bound != ip { return Err(AdmissionError::LinkAddressChanged); }
+        return match routes.get(&ip).map(|(owner, _)| *owner) {
+            Some(owner) if owner == link_id => Ok(Admission::AlreadyAdmitted),
+            Some(_) => Err(AdmissionError::AddressInUse),
+            None => {
+                // восстановление нарушенного инварианта: допущенный Link без маршрута
+                if routes.len() >= MAX_ALLOWED_CLIENTS { return Err(AdmissionError::Capacity); }
+                routes.insert(ip, (link_id, handle));
+                Ok(Admission::AlreadyAdmitted)
+            }
+        };
+    }
+    let evict = match routes.get(&ip).map(|(owner, _)| *owner) {
+        Some(owner) if owner != link_id => {
+            if replaces.contains(&owner) && allowed.get(&owner) == Some(&ip) { Some(owner) } else { return Err(AdmissionError::AddressInUse); }
+        }
+        _ => None,
+    };
+    // вытесняемый Link освобождает по одному месту в allowed и routes
+    let freed = usize::from(evict.is_some());
+    if allowed.len() - freed >= MAX_ALLOWED_CLIENTS || routes.len() - freed >= MAX_ALLOWED_CLIENTS { return Err(AdmissionError::Capacity); }
+    if let Some(owner) = evict {
+        permissions.remove(&owner);
+        allowed.remove(&owner);
+        routes.remove(&ip);
+    }
+    allowed.insert(link_id, ip);
+    routes.insert(ip, (link_id, handle));
+    // новый допуск никогда не наследует остаток прав от прежнего состояния этого LinkId
+    permissions.remove(&link_id);
+    Ok(Admission::Admitted)
+}
+
+fn disallow_link<H>(host_access: &HostAccessSet, allowed: &AllowedMap, routes: &RouteMap<H>, link_id: &leviculum_std::api::LinkId) {
+    let mut permissions = host_access.write().unwrap();
+    let mut allowed = allowed.write().unwrap();
+    let mut routes = routes.write().unwrap();
+    permissions.remove(link_id);
+    if let Some(ip) = allowed.remove(link_id) {
+        if routes.get(&ip).is_some_and(|(owner, _)| owner == link_id) {
+            routes.remove(&ip);
+        }
+    }
+}
+
+fn set_link_host_access(host_access: &HostAccessSet, allowed: &AllowedMap, link_id: &leviculum_std::api::LinkId, grant: bool) -> bool {
+    let mut permissions = host_access.write().unwrap();
+    if grant {
+        if allowed.read().unwrap().contains_key(link_id) {
+            permissions.insert(*link_id);
+            return true;
+        }
+        permissions.remove(link_id);
+        return false;
+    }
+    permissions.remove(link_id);
+    true
+}
+
+/// Publish the current Trust decision without letting an older evaluator overwrite a revoke.
+/// Evaluation uses this critical section; ordinary admission's promote_client_link retains the
+/// same Trust guard through role/TUN/host publication. `inspect` is read-only/in-memory;
+/// `publish` must only do the small TUN permission update (no I/O, admission, Link close or await).
+/// Lock order: Trust -> host_access -> allowed. Neither packet processing nor TUN table writers
+/// acquire Trust while holding these locks. In particular, never acquire the host commit gate here.
+fn publish_host_access_decision<R>(
+    authority: &Mutex<trust::Trust>, pk: &trust::Pk,
+    inspect: impl FnOnce(&trust::Trust) -> R, publish: impl FnOnce(bool) -> bool,
+) -> (R, bool) {
+    let tr = authority.lock().unwrap();
+    let granted = !tr.host_access_roots(pk, &tr.me_hash).is_empty();
+    let result = inspect(&tr);
+    let applied = publish(granted);
+    // Keep the authority guard alive through the actual ACL write, not just the decision.
+    drop(tr);
+    (result, applied)
+}
+
 impl TunState {
+    /// Load strict local ACL state and take an initial host-interface snapshot.
+    /// Enforced traffic remains fail-closed until this succeeds.
+    pub fn configure_host_acl(&self, state: &Path) -> Result<()> {
+        use std::sync::atomic::Ordering::Release;
+        self.host_acl_ready.store(false, Release);
+        let snapshot = Arc::new(host_acl::build(state)?);
+        *self.host_inventory.write().unwrap() = Some(snapshot);
+        self.host_acl_ready.store(true, Release);
+        if !self.host_acl_started.swap(true, Release) {
+            let state = state.to_path_buf();
+            let inventory = self.host_inventory.clone();
+            let ready = self.host_acl_ready.clone();
+            let refresh = std::thread::Builder::new().name("host-acl-refresh".into()).spawn(move || loop {
+                std::thread::sleep(host_acl::refresh_interval());
+                match host_acl::build(&state) {
+                    Ok(next) => {
+                        *inventory.write().unwrap() = Some(Arc::new(next));
+                        ready.store(true, Release);
+                    }
+                    Err(_) => ready.store(false, Release),
+                }
+            });
+            if let Err(error) = refresh {
+                self.host_acl_ready.store(false, Release);
+                self.host_acl_started.store(false, Release);
+                return Err(error).context("start host ACL inventory refresh");
+            }
+        }
+        Ok(())
+    }
+
+    /// HOST_ACCESS is opt-in, per admitted Link, and never inferred by allow(). Returns whether the requested state holds:
+    /// a grant for a Link that is not admitted is refused (`false`, no permission recorded); a revoke always succeeds.
+    pub fn set_host_access(&self, link_id: &leviculum_std::api::LinkId, allowed: bool) -> bool {
+        set_link_host_access(&self.host_access, &self.allowed, link_id, allowed)
+    }
+
+    pub fn host_acl_ready(&self) -> bool {
+        self.host_acl_ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn allow_health_echo(&self, link_id: leviculum_std::api::LinkId) -> bool {
+        let now = Instant::now();
+        let mut last = self.health_echo_last.lock().unwrap();
+        if last.get(&link_id).is_some_and(|at| now.duration_since(*at) < Duration::from_secs(1)) { return false; }
+        if last.len() >= 256 { last.retain(|_, at| now.duration_since(*at) < Duration::from_secs(5)); }
+        if last.len() >= 256 && !last.contains_key(&link_id) { return false; }
+        last.insert(link_id, now);
+        true
+    }
+
     fn open(cli: &Cli, is_exit: bool) -> Result<Arc<Self>> {
         if cli.tun_fd >= 0 {
             // Дескриптор принадлежит VpnService (Java держит свою копию и закроет её при остановке): берём собственную через dup.
@@ -1808,6 +2092,11 @@ impl TunState {
                 routes: std::sync::RwLock::new(HashMap::new()),
                 enforce: Default::default(),
                 allowed: std::sync::RwLock::new(HashMap::new()),
+                host_access: std::sync::RwLock::new(HashSet::new()),
+                host_inventory: Arc::new(std::sync::RwLock::new(None)),
+                host_acl_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                host_acl_started: Default::default(),
+                health_echo_last: std::sync::Mutex::new(HashMap::new()),
                 c: TunCounters::default(),
                 routing: Default::default(),
                 router: std::sync::RwLock::new(Arc::new(route::Router::empty())),
@@ -1841,6 +2130,11 @@ impl TunState {
             routes: std::sync::RwLock::new(HashMap::new()),
             enforce: Default::default(),
             allowed: std::sync::RwLock::new(HashMap::new()),
+            host_access: std::sync::RwLock::new(HashSet::new()),
+            host_inventory: Arc::new(std::sync::RwLock::new(None)),
+            host_acl_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            host_acl_started: Default::default(),
+            health_echo_last: std::sync::Mutex::new(HashMap::new()),
             c: TunCounters::default(),
             routing: Default::default(),
             router: std::sync::RwLock::new(Arc::new(route::Router::empty())),
@@ -1864,7 +2158,7 @@ impl TunState {
     /// Пакет, пришедший по Link: на выходе запомнить, чей это IP, и положить в TUN.
     fn on_link_packet(&self, node: &Arc<Node>, link_id: leviculum_std::api::LinkId, pkt: &[u8]) {
         use std::sync::atomic::Ordering::Relaxed;
-        if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        if !valid_ipv4_packet(pkt) {
             self.c.not_ipv4.fetch_add(1, Relaxed);
             return;
         }
@@ -1884,6 +2178,28 @@ impl TunState {
                     return;
                 }
             }
+            if !self.host_acl_ready.load(Relaxed) {
+                self.c.unauth_drops.fetch_add(1, Relaxed);
+                return;
+            }
+            let inventory = match self.host_inventory.read().unwrap().as_ref().cloned() {
+                Some(snapshot) => snapshot,
+                None => { self.c.unauth_drops.fetch_add(1, Relaxed); return; }
+            };
+            let dst = u32::from_be_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
+            match host_acl::classify_destination(dst, &inventory) {
+                host_acl::DestinationDecision::Internet => {}
+                host_acl::DestinationDecision::Deny => { self.c.unauth_drops.fetch_add(1, Relaxed); return; }
+                host_acl::DestinationDecision::HostNeedsPermission => {
+                    let granted = self.host_access.read().unwrap().contains(&link_id);
+                    let health_echo = inventory.service_tun.contains(&dst) && is_icmp_echo_request(pkt)
+                        && self.allow_health_echo(link_id);
+                    if !inbound_host_access_allowed(pkt, self.host_acl_ready.load(Relaxed), &inventory, granted) && !health_echo {
+                        self.c.unauth_drops.fetch_add(1, Relaxed);
+                        return;
+                    }
+                }
+            }
         } else if self.is_exit {
             let src = u32::from_be_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]);
             let known = self.routes.read().unwrap().get(&src).map(|(id, _)| *id == link_id).unwrap_or(false);
@@ -1897,7 +2213,7 @@ impl TunState {
 
     /// Пакет с дополнительного Link: живость основного он не отмечает (иначе молчание основного выхода осталось бы незамеченным).
     fn on_extra_packet(&self, pkt: &[u8]) {
-        if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        if !valid_ipv4_packet(pkt) {
             self.c.not_ipv4.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
@@ -1905,25 +2221,36 @@ impl TunState {
     }
 
     /// Выход (режим VPN): пустить пакеты этого Link с адресом `ip` и вести к нему обратный маршрут.
-    fn allow(&self, node: &Arc<Node>, link_id: leviculum_std::api::LinkId, ip: u32) {
+    /// Результат авторитетный: `Ok` - Link и маршрут занесены (или уже были занесены с тем же адресом), `Err` - таблицы не изменены,
+    /// и вызывающий не вправе слать AUTH_OK. Новый Link не наследует HOST_ACCESS.
+    pub fn allow(&self, node: &Arc<Node>, link_id: leviculum_std::api::LinkId, ip: u32) -> Result<Admission, AdmissionError> {
         let handle = Arc::new(node.engine().link_handle(&link_id));
-        self.allowed.write().unwrap().insert(link_id, ip);
-        self.routes.write().unwrap().insert(ip, (link_id, handle));
+        self.allow_with_handle(link_id, ip, handle)
     }
 
-    fn disallow(&self, link_id: &leviculum_std::api::LinkId) {
-        if let Some(ip) = self.allowed.write().unwrap().remove(link_id) {
-            let mut r = self.routes.write().unwrap();
-            if r.get(&ip).map(|(id, _)| id == link_id).unwrap_or(false) {
-                r.remove(&ip);
-            }
-        }
+    /// In-memory admission half: prepare the handle before taking Trust/Link-state guards.
+    fn allow_with_handle(&self, link_id: LinkId, ip: u32, handle: Arc<leviculum_std::LinkHandle>) -> Result<Admission, AdmissionError> {
+        self.allow_replacing_with_handle(link_id, ip, handle, &[])
+    }
+
+    /// Допуск, который может атомарно вытеснить прежний Link той же identity (`replaces`, см. `admit_link_replacing`).
+    /// Список вычисляет вызывающий под guard Trust+links; здесь identity не известна и не проверяется.
+    fn allow_replacing_with_handle(&self, link_id: LinkId, ip: u32, handle: Arc<leviculum_std::LinkHandle>, replaces: &[LinkId]) -> Result<Admission, AdmissionError> {
+        use std::sync::atomic::Ordering::Acquire;
+        // принимающий выход с неготовым ACL роняет весь трафик клиента: честный отказ вместо допуска в «чёрную дыру»
+        if self.enforce.load(Acquire) && !self.host_acl_ready.load(Acquire) { return Err(AdmissionError::AclNotReady); }
+        admit_link_replacing(&self.host_access, &self.allowed, &self.routes, link_id, ip, handle, replaces)
+    }
+
+    pub fn disallow(&self, link_id: &leviculum_std::api::LinkId) {
+        disallow_link(&self.host_access, &self.allowed, &self.routes, link_id);
     }
 
     fn stats(&self) -> serde_json::Value {
         use std::sync::atomic::Ordering::Relaxed;
         serde_json::json!({
             "unauth_drops": self.c.unauth_drops.load(Relaxed),
+            "host_acl_ready": self.host_acl_ready.load(std::sync::atomic::Ordering::Relaxed),
             "from_tun_pkts": self.c.from_tun_pkts.load(Relaxed), "from_tun_bytes": self.c.from_tun_bytes.load(Relaxed),
             "to_tun_pkts": self.c.to_tun_pkts.load(Relaxed), "to_tun_bytes": self.c.to_tun_bytes.load(Relaxed),
             "tun_write_drops": self.c.tun_write_drops.load(Relaxed), "route_miss": self.c.route_miss.load(Relaxed),
@@ -1959,8 +2286,12 @@ async fn tun_reader(tun: Arc<TunState>, _node: Arc<Node>, sh: Arc<Shared>) {
                 return;
             }
             let pkt = &buf[..n as usize];
-            if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+            if !valid_ipv4_packet(pkt) {
                 tun.c.not_ipv4.fetch_add(1, Relaxed);
+                continue;
+            }
+            if tun.is_exit && tun.enforce.load(Relaxed) && !tun.response_allowed(pkt) {
+                tun.c.unauth_drops.fetch_add(1, Relaxed);
                 continue;
             }
             let mut on_main = true;
@@ -2017,6 +2348,60 @@ async fn tun_reader(tun: Arc<TunState>, _node: Arc<Node>, sh: Arc<Shared>) {
     }
 }
 
+impl TunState {
+    /// Validate an exit-side host response against the client Link selected by dst.
+    fn response_allowed(&self, pkt: &[u8]) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.host_acl_ready.load(Relaxed) { return false; }
+        let inventory = match self.host_inventory.read().unwrap().as_ref().cloned() { Some(v) => v, None => return false };
+        let dst = u32::from_be_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
+        let link = match self.routes.read().unwrap().get(&dst) { Some((link, _)) => *link, None => return false };
+        if self.allowed.read().unwrap().get(&link) != Some(&dst) { return false; }
+        let src = u32::from_be_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]);
+        match host_acl::classify_source(src, &inventory) {
+            host_acl::SourceDecision::Public => true,
+            host_acl::SourceDecision::Deny => false,
+            host_acl::SourceDecision::HostNeedsPermission => {
+                response_host_access_allowed(pkt, self.host_acl_ready.load(Relaxed), &inventory, self.host_access.read().unwrap().contains(&link))
+            }
+        }
+    }
+}
+
+fn host_service_packet_valid(pkt: &[u8]) -> bool {
+    if pkt.len() < 20 || (pkt[0] & 0x0f) != 5 { return false; }
+    let frag = u16::from_be_bytes([pkt[6], pkt[7]]);
+    if frag & 0x2000 != 0 || frag & 0x1fff != 0 { return false; }
+    let payload = pkt.len() - 20;
+    match pkt[9] {
+        6 => payload >= 20 && usize::from(pkt[32] >> 4) * 4 >= 20
+            && usize::from(pkt[32] >> 4) * 4 <= payload,
+        17 => payload >= 8 && usize::from(u16::from_be_bytes([pkt[24], pkt[25]])) >= 8
+            && usize::from(u16::from_be_bytes([pkt[24], pkt[25]])) <= payload,
+        1 => payload >= 8,
+        _ => false,
+    }
+}
+
+fn is_icmp_echo_request(pkt: &[u8]) -> bool { pkt.len() >= 28 && pkt[9] == 1 && pkt[20] == 8 && pkt[21] == 0 }
+fn is_icmp_echo_reply(pkt: &[u8]) -> bool { pkt.len() >= 28 && pkt[9] == 1 && pkt[20] == 0 && pkt[21] == 0 }
+
+fn inbound_host_access_allowed(pkt: &[u8], ready: bool, inventory: &host_acl::Inventory, granted: bool) -> bool {
+    let dst = u32::from_be_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
+    ready && host_acl::classify_destination(dst, inventory) == host_acl::DestinationDecision::HostNeedsPermission
+        && ((granted && inventory.host_allow.contains(&dst))
+            || (inventory.service_tun.contains(&dst) && is_icmp_echo_request(pkt)))
+        && host_service_packet_valid(pkt)
+}
+
+fn response_host_access_allowed(pkt: &[u8], ready: bool, inventory: &host_acl::Inventory, granted: bool) -> bool {
+    let src = u32::from_be_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]);
+    ready && host_acl::classify_source(src, inventory) == host_acl::SourceDecision::HostNeedsPermission
+        && ((granted && inventory.host_allow.contains(&src))
+            || (inventory.service_tun.contains(&src) && is_icmp_echo_reply(pkt)))
+        && host_service_packet_valid(pkt)
+}
+
 /// IPv4 ICMP echo request (src -> dst, 8 bytes of payload): проба живости туннеля. Выход отвечает ядром, как на обычный ping.
 fn icmp_echo(src: [u8; 4], dst: [u8; 4], id: u16, seq: u16) -> Vec<u8> {
     fn csum(b: &[u8]) -> u16 {
@@ -2043,7 +2428,7 @@ fn icmp_echo(src: [u8; 4], dst: [u8; 4], id: u16, seq: u16) -> Vec<u8> {
     p[20] = 8; // echo request
     p[24..26].copy_from_slice(&id.to_be_bytes());
     p[26..28].copy_from_slice(&seq.to_be_bytes());
-    p[28..36].copy_from_slice(b"rawgprob");
+    p[28..36].copy_from_slice(b"knotprob");
     let c = csum(&p[20..]);
     p[22..24].copy_from_slice(&c.to_be_bytes());
     p
@@ -2228,6 +2613,465 @@ async fn client_tun(cli: &Cli, node: Arc<Node>, sh: Arc<Shared>, dest: &Destinat
 mod tests {
     use super::*;
 
+    // Обход enforce роли `e` существует только в debug/с явным feature; в штатном release роль e с tun отклоняется при любой переменной.
+    #[test]
+    fn lab_exit_no_enforce_gate_matches_build_kind() {
+        let lab = cfg!(any(debug_assertions, feature = "lab-exit-no-enforce"));
+        assert!(exit_no_enforce_gate("c", "tun", None).is_ok() && exit_no_enforce_gate("e", "tap", None).is_ok(), "прочие роли и режимы не затронуты");
+        assert!(exit_no_enforce_gate("e", "tun", None).is_err(), "без переменной выход без enforce не стартует");
+        assert!(exit_no_enforce_gate("e", "tun", Some("0")).is_err());
+        assert_eq!(exit_no_enforce_gate("e", "tun", Some("1")).is_ok(), lab, "переменная действует только в сборке с обходом");
+        if !lab {
+            assert!(!exit_no_enforce_gate("e", "tun", Some("1")).unwrap_err().contains("KNOTHOP"), "release не называет переменную");
+        }
+    }
+
+    fn acl_packet(src: &str, dst: &str, proto: u8, len: usize, icmp_type: Option<u8>) -> Vec<u8> {
+        let mut p = vec![0u8; len];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = proto;
+        p[12..16].copy_from_slice(&src.parse::<std::net::Ipv4Addr>().unwrap().octets());
+        p[16..20].copy_from_slice(&dst.parse::<std::net::Ipv4Addr>().unwrap().octets());
+        if proto == 6 { p[32] = 0x50; }
+        if proto == 17 { p[24..26].copy_from_slice(&(len as u16 - 20).to_be_bytes()); }
+        if let Some(kind) = icmp_type { p[20] = kind; }
+        p
+    }
+
+    type Tables = (HostAccessSet, AllowedMap, RouteMap<()>);
+
+    fn tables() -> Tables {
+        (std::sync::RwLock::new(HashSet::new()), std::sync::RwLock::new(HashMap::new()), std::sync::RwLock::new(HashMap::new()))
+    }
+
+    fn lid(n: u8) -> leviculum_std::api::LinkId { leviculum_std::api::LinkId::new([n; 16]) }
+
+    fn admit(t: &Tables, link: u8, ip: u32) -> Result<Admission, AdmissionError> {
+        admit_link(&t.0, &t.1, &t.2, lid(link), ip, ())
+    }
+
+    fn snapshot(t: &Tables) -> (usize, usize, usize) {
+        (t.0.read().unwrap().len(), t.1.read().unwrap().len(), t.2.read().unwrap().len())
+    }
+
+    // Synthetic authority; production Trust, HostCommit and TUN permission core, not an ACL model.
+    struct HostPublicationFixture {
+        authority: Arc<Mutex<trust::Trust>>,
+        pk: trust::Pk,
+        host_revoke: trust::HostAccessRecord,
+        issuer_revoke: trust::Record,
+    }
+
+    fn host_publication_fixture() -> HostPublicationFixture {
+        let root = leviculum_std::api::generate_identity();
+        let admin = leviculum_std::api::generate_identity();
+        let holder = leviculum_std::api::generate_identity();
+        let pk = holder.public_key_bytes();
+        let mut issuer = trust::Trust::new(root.clone(), None);
+        let delegation = issuer.issue(*root.hash(), admin.public_key_bytes(), trust::ADD | trust::REMOVE | trust::USE).unwrap();
+        let holder_record = issuer.issue(*root.hash(), pk, trust::USE).unwrap();
+        let mut delegate = trust::Trust::new(admin.clone(), None);
+        delegate.add_anchor(&root.public_key_bytes()).unwrap();
+        assert_eq!(delegate.offer(delegation.clone()), trust::Offer::Added);
+        let scoped_authority = issuer.sign_host_access(*root.hash(), *root.hash(), admin.public_key_bytes(), true).unwrap();
+        let grant = delegate.sign_host_access(*root.hash(), *root.hash(), pk, true).unwrap();
+        let host_revoke = delegate.sign_host_access(*root.hash(), *root.hash(), pk, false).unwrap();
+        let issuer_revoke = issuer.issue(*root.hash(), admin.public_key_bytes(), 0).unwrap();
+        let mut target = trust::Trust::new(root, None);
+        assert_eq!(target.offer(delegation), trust::Offer::Added);
+        assert_eq!(target.offer(holder_record), trust::Offer::Added);
+        let authority = Arc::new(Mutex::new(target));
+        for record in [scoped_authority, grant] {
+            commit_publication_record(&authority, &record);
+        }
+        HostPublicationFixture { authority, pk, host_revoke, issuer_revoke }
+    }
+
+    fn commit_publication_record(authority: &Mutex<trust::Trust>, record: &trust::HostAccessRecord) {
+        let commit = authority.lock().unwrap().prepare_host_access(record).unwrap();
+        // Same split as the LXMF worker: commit gate/I/O never requested under Trust.
+        commit.commit(authority).unwrap();
+    }
+
+    fn publish_acl(authority: &Mutex<trust::Trust>, pk: &trust::Pk, t: &Tables) -> bool {
+        publish_host_access_decision(authority, pk, |_| (), |grant| set_link_host_access(&t.0, &t.1, &lid(1), grant)).1
+    }
+
+    #[test]
+    fn host_publication_delayed_evaluator_cannot_restore_revoked_access() {
+        use std::sync::mpsc::channel;
+        // Ordinary authority revocation must work too; it need not change host_version.
+        for revoke_issuer in [false, true] {
+            let HostPublicationFixture { authority, pk, host_revoke, issuer_revoke } = host_publication_fixture();
+            let t = Arc::new(tables());
+            admit(&t, 1, 0xc6120107).unwrap();
+            assert!(publish_acl(&authority, &pk, &t));
+            assert!(t.0.read().unwrap().contains(&lid(1)));
+            let (paused, ready) = channel();
+            let (resume, resumed) = channel();
+            let old_authority = authority.clone();
+            let old_tables = t.clone();
+            let old = std::thread::spawn(move || {
+                // The former evaluator could carry this true across revoke/ACK. The actual
+                // shared publisher accepts no snapshot; on resumption it must read Trust itself.
+                let stale_true = {
+                    let tr = old_authority.lock().unwrap();
+                    !tr.host_access_roots(&pk, &tr.me_hash).is_empty()
+                };
+                paused.send(stale_true).unwrap();
+                resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(publish_acl(&old_authority, &pk, &old_tables));
+            });
+            assert!(ready.recv_timeout(Duration::from_secs(5)).unwrap());
+            if revoke_issuer {
+                assert_eq!(authority.lock().unwrap().offer(issuer_revoke), trust::Offer::Added);
+            } else {
+                commit_publication_record(&authority, &host_revoke);
+            }
+            assert!(publish_acl(&authority, &pk, &t)); // enforce_rights publication before ACK
+            {
+                let tr = authority.lock().unwrap();
+                assert!(tr.host_access_roots(&pk, &tr.me_hash).is_empty()); // ACK effective=false
+                assert_ne!(tr.rights(&pk) & trust::USE, 0, "holder USE survives host/issuer revoke");
+            }
+            assert!(!t.0.read().unwrap().contains(&lid(1)));
+            resume.send(()).unwrap();
+            old.join().unwrap();
+            assert!(!t.0.read().unwrap().contains(&lid(1)), "old evaluator must not restore host access after revoke/ACK");
+            assert_eq!(snapshot(&t), (0, 1, 1), "revoking host access does not revoke ordinary admission");
+            let mut inventory = host_acl::Inventory::default();
+            let host = u32::from(std::net::Ipv4Addr::new(10, 99, 0, 1));
+            inventory.owned.insert(host);
+            inventory.host_allow.insert(host);
+            let granted = t.0.read().unwrap().contains(&lid(1));
+            assert!(!inbound_host_access_allowed(&acl_packet("198.18.1.7", "10.99.0.1", 6, 40, None), true, &inventory, granted));
+            assert!(!response_host_access_allowed(&acl_packet("10.99.0.1", "198.18.1.7", 6, 40, None), true, &inventory, granted));
+        }
+    }
+
+    #[test]
+    fn host_publication_holds_trust_through_delayed_setter() {
+        use std::sync::{TryLockError, mpsc::channel};
+        let HostPublicationFixture { authority, pk, host_revoke, .. } = host_publication_fixture();
+        let t = Arc::new(tables());
+        admit(&t, 1, 0xc6120107).unwrap();
+        let revoke = authority.lock().unwrap().prepare_host_access(&host_revoke).unwrap();
+        let (paused, ready) = channel();
+        let (resume, resumed) = channel();
+        let old_authority = authority.clone();
+        let old_tables = t.clone();
+        let old = std::thread::spawn(move || {
+            publish_host_access_decision(&old_authority, &pk, |_| (), |grant| {
+                paused.send(grant).unwrap();
+                resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+                set_link_host_access(&old_tables.0, &old_tables.1, &lid(1), grant)
+            })
+        });
+        assert!(ready.recv_timeout(Duration::from_secs(5)).unwrap());
+        // This is the exact former TOCTOU boundary. Revoke cannot commit here, so cannot
+        // publish false/ACK and then be overwritten by this already computed true.
+        let guarded = matches!(authority.try_lock(), Err(TryLockError::WouldBlock));
+        let (attempted, attempt) = channel();
+        let (acked, ack) = channel();
+        let new_authority = authority.clone();
+        let new_tables = t.clone();
+        let new = std::thread::spawn(move || {
+            attempted.send(()).unwrap();
+            revoke.commit(&new_authority).unwrap();
+            assert!(publish_acl(&new_authority, &pk, &new_tables));
+            let tr = new_authority.lock().unwrap();
+            acked.send(!tr.host_access_roots(&pk, &tr.me_hash).is_empty()).unwrap();
+        });
+        attempt.recv_timeout(Duration::from_secs(5)).unwrap();
+        let no_early_ack = matches!(ack.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        resume.send(()).unwrap();
+        assert_eq!(old.join().unwrap(), ((), true));
+        assert!(!ack.recv_timeout(Duration::from_secs(5)).unwrap());
+        new.join().unwrap();
+        assert!(guarded, "Trust was dropped before the actual setter");
+        assert!(no_early_ack, "revoke/ACK must wait for the in-flight publisher");
+        assert!(!t.0.read().unwrap().contains(&lid(1)));
+    }
+
+    #[test]
+    fn host_publication_preserves_root_union_and_authoritative_admission() {
+        let HostPublicationFixture { authority, pk, host_revoke, .. } = host_publication_fixture();
+        let t = tables();
+        assert!(!publish_acl(&authority, &pk, &t), "a valid Trust grant cannot admit a Link");
+        assert_eq!(snapshot(&t), (0, 0, 0));
+        admit(&t, 1, 0xc6120107).unwrap();
+        let other_root = leviculum_std::api::generate_identity();
+        let mut other = trust::Trust::new(other_root.clone(), None);
+        let holder_record = other.issue(*other_root.hash(), pk, trust::USE).unwrap();
+        let grant = {
+            let mut tr = authority.lock().unwrap();
+            tr.add_anchor(&other_root.public_key_bytes()).unwrap();
+            tr.allow_host_root(*other_root.hash(), 16);
+            assert_eq!(tr.offer(holder_record), trust::Offer::Added);
+            other.sign_host_access(*other_root.hash(), tr.me_hash, pk, true).unwrap()
+        };
+        commit_publication_record(&authority, &grant);
+        commit_publication_record(&authority, &host_revoke);
+        assert!(publish_acl(&authority, &pk, &t));
+        assert!(t.0.read().unwrap().contains(&lid(1)), "another accepted root still grants HOST_ACCESS");
+        disallow_link(&t.0, &t.1, &t.2, &lid(1));
+        assert!(!publish_acl(&authority, &pk, &t), "a late evaluator cannot resurrect a closed Link");
+        assert_eq!(snapshot(&t), (0, 0, 0));
+    }
+
+    #[test]
+    fn admission_is_idempotent_for_same_link_and_address_and_keeps_grant() {
+        let t = tables();
+        assert_eq!(admit(&t, 1, 0x0a000002), Ok(Admission::Admitted));
+        assert!(set_link_host_access(&t.0, &t.1, &lid(1), true));
+        assert_eq!(admit(&t, 1, 0x0a000002), Ok(Admission::AlreadyAdmitted));
+        assert!(t.0.read().unwrap().contains(&lid(1)), "repeat admission must not drop or add HOST_ACCESS");
+        assert_eq!(snapshot(&t), (1, 1, 1));
+        // нарушенный инвариант (допущен, маршрута нет) восстанавливается тем же вызовом
+        t.2.write().unwrap().clear();
+        assert_eq!(admit(&t, 1, 0x0a000002), Ok(Admission::AlreadyAdmitted));
+        assert_eq!(t.2.read().unwrap().get(&0x0a000002).map(|(l, _)| *l), Some(lid(1)));
+    }
+
+    #[test]
+    fn admission_refuses_ip_collision_and_address_change_without_mutation() {
+        let t = tables();
+        assert_eq!(admit(&t, 1, 0x0a000002), Ok(Admission::Admitted));
+        let before = snapshot(&t);
+        assert_eq!(admit(&t, 2, 0x0a000002), Err(AdmissionError::AddressInUse));
+        assert_eq!(admit(&t, 1, 0x0a000003), Err(AdmissionError::LinkAddressChanged));
+        assert_eq!(snapshot(&t), before, "refusal is all-or-nothing");
+        assert!(!t.1.read().unwrap().contains_key(&lid(2)));
+        assert!(!t.2.read().unwrap().contains_key(&0x0a000003));
+        assert_eq!(t.1.read().unwrap().get(&lid(1)), Some(&0x0a000002));
+    }
+
+    fn admit_replacing(t: &Tables, link: u8, ip: u32, replaces: &[u8]) -> Result<Admission, AdmissionError> {
+        let r: Vec<_> = replaces.iter().map(|n| lid(*n)).collect();
+        admit_link_replacing(&t.0, &t.1, &t.2, lid(link), ip, (), &r)
+    }
+
+    #[test]
+    fn replacing_admission_evicts_listed_owner_atomically_without_inheriting_host_access() {
+        let t = tables();
+        assert_eq!(admit(&t, 1, 0x0a000002), Ok(Admission::Admitted));
+        assert!(set_link_host_access(&t.0, &t.1, &lid(1), true));
+        assert_eq!(admit_replacing(&t, 2, 0x0a000002, &[1]), Ok(Admission::Admitted));
+        assert_eq!(t.2.read().unwrap().get(&0x0a000002).map(|(l, _)| *l), Some(lid(2)));
+        assert_eq!(t.1.read().unwrap().get(&lid(2)), Some(&0x0a000002));
+        assert!(!t.1.read().unwrap().contains_key(&lid(1)), "evicted Link loses its admission");
+        assert!(t.0.read().unwrap().is_empty(), "neither the evicted nor the new Link holds HOST_ACCESS");
+        assert_eq!(snapshot(&t), (0, 1, 1));
+        // поздний disallow вытесненного Link не снимает маршрут нового
+        disallow_link(&t.0, &t.1, &t.2, &lid(1));
+        assert_eq!(t.2.read().unwrap().get(&0x0a000002).map(|(l, _)| *l), Some(lid(2)));
+        assert_eq!(snapshot(&t), (0, 1, 1));
+    }
+
+    #[test]
+    fn replacing_admission_refuses_unlisted_owner_or_mismatched_address_without_mutation() {
+        let t = tables();
+        assert_eq!(admit(&t, 1, 0x0a000002), Ok(Admission::Admitted));
+        assert!(set_link_host_access(&t.0, &t.1, &lid(1), true));
+        let before = snapshot(&t);
+        // владелец не в списке (в списке чужой Link)
+        assert_eq!(admit_replacing(&t, 2, 0x0a000002, &[9]), Err(AdmissionError::AddressInUse));
+        assert_eq!(admit_replacing(&t, 2, 0x0a000002, &[]), Err(AdmissionError::AddressInUse));
+        assert_eq!(snapshot(&t), before);
+        assert!(t.0.read().unwrap().contains(&lid(1)));
+        // список ссылается на Link с другим адресом: он не владелец нужного адреса
+        assert_eq!(admit(&t, 3, 0x0a000003), Ok(Admission::Admitted));
+        let before = snapshot(&t);
+        assert_eq!(admit_replacing(&t, 2, 0x0a000002, &[3]), Err(AdmissionError::AddressInUse));
+        assert_eq!(snapshot(&t), before);
+        assert_eq!(t.2.read().unwrap().get(&0x0a000002).map(|(l, _)| *l), Some(lid(1)));
+        assert_eq!(t.2.read().unwrap().get(&0x0a000003).map(|(l, _)| *l), Some(lid(3)));
+        // нарушенный инвариант: владелец маршрута без записи allowed на этот адрес не вытесняется
+        t.1.write().unwrap().remove(&lid(1));
+        let before = snapshot(&t);
+        assert_eq!(admit_replacing(&t, 2, 0x0a000002, &[1]), Err(AdmissionError::AddressInUse));
+        assert_eq!(snapshot(&t), before);
+        // тот же Link, другой адрес и список вытеснения: по-прежнему LinkAddressChanged
+        assert_eq!(admit_replacing(&t, 3, 0x0a000009, &[1]), Err(AdmissionError::LinkAddressChanged));
+        // свободный адрес со списком вытеснения: обычный допуск, ничего лишнего не удалено
+        assert_eq!(admit_replacing(&t, 4, 0x0a000004, &[3]), Ok(Admission::Admitted));
+        assert_eq!(t.2.read().unwrap().get(&0x0a000003).map(|(l, _)| *l), Some(lid(3)));
+    }
+
+    #[test]
+    fn replacing_admission_keeps_capacity_and_is_all_or_nothing() {
+        let t = tables();
+        for i in 0..MAX_ALLOWED_CLIENTS {
+            assert_eq!(admit_link(&t.0, &t.1, &t.2, leviculum_std::api::LinkId::new([i as u8; 16]), 0x0a000100 + i as u32, ()), Ok(Admission::Admitted));
+        }
+        let before = snapshot(&t);
+        let extra = leviculum_std::api::LinkId::new([0xee, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        // замена на полных таблицах: баланс нулевой
+        assert_eq!(admit_link_replacing(&t.0, &t.1, &t.2, extra, 0x0a000100, (), &[lid(0)]), Ok(Admission::Admitted));
+        assert_eq!(snapshot(&t), before);
+        assert!(!t.1.read().unwrap().contains_key(&lid(0)));
+        // не-замена на полных таблицах по-прежнему Capacity, никто не вытеснен
+        let extra2 = leviculum_std::api::LinkId::new([0xef, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(admit_link_replacing(&t.0, &t.1, &t.2, extra2, 0x0a020000, (), &[lid(1)]), Err(AdmissionError::Capacity));
+        assert_eq!(snapshot(&t), before);
+        assert!(t.1.read().unwrap().contains_key(&lid(1)));
+    }
+
+    #[test]
+    fn admission_capacity_is_enforced_and_existing_links_stay_idempotent() {
+        let t = tables();
+        for i in 0..MAX_ALLOWED_CLIENTS {
+            assert_eq!(admit_link(&t.0, &t.1, &t.2, leviculum_std::api::LinkId::new([i as u8; 16]), 0x0a000100 + i as u32, ()), Ok(Admission::Admitted));
+        }
+        let before = snapshot(&t);
+        assert_eq!(before, (0, MAX_ALLOWED_CLIENTS, MAX_ALLOWED_CLIENTS));
+        // заполненные Link имеют вид [i; 16]; этот заведомо иной
+        let extra = leviculum_std::api::LinkId::new([0xee, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(admit_link(&t.0, &t.1, &t.2, extra, 0x0a010000, ()), Err(AdmissionError::Capacity));
+        assert_eq!(snapshot(&t), before);
+        assert!(!t.1.read().unwrap().contains_key(&extra));
+        assert_eq!(admit_link(&t.0, &t.1, &t.2, leviculum_std::api::LinkId::new([0; 16]), 0x0a000100, ()), Ok(Admission::AlreadyAdmitted));
+        // освобождённое место снова доступно
+        disallow_link(&t.0, &t.1, &t.2, &leviculum_std::api::LinkId::new([0; 16]));
+        assert_eq!(admit_link(&t.0, &t.1, &t.2, extra, 0x0a010000, ()), Ok(Admission::Admitted));
+    }
+
+    #[test]
+    fn host_access_requires_admission_and_never_survives_disallow_or_readmission() {
+        let t = tables();
+        assert!(!set_link_host_access(&t.0, &t.1, &lid(1), true), "grant for an unadmitted Link is refused");
+        assert!(t.0.read().unwrap().is_empty());
+        admit(&t, 1, 0x0a000002).unwrap();
+        assert!(!t.0.read().unwrap().contains(&lid(1)), "default is no HOST_ACCESS");
+        assert!(set_link_host_access(&t.0, &t.1, &lid(1), true));
+        assert!(t.0.read().unwrap().contains(&lid(1)));
+        assert!(set_link_host_access(&t.0, &t.1, &lid(1), false));
+        assert!(t.0.read().unwrap().is_empty());
+        assert!(set_link_host_access(&t.0, &t.1, &lid(1), true));
+        disallow_link(&t.0, &t.1, &t.2, &lid(1));
+        assert_eq!(snapshot(&t), (0, 0, 0), "disallow removes permission, binding and route; freed IP is reusable");
+        // устаревший остаток разрешения для неизвестного LinkId не переходит в новый допуск
+        t.0.write().unwrap().insert(lid(1));
+        assert_eq!(admit(&t, 1, 0x0a000002), Ok(Admission::Admitted));
+        assert!(!t.0.read().unwrap().contains(&lid(1)));
+        // disallow чужого маршрута не стирает маршрут нового владельца адреса
+        disallow_link(&t.0, &t.1, &t.2, &lid(9));
+        assert_eq!(t.2.read().unwrap().get(&0x0a000002).map(|(l, _)| *l), Some(lid(1)));
+    }
+
+    #[test]
+    fn admission_error_codes_are_stable_and_address_free() {
+        let all = [AdmissionError::AclNotReady, AdmissionError::Capacity, AdmissionError::AddressInUse, AdmissionError::LinkAddressChanged];
+        let codes: HashSet<_> = all.iter().map(|e| e.code()).collect();
+        assert_eq!(codes.len(), all.len());
+        assert!(all.iter().all(|e| e.to_string() == e.code() && e.code().bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
+    }
+
+    #[test]
+    fn host_acl_is_exact_grant_gated_and_preserves_public_internet() {
+        let mut inventory = host_acl::Inventory::default();
+        let own_public = u32::from(std::net::Ipv4Addr::new(8, 8, 4, 4));
+        let own_private = u32::from(std::net::Ipv4Addr::new(10, 1, 2, 3));
+        inventory.owned.extend([own_public, own_private, u32::from(std::net::Ipv4Addr::new(10, 99, 0, 1))]);
+        inventory.host_allow.extend([own_public, own_private]);
+        inventory.service_tun.insert(u32::from(std::net::Ipv4Addr::new(10, 99, 0, 1)));
+        let tcp = |dst| acl_packet("198.18.1.7", dst, 6, 40, None);
+        assert!(matches!(host_acl::classify_destination(u32::from(std::net::Ipv4Addr::new(1, 1, 1, 1)), &inventory), host_acl::DestinationDecision::Internet));
+        assert!(!inbound_host_access_allowed(&tcp("8.8.4.4"), true, &inventory, false));
+        assert!(inbound_host_access_allowed(&tcp("8.8.4.4"), true, &inventory, true));
+        assert!(!inbound_host_access_allowed(&tcp("10.1.2.3"), true, &inventory, false));
+        assert!(inbound_host_access_allowed(&tcp("10.1.2.3"), true, &inventory, true));
+        assert!(!inbound_host_access_allowed(&tcp("10.1.2.4"), true, &inventory, true));
+        assert!(!inbound_host_access_allowed(&tcp("172.17.0.1"), true, &inventory, true));
+        assert!(!inbound_host_access_allowed(&tcp("198.18.0.2"), true, &inventory, true));
+        assert!(!inbound_host_access_allowed(&tcp("8.8.4.4"), false, &inventory, true));
+    }
+
+    #[test]
+    fn host_acl_fail_closed_on_unready_non_v4_options_and_fragments_and_revokes_responses() {
+        let mut inventory = host_acl::Inventory::default();
+        let client = "198.18.1.7";
+        let host = u32::from(std::net::Ipv4Addr::new(10, 99, 0, 1));
+        inventory.owned.insert(host);
+        inventory.host_allow.insert(host);
+        inventory.service_tun.insert(host);
+        let reply = acl_packet("10.99.0.1", client, 6, 40, None);
+        assert!(response_host_access_allowed(&reply, true, &inventory, true));
+        assert!(!response_host_access_allowed(&reply, true, &inventory, false), "revocation applies to active-flow responses");
+        let mut fragmented = acl_packet(client, "10.99.0.1", 6, 40, None);
+        fragmented[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        assert!(!inbound_host_access_allowed(&fragmented, true, &inventory, true));
+        let mut options = acl_packet(client, "10.99.0.1", 6, 40, None);
+        options[0] = 0x46;
+        assert!(!inbound_host_access_allowed(&options, true, &inventory, true));
+        let non_v4 = vec![0x60; 40];
+        assert!(!valid_ipv4_packet(&non_v4));
+        assert!(!response_host_access_allowed(&reply, false, &host_acl::Inventory::default(), true));
+    }
+
+    #[test]
+    fn service_tun_exception_is_only_echo_request_reply() {
+        let mut inventory = host_acl::Inventory::default();
+        let tun = u32::from(std::net::Ipv4Addr::new(10, 99, 0, 1));
+        inventory.owned.insert(tun);
+        inventory.service_tun.insert(tun);
+        let mut request = acl_packet("198.18.1.7", "10.99.0.1", 1, 28, Some(8));
+        request[21] = 0;
+        assert!(inbound_host_access_allowed(&request, true, &inventory, false));
+        request[20] = 3;
+        assert!(!inbound_host_access_allowed(&request, true, &inventory, false));
+        let mut reply = acl_packet("10.99.0.1", "198.18.1.7", 1, 28, Some(0));
+        reply[21] = 0;
+        assert!(response_host_access_allowed(&reply, true, &inventory, false));
+    }
+
+    #[test]
+    fn ipv4_validation_rejects_truncation_bad_lengths_and_malformed_fragments() {
+        let mut p = vec![0u8; 28];
+        p[0] = 0x45;
+        p[8] = 64;
+        p[2..4].copy_from_slice(&28u16.to_be_bytes());
+        assert!(valid_ipv4_packet(&p));
+        assert!(!valid_ipv4_packet(&p[..27]));
+        p[2..4].copy_from_slice(&19u16.to_be_bytes());
+        assert!(!valid_ipv4_packet(&p));
+        p[2..4].copy_from_slice(&29u16.to_be_bytes());
+        assert!(!valid_ipv4_packet(&p));
+        p[2..4].copy_from_slice(&28u16.to_be_bytes());
+        p[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        assert!(valid_ipv4_packet(&p));
+        p[2..4].copy_from_slice(&27u16.to_be_bytes());
+        assert!(!valid_ipv4_packet(&p), "non-final fragment payload must be an 8-byte multiple");
+        p[6..8].copy_from_slice(&0x8000u16.to_be_bytes());
+        p[2..4].copy_from_slice(&28u16.to_be_bytes());
+        assert!(!valid_ipv4_packet(&p), "reserved fragment flag rejected");
+    }
+
+    #[test]
+    fn proof_binding_cli_defaults_to_safe_cipher_policy_and_keeps_explicit_overrides() {
+        let cli = Cli::try_parse_from(["rns-iroh-node", "--role", "c", "--ip", "127.0.0.1"])
+            .unwrap();
+        assert_eq!(cli.proof_binding, "cipher");
+        assert_eq!(
+            parse_cli_proof_binding_policy(&cli.proof_binding).unwrap(),
+            leviculum_std::api::ProofBindingPolicy::ByCipher
+        );
+        assert_eq!(
+            parse_cli_proof_binding_policy("hash").unwrap(),
+            leviculum_std::api::ProofBindingPolicy::Explicit(
+                leviculum_std::api::ProofBinding::PacketHash
+            )
+        );
+        assert_eq!(
+            parse_cli_proof_binding_policy("tag").unwrap(),
+            leviculum_std::api::ProofBindingPolicy::Explicit(
+                leviculum_std::api::ProofBinding::TokenTag
+            )
+        );
+    }
+
     #[test]
     fn memory_log_is_bounded() {
         let sh = Shared::new();
@@ -2241,7 +3085,7 @@ mod tests {
 
     #[test]
     fn file_log_rotates_at_limit() {
-        let dir = std::env::temp_dir().join(format!("rawg-log-test-{}-{}", std::process::id(), now_ms()));
+        let dir = std::env::temp_dir().join(format!("knothop-log-test-{}-{}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("log.txt");
         std::fs::write(&p, vec![b'x'; LOG_FILE_MAX as usize]).unwrap();
@@ -2254,7 +3098,7 @@ mod tests {
 
     #[test]
     fn queued_log_lines_reach_the_file_in_order() {
-        let dir = std::env::temp_dir().join(format!("rawg-log-queue-{}-{}", std::process::id(), now_ms()));
+        let dir = std::env::temp_dir().join(format!("knothop-log-queue-{}-{}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("log.txt");
         append_log(&p, "первая");
@@ -2302,5 +3146,67 @@ mod tests {
         let s = t.lock().unwrap();
         assert_eq!(s.live, 0);
         assert!(s.per_ip.is_empty());
+    }
+    // QAB-M5: поток магических датаграмм без разрешения не держит опрос источника дольше бюджета и не мешает настоящему пакету
+    async fn dgram_pair() -> (Endpoint, Endpoint) {
+        let mk = || async {
+            Endpoint::builder(presets::Minimal)
+                .secret_key(SecretKey::generate())
+                .alpns(vec![b"rns/0".to_vec()])
+                .relay_mode(RelayMode::Disabled)
+                .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .unwrap()
+                .bind()
+                .await
+                .unwrap()
+        };
+        (mk().await, mk().await)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn magic_flood_without_grant_is_bounded_per_poll_and_real_packet_still_arrives() {
+        let (server, client) = dgram_pair().await;
+        let port = server.bound_sockets()[0].port();
+        let srv = server.clone();
+        let accepted = tokio::spawn(async move { srv.accept().await.unwrap().await.unwrap() });
+        let cconn = client.connect(EndpointAddr::new(server.id()).with_ip_addr(SocketAddr::from(([127, 0, 0, 1], port))), b"rns/0").await.unwrap();
+        let sconn = accepted.await.unwrap();
+        let mut src = QuicDgramSource::new(sconn);
+
+        let mut magic = qprobe::MAGIC.to_vec();
+        magic.extend_from_slice(&[b'Q', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        magic.resize(40, 0);
+        let sent = 200u64;
+        for _ in 0..sent {
+            let _ = cconn.send_datagram(bytes::Bytes::from(magic.clone()));
+        }
+        cconn.send_datagram(bytes::Bytes::from(vec![0x08u8; 64])).unwrap();
+
+        // дать датаграммам дойти до очереди приёма
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // try_recv: за один вызов съедается не больше WORK_BUDGET магических датаграмм
+        let mut real = None;
+        for _ in 0..(sent as usize + 4) {
+            let before = src.filter.seen;
+            let r = src.try_recv();
+            assert!(src.filter.seen - before <= qprobe::WORK_BUDGET as u64, "за вызов съедено {}", src.filter.seen - before);
+            if let Some(r) = r {
+                real = Some(r.unwrap());
+                break;
+            }
+        }
+        // остаток (если очередь приёма отбросила часть) доставляется через recv, который уступает исполнителю
+        let got = match real {
+            Some(b) => b,
+            None => tokio::time::timeout(Duration::from_secs(3), src.recv()).await.expect("настоящий пакет не дошёл").unwrap(),
+        };
+        assert_eq!(got, vec![0x08u8; 64], "настоящий пакет не искажён и не потерян");
+        assert!(src.filter.seen > 0, "магические датаграммы сняты фильтром");
+        assert!(src.filter.dropped <= src.filter.seen, "отброшено не больше, чем снято");
+        // эха нет: разрешения не выдавались
+        let echoes = tokio::time::timeout(Duration::from_millis(300), cconn.read_datagram()).await;
+        assert!(echoes.is_err(), "без разрешения эха нет");
+        cconn.close(0u32.into(), b"done");
     }
 }

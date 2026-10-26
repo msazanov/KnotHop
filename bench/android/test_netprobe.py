@@ -49,7 +49,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class NetprobeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.TemporaryDirectory(prefix="rawg-netprobe-")
+        cls.tmp = tempfile.TemporaryDirectory(prefix="knothop-netprobe-")
         cls.binary = str(Path(cls.tmp.name) / "netprobe")
         subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror",
                         str(Path(__file__).with_name("netprobe.c")), "-o", cls.binary], check=True)

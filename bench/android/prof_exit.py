@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Профиль CPU выхода rawgd в лаборатории lab13 (wall-clock сэмплер на eu-stack, как bench/stack_sampler.py).
+"""Профиль CPU выхода knothopd в лаборатории lab13 (wall-clock сэмплер на eu-stack, как bench/stack_sampler.py).
 
-  RAWGD_BIN=deploy/dist/rawgd python3 -I bench/android/prof_exit.py [--clients 1] [--samples 80] [--cpus 1] [--udp-mbit 0]
+  KNOTHOP_BIN=deploy/dist/knothopd python3 -I bench/android/prof_exit.py [--clients 1] [--samples 80] [--cpus 1] [--udp-mbit 0]
 
 Поднимает lab13 (adm - выход), N клиентов, гонит iperf3 TCP (или UDP с --udp-mbit) клиентов к «сайту» через туннель и во время
-передачи снимает стеки процесса rawgd в adm. Итог: доли состояний потоков и верхние «свои» кадры потоков, которые были в состоянии R.
+передачи снимает стеки процесса knothopd в adm. Итог: доли состояний потоков и верхние «свои» кадры потоков, которые были в состоянии R.
 Только локальная лаборатория. В конце lab13 down.
 """
 import argparse, collections, json, os, re, subprocess, sys, time
@@ -53,7 +53,7 @@ def symbolizer(pid, binary):
     segs = []
     for l in maps:
         f = l.split()
-        if len(f) >= 6 and f[5].endswith("/rawgd"):
+        if len(f) >= 6 and f[5].endswith("/knothopd"):
             a, b = (int(x, 16) for x in f[0].split("-"))
             segs.append((a, b, int(f[2], 16)))
     cache = {}
@@ -73,7 +73,7 @@ def symbolizer(pid, binary):
             names = [lines[i] for i in range(0, len(lines), 2)]
         it = iter(names)
         for x, o in zip(need, offs):
-            cache[x] = next(it, "??") if o is not None else "<не rawgd>"
+            cache[x] = next(it, "??") if o is not None else "<не knothopd>"
         return [cache[x] for x in addrs]
     return resolve
 
@@ -85,7 +85,7 @@ def main():
     ap.add_argument("--cpus", default="1")
     ap.add_argument("--udp-mbit", type=int, default=0, help="0 - TCP; иначе UDP с этой скоростью на клиента")
     ap.add_argument("--duration", type=int, default=60)
-    ap.add_argument("--out", default=str(Path.home() / f".cache/rawg-bench/prof-exit-{time.strftime('%Y%m%d-%H%M%S')}.json"))
+    ap.add_argument("--out", default=str(Path.home() / f".cache/knothop-bench/prof-exit-{time.strftime('%Y%m%d-%H%M%S')}.json"))
     a = ap.parse_args()
     sh(*LAB, "down", timeout=120)
     try:
@@ -104,7 +104,7 @@ def main():
         for i, _ in enumerate(names):
             sh("docker", "exec", "-d", "l13-site", "iperf3", "-s", "-p", str(5201 + i))
         time.sleep(1)
-        pid = sh("docker", "exec", "adm", "sh", "-c", "pidof rawgd").stdout.split()[0]
+        pid = sh("docker", "exec", "adm", "sh", "-c", "pidof knothopd").stdout.split()[0]
         procs = []
         for i, n in enumerate(names):
             extra = ["-u", "-b", f"{a.udp_mbit}M"] if a.udp_mbit else []
@@ -113,7 +113,7 @@ def main():
         time.sleep(5)
         states, top, top_r, comm_r = collections.Counter(), collections.Counter(), collections.Counter(), collections.Counter()
         idle, busy, chains, incl = collections.Counter(), collections.Counter(), collections.Counter(), collections.Counter()
-        resolve = symbolizer(pid, os.environ.get("RAWGD_BIN", ""))
+        resolve = symbolizer(pid, os.environ.get("KNOTHOP_BIN", ""))
         t_end = time.time() + a.duration - 10
         n_s = 0
         raw = []
@@ -123,7 +123,7 @@ def main():
         for fr, stt in raw:
             for tid, addrs in fr.items():
                 comm, st = stt.get(tid, ("?", "?"))
-                fs = [f for f in resolve(addrs[:40]) if f != "<не rawgd>"] or ["<вне rawgd: libc/ядро>"]
+                fs = [f for f in resolve(addrs[:40]) if f != "<не knothopd>"] or ["<вне knothopd: libc/ядро>"]
                 states[(comm, st)] += 1
                 # простой: поток ждёт (condvar, epoll, парковка) - в профиль работы не идёт
                 if fs and IDLE.search(fs[0]):

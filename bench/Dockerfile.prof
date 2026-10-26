@@ -1,2 +1,2 @@
-FROM rawg-bench:rns1.5.7
+FROM knothop-bench:rns1.5.7
 RUN apt-get update && apt-get install -y --no-install-recommends iperf3 gcc && rm -rf /var/lib/apt/lists/* && pip install --no-cache-dir py-spy

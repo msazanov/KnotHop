@@ -1,4 +1,4 @@
-//! rawgd: серверный узел группы, хаб и клиент VPN с авторизацией по identity (решение D2 v2, docs/decisions/0004).
+//! knothopd: серверный узел группы, хаб и клиент VPN с авторизацией по identity (решение D2 v2, docs/decisions/0004).
 //!
 //! Роли:
 //!   hub     - узел-ретранслятор RNS без группы: в лаборатории изображает публичную сеть RNS (только связность и обнаружение);
@@ -17,13 +17,19 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 #[path = "vpn_path.rs"]
 mod path;
+#[path = "lxmf_admin.rs"]
+mod lxmf_admin;
+
+#[cfg(test)]
+#[path = "../../tests/client_inbox13_tests.rs"]
+mod client_inbox13_tests;
 
 type HmacSha = Hmac<Sha256>;
 
 // ------------------------------------------------------------------------------------------------ команды
 
 #[derive(Parser, Clone)]
-#[command(name = "rawgd", about = "rawg: серверный узел, хаб и клиент VPN")]
+#[command(name = "knothopd", about = "KnotHop: серверный узел, хаб и клиент VPN")]
 pub struct VpnCli {
     #[command(subcommand)]
     pub cmd: VpnCmd,
@@ -45,7 +51,7 @@ pub enum VpnCmd {
     List(StateArg),
     /// создать серверный секрет группы (>= 128 бит) и записать в файл
     Keygen(KeygenArgs),
-    /// выпустить приглашение `rawgi-…` для новой ноды (локальная команда админа)
+    /// выпустить приглашение `kh-…` для новой ноды (локальная команда админа)
     Invite(InviteArgs),
     /// выдать или изменить права ноды (запись подписывается identity из --state)
     Grant(GrantArgs),
@@ -55,11 +61,35 @@ pub enum VpnCmd {
     Bench(BenchArgs),
     /// создать identity, если её ещё нет, и записать `whoami.json` (хеш и адрес в туннеле): приложению адрес нужен до создания TUN
     Whoami(StateArg),
+    /// безопасный native bridge: пока LXMF executor не активен, submit отклоняется как unavailable
+    AdminSubmit(AdminSubmitArgs),
+    /// прочитать состояние команды из bounded durable journal
+    AdminStatus(AdminStatusArgs),
+    /// безопасный capability/authority snapshot без сетевых hints и секретов
+    AdminView(AdminViewArgs),
     /// список категорий скачанных geoip.dat/geosite.dat в `rules-cats.json` (раздельное туннелирование)
     RulesList(StateArg),
     /// подсети правил «мимо туннеля» в `direct.cidr` и отчёт `rules-report.json`
     RulesCompile(StateArg),
 }
+
+#[derive(Args, Clone)]
+pub struct AdminSubmitArgs {
+    #[arg(long)] pub state: PathBuf,
+    #[arg(long)] pub target: String,
+    #[arg(long)] pub root: String,
+    #[arg(long)] pub op: String,
+    #[arg(long)] pub holder: Option<String>,
+    #[arg(long)] pub rights: Option<u16>,
+    #[arg(long)] pub scope: String,
+    #[arg(long)] pub request_id: String,
+}
+
+#[derive(Args, Clone)]
+pub struct AdminStatusArgs { #[arg(long)] pub state: PathBuf, #[arg(long)] pub request_id: String }
+
+#[derive(Args, Clone)]
+pub struct AdminViewArgs { #[arg(long)] pub state: PathBuf, #[arg(long)] pub target: String }
 
 #[derive(Args, Clone)]
 pub struct PolicyArgs {
@@ -95,7 +125,7 @@ pub struct NodeArgs {
     /// имя группы (тег группы выводится из него; не секрет)
     #[arg(long, default_value = "")]
     pub group: String,
-    /// файл серверного секрета группы (rawgd keygen)
+    /// файл серверного секрета группы (knothopd keygen)
     #[arg(long, default_value = "-")]
     pub secret_file: PathBuf,
     /// имя узла для таблиц и интерфейса; по умолчанию - имя хоста (так один и тот же конфиг годится для всех узлов)
@@ -137,7 +167,7 @@ pub struct NodeArgs {
     /// подсеть адресов клиентов; одинакова на всех узлах группы и не должна пересекаться с сетями узлов
     #[arg(long, default_value = "198.18.0.0/15")]
     pub client_net: String,
-    /// модель 0013: приглашение `rawgi-…` (одноразовое; после зачисления игнорируется). Без приглашения нода сама себе админ
+    /// модель 0013: приглашение `kh-…` (одноразовое; после зачисления игнорируется). Без приглашения нода сама себе админ
     #[arg(long, default_value = "")]
     pub invite: String,
     /// то же приглашение из файла
@@ -166,7 +196,7 @@ struct NodeConf {
     workers: Option<usize>,
     tun_name: Option<String>,
     client_net: Option<String>,
-    /// модель 0013: приглашение rawgi- (одноразовое; после зачисления игнорируется)
+    /// модель 0013: приглашение kh- (одноразовое; после зачисления игнорируется)
     invite: Option<String>,
     invite_file: Option<PathBuf>,
 }
@@ -175,7 +205,7 @@ struct NodeConf {
 async fn http_get(host: &str, path: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::time::timeout(Duration::from_secs(4), tokio::net::TcpStream::connect((host, 80))).await.ok()?.ok()?;
-    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: rawgd\r\nConnection: close\r\n\r\n").as_bytes()).await.ok()?;
+    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: knothopd\r\nConnection: close\r\n\r\n").as_bytes()).await.ok()?;
     let mut buf = Vec::new();
     tokio::time::timeout(Duration::from_secs(4), s.take(8192).read_to_end(&mut buf)).await.ok()?.ok()?;
     let t = String::from_utf8_lossy(&buf).to_string();
@@ -186,10 +216,10 @@ async fn http_get(host: &str, path: &str) -> Option<String> {
 }
 
 /// Двухбуквенный код страны узла по его внешнему IP: несколько сервисов по очереди, результат кэшируется в каталоге состояния.
-/// Порядок: RAWGD_REGION (задаёт оператор/стенд) -> сервисы -> кэш -> "XX".
+/// Порядок: KNOTHOP_REGION (задаёт оператор/стенд) -> сервисы -> кэш -> "XX".
 async fn detect_region(state: &Path) -> String {
     let ok = |c: &str| c.len() == 2 && c.chars().all(|x| x.is_ascii_alphabetic());
-    if let Ok(r) = std::env::var("RAWGD_REGION") {
+    if let Ok(r) = std::env::var("KNOTHOP_REGION") {
         let r = r.trim().to_uppercase();
         if ok(&r) {
             return r;
@@ -237,7 +267,7 @@ fn norm_peer_name(name: &str, cc: &str) -> Option<String> {
     Some(if cc_ok { format!("knothop-{cc}-{name}") } else { name })
 }
 
-/// Тип узла, три значения: «android», «ios», «server» (rawgd node или приложение на Windows/Linux/macOS).
+/// Тип узла, три значения: «android», «ios», «server» (knothopd node или приложение на Windows/Linux/macOS).
 /// Только по допущенному Link, не в анонсе (ADR 0016).
 fn platform() -> &'static str {
     match std::env::consts::OS {
@@ -458,10 +488,10 @@ pub struct HubArgs {
 pub struct ClientArgs {
     #[arg(long)]
     pub state: PathBuf,
-    /// файл с профилем легаси-модели (строка rawg2-...); без него клиент работает по модели 0013 (своя identity в --state, права записями)
+    /// файл с профилем легаси-модели (строка kh2-...); без него клиент работает по модели 0013 (своя identity в --state, права записями)
     #[arg(long)]
     pub profile_file: Option<PathBuf>,
-    /// модель 0013: приглашение `rawgi-…` (одноразовое; после зачисления игнорируется)
+    /// модель 0013: приглашение `kh-…` (одноразовое; после зачисления игнорируется)
     #[arg(long, default_value = "")]
     pub invite: String,
     #[arg(long)]
@@ -588,6 +618,11 @@ const T_OBSERVE: u8 = 21; // admitted client -> exit: UI visible (one byte 0/1),
 /// получатель проверяет права ключа по своим записям, держит не дольше CINFO_TTL; только для отображения
 const T_CINFO: u8 = 22;
 const CINFO_TTL: Duration = Duration::from_secs(60);
+/// Теневой зонд QUIC (этапы A/B make-before-break, qprobe.rs). Допущенный клиент -> выход: ver(1) | ключ iroh соединения зонда (32). Выход выдаёт
+/// этому ключу короткое разрешение на эхо датаграмм и отвечает T_PROBER: ver(1) | статус(1; 0 - разрешено) | ttl(1). Старый узел не знает T_PROBEQ
+/// (`on_control` молча игнорирует неизвестный тип): ответа нет, клиент остаётся на поведении этапа 0.
+const T_PROBEQ: u8 = 23;
+const T_PROBER: u8 = 24;
 const CINFO_MAX: usize = 64;
 /// T_DIR: не более DIR_MAX записей каталога, кусками не длиннее DIR_CHUNK Б
 const DIR_MAX: usize = 16;
@@ -675,21 +710,21 @@ fn rand16() -> [u8; 16] {
 /// Тег группы: не секрет, по нему узлы группы отличают свои анонсы.
 fn group_tag(group: &str) -> String {
     let mut h = Sha256::new();
-    h.update(b"rawg-group-v1\0");
+    h.update(b"knothop-group-v1\0");
     h.update(group.as_bytes());
     hex(&h.finalize()[..8])
 }
 
 /// Ключ серверной аутентификации: выводится из серверного секрета и имени группы; клиентам не передаётся.
 fn server_auth_key(secret: &[u8], group: &str) -> [u8; 32] {
-    mac32(secret, &[b"rawg-server-auth-v1\0", group.as_bytes()])
+    mac32(secret, &[b"knothop-server-auth-v1\0", group.as_bytes()])
 }
 
 fn read_secret(path: &Path) -> Result<Vec<u8>> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read secret {}", path.display()))?;
     let secret = b64d(raw.trim())?;
     if secret.len() < 16 {
-        bail!("серверный секрет слишком короткий (нужно >= 128 бит, rawgd keygen)");
+        bail!("серверный секрет слишком короткий (нужно >= 128 бит, knothopd keygen)");
     }
     Ok(secret)
 }
@@ -697,7 +732,7 @@ fn read_secret(path: &Path) -> Result<Vec<u8>> {
 /// Подсеть адресов клиентов (одна на всю группу: клиент сохраняет адрес при смене выхода). Задаётся в конфиге узла (`client_net`),
 /// выбирается так, чтобы не пересекаться с сетями узлов (на ru1 10.130.0.0/24 попадает в 10.128.0.0/10 - для пилота 198.18.0.0/15).
 static CLIENT_NET: std::sync::OnceLock<(u32, u8)> = std::sync::OnceLock::new();
-/// Двухбуквенный код страны этого узла (по внешнему IP или RAWGD_REGION); уходит только допущенным по Link (в анонсе его нет, ADR 0016).
+/// Двухбуквенный код страны этого узла (по внешнему IP или KNOTHOP_REGION); уходит только допущенным по Link (в анонсе его нет, ADR 0016).
 static REGION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn parse_net(t: &str) -> Result<(u32, u8)> {
@@ -810,12 +845,12 @@ pub struct Profile {
 /// Identity клиента из seed: два независимых ключа через HMAC (X25519 и Ed25519), так что в профиле 32 байта вместо 64.
 fn client_identity(seed: &[u8; 32]) -> Result<Identity> {
     let mut b = [0u8; 64];
-    b[..32].copy_from_slice(&mac32(seed, &[b"rawg-client-x25519-v1"]));
-    b[32..].copy_from_slice(&mac32(seed, &[b"rawg-client-ed25519-v1"]));
+    b[..32].copy_from_slice(&mac32(seed, &[b"knothop-client-x25519-v1"]));
+    b[32..].copy_from_slice(&mac32(seed, &[b"knothop-client-ed25519-v1"]));
     Identity::from_private_key_bytes(&b).map_err(|e| anyhow::anyhow!("identity клиента: {e:?}"))
 }
 
-/// Формат (v2, бинарный, затем base64url): `rawg2-` + base64(
+/// Формат (v2, бинарный, затем base64url): `kh2-` + base64(
 ///   версия(1)=2 | seed(32) | ip(4) | len+имя группы | n(1) | n x [ len+имя | d(16) | k(32) | m(1) | m x (тип(1)=4|6, ip, порт u16 BE) ] | sha256[..4] ).
 pub fn encode_profile(p: &Profile) -> String {
     let mut b = vec![2u8];
@@ -854,12 +889,12 @@ pub fn encode_profile(p: &Profile) -> String {
     }
     let ck = Sha256::digest(&b);
     b.extend_from_slice(&ck[..4]);
-    format!("rawg2-{}", b64e(&b))
+    format!("kh2-{}", b64e(&b))
 }
 
 pub fn decode_profile(s: &str) -> Result<Profile> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    let body = s.strip_prefix("rawg2-").ok_or_else(|| anyhow::anyhow!("не профиль rawg (нет префикса rawg2-)"))?;
+    let body = s.strip_prefix("kh2-").ok_or_else(|| anyhow::anyhow!("не профиль KnotHop (нет префикса kh2-)"))?;
     let b = b64d(body)?;
     if b.len() < 8 {
         bail!("профиль слишком короткий");
@@ -930,6 +965,64 @@ impl<'a> Rd<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_cli_is_non_shell_and_never_claims_queue_or_apply() {
+        let view: serde_json::Value = serde_json::from_str(&run_cli_json(
+            "admin-view --state /ignored --target 00112233445566778899aabbccddeeff", "/safe/state"
+        )).unwrap();
+        assert_eq!(view["capabilities"]["admin_commands"], false);
+        assert_eq!(view["effective_authority"]["authorities"].as_array().unwrap().len(), 0);
+        let rejected: serde_json::Value = serde_json::from_str(&run_cli_json(
+            "admin-submit --state /ignored --target 00112233445566778899aabbccddeeff --root 00112233445566778899aabbccddeeff --op rights.grant --holder 00 --rights 64 --scope 00112233445566778899aabbccddeeff --request-id 00112233445566778899aabbccddeeff",
+            "/safe/state"
+        )).unwrap();
+        assert_eq!(rejected["accepted"], false);
+        assert_eq!(rejected["queued"], false);
+        // без живого клиентского LXMF runtime на этом state команда не принимается (нет фальшивой очереди)
+        assert_eq!(rejected["rejected"], "unsupported_offline");
+        let shell: serde_json::Value = serde_json::from_str(&run_cli_json("admin-view; reboot", "/safe/state")).unwrap();
+        assert_eq!(shell["rejected"], "invalid_cli_input");
+    }
+
+    #[test]
+    fn my_node_view_and_rights_set_use_inbox_and_signed_issue_rules() {
+        let base = std::env::temp_dir().join(format!("knothop-mynode-{}-{}", std::process::id(), now_ms()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let ida = load_or_create_identity(&a).unwrap();
+        let idb = load_or_create_identity(&b).unwrap();
+        let holder_pk: trust::Pk = idb.public_key_bytes().try_into().unwrap();
+        let holder = hex(idb.hash());
+        let state = a.to_str().unwrap();
+        // чужой для сети держатель пока неизвестен: запись не создаётся
+        let r: serde_json::Value = serde_json::from_str(&run_cli_json(&format!("rights-set --state {state} --holder {holder} --rights 1"), state)).unwrap();
+        assert_eq!(r["accepted"], false);
+        let mut tr = trust::Trust::load(ida, &a).unwrap();
+        tr.issue(tr.me_hash, holder_pk, trust::USE).unwrap();
+        tr.save().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&run_cli_json(&format!("trust-view --state {state}"), state)).unwrap();
+        assert_eq!(v["my_rights"], trust::ALL);
+        assert_eq!(v["can_add"], true);
+        assert_eq!(v["participants"].as_array().unwrap().len(), 1);
+        assert_eq!(v["participants"][0]["holder"], holder);
+        assert_eq!(v["participants"][0]["rights"], trust::USE);
+        assert_eq!(v["queued"], 0);
+        // HOST_ACCESS и мусор отвергаются до подписи
+        for bad in ["rights-set --holder X --rights 1", &format!("rights-set --holder {holder} --rights 64"), &format!("rights-set --holder {holder} --rights 1 --root {holder}")] {
+            let r: serde_json::Value = serde_json::from_str(&run_cli_json(bad, state)).unwrap();
+            assert_eq!(r["accepted"], false, "{bad}");
+        }
+        let r: serde_json::Value = serde_json::from_str(&run_cli_json(&format!("rights-set --state {state} --holder {holder} --rights 7"), state)).unwrap();
+        assert_eq!(r["accepted"], true, "{r}");
+        let v: serde_json::Value = serde_json::from_str(&run_cli_json(&format!("trust-view --state {state}"), state)).unwrap();
+        assert_eq!(v["queued"], 1);
+        assert_eq!(v["participants"][0]["queued"], 7);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn exit_datagram_probe_requires_exact_echo_not_control_or_foreign_nonce() {
         let reply = dgram_ping(42, 1234, b'R');
@@ -982,8 +1075,6 @@ mod tests {
         assert_eq!(norm_peer_name(&"я".repeat(80), "").unwrap().chars().count(), 32);
     }
 
-    use super::*;
-
     #[test]
     fn profile_roundtrip_and_size() {
         let mk = |n: &str, i: u8| ProfServer { n: n.into(), d: [i; 16], k: [i + 1; 32], a: vec!["203.0.113.7:47001".into(), "[2001:db8::1]:47001".into(), "ru1.example.org:47001".into()] };
@@ -996,7 +1087,7 @@ mod tests {
         let n = bad.len() - 5;
         bad[n] = if bad[n] == b'A' { b'B' } else { b'A' };
         assert!(decode_profile(std::str::from_utf8(&bad).unwrap()).is_err());
-        assert!(decode_profile("rawg1-xxxx").is_err());
+        assert!(decode_profile("kh1-xxxx").is_err());
     }
 
     #[test]
@@ -1370,6 +1461,20 @@ mod tests {
     }
 
     #[test]
+    fn auth_ok_only_after_successful_tun_admission() {
+        assert_eq!(admission_outcome(Ok(Admission::Admitted)), AdmitOutcome::SendAuthOk);
+        assert_eq!(admission_outcome(Ok(Admission::AlreadyAdmitted)), AdmitOutcome::SendAuthOk);
+        for e in [AdmissionError::AclNotReady, AdmissionError::Capacity, AdmissionError::AddressInUse, AdmissionError::LinkAddressChanged] {
+            match admission_outcome(Err(e)) {
+                AdmitOutcome::Refuse { reason, note } => assert!(!reason.is_empty() && !note.is_empty(), "{e}"),
+                AdmitOutcome::SendAuthOk => panic!("{e} must not lead to AUTH_OK"),
+            }
+        }
+        assert_eq!(admission_outcome(Err(AdmissionError::Capacity)), AdmitOutcome::Refuse { reason: b"exit client capacity", note: "exit client capacity" });
+        assert_eq!(admission_outcome(Err(AdmissionError::AddressInUse)), AdmitOutcome::Refuse { reason: b"address clash", note: "конфликт адреса клиента" });
+    }
+
+    #[test]
     fn client_ip_stays_in_net() {
         let _ = CLIENT_NET.set(parse_net("198.18.0.0/15").unwrap());
         for b in 0..=255u8 {
@@ -1424,9 +1529,9 @@ mod tests {
         let id = leviculum_std::api::generate_identity();
         let pk = id.public_key_bytes();
         let t13 = dest_from_pub_tag(&pk, T13_TAG);
-        let old_name = Destination::new(Some(Identity::from_public_key_bytes(&pk).unwrap()), Direction::Out, DestinationType::Single, "rawgvpn", &["node", T13_TAG]).unwrap();
-        assert_ne!(t13, *old_name.hash().as_bytes(), "0013 больше не использует имя rawgvpn");
-        let legacy = Destination::new(Some(Identity::from_public_key_bytes(&pk).unwrap()), Direction::Out, DestinationType::Single, "rawgvpn", &["node", "grp"]).unwrap();
+        let old_name = Destination::new(Some(Identity::from_public_key_bytes(&pk).unwrap()), Direction::Out, DestinationType::Single, "knothopvpn", &["node", T13_TAG]).unwrap();
+        assert_ne!(t13, *old_name.hash().as_bytes(), "0013 больше не использует имя knothopvpn");
+        let legacy = Destination::new(Some(Identity::from_public_key_bytes(&pk).unwrap()), Direction::Out, DestinationType::Single, "knothopvpn", &["node", "grp"]).unwrap();
         assert_eq!(dest_from_pub_tag(&pk, "grp"), *legacy.hash().as_bytes());
     }
 
@@ -1547,17 +1652,18 @@ struct Base {
     ep: Endpoint,
     sh: Arc<Shared>,
     cli: Cli,
+    admin_lxmf: Option<lxmf_admin::AdminRuntime>,
 }
 
 /// Узел RNS + конечная точка QUIC. Общие настройки носителя те же, что у стенда (датаграммы QUIC, GCM на Link).
-async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>, key: SecretKey, mbit: u64, extra: &[&str], tcp: Option<u16>) -> Result<Base> {
+async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>, key: SecretKey, admin_identity: Option<Identity>, mbit: u64, extra: &[&str], tcp: Option<u16>) -> Result<Base> {
     std::fs::create_dir_all(state).context("create state dir")?;
-    let mut args: Vec<String> = ["rawgd", "--role", role, "--ip", "0.0.0.0", "--relay", "none", "--mode", "tun", "--carrier", "datagram", "--dgram-mtu",
+    let mut args: Vec<String> = ["knothopd", "--role", role, "--ip", "0.0.0.0", "--relay", "none", "--mode", "tun", "--carrier", "datagram", "--dgram-mtu",
         "1400", "--cipher", "gcm", "--data-cap", "4096", "--chan-buf", "4096", "--quic-initial-mtu", "1452", "--quic-cc", "tunnel", "--quic-cc-mbit"]
         .iter().map(|s| s.to_string()).collect();
     args.push(mbit.to_string());
     // стенд: глубина очередей (по умолчанию 4096 пакетов; очередь интерфейса - на каждый Link-носитель) - для замеров W43
-    for (env, flag) in [("RAWGD_CHAN_BUF", "--chan-buf"), ("RAWGD_DATA_CAP", "--data-cap")] {
+    for (env, flag) in [("KNOTHOP_CHAN_BUF", "--chan-buf"), ("KNOTHOP_DATA_CAP", "--data-cap")] {
         if let Some(v) = std::env::var(env).ok().filter(|v| v.parse::<usize>().map(|n| (16..=65536).contains(&n)).unwrap_or(false)) {
             if let Some(i) = args.iter().position(|x| x == flag) {
                 args[i + 1] = v;
@@ -1581,7 +1687,7 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
     let mut nb = NodeBuilder::new()
         .storage_path(store)
         .enable_transport(transport)
-        .proof_binding(leviculum_std::api::ProofBinding::TokenTag)
+        .proof_binding_policy(leviculum_std::api::ProofBindingPolicy::ByCipher)
         .data_channel_capacity(cli.data_cap)
         .link_cipher(leviculum_std::api::LinkCipher::Gcm)
         // ADR 0016: Link зачисления идёт через чужие транспорты RNS и может быть только стандартным CBC; такой Link допускается лишь на зачисление
@@ -1589,6 +1695,11 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
     if let Some(tp) = tcp {
         nb = nb.add_tcp_server(SocketAddr::from(([0, 0, 0, 0], tp)));
     }
+    let admin_lxmf = admin_identity.map(lxmf_admin::AdminProcessor::new);
+    let (admin_lxmf, nb) = match admin_lxmf {
+        Some((processor, runtime)) => (Some(runtime), nb.core_processor(processor)),
+        None => (None, nb),
+    };
     let mut node = nb.build().context("build node")?;
     node.start().await.context("start node")?;
     let events = node.take_event_receiver().context("event receiver")?;
@@ -1617,7 +1728,7 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
-    Ok(Base { node, events, ep, sh, cli })
+    Ok(Base { node, events, ep, sh, cli, admin_lxmf })
 }
 
 fn transport_cfg(cli: &Cli) -> Option<QuicTransportConfig> {
@@ -1645,11 +1756,263 @@ pub struct CarrierCtl {
     pub rtt_us: std::sync::atomic::AtomicU32,
     /// имя, под которым узел набран (оно входит в название интерфейса); имя в таблице может быть другим (в профиле старое), поэтому сверять нужно по нему
     pub label: Mutex<String>,
+    /// EndpointId пира (ключ памяти носителей health.rs); задаёт дозвон, пусто - пока дозвон не запущен
+    pub peer: Mutex<String>,
+    /// когда Link замолчал на QUIC: подозрение, а не запись в health.rs; подтверждает его только работающий сразу после этого TCP (`confirm_quic_silence`)
+    pub silence: Mutex<Option<Instant>>,
+    /// когда в последний раз тишина по QUIC совпала со сбоем TCP-дозвона (общий сбой пути, а не блокировка носителя)
+    pub joint_fail: Mutex<Option<Instant>>,
+    /// возврат TCP -> QUIC без разрыва Link (этапы A/B): где он сейчас
+    pub ret: Mutex<Ret>,
+    /// номер попытки возврата: растёт при каждом входе в `tcp_return` и при её конце (`ret_end`). Публикация с устаревшим номером отвергается (QAB-M3)
+    pub ret_epoch: std::sync::atomic::AtomicU64,
+    /// когда пир не ответил на T_PROBEQ (старый узел): до `RET_UNSUPPORTED_TTL` возврат идёт по этапу 0
+    pub ret_unsupported: Mutex<Option<Instant>>,
+    /// сколько раз подряд T_PROBER не пришёл (единичная потеря пакета не делает пира устаревшим, QAB-M1); сбрасывается любым T_PROBER
+    pub ret_miss: std::sync::atomic::AtomicU32,
 }
+
+/// Состояние возврата TCP -> QUIC (этапы A/B, docs/reviews/quic-return-make-before-break-2026-10-25.md, раздел 13/14). Номера - интерфейсы RNS:
+/// `tcp` - носитель TCP, `quic` - привязанное рядом QUIC-соединение.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ret {
+    Idle,
+    /// зонд прошёл, QUIC привязан к RNS рядом с TCP; ждём, пока супервизор клиента заметит Link на TCP
+    Standby { tcp: usize, quic: usize },
+    /// супервизор строит Link на QUIC, прежний Link на TCP держится до нового
+    Moving { tcp: usize, quic: usize },
+    /// Link уже на проверенном QUIC; TCP снимается, когда на нём не останется зависимых Link
+    Moved,
+    /// перенос не удался: сторож закрывает QUIC, TCP и прежний Link не тронуты
+    Failed,
+    /// Link ушёл с TCP, но не на проверенный QUIC (его пересобрали сами другим путём): QUIC зонда его не несёт, на него не рассчитываем (QAB-L3)
+    Left,
+}
+
+/// Что делает супервизор клиента на очередном тике при `Standby`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetTick {
+    Nothing,
+    /// Link выхода сидит на TCP: поднять новый на QUIC (старый держим), TCP-интерфейс исключить из выбора пути
+    Move(usize),
+    /// Link уже на проверенном QUIC (без нас): перенос свершился
+    AlreadyOff,
+    /// Link ушёл с TCP на что-то другое: QUIC зонда его не несёт
+    Left,
+}
+
+/// Чистое решение тика: `attached` - интерфейс текущего Link выхода (None - ещё не известен).
+fn ret_tick(state: Ret, attached: Option<usize>) -> (Ret, RetTick) {
+    match (state, attached) {
+        (Ret::Standby { tcp, quic }, Some(a)) if a == tcp => (Ret::Moving { tcp, quic }, RetTick::Move(tcp)),
+        (Ret::Standby { quic, .. }, Some(a)) if a == quic => (Ret::Moved, RetTick::AlreadyOff),
+        (Ret::Standby { .. }, Some(_)) => (Ret::Left, RetTick::Left),
+        (s, _) => (s, RetTick::Nothing),
+    }
+}
+
+/// Публикация владения ресурсом попытки возврата (QAB-M3): слот и состояние меняются под одним порядком замков (слот -> состояние), а
+/// попытка с устаревшим `epoch` ничего не публикует и получает ресурс обратно (вызывающий его закрывает). Так поздний наблюдатель не затирает
+/// `Idle` и не вмешивается в новую попытку.
+fn ret_publish<T>(epoch: &std::sync::atomic::AtomicU64, attempt: u64, slot: &Mutex<Option<T>>, payload: T, ret: &Mutex<Ret>, next: Ret) -> std::result::Result<(), T> {
+    let mut s = slot.lock().unwrap();
+    let mut r = ret.lock().unwrap();
+    if epoch.load(Relaxed) != attempt {
+        return Err(payload);
+    }
+    *s = Some(payload);
+    *r = next;
+    Ok(())
+}
+
+/// Лабораторный отказ B (`KNOTHOP_LAB_RET_B_FAIL`) доступен только в отладочной сборке; в release это константа `false`, и вызывающий код вырезан `cfg`.
+#[cfg(debug_assertions)]
+const fn lab_ret_b_fail_allowed() -> bool {
+    true
+}
+#[cfg(not(debug_assertions))]
+const fn lab_ret_b_fail_allowed() -> bool {
+    false
+}
+// release-конфигурация: проверка при компиляции, что хук недоступен
+#[cfg(not(debug_assertions))]
+const _: () = assert!(!lab_ret_b_fail_allowed());
+
+#[cfg(debug_assertions)]
+fn lab_ret_b_fail(env_set: bool) -> bool {
+    lab_ret_b_fail_allowed() && env_set
+}
+
+/// QAB-M2: после неудачного переноса прежний Link мог быть вытеснен сервером (допуск B идёт раньше AUTH_OK), и обещать, что "прежний Link цел", нельзя.
+/// Пока окно открыто, закрытие/молчание именно этого Link не считается отказом выхода и носителя TCP: Link восстанавливается через тот же TCP.
+const RET_RECOVER_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy)]
+struct RetRecover {
+    dest: [u8; 16],
+    /// прежний Link на TCP
+    link: LinkId,
+    /// интерфейс неудавшегося QUIC: к нему новый Link не привязывается (он закрывается сторожем)
+    quic_if: Option<usize>,
+    /// начало переноса (для измерения разрыва)
+    move_at: Instant,
+    /// когда B не удался
+    armed: Instant,
+}
+
+/// Закрытие `link` выхода `dest` вскоре после неудачи B объясняется вытеснением сервером, а не отказом выхода.
+fn recover_decision(r: Option<&RetRecover>, dest: &[u8; 16], link: &LinkId, now: Instant) -> bool {
+    r.is_some_and(|r| r.dest == *dest && r.link == *link && now.saturating_duration_since(r.armed) <= RET_RECOVER_WINDOW)
+}
+
+/// QAB-R1: неизменяемый контекст начатого B, фиксируется супервизором в момент старта переноса, независимо от изменяемого `Ret`.
+/// Сторож (`tcp_return`) при смерти QUIC или `RET_MOVE_TIMEOUT` ставит `Idle` и стирает номера интерфейсов, но этот контекст не трогает:
+/// решение о восстановлении принимает супервизор по нему, кто бы первым ни заметил отказ.
+#[derive(Debug, Clone, Copy)]
+struct RetMove {
+    dest: [u8; 16],
+    /// прежний Link на TCP
+    link: LinkId,
+    tcp_if: usize,
+    quic_if: usize,
+    /// номер попытки возврата (`ret_epoch`) на момент старта B
+    attempt: u64,
+    started: Instant,
+}
+
+/// Устаревший контекст (B не дал ни Ok, ни Err за это время) не вооружает восстановление.
+const RET_MOVE_CTX_TTL: Duration = Duration::from_secs(100);
+
+/// B не удался (`connect_exit` вернул Err для `dest`): забирает контекст (одно восстановление на попытку), отмечает перенос сорвавшимся
+/// (если сторож ещё не поставил `Idle`) и возвращает вооружённое восстановление по этому контексту. Другой выход, пустой или устаревший контекст - None.
+fn ret_b_error(mv: &mut Option<RetMove>, cc: &CarrierCtl, dest: &[u8; 16], now: Instant) -> Option<RetRecover> {
+    if !mv.as_ref().is_some_and(|m| m.dest == *dest) {
+        return None;
+    }
+    let m = mv.take()?;
+    cc.ret_fail();
+    if now.saturating_duration_since(m.started) > RET_MOVE_CTX_TTL {
+        return None;
+    }
+    Some(RetRecover { dest: m.dest, link: m.link, quic_if: Some(m.quic_if), move_at: m.started, armed: now })
+}
+
+/// B удался или отменён: контекст снят, восстановление не вооружается.
+fn ret_b_done(mv: &mut Option<RetMove>, dest: &[u8; 16]) {
+    if mv.as_ref().is_some_and(|m| m.dest == *dest) {
+        *mv = None;
+    }
+}
+
+/// Конец попытки (или её отмена): в том же порядке замков забирает ресурс, ставит состояние и повышает эпоху - с этого момента любая
+/// публикация старой попытки отвергается. Возвращает забранный ресурс (его закрывает вызывающий вне замков).
+fn ret_finish<T>(epoch: &std::sync::atomic::AtomicU64, slot: &Mutex<Option<T>>, ret: &Mutex<Ret>, next: Ret) -> Option<T> {
+    let mut s = slot.lock().unwrap();
+    let mut r = ret.lock().unwrap();
+    epoch.fetch_add(1, Relaxed);
+    *r = next;
+    s.take()
+}
+
+/// Как долго пир считается не знающим T_PROBEQ после молчания в ответ: старые узлы обновляются редко, а запрос стоит одной попытки возврата.
+const RET_UNSUPPORTED_TTL: Duration = Duration::from_secs(30 * 60);
+/// Сколько ждать, пока супервизор поднимет Link на QUIC (авторизация и проверка датаграммы в connect_exit укладываются в ~25 с).
+const RET_MOVE_TIMEOUT: Duration = Duration::from_secs(40);
+/// Сколько ждать ответ T_PROBER.
+const RET_PROBER_WAIT: Duration = Duration::from_secs(3);
+/// Сколько раз подряд T_PROBER не пришёл, прежде чем пир считается не знающим T_PROBEQ (QAB-M1).
+const RET_MISS_LIMIT: u32 = 2;
 
 impl CarrierCtl {
     fn new() -> Arc<Self> {
-        Arc::new(Self { prefer_tcp: AtomicBool::new(false), mode: Mutex::new("none"), switches: Default::default(), generation: Default::default(), fails: Default::default(), rtt_us: Default::default(), label: Mutex::new(String::new()) })
+        Arc::new(Self { prefer_tcp: AtomicBool::new(false), mode: Mutex::new("none"), switches: Default::default(), generation: Default::default(), fails: Default::default(), rtt_us: Default::default(), label: Mutex::new(String::new()), peer: Mutex::new(String::new()), silence: Mutex::new(None), joint_fail: Mutex::new(None), ret: Mutex::new(Ret::Idle), ret_epoch: Default::default(), ret_unsupported: Mutex::new(None), ret_miss: Default::default() })
+    }
+    fn ret_get(&self) -> Ret {
+        *self.ret.lock().unwrap()
+    }
+    /// Новая попытка возврата: предыдущие публикации (позднего наблюдателя) станут недействительны. Возвращает её номер.
+    fn ret_begin_attempt(&self) -> u64 {
+        self.ret_epoch.fetch_add(1, Relaxed) + 1
+    }
+    /// Состояние меняется, только пока попытка `attempt` актуальна (иначе новая/завершённая попытка не затирается).
+    fn ret_set_if(&self, attempt: u64, r: Ret) -> bool {
+        let mut cur = self.ret.lock().unwrap();
+        if self.ret_epoch.load(Relaxed) != attempt {
+            return false;
+        }
+        *cur = r;
+        true
+    }
+    /// Тик супервизора: решает по `ret_tick` и записывает следующее состояние.
+    fn ret_poll(&self, attached: Option<usize>) -> RetTick {
+        let act = {
+            let mut r = self.ret.lock().unwrap();
+            let (next, act) = ret_tick(*r, attached);
+            *r = next;
+            act
+        };
+        if act == RetTick::AlreadyOff {
+            // Link пересобран вне TCP без нас, но на проверенный QUIC: носитель этого пира уже не TCP
+            self.set_mode("quic");
+            self.prefer_tcp.store(false, Relaxed);
+        }
+        act
+    }
+    /// Link выхода поднят на проверенном QUIC-интерфейсе: возврат свершился. Носитель считается QUIC с этого момента (`generation` растёт здесь, до чтения
+    /// супервизором `gen_at_connect`: новый Link не принимается за пережившего смену носителя). Link, ушедший на любой другой интерфейс (не TCP и не
+    /// этот QUIC), QUIC не несёт: состояние `Left`, носитель не меняется (QAB-L3). Иначе (TCP-интерфейс, чужое состояние) - false.
+    fn ret_commit(&self, attached: Option<usize>) -> bool {
+        let mut r = self.ret.lock().unwrap();
+        match (*r, attached) {
+            (Ret::Standby { quic, .. } | Ret::Moving { quic, .. }, Some(a)) if a == quic => {
+                *r = Ret::Moved;
+                drop(r);
+                self.set_mode("quic");
+                self.prefer_tcp.store(false, Relaxed);
+                true
+            }
+            (Ret::Standby { tcp, .. } | Ret::Moving { tcp, .. }, Some(a)) if a != tcp => {
+                *r = Ret::Left;
+                false
+            }
+            _ => false,
+        }
+    }
+    /// Попытка переноса Link не удалась: `Moving` -> `Failed` (из других состояний ничего не меняется).
+    fn ret_fail(&self) {
+        let mut r = self.ret.lock().unwrap();
+        if matches!(*r, Ret::Moving { .. } | Ret::Standby { .. }) {
+            *r = Ret::Failed;
+        }
+    }
+    /// QUIC привязан к RNS рядом с TCP, но Link ещё/уже на TCP и QUIC потерян: носитель снова TCP.
+    fn ret_revert(&self) {
+        self.set_mode("tcp");
+        self.prefer_tcp.store(true, Relaxed);
+    }
+    /// TCP снят, QUIC-соединение зонда становится носителем. Если Link не успели перенести, QUIC всё равно носитель (TCP уже мёртв).
+    fn ret_adopt(&self) {
+        if !self.is_quic() {
+            self.set_mode("quic");
+            self.prefer_tcp.store(false, Relaxed);
+        }
+        *self.ret.lock().unwrap() = Ret::Idle;
+    }
+    /// Единственное правило для цепочки "T_PROBER не пришёл": первый раз - ждём ещё (потеря пакета не означает старый узел), второй подряд - узел
+    /// не знает T_PROBEQ. Возвращает true, когда пир признан устаревшим.
+    fn ret_prober_missed(&self, now: Instant) -> bool {
+        if self.ret_miss.fetch_add(1, Relaxed) + 1 >= RET_MISS_LIMIT {
+            self.ret_mark_unsupported(now);
+            true
+        } else {
+            false
+        }
+    }
+    fn ret_unsupported_now(&self, now: Instant) -> bool {
+        self.ret_unsupported.lock().unwrap().is_some_and(|t| now.saturating_duration_since(t) < RET_UNSUPPORTED_TTL)
+    }
+    fn ret_mark_unsupported(&self, now: Instant) {
+        *self.ret_unsupported.lock().unwrap() = Some(now);
     }
     fn set_mode(&self, m: &'static str) {
         *self.mode.lock().unwrap() = m;
@@ -1657,6 +2020,389 @@ impl CarrierCtl {
     }
     fn is_quic(&self) -> bool {
         *self.mode.lock().unwrap() == "quic"
+    }
+}
+
+/// Пауза до первой попытки вернуться на QUIC по умолчанию, с; потолок роста (KNOTHOP_TCP_BACKOFF_S меняет только первую).
+const TCP_BACK_OFF_FIRST_S: u64 = 120;
+const TCP_BACK_OFF_MAX_S: u64 = 1800;
+/// QUIC-сессия прожила столько - соединение доказано не одним рукопожатием, и запись «QUIC не работает» (health.rs) стирается. Больше окон
+/// детекторов тишины (fail_ms 3 с) и потерь пингов (3-4 с при >= 8 пингах) вместе с запасом.
+const QUIC_PROVEN: Duration = Duration::from_secs(20);
+/// QUIC-сессия прожила столько - возврат удался и UDP пригоден: пауза `back_off` начинается заново. Вдвое больше первой памяти health.rs (5 мин) и
+/// впятеро больше первой паузы (120 с): путь, державший сессию дольше, не похож на тот, что режут после рукопожатия. При дрожащем UDP цена -
+/// одна неудачная попытка (~25 с, O52) не чаще раза в ~12 мин против раза в 30 мин у потолка.
+const QUIC_STABLE: Duration = Duration::from_secs(600);
+
+/// Пора снять рабочий TCP ради попытки вернуться на QUIC? Пока QUIC помечен неработающим (health.rs), TCP не рвём: возврат всё равно запрещён,
+/// а просроченный срок убивал бы каждую новую сессию за 0,5 с (churn TCP, Link пересобирается впустую).
+fn tcp_release_due(elapsed: Duration, back_off_s: u64, quic_bad: bool) -> bool {
+    !quic_bad && elapsed >= Duration::from_secs(back_off_s)
+}
+
+/// Следующая пауза перед возвратом на QUIC после попытки.
+fn grown_back_off(back_off_s: u64) -> u64 {
+    back_off_s.saturating_mul(2).min(TCP_BACK_OFF_MAX_S)
+}
+
+/// Пауза возврата после завершённой QUIC-сессии длиной `up`: стабильная сессия сбрасывает рост паузы к первой.
+fn back_off_after_quic(back_off_s: u64, first_s: u64, up: Duration) -> u64 {
+    if up >= QUIC_STABLE { first_s.min(TCP_BACK_OFF_MAX_S) } else { back_off_s }
+}
+
+/// QUIC-сессия длиной `up` доказана: стереть запись о неработающем QUIC. Рукопожатие без живой сессии её не стирает - иначе счётчик
+/// неудач (рост срока памяти 5 мин -> 6 ч) обнулялся бы при каждой попытке, прошедшей рукопожатие и сорвавшейся на данных.
+fn settle_quic_health(health: &health::Health, peer: &str, up: Duration) -> bool {
+    let proven = up >= QUIC_PROVEN;
+    if proven && !peer.is_empty() {
+        health.ok(peer, health::Kind::Quic);
+    }
+    proven
+}
+
+/// Смена носителя этого пира после создания Link (в том числе нами: дозвон сам снял TCP по `back_off`, или QUIC пересоединён после рестарта пира).
+/// Link привязан к интерфейсу прежнего носителя и молчит из-за смены, а не из-за качества нового.
+fn carrier_flipped(ctl: &CarrierCtl, gen_at_connect: u32) -> bool {
+    ctl.generation.load(Relaxed) != gen_at_connect
+}
+
+/// Чем объяснять тишину Link (`нет ответа`).
+#[derive(Debug, PartialEq, Eq)]
+enum SilenceCause {
+    /// Link жил на текущем QUIC и замолчал: вероятно, UDP режется
+    Quic,
+    /// носитель сменился после создания Link: тишина объяснена сменой, QUIC не виноват
+    CarrierSwap,
+    /// носитель не QUIC, или TCP уже выбран
+    Other,
+}
+
+fn silence_cause(is_quic: bool, prefer_tcp: bool, flipped: bool) -> SilenceCause {
+    if !is_quic || prefer_tcp {
+        SilenceCause::Other
+    } else if flipped {
+        SilenceCause::CarrierSwap
+    } else {
+        SilenceCause::Quic
+    }
+}
+
+/// Сколько после тишины по QUIC TCP-дозвон может подтвердить подозрение: TCP, поднявшийся позже, говорит уже не об этой тишине.
+const SILENCE_CONFIRM: Duration = Duration::from_secs(30);
+/// Второе совпадение тишины по QUIC со сбоем TCP-дозвона за это время считается настоящей блокировкой обоих носителей, а не разовым сбоем сети.
+const JOINT_FAIL_REPEAT: Duration = Duration::from_secs(600);
+
+/// Разбор тишины Link у пира: при тишине по QUIC пробуем TCP. В память носителей (health.rs) QUIC при этом НЕ пишется: тишина может быть сбоем
+/// самой сети (handover), а не блокировкой UDP. Запись делает `confirm_quic_silence`, когда рабочий TCP подтвердился сразу после тишины.
+fn judge_silence(cc: &CarrierCtl, flipped: bool, now: Instant) -> SilenceCause {
+    let cause = silence_cause(cc.is_quic(), cc.prefer_tcp.load(Relaxed), flipped);
+    if cause == SilenceCause::Quic {
+        cc.prefer_tcp.store(true, Relaxed);
+        cc.switches.fetch_add(1, Relaxed);
+        *cc.silence.lock().unwrap() = Some(now);
+    }
+    cause
+}
+
+/// Подозрение на тишину ещё в силе (`SILENCE_CONFIRM`)? Забирает его в любом случае.
+fn take_silence(cc: &CarrierCtl, now: Instant) -> bool {
+    cc.silence.lock().unwrap().take().is_some_and(|at| now.saturating_duration_since(at) <= SILENCE_CONFIRM)
+}
+
+/// TCP поднялся и подтвердил доставку (`tcpc::Dial::Up`) вскоре после тишины по QUIC: сеть жива, молчит именно UDP - QUIC запоминается
+/// неработающим (у узла запись уходит в carrier_health.json, у клиента остаётся в памяти процесса: `health.init` вызывает только команда node,
+/// файлов и пробуждений на телефоне не добавляется). Возвращает срок памяти.
+fn confirm_quic_silence(health: &health::Health, cc: &CarrierCtl, peer: &str, now: Instant) -> Option<Duration> {
+    (take_silence(cc, now) && !peer.is_empty()).then(|| health.fail(peer, health::Kind::Quic))
+}
+
+/// Что делать с `Dial::Blackhole`, пришедшим при подозрении на тишину по QUIC.
+#[derive(Debug, PartialEq, Eq)]
+enum JointFail {
+    /// подозрения не было (или оно устарело): обычная обработка Blackhole
+    NoSuspicion,
+    /// оба носителя молчат в одном окне - общий сбой пути: ни TCP, ни QUIC не запоминаются
+    PathFailure,
+    /// то же совпадение повторилось за `JOINT_FAIL_REPEAT`: обе блокировки настоящие, запоминаются оба
+    BothBlocked,
+}
+
+/// TCP-дозвон не прошёл при подозрении на тишину по QUIC. `Unreachable` (хост не отвечает) ничего не запоминает ни у кого; `Blackhole` в одном окне
+/// с тишиной QUIC - общий сбой (handover, потеря сети), а не блокировка носителя: пара на ≥5 мин не блокируется. Повтор совпадения за 10 мин
+/// остаётся сигналом настоящей блокировки обоих носителей (DPI на UDP и на TCP).
+fn tcp_failed_with_silence(cc: &CarrierCtl, blackhole: bool, now: Instant) -> JointFail {
+    if !take_silence(cc, now) {
+        return JointFail::NoSuspicion;
+    }
+    if !blackhole {
+        return JointFail::PathFailure;
+    }
+    let prev = cc.joint_fail.lock().unwrap().replace(now);
+    if prev.is_some_and(|p| now.saturating_duration_since(p) <= JOINT_FAIL_REPEAT) { JointFail::BothBlocked } else { JointFail::PathFailure }
+}
+
+/// `Dial::Blackhole`: хост отвечает, данные не доходят. Запоминает TCP; QUIC, не прошедший перед этим (`quic_suspect`) или молчавший в паре с TCP
+/// повторно (`BothBlocked`), запоминается вместе с ним. Совпадение с тишиной по QUIC впервые - общий сбой пути: не запоминается ничего (None).
+/// Возвращает срок памяти TCP.
+fn record_tcp_blackhole(health: &health::Health, cc: &CarrierCtl, peer: &str, quic_suspect: &mut bool, now: Instant) -> Option<Duration> {
+    let joint = tcp_failed_with_silence(cc, true, now);
+    let suspect = std::mem::take(quic_suspect);
+    if joint == JointFail::PathFailure && !suspect {
+        return None;
+    }
+    let d = health.fail(peer, health::Kind::Tcp);
+    if suspect || joint == JointFail::BothBlocked {
+        health.fail(peer, health::Kind::Quic);
+    }
+    Some(d)
+}
+
+/// Этап 0 make-before-break (docs/reviews/quic-return-make-before-break-2026-10-25.md): детерминированные регрессии без сети и часов.
+#[cfg(test)]
+mod carrier_return_tests {
+    use super::*;
+
+    fn quic_ctl(peer: &str) -> Arc<CarrierCtl> {
+        let cc = CarrierCtl::new();
+        *cc.peer.lock().unwrap() = peer.to_string();
+        cc.set_mode("quic");
+        cc
+    }
+
+    // 1. Тишина после снятия TCP нашим дозвоном не вменяется QUIC.
+    #[test]
+    fn silence_after_our_own_tcp_release_does_not_blame_quic() {
+        let h = health::Health::default();
+        let cc = CarrierCtl::new();
+        let now = Instant::now();
+        *cc.peer.lock().unwrap() = "p".into();
+        cc.set_mode("tcp");
+        let gen_at_connect = cc.generation.load(Relaxed); // Link поднят на TCP
+        cc.set_mode("none"); // сторож дозвона закрыл TCP по паузе возврата
+        cc.set_mode("quic"); // QUIC соединился за миллисекунды
+        let flipped = carrier_flipped(&cc, gen_at_connect);
+        assert!(flipped);
+        assert_eq!(judge_silence(&cc, flipped, now), SilenceCause::CarrierSwap);
+        assert!(confirm_quic_silence(&h, &cc, "p", now).is_none() && !h.is_bad("p", health::Kind::Quic), "QUIC не запоминается");
+        assert!(!cc.prefer_tcp.load(Relaxed) && cc.switches.load(Relaxed) == 0, "клиент остаётся на QUIC");
+        // Link, поднятый уже на этом QUIC, замолчал: теперь это тишина по QUIC
+        let gen_new = cc.generation.load(Relaxed);
+        assert_eq!(judge_silence(&cc, carrier_flipped(&cc, gen_new), now), SilenceCause::Quic);
+        assert!(cc.prefer_tcp.load(Relaxed) && cc.silence.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn silence_cause_table() {
+        use SilenceCause::*;
+        assert_eq!(silence_cause(true, false, false), Quic);
+        assert_eq!(silence_cause(true, false, true), CarrierSwap);
+        assert_eq!(silence_cause(true, true, false), Other, "TCP уже выбран");
+        assert_eq!(silence_cause(false, false, false), Other, "носитель не QUIC");
+        assert_eq!(silence_cause(false, false, true), Other);
+    }
+
+    // 2. Гипотеза отчёта: при помеченном QUIC просроченный срок рвёт каждую новую TCP-сессию (churn). Модель: сторож проверяет раз в 0,5 с.
+    #[test]
+    fn tcp_is_not_churned_while_quic_is_bad() {
+        let back_off = 120u64;
+        let quic_bad_until = 314.0f64; // 14 с на два провала handshake + 5 мин памяти (health.rs FIRST)
+        // Модель цикла dial_direct: сторож раз в 0,5 с; убитая сессия возвращает цикл наверх, где возврат на QUIC разрешён только при
+        // !quic_bad и сроке; иначе TCP поднимается снова с паузой short_tcp (1,5 -> 3 -> ... -> 60 с, если сессия жила < 15 с).
+        // tcp_since не обнуляется, пока стоит prefer_tcp, поэтому срок отсчитывается от первого перехода на TCP (t = 0).
+        let bad_at = |t: f64| t < quic_bad_until;
+        let run = |watch_due: &dyn Fn(Duration, bool) -> bool| {
+            let (mut kills, mut t, mut short) = (0u32, 0.0f64, 0u32);
+            loop {
+                let started = t;
+                loop {
+                    t += 0.5;
+                    if t >= 330.0 {
+                        return kills;
+                    }
+                    if watch_due(Duration::from_secs_f64(t), bad_at(t)) {
+                        break;
+                    }
+                }
+                kills += 1;
+                if tcp_release_due(Duration::from_secs_f64(t), back_off, bad_at(t)) {
+                    return kills; // цикл вернулся на QUIC
+                }
+                if t - started < 15.0 {
+                    short = (short + 1).min(6);
+                    t += ((1500u64 << (short - 1)).min(60_000)) as f64 / 1000.0;
+                } else {
+                    short = 0;
+                }
+                t += 0.5;
+            }
+        };
+        let old = run(&|el, _bad| el >= Duration::from_secs(back_off)); // условие до правки: дедлайн без учёта quic_bad
+        let new = run(&|el, bad| tcp_release_due(el, back_off, bad));
+        eprintln!("churn model: killed TCP sessions old={old} new={new}");
+        assert!(old >= 6, "гипотеза подтверждена моделью: прежнее условие рвёт TCP-сессию снова и снова, пока QUIC помечен: {old}");
+        assert_eq!(new, 1, "новое: единственное срабатывание после истечения памяти QUIC, затем возврат на QUIC");
+        // а пока QUIC помечен, срок не наступает вообще
+        assert!(!tcp_release_due(Duration::from_secs(3600), back_off, true));
+        assert!(tcp_release_due(Duration::from_secs(back_off), back_off, false));
+        assert!(!tcp_release_due(Duration::from_secs(back_off - 1), back_off, false));
+    }
+
+    // 3. Пауза возврата: рост до потолка 1800, сброс после стабильной QUIC-сессии.
+    #[test]
+    fn back_off_grows_to_cap_and_resets_after_stable_quic() {
+        let mut b = TCP_BACK_OFF_FIRST_S;
+        let mut seen = vec![b];
+        for _ in 0..6 {
+            b = grown_back_off(b);
+            seen.push(b);
+        }
+        assert_eq!(seen, [120, 240, 480, 960, 1800, 1800, 1800], "потолок 30 мин сохранён");
+        assert_eq!(grown_back_off(u64::MAX), TCP_BACK_OFF_MAX_S);
+        // короткие QUIC-сессии (срыв до порога) паузу не сбрасывают
+        assert_eq!(back_off_after_quic(1800, 120, Duration::from_secs(30)), 1800);
+        assert_eq!(back_off_after_quic(480, 120, QUIC_STABLE - Duration::from_secs(1)), 480);
+        // стабильная сессия сбрасывает к первой паузе (в том числе лабораторной)
+        assert_eq!(back_off_after_quic(1800, 120, QUIC_STABLE), 120);
+        assert_eq!(back_off_after_quic(960, 30, Duration::from_secs(3600)), 30);
+        // первая пауза из окружения не может превысить потолок
+        assert_eq!(back_off_after_quic(60, 99_999, QUIC_STABLE), TCP_BACK_OFF_MAX_S);
+    }
+
+    // 4. UDP заблокирован, TCP жив: тишина пишется в память носителей, как раньше, но только после подтверждения TCP. Рукопожатие без живой
+    // сессии запись не стирает, сессия QUIC_PROVEN - стирает.
+    #[test]
+    fn quic_silence_with_live_tcp_is_remembered_and_escalates_until_session_is_proven() {
+        let h = health::Health::default();
+        let cc = quic_ctl("peer");
+        let t0 = Instant::now();
+        assert_eq!(judge_silence(&cc, false, t0), SilenceCause::Quic);
+        assert!(!h.is_bad("peer", health::Kind::Quic), "до подтверждения TCP ничего не записано");
+        assert!(cc.prefer_tcp.load(Relaxed) && cc.switches.load(Relaxed) == 1);
+        // TCP поднялся и подтвердил доставку через 3 с
+        let d1 = confirm_quic_silence(&h, &cc, "peer", t0 + Duration::from_secs(3)).unwrap();
+        assert_eq!(d1, Duration::from_secs(300));
+        assert!(h.is_bad("peer", health::Kind::Quic) && !h.is_bad("peer", health::Kind::Tcp) && h.blocked_for("peer").is_none());
+        // подозрение израсходовано: повторное подтверждение ничего не добавляет
+        assert!(confirm_quic_silence(&h, &cc, "peer", t0 + Duration::from_secs(4)).is_none());
+        // повторная попытка: рукопожатие прошло, сессия сорвалась за 5 с (тишина) - запись остаётся, срок растёт
+        assert!(!settle_quic_health(&h, "peer", Duration::from_secs(5)));
+        cc.prefer_tcp.store(false, Relaxed);
+        let t1 = t0 + Duration::from_secs(400);
+        judge_silence(&cc, false, t1);
+        let d2 = confirm_quic_silence(&h, &cc, "peer", t1 + Duration::from_secs(3)).unwrap();
+        assert!(d2 > d1, "срок памяти растёт: {d2:?} > {d1:?}");
+        // сессия дожила до QUIC_PROVEN: записи нет, счёт неудач обнулён
+        assert!(settle_quic_health(&h, "peer", QUIC_PROVEN));
+        assert!(!h.is_bad("peer", health::Kind::Quic));
+        cc.prefer_tcp.store(false, Relaxed);
+        let t2 = t1 + Duration::from_secs(900);
+        judge_silence(&cc, false, t2);
+        assert_eq!(confirm_quic_silence(&h, &cc, "peer", t2 + Duration::from_secs(3)).unwrap(), d1, "после доказанной сессии отсчёт неудач начинается заново");
+    }
+
+    // M-1: handover - молчат оба носителя в одном окне.
+    #[test]
+    fn handover_with_both_carriers_silent_blocks_neither_for_long() {
+        let h = health::Health::default();
+        let cc = quic_ctl("peer");
+        let t0 = Instant::now();
+        assert_eq!(judge_silence(&cc, false, t0), SilenceCause::Quic);
+        // TCP-дозвон в том же окне: хост отвечает, данные не доходят (Blackhole)
+        let mut quic_suspect = false;
+        assert!(record_tcp_blackhole(&h, &cc, "peer", &mut quic_suspect, t0 + Duration::from_secs(4)).is_none());
+        // ничего не записано: ни QUIC, ни TCP; пара не заблокирована
+        assert!(!h.is_bad("peer", health::Kind::Quic) && !h.is_bad("peer", health::Kind::Tcp) && h.blocked_for("peer").is_none());
+        // сеть вернулась, TCP поднялся позже: подозрение уже снято, QUIC не запоминается
+        assert!(confirm_quic_silence(&h, &cc, "peer", t0 + Duration::from_secs(9)).is_none());
+        assert!(!h.is_bad("peer", health::Kind::Quic));
+    }
+
+    #[test]
+    fn handover_with_unreachable_tcp_drops_the_suspicion() {
+        let h = health::Health::default();
+        let cc = quic_ctl("peer");
+        let t0 = Instant::now();
+        judge_silence(&cc, false, t0);
+        assert_eq!(tcp_failed_with_silence(&cc, false, t0 + Duration::from_secs(2)), JointFail::PathFailure);
+        assert!(confirm_quic_silence(&h, &cc, "peer", t0 + Duration::from_secs(8)).is_none(), "TCP, поднявшийся после провала дозвона, тишину не подтверждает");
+        assert!(!h.is_bad("peer", health::Kind::Quic));
+    }
+
+    #[test]
+    fn stale_silence_suspicion_is_not_confirmed_or_joint() {
+        let h = health::Health::default();
+        let cc = quic_ctl("peer");
+        let t0 = Instant::now();
+        judge_silence(&cc, false, t0);
+        assert!(confirm_quic_silence(&h, &cc, "peer", t0 + SILENCE_CONFIRM + Duration::from_secs(1)).is_none(), "TCP позже окна не подтверждает");
+        cc.prefer_tcp.store(false, Relaxed);
+        judge_silence(&cc, false, t0);
+        assert_eq!(tcp_failed_with_silence(&cc, true, t0 + SILENCE_CONFIRM + Duration::from_secs(1)), JointFail::NoSuspicion, "устаревшее подозрение: обычный Blackhole");
+        assert_eq!(tcp_failed_with_silence(&cc, true, t0), JointFail::NoSuspicion, "без подозрения - обычная обработка");
+    }
+
+    // Настоящая блокировка обоих носителей не маскируется: то же совпадение второй раз за 10 мин даёт запись обоих.
+    #[test]
+    fn repeated_joint_failure_is_a_real_block_of_both_carriers() {
+        let h = health::Health::default();
+        let cc = quic_ctl("peer");
+        let t0 = Instant::now();
+        let mut qs = false;
+        judge_silence(&cc, false, t0);
+        assert!(record_tcp_blackhole(&h, &cc, "peer", &mut qs, t0 + Duration::from_secs(4)).is_none(), "первое совпадение - общий сбой");
+        assert!(h.blocked_for("peer").is_none());
+        // дозвон вернулся на QUIC, Link снова замолчал, TCP снова Blackhole
+        cc.set_mode("quic");
+        cc.prefer_tcp.store(false, Relaxed);
+        let t1 = t0 + Duration::from_secs(60);
+        judge_silence(&cc, false, t1);
+        assert!(record_tcp_blackhole(&h, &cc, "peer", &mut qs, t1 + Duration::from_secs(4)).is_some());
+        assert!(h.blocked_for("peer").is_some(), "повтор: настоящая блокировка обоих запоминается как раньше");
+        // совпадение через 10+ мин после предыдущего снова считается разовым
+        let h2 = health::Health::default();
+        cc.set_mode("quic");
+        cc.prefer_tcp.store(false, Relaxed);
+        let t2 = t1 + JOINT_FAIL_REPEAT + Duration::from_secs(30);
+        judge_silence(&cc, false, t2);
+        assert!(record_tcp_blackhole(&h2, &cc, "peer", &mut qs, t2 + Duration::from_secs(4)).is_none());
+        assert!(h2.blocked_for("peer").is_none());
+    }
+
+    // Blackhole без тишины по QUIC (и с handshake-подозрением, как до правки) - прежнее поведение.
+    #[test]
+    fn plain_blackhole_keeps_legacy_marking() {
+        let h = health::Health::default();
+        let cc = quic_ctl("peer");
+        let mut qs = false;
+        assert!(record_tcp_blackhole(&h, &cc, "peer", &mut qs, Instant::now()).is_some());
+        assert!(h.is_bad("peer", health::Kind::Tcp) && !h.is_bad("peer", health::Kind::Quic));
+        let mut qs = true; // QUIC не соединился дважды, потом Blackhole: пара заблокирована
+        assert!(record_tcp_blackhole(&h, &cc, "peer", &mut qs, Instant::now()).is_some());
+        assert!(!qs && h.blocked_for("peer").is_some());
+    }
+
+    #[test]
+    fn silence_without_known_peer_still_switches_but_remembers_nothing() {
+        let h = health::Health::default();
+        let cc = quic_ctl("");
+        let t0 = Instant::now();
+        assert_eq!(judge_silence(&cc, false, t0), SilenceCause::Quic);
+        assert!(cc.prefer_tcp.load(Relaxed));
+        assert!(confirm_quic_silence(&h, &cc, "", t0).is_none());
+        assert!(settle_quic_health(&h, "", QUIC_PROVEN), "пустой ключ ничего не стирает, но сессия считается доказанной");
+    }
+
+    // Связка: QUIC помечен -> тишина не даёт возврата, TCP живёт, цикл не крутится.
+    #[test]
+    fn marked_quic_blocks_return_and_keeps_tcp() {
+        let h = health::Health::default();
+        let cc = quic_ctl("peer");
+        let t0 = Instant::now();
+        judge_silence(&cc, false, t0);
+        confirm_quic_silence(&h, &cc, "peer", t0 + Duration::from_secs(2));
+        let quic_bad = h.is_bad("peer", health::Kind::Quic);
+        assert!(quic_bad);
+        assert!(!tcp_release_due(Duration::from_secs(TCP_BACK_OFF_MAX_S), 120, quic_bad));
     }
 }
 
@@ -1737,8 +2483,8 @@ async fn resolve_addrs(addrs: &[String]) -> Vec<SocketAddr> {
         }
     }
     // Адреса приходят из анонсов (набор по тегу группы доступен любому) и из таблиц: набирать loopback, частные и служебные сети нельзя -
-    // иначе чужой анонс превращает узел в сканер внутренней сети хоста (SSRF). Лаборатория включает RAWGD_ALLOW_PRIVATE_DIAL=1.
-    if std::env::var("RAWGD_ALLOW_PRIVATE_DIAL").is_err() {
+    // иначе чужой анонс превращает узел в сканер внутренней сети хоста (SSRF). Лаборатория включает KNOTHOP_ALLOW_PRIVATE_DIAL=1.
+    if std::env::var("KNOTHOP_ALLOW_PRIVATE_DIAL").is_err() {
         out.retain(|a| is_global_ip(&a.ip()));
     }
     out.sort_by_key(|a| a.is_ipv6());
@@ -1750,19 +2496,20 @@ async fn resolve_addrs(addrs: &[String]) -> Vec<SocketAddr> {
 /// (анонс его обновляет): разрешаются заново при каждой попытке, новые адреса подхватываются без перезапуска (0014 R4).
 /// Носитель: QUIC (датаграммы), а если он не соединяется или монитор качества нашёл потери UDP - TCP. Из TCP возвращаемся на QUIC, когда прошла
 /// пауза `back_off` (120 с, удваивается до 30 мин) от момента перехода на TCP, даже если TCP-сессии рвались. Если UDP всё ещё плох, монитор снова переключит за ~30 с.
-async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: String, id: EndpointId, book: Arc<Addrs>, alive: Arc<AtomicBool>, ctl: Arc<CarrierCtl>) {
+async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: String, id: EndpointId, book: Arc<Addrs>, alive: Arc<AtomicBool>, ctl: Arc<CarrierCtl>, hook: Option<ReturnHook>) {
     let mut n = 0u32;
     let mut quic_fail = 0u32;
     let mut tcp_fail = 0u32;
     // подряд TCP-сессий, закрытых за секунды после подключения
     let mut short_tcp = 0u32;
-    // первая пауза до попытки вернуться на QUIC; растёт вдвое до 30 минут (RAWGD_TCP_BACKOFF_S - для стенда)
-    let first_back: u64 = std::env::var("RAWGD_TCP_BACKOFF_S").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
+    // первая пауза до попытки вернуться на QUIC; растёт вдвое до 30 минут (KNOTHOP_TCP_BACKOFF_S - для стенда)
+    let first_back: u64 = std::env::var("KNOTHOP_TCP_BACKOFF_S").ok().and_then(|v| v.parse().ok()).unwrap_or(TCP_BACK_OFF_FIRST_S);
     let mut back_off = first_back;
     // с какого момента носитель TCP: замечаем по флагу в цикле, в том числе когда флаг выставил монитор извне
     let mut tcp_since: Option<Instant> = None;
     // память о неработающих носителях к этому пиру (health.rs): ключ - EndpointId, не имя и не адрес
     let peer = id.to_string();
+    *ctl.peer.lock().unwrap() = peer.clone();
     // QUIC дважды не соединился: если TCP при этом работает (или тоже режется при живом хосте), QUIC запоминается как неработающий
     let mut quic_suspect = false;
     let mut announced_block = false;
@@ -1784,11 +2531,11 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
         }
         if ctl.prefer_tcp.load(Relaxed) {
             let since = *tcp_since.get_or_insert_with(Instant::now);
-            if !quic_bad && since.elapsed() >= Duration::from_secs(back_off) {
+            if tcp_release_due(since.elapsed(), back_off, quic_bad) {
                 // пауза вышла: пробуем QUIC снова; если UDP всё ещё плох, монитор переключит обратно, а пауза вырастет
                 ctl.prefer_tcp.store(false, Relaxed);
                 tcp_since = None;
-                back_off = (back_off * 2).min(1800);
+                back_off = grown_back_off(back_off);
                 sh.note(format!("{label}: пробую вернуться на QUIC"));
             }
         } else {
@@ -1811,29 +2558,9 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                     n += 1;
                     quic_fail = 0;
                     quic_suspect = false;
-                    sh.health.ok(&peer, health::Kind::Quic);
                     ctl.set_mode("quic");
                     sh.note(format!("quic connected to {label}"));
-                    let c2 = conn.clone();
-                    let (ctl2, alive2) = (ctl.clone(), alive.clone());
-                    let watch = tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            if let Some(p) = c2.paths().iter().find(|p| p.is_selected()) {
-                                ctl2.rtt_us.store(p.rtt().as_micros().min(u32::MAX as u128) as u32, Relaxed);
-                            }
-                            if ctl2.prefer_tcp.load(Relaxed) || !alive2.load(Relaxed) {
-                                c2.close(0u32.into(), b"switch carrier");
-                                break;
-                            }
-                        }
-                    });
-                    attach_datagrams_until_closed(node.clone(), sh.clone(), format!("iroh-dg-out-{label}-{n}"), conn).await;
-                    watch.abort();
-                    ctl.set_mode("none");
-                    ctl.rtt_us.store(0, Relaxed);
-                    sh.note(format!("quic to {label} ended"));
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    quic_session(&node, &sh, &ctl, &alive, &label, &peer, conn, QuicSide::Fresh(format!("iroh-dg-out-{label}-{n}")), Instant::now(), &mut back_off, first_back).await;
                 }
                 _ => {
                     quic_fail += 1;
@@ -1865,23 +2592,93 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                         let d = sh.health.fail(&peer, health::Kind::Quic);
                         sh.note(format!("{label}: QUIC не проходит, а TCP работает: запоминаю QUIC как неработающий на {} мин", d.as_secs() / 60));
                     }
+                    // Link молчал на QUIC, и сразу после этого TCP подтвердил доставку: сеть жива, молчит UDP
+                    if let Some(d) = confirm_quic_silence(&sh.health, &ctl, &peer, Instant::now()) {
+                        sh.note(format!("{label}: Link молчал на QUIC, а TCP работает: запоминаю QUIC как неработающий на {} мин", d.as_secs() / 60));
+                    }
                     ctl.set_mode("tcp");
-                    let deadline = tcp_since.unwrap_or_else(Instant::now) + Duration::from_secs(back_off);
+                    let tcp_from = tcp_since.unwrap_or_else(Instant::now);
+                    let wait_s = back_off;
                     sh.note(format!("tcp connected to {label} (носитель TCP, возврат на QUIC через {back_off} с от перехода)"));
                     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
                     let (alive2, st2) = (alive.clone(), stop_tx.clone());
+                    let (sh2, peer2) = (sh.clone(), peer.clone());
+                    // возврат на QUIC без разрыва Link (этапы A/B): зонд и перенос идут при живом TCP, `bo` - пауза, выросшая за неудачные попытки
+                    let bo = Arc::new(std::sync::atomic::AtomicU64::new(back_off));
+                    let slot: Arc<Mutex<Option<RetAdopt>>> = Default::default();
+                    let lease: Arc<Mutex<Option<DrainLease>>> = Default::default();
+                    let env = hook.clone().map(|hook| RetEnv {
+                        ep: ep.clone(), node: node.clone(), sh: sh.clone(), label: label.clone(), id, book: book.clone(), ctl: ctl.clone(),
+                        peer: peer.clone(), hook, tcp_name: format!("tcp-out-{label}-{n}"), slot: slot.clone(), lease: lease.clone(), alive: alive.clone(),
+                    });
+                    let bo2 = bo.clone();
                     let watch = tokio::spawn(async move {
+                        let (mut from, mut wait) = (tcp_from, wait_s);
                         loop {
                             tokio::time::sleep(Duration::from_millis(500)).await;
-                            if !alive2.load(Relaxed) || Instant::now() >= deadline {
+                            // срок проверяется вместе с памятью о QUIC: помеченный неработающим QUIC не повод рвать рабочий TCP
+                            if !alive2.load(Relaxed) {
                                 let _ = st2.send(true);
                                 break;
+                            }
+                            if !tcp_release_due(from.elapsed(), wait, sh2.health.is_bad(&peer2, health::Kind::Quic)) {
+                                continue;
+                            }
+                            let step = match &env {
+                                Some(env) => tcp_return(env).await,
+                                None => RetStep::Legacy,
+                            };
+                            match step {
+                                // старый пир, нет Link выхода на TCP или узел без клиента: поведение этапа 0 (снять TCP, поднять QUIC заново)
+                                RetStep::Legacy => {
+                                    let _ = st2.send(true);
+                                    break;
+                                }
+                                // QUIC доказан и несёт Link: TCP снимается, QUIC-соединение зонда усыновит дозвон
+                                RetStep::Commit => {
+                                    let _ = st2.send(true);
+                                    break;
+                                }
+                                // зонд не прошёл или пир отложил его: TCP не тронут, пауза растёт, считается заново
+                                RetStep::Stay => {
+                                    wait = grown_back_off(wait);
+                                    bo2.store(wait, Relaxed);
+                                    from = Instant::now();
+                                }
                             }
                         }
                     });
                     let started = Instant::now();
                     tcpc::attach(node.clone(), sh.clone(), format!("tcp-out-{label}-{n}"), stream, true, stop_rx).await;
+                    // QAB-M3: сторож останавливается и ДОЖИДАЕТСЯ вне любых замков (его будущее сбрасывается, ConnGuard/слот закрывают QUIC), и только
+                    // потом слот забирается: поздний сторож не может ни опубликовать, ни затереть состояние. Эпоха растёт в `ret_finish`.
                     watch.abort();
+                    let _ = watch.await;
+                    back_off = bo.load(Relaxed);
+                    let adopted = ret_finish(&ctl.ret_epoch, &slot, &ctl.ret, Ret::Idle);
+                    // QAB-R2: аренда барьера отпускается после того, как интерфейс TCP исчез из движка (offline), но не дольше 3 с и не при остановке клиента.
+                    // `attach` возвращается раньше удаления интерфейса драйвером; пока он online, новый Link мог бы выбрать его.
+                    let held = lease.lock().unwrap().take();
+                    if held.is_some() {
+                        let tcp_name = format!("tcp-out-{label}-{n}");
+                        let t_down = Instant::now();
+                        while iface_by_name(&node, &tcp_name).is_some() && alive.load(Relaxed) {
+                            if t_down.elapsed() > Duration::from_secs(3) {
+                                sh.note(format!("{label}: интерфейс TCP не исчез из движка за 3 с, аренду барьера отпускаю"));
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                    drop(held);
+                    if let Some(ad) = adopted {
+                        // QUIC-соединение зонда уже несёт Link (или TCP умер раньше): дальше это обычная QUIC-сессия
+                        ctl.ret_adopt();
+                        sh.note(format!("{label}: возврат на QUIC без разрыва Link, TCP снят"));
+                        let (conn, done, since) = ad.into_parts();
+                        quic_session(&node, &sh, &ctl, &alive, &label, &peer, conn, QuicSide::Adopted(done), since, &mut back_off, first_back).await;
+                        continue;
+                    }
                     ctl.set_mode("none");
                     // Сессия умерла сразу после рукопожатия (данные пира не доходят: чёрная дыра на пути): повтор каждые 0,5 с лишь рвёт Link,
                     // поднятый встречным соединением, при каждой смене носителя. Паузу растим 1,5 -> 3 -> ... -> 60 с, живая сессия её сбрасывает.
@@ -1898,17 +2695,19 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
                 tcpc::Dial::Blackhole => {
-                    // хост отвечает, но данные не доходят: запоминаем; QUIC, не прошедший перед этим, запоминается вместе с ним (пара заблокирована)
-                    let d = sh.health.fail(&peer, health::Kind::Tcp);
-                    sh.note(format!("{label}: TCP соединяется, но данные не доходят (DPI или чёрная дыра), запоминаю на {} мин", d.as_secs() / 60));
-                    if std::mem::take(&mut quic_suspect) {
-                        sh.health.fail(&peer, health::Kind::Quic);
+                    // хост отвечает, но данные не доходят: запоминаем; QUIC, не прошедший перед этим, запоминается вместе с ним (пара заблокирована).
+                    // Исключение: Link только что молчал на QUIC и TCP не прошёл в том же окне - общий сбой пути (handover), не блокировка носителей;
+                    // повтор такого совпадения за 10 мин считается настоящей блокировкой обоих.
+                    match record_tcp_blackhole(&sh.health, &ctl, &peer, &mut quic_suspect, Instant::now()) {
+                        Some(d) => sh.note(format!("{label}: TCP соединяется, но данные не доходят (DPI или чёрная дыра), запоминаю на {} мин", d.as_secs() / 60)),
+                        None => sh.note(format!("{label}: QUIC и TCP молчат в одном окне - общий сбой пути, носители не запоминаю")),
                     }
                     ctl.prefer_tcp.store(false, Relaxed);
                     tcp_since = None;
                 }
                 tcpc::Dial::Unreachable => {
-                    // хост не отвечает: это не признак блокировки, ничего не запоминаем
+                    // хост не отвечает: это не признак блокировки, ничего не запоминаем (в том числе подозрение на тишину по QUIC: сети нет)
+                    let _ = tcp_failed_with_silence(&ctl, false, Instant::now());
                     quic_suspect = false;
                     tcp_fail += 1;
                     if tcp_fail >= 3 {
@@ -1920,6 +2719,559 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                 }
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ QUIC-сессия и возврат TCP -> QUIC без разрыва Link
+
+/// Как QUIC-соединение подключается к RNS в `quic_session`.
+enum QuicSide {
+    /// новое соединение: привязать как интерфейс с этим именем
+    Fresh(String),
+    /// уже привязано возвратом (`tcp_return`): ждём конца задачи привязки
+    Adopted(tokio::task::JoinHandle<()>),
+}
+
+/// QUIC-сессия (датаграммы): сторож RTT и здоровья, ожидание конца, учёт паузы возврата. Общая для нового соединения и усыновлённого после возврата.
+#[allow(clippy::too_many_arguments)]
+async fn quic_session(node: &Arc<Node>, sh: &Arc<Shared>, ctl: &Arc<CarrierCtl>, alive: &Arc<AtomicBool>, label: &str, peer: &str, conn: Connection, side: QuicSide, q_start: Instant, back_off: &mut u64, first_back: u64) {
+    let c2 = conn.clone();
+    let (ctl2, alive2) = (ctl.clone(), alive.clone());
+    let (sh2, peer2) = (sh.clone(), peer.to_string());
+    let watch = tokio::spawn(async move {
+        let mut proven = false;
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Some(p) = c2.paths().iter().find(|p| p.is_selected()) {
+                ctl2.rtt_us.store(p.rtt().as_micros().min(u32::MAX as u128) as u32, Relaxed);
+            }
+            // запись «QUIC не работает» стирает не рукопожатие, а сессия, прожившая QUIC_PROVEN
+            if !proven {
+                proven = settle_quic_health(&sh2.health, &peer2, q_start.elapsed());
+            }
+            if ctl2.prefer_tcp.load(Relaxed) || !alive2.load(Relaxed) {
+                c2.close(0u32.into(), b"switch carrier");
+                break;
+            }
+        }
+    });
+    match side {
+        QuicSide::Fresh(name) => attach_datagrams_until_closed(node.clone(), sh.clone(), name, conn).await,
+        QuicSide::Adopted(done) => {
+            let _ = done.await;
+        }
+    }
+    watch.abort();
+    ctl.set_mode("none");
+    ctl.rtt_us.store(0, Relaxed);
+    sh.note(format!("quic to {label} ended"));
+    // стабильная сессия: возврат удался, пауза до следующего возврата с TCP начинается заново (потолок 30 мин сохранён)
+    let reset = back_off_after_quic(*back_off, first_back, q_start.elapsed());
+    if reset != *back_off {
+        sh.note(format!("{label}: QUIC держался {} мин, пауза возврата с TCP {back_off} -> {reset} с", q_start.elapsed().as_secs() / 60));
+        *back_off = reset;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// Доступ дозвона клиента к его Link (нужен только возврату TCP -> QUIC): у узла (mesh) его нет, там остаётся этап 0.
+#[derive(Clone)]
+struct ReturnHook {
+    ctx: Arc<ClientCtx>,
+    dest: [u8; 16],
+}
+
+/// QUIC-соединение, прошедшее зонд и привязанное к RNS рядом с TCP: ждёт переноса Link, затем усыновляется дозвоном. Владелец ресурса (QAB-M3):
+/// пока оно лежит в слоте, любое снятие слота (в том числе сброс при отмене попытки) закрывает соединение в `Drop`; задача привязки заканчивается сама.
+struct RetAdopt {
+    conn: Option<Connection>,
+    done: Option<tokio::task::JoinHandle<()>>,
+    since: Instant,
+}
+
+impl RetAdopt {
+    fn new(conn: Connection, done: tokio::task::JoinHandle<()>) -> Self {
+        Self { conn: Some(conn), done: Some(done), since: Instant::now() }
+    }
+    /// задача привязки закончилась (QUIC закрыт)
+    fn finished(&self) -> bool {
+        self.done.as_ref().map(|d| d.is_finished()).unwrap_or(true)
+    }
+    /// Передать соединение дозвону (усыновление): `Drop` после этого ничего не закрывает.
+    fn into_parts(mut self) -> (Connection, tokio::task::JoinHandle<()>, Instant) {
+        (self.conn.take().expect("conn"), self.done.take().expect("done"), self.since)
+    }
+}
+
+impl Drop for RetAdopt {
+    fn drop(&mut self) {
+        if let Some(c) = self.conn.take() {
+            c.close(0u32.into(), b"return dropped");
+        }
+    }
+}
+
+/// Соединение между открытием и передачей слоту: отмена задачи (abort сторожа) закрывает его, а не оставляет живым (QAB-M3).
+struct ConnGuard(Option<Connection>);
+
+impl ConnGuard {
+    fn new(c: Connection) -> Self {
+        Self(Some(c))
+    }
+    fn conn(&self) -> &Connection {
+        self.0.as_ref().expect("conn")
+    }
+    fn disarm(&mut self) -> Connection {
+        self.0.take().expect("conn")
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.take() {
+            c.close(0u32.into(), b"probe dropped");
+        }
+    }
+}
+
+struct RetEnv {
+    ep: Endpoint,
+    node: Arc<Node>,
+    sh: Arc<Shared>,
+    label: String,
+    id: EndpointId,
+    book: Arc<Addrs>,
+    ctl: Arc<CarrierCtl>,
+    peer: String,
+    hook: ReturnHook,
+    /// имя интерфейса TCP-носителя этой сессии
+    tcp_name: String,
+    slot: Arc<Mutex<Option<RetAdopt>>>,
+    /// аренда барьера снятия TCP (QAB-M1): кладётся перед `Legacy`/`Commit`, отпускается дозвоном, когда TCP снят
+    lease: Arc<Mutex<Option<DrainLease>>>,
+    alive: Arc<AtomicBool>,
+}
+
+enum RetStep {
+    /// этап 0: снять TCP и поднять QUIC заново. Для клиента с Link - только через барьер `drain_begin` (аренда уже в `RetEnv::lease`)
+    Legacy,
+    /// QUIC несёт Link, зависимых Link на TCP нет, барьер пройден: TCP можно снять
+    Commit,
+    /// зонд не прошёл, пир отложил его, или снятие запрещено барьером: TCP не тронут, пауза растёт
+    Stay,
+}
+
+static RET_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Через столько мин ожидания зависимых Link на TCP в заметки идёт предупреждение (принудительного срока нет: Link на TCP не рвём).
+const RET_DRAIN_NOTE: Duration = Duration::from_secs(300);
+/// Запас на задержку доставки T_PROBER: разрешение живёт с момента выдачи сервером, а клиент отсчитывает от получения ответа.
+const RET_GRANT_MARGIN: Duration = Duration::from_millis(500);
+/// Сколько нужно разрешению на сам прогон после рукопожатия (8 запросов с интервалом + ожидание эха, qprobe).
+const RET_PROBE_RUN: Duration = Duration::from_millis(1800);
+
+fn iface_by_name(node: &Arc<Node>, name: &str) -> Option<usize> {
+    node.engine().interface_stats().iter().find(|i| i.online && i.name == name).map(|i| i.interface_id.0)
+}
+
+/// QAB-L2: сколько осталось разрешению после получения T_PROBER.
+fn grant_residual(ttl: Duration, since_reply: Duration) -> Duration {
+    ttl.saturating_sub(RET_GRANT_MARGIN).saturating_sub(since_reply)
+}
+
+/// QAB-L2: сколько ждать рукопожатие при остатке разрешения `residual`. Второе - ограничен ли срок остатком (тогда таймаут не доказывает, что QUIC не работает).
+fn handshake_budget(residual: Duration) -> (Duration, bool) {
+    let cap = Duration::from_secs(6);
+    let room = residual.saturating_sub(RET_PROBE_RUN);
+    if room < cap { (room, true) } else { (cap, false) }
+}
+
+/// QAB-L2: зонд без единого эха после истечения разрешения - причина в сроке, а не в QUIC.
+fn grant_expired(echoed: u8, since_reply: Duration, ttl: Duration) -> bool {
+    echoed == 0 && since_reply >= ttl.saturating_sub(RET_GRANT_MARGIN)
+}
+
+/// Этап 0 для клиента (разрыв до установки: TCP снимается, QUIC поднимается заново) допустим только через барьер (QAB-M1): с живыми
+/// зависимыми Link, неизвестным интерфейсом или недосчитанными Link TCP остаётся. Собственный основной Link выхода при этом рвётся -
+/// так и было на этапе 0 (владельцу описано как явная развилка).
+fn stage0(e: &RetEnv, tcp_if: usize, why: &str) -> RetStep {
+    match e.hook.ctx.drain_begin(tcp_if, &e.hook.dest, true) {
+        Ok(lease) => {
+            *e.lease.lock().unwrap() = Some(lease);
+            e.sh.note(format!("{}: {why}, возвращаюсь как раньше (этап 0, разрыв Link до установки нового)", e.label));
+            RetStep::Legacy
+        }
+        Err(b) => {
+            e.sh.note(format!("{}: {why}, но TCP не снимаю ({}), остаюсь на TCP", e.label, b.describe()));
+            RetStep::Stay
+        }
+    }
+}
+
+/// Этапы A и B возврата с TCP на QUIC: теневой зонд (A), затем привязка QUIC к RNS и перенос Link супервизором (B). Вызывается сторожем TCP, когда пришёл срок
+/// возврата (вместо прежнего «снять TCP и подключиться заново», то есть без добавочных попыток и пробуждений). TCP и Link не трогаются, пока зонд не прошёл.
+/// Любое снятие TCP (в том числе Legacy) идёт только через барьер `drain_begin`.
+async fn tcp_return(e: &RetEnv) -> RetStep {
+    let (cc, label) = (&e.ctl, e.label.as_str());
+    // TCP-интерфейса уже нет: защищать нечего
+    let Some(tcp_if) = iface_by_name(&e.node, &e.tcp_name) else { return RetStep::Legacy };
+    if cc.ret_unsupported_now(Instant::now()) {
+        return stage0(e, tcp_if, "пир не знает зонд QUIC");
+    }
+    // Нужен Link выхода (ему же этот TCP): по нему просим разрешение на эхо и по нему же потом переносим трафик
+    let Some(link) = e.hook.ctx.main_link_on(&e.hook.dest, tcp_if) else {
+        return stage0(e, tcp_if, "Link выхода не на этом TCP");
+    };
+    let attempt = cc.ret_begin_attempt();
+    // 1. DNS - до запроса разрешения: разрешение живёт 10 с и не должно тратиться на разрешение имён (QAB-L2)
+    let resolved = resolve_addrs(&e.book.get()).await;
+    if resolved.is_empty() {
+        return RetStep::Stay;
+    }
+    // 2. Согласование: старый узел T_PROBEQ не знает и молчит. Первое молчание - возможная потеря пакета, второе подряд - этап 0 и память на RET_UNSUPPORTED_TTL.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    e.hook.ctx.probe_wait.lock().unwrap().insert(link, tx);
+    send_ctl(&e.node, link, T_PROBEQ, &qprobe::probeq_body(e.ep.id().as_bytes())).await;
+    let (ttl, t_rx) = match tokio::time::timeout(RET_PROBER_WAIT, rx).await {
+        Ok(Ok((true, ttl))) => {
+            cc.ret_miss.store(0, Relaxed);
+            (ttl, Instant::now())
+        }
+        Ok(Ok((false, _))) => {
+            cc.ret_miss.store(0, Relaxed);
+            e.sh.note(format!("{label}: зонд QUIC отложен узлом (слишком часто/занят), остаюсь на TCP"));
+            return RetStep::Stay;
+        }
+        _ => {
+            e.hook.ctx.probe_wait.lock().unwrap().remove(&link);
+            if cc.ret_prober_missed(Instant::now()) {
+                return stage0(e, tcp_if, "узел не отвечает на зонд QUIC дважды подряд");
+            }
+            e.sh.note(format!("{label}: ответ на запрос зонда QUIC не пришёл (1 из {RET_MISS_LIMIT}), остаюсь на TCP и повторю позже"));
+            return RetStep::Stay;
+        }
+    };
+    // 3. Отдельное соединение зонда: не привязано к RNS, Link не создаёт. Рукопожатие укладывается в остаток разрешения (QAB-L2).
+    let residual = grant_residual(ttl, t_rx.elapsed());
+    if residual < qprobe::MIN_RESIDUAL {
+        e.sh.note(format!("{label}: разрешение зонда почти истекло ({} мс), не начинаю, остаюсь на TCP", residual.as_millis()));
+        return RetStep::Stay;
+    }
+    let (hs, limited) = handshake_budget(residual);
+    let mut addr = EndpointAddr::new(e.id);
+    for a in &resolved {
+        addr = addr.with_ip_addr(*a);
+    }
+    let mut conn = match tokio::time::timeout(hs, e.ep.connect(addr, ALPN)).await {
+        Ok(Ok(c)) => ConnGuard::new(c),
+        _ => {
+            if limited {
+                e.sh.note(format!("{label}: рукопожатие зонда не уложилось в остаток разрешения ({} мс), QUIC не виню, остаюсь на TCP", hs.as_millis()));
+                return RetStep::Stay;
+            }
+            let d = e.sh.health.fail(&e.peer, health::Kind::Quic);
+            e.sh.note(format!("{label}: зонд QUIC: соединение не открылось, остаюсь на TCP, QUIC запомнен на {} мин", d.as_secs() / 60));
+            return RetStep::Stay;
+        }
+    };
+    // 4. Эхо датаграмм в обе стороны
+    let st = qprobe::run(conn.conn(), rand_core::OsRng.next_u64()).await;
+    if !qprobe::probe_passed(&st) {
+        if grant_expired(st.echoed, t_rx.elapsed(), ttl) {
+            e.sh.note(format!("{label}: разрешение зонда истекло до эха ({}/{}), QUIC не виню, остаюсь на TCP", st.echoed, st.sent));
+            return RetStep::Stay;
+        }
+        let d = e.sh.health.fail(&e.peer, health::Kind::Quic);
+        e.sh.note(format!("{label}: зонд QUIC не прошёл ({}/{} эхо за {} мс), остаюсь на TCP, QUIC запомнен на {} мин", st.echoed, st.sent, st.took_ms, d.as_secs() / 60));
+        return RetStep::Stay;
+    }
+    e.sh.note(format!("{label}: зонд QUIC прошёл ({}/{} эхо за {} мс, вверх {} Б, вниз {} Б)", st.echoed, st.sent, st.took_ms, st.bytes_up, st.bytes_down));
+    // 5. Коммит: привязать QUIC к RNS рядом с TCP; Link переносит супервизор клиента, старый держится до нового.
+    // Слот и состояние публикуются без await между привязкой и публикацией; устаревшая попытка ничего не публикует (QAB-M3).
+    let name = format!("iroh-dg-out-{label}-r{}", RET_SEQ.fetch_add(1, Relaxed));
+    let conn = conn.disarm();
+    let done = tokio::spawn(attach_datagrams_until_closed(e.node.clone(), e.sh.clone(), name.clone(), conn.clone()));
+    if ret_publish(&cc.ret_epoch, attempt, &e.slot, RetAdopt::new(conn, done), &cc.ret, Ret::Idle).is_err() {
+        e.sh.note(format!("{label}: попытка возврата устарела до публикации, QUIC закрыт"));
+        return RetStep::Stay;
+    }
+    let quic_dead = || e.slot.lock().unwrap().as_ref().map(|a| a.finished()).unwrap_or(true);
+    let teardown = |why: &str, fail: bool| {
+        // забираем ресурс и ставим Idle одним шагом; Drop закрывает QUIC вне замков
+        let taken = ret_finish(&cc.ret_epoch, &e.slot, &cc.ret, Ret::Idle);
+        drop(taken);
+        let note = if fail {
+            format!("{label}: возврат на QUIC отменён ({why}), QUIC запомнен на {} мин", e.sh.health.fail(&e.peer, health::Kind::Quic).as_secs() / 60)
+        } else {
+            format!("{label}: возврат на QUIC отменён ({why})")
+        };
+        e.sh.note(note);
+    };
+    // Интерфейс привязанного QUIC: по нему сверяется, что Link действительно ушёл на проверенный QUIC (QAB-L3)
+    let t_if = Instant::now();
+    let quic_if = loop {
+        if let Some(i) = iface_by_name(&e.node, &name) {
+            break Some(i);
+        }
+        if quic_dead() || t_if.elapsed() > Duration::from_secs(3) || !e.alive.load(Relaxed) {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let Some(quic_if) = quic_if else {
+        teardown("интерфейс QUIC не появился", false);
+        return RetStep::Stay;
+    };
+    if !cc.ret_set_if(attempt, Ret::Standby { tcp: tcp_if, quic: quic_if }) {
+        return RetStep::Stay;
+    }
+    let t0 = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if !e.alive.load(Relaxed) {
+            teardown("клиент останавливается", false);
+            return RetStep::Stay;
+        }
+        if quic_dead() {
+            teardown("QUIC закрылся до переноса", true);
+            return RetStep::Stay;
+        }
+        match cc.ret_get() {
+            Ret::Moved => break,
+            Ret::Failed => {
+                teardown("Link не поднялся на QUIC", true);
+                return RetStep::Stay;
+            }
+            Ret::Left => {
+                teardown("Link ушёл с TCP другим путём, проверенный QUIC его не несёт", false);
+                e.sh.note(format!("{label}: Link ушёл с TCP по другому пути - это не перенос на QUIC, режим носителя не меняю"));
+                return RetStep::Stay;
+            }
+            _ if t0.elapsed() > RET_MOVE_TIMEOUT => {
+                teardown("Link не перенесён вовремя", true);
+                return RetStep::Stay;
+            }
+            _ => {}
+        }
+    }
+    // 6. Link уже на проверенном QUIC (mode = quic). TCP снимается только через барьер: пока на нём что-либо живо, неизвестно или недосчитано - остаётся (без срока)
+    let drain0 = Instant::now();
+    let mut noted = false;
+    loop {
+        if !e.alive.load(Relaxed) {
+            return RetStep::Stay;
+        }
+        if quic_dead() || cc.prefer_tcp.load(Relaxed) {
+            // QUIC потерян или монитор нашёл потери UDP, пока на TCP ещё живы Link: носитель снова TCP, а Link на QUIC пересоберёт супервизор
+            let taken = ret_finish(&cc.ret_epoch, &e.slot, &cc.ret, Ret::Idle);
+            drop(taken);
+            cc.ret_revert();
+            let d = e.sh.health.fail(&e.peer, health::Kind::Quic);
+            e.sh.note(format!("{label}: QUIC потерян до снятия TCP, возвращаюсь на TCP, QUIC запомнен на {} мин", d.as_secs() / 60));
+            return RetStep::Stay;
+        }
+        match e.hook.ctx.drain_begin(tcp_if, &e.hook.dest, false) {
+            Ok(lease) => {
+                *e.lease.lock().unwrap() = Some(lease);
+                return RetStep::Commit;
+            }
+            Err(b) => {
+                if !noted && drain0.elapsed() > RET_DRAIN_NOTE {
+                    noted = true;
+                    e.sh.note(format!("{label}: TCP не снимаю: {}", b.describe()));
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+impl ClientCtx {
+    /// Link выхода `dest`, который сейчас основной и привязан к интерфейсу `iface`.
+    fn main_link_on(&self, dest: &[u8; 16], iface: usize) -> Option<LinkId> {
+        let (d, id, _) = (*self.cur.lock().unwrap())?;
+        let on = self.node.engine().link_stats(&id).and_then(|s| s.attached_interface()) == Some(iface);
+        (d == *dest && on).then_some(id)
+    }
+
+    /// QAB-M1: единый отказобезопасный барьер снятия TCP-носителя `iface` (все ветки: Commit, Legacy, неподдерживающий пир, потерянный T_PROBER).
+    /// Под замком `drain` (порядок замков: drain -> cur/extra/admitted -> движок; никто не держит cur/extra/admitted, беря drain) собираются все
+    /// зависимые Link по ФАКТИЧЕСКОМУ интерфейсу: основной, дополнительные, допущенные, и Link в процессе подключения (билеты `ConnectTicket`,
+    /// в том числе конечный Link к другому выходу, идущий транзитом через этот носитель). Вердикт - `drain_verdict`; успех помечает интерфейс
+    /// снимаемым: новые привязки к нему запрещены (`carrier_ifaces`, `ConnectTicket::begin`) до конца аренды.
+    /// Ограничение: транзитные Link, которые узел ретранслирует для других (core, API форка их не перечисляет), здесь видны только косвенно -
+    /// через разницу счётчиков движка `uncounted`; клиент (телефон) транзита не ретранслирует. При любой неопределённости - отказ, TCP остаётся.
+    fn drain_begin(self: &Arc<Self>, iface: usize, own: &[u8; 16], allow_own_main: bool) -> std::result::Result<DrainLease, DrainBlock> {
+        let mut d = self.drain.lock().unwrap();
+        let mut known: Vec<(LinkId, Option<[u8; 16]>)> = Vec::new();
+        if let Some((dest, id, _)) = *self.cur.lock().unwrap() {
+            known.push((id, Some(dest)));
+        }
+        known.extend(self.tun.extra.read().unwrap().values().map(|x| (x.id, None)));
+        known.extend(self.admitted_exits.lock().unwrap().keys().map(|id| (*id, None)));
+        let eng = self.node.engine();
+        let counted = eng.active_link_count() + eng.pending_link_count();
+        d.try_drain(iface, own, allow_own_main, &known, |id| eng.link_stats(id).map(|s| s.attached_interface()), counted)?;
+        Ok(DrainLease { ctx: self.clone(), iface })
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ барьер снятия TCP (QAB-M1)
+
+/// Зависимость от носителя: Link (или подключение) и интерфейс, к которому он ФАКТИЧЕСКИ привязан (None - пока неизвестен).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dep {
+    iface: Option<usize>,
+    /// выход, для которого это основной Link
+    main_of: Option<[u8; 16]>,
+}
+
+/// Почему носитель снять нельзя.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainBlock {
+    /// на интерфейсе живут Link, которые мы не вправе рвать
+    Live(usize),
+    /// интерфейс Link/подключения ещё неизвестен: "не знаем" не равно "можно отрезать"
+    Unknown(usize),
+    /// движок знает больше Link, чем мы перечислили (транзит, Link между регистрациями)
+    Uncounted(usize),
+}
+
+impl DrainBlock {
+    fn describe(&self) -> String {
+        match self {
+            DrainBlock::Live(n) => format!("на носителе живых зависимых Link: {n}"),
+            DrainBlock::Unknown(n) => format!("неизвестный интерфейс у {n} Link/подключений"),
+            DrainBlock::Uncounted(n) => format!("движок знает на {n} Link больше, чем перечислено"),
+        }
+    }
+}
+
+/// Чистый вердикт барьера. `Ok(n)` - снять можно, при этом оборвутся `n` основных Link собственного выхода `own` (только если `allow_own_main`:
+/// этап 0, разрыв до установки; ветка Commit ничего не рвёт, `allow_own_main = false`). Порядок проверок: неизвестное -> живое чужое -> недосчитанное.
+fn drain_verdict(deps: &[Dep], iface: usize, own: &[u8; 16], allow_own_main: bool, uncounted: usize) -> std::result::Result<usize, DrainBlock> {
+    let unknown = deps.iter().filter(|d| d.iface.is_none()).count();
+    if unknown > 0 {
+        return Err(DrainBlock::Unknown(unknown));
+    }
+    let on: Vec<&Dep> = deps.iter().filter(|d| d.iface == Some(iface)).collect();
+    let own_main = on.iter().filter(|d| allow_own_main && d.main_of == Some(*own)).count();
+    let live = on.len() - own_main;
+    if live > 0 {
+        return Err(DrainBlock::Live(live));
+    }
+    if uncounted > 0 {
+        return Err(DrainBlock::Uncounted(uncounted));
+    }
+    Ok(own_main)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Ticket {
+    /// интерфейс пути, по которому открывается Link (None - ещё ищем путь)
+    iface: Option<usize>,
+    link: Option<LinkId>,
+}
+
+/// Состояние барьера: снимаемые интерфейсы и подключения в процессе. Чистые методы - тестируются без сети.
+#[derive(Default)]
+struct DrainState {
+    draining: HashSet<usize>,
+    tickets: HashMap<u64, Ticket>,
+    next: u64,
+}
+
+impl DrainState {
+    fn open(&mut self) -> u64 {
+        self.next += 1;
+        self.tickets.insert(self.next, Ticket { iface: None, link: None });
+        self.next
+    }
+    /// Подключение выбрало путь по `iface`. Атомарно с `try_drain`: на снимаемый интерфейс новые подключения не привязываются.
+    fn begin_connect(&mut self, t: u64, iface: usize) -> bool {
+        if self.draining.contains(&iface) {
+            return false;
+        }
+        if let Some(x) = self.tickets.get_mut(&t) {
+            x.iface = Some(iface);
+        }
+        true
+    }
+    fn set_link(&mut self, t: u64, link: LinkId) {
+        if let Some(x) = self.tickets.get_mut(&t) {
+            x.link = Some(link);
+        }
+    }
+    fn close(&mut self, t: u64) {
+        self.tickets.remove(&t);
+    }
+    /// `known` - Link, перечисленные владельцами (основной/дополнительные/допущенные), `stats` - фактический интерфейс Link (внешний None - Link мёртв),
+    /// `counted` - сколько Link знает движок (активных + в рукопожатии).
+    fn try_drain(&mut self, iface: usize, own: &[u8; 16], allow_own_main: bool, known: &[(LinkId, Option<[u8; 16]>)],
+        stats: impl Fn(&LinkId) -> Option<Option<usize>>, counted: usize) -> std::result::Result<usize, DrainBlock> {
+        let mut by_id: HashMap<LinkId, Option<[u8; 16]>> = HashMap::new();
+        for (id, main) in known {
+            let e = by_id.entry(*id).or_insert(None);
+            *e = e.or(*main);
+        }
+        for t in self.tickets.values() {
+            if let Some(id) = t.link {
+                by_id.entry(id).or_insert(None);
+            }
+        }
+        let mut deps: Vec<Dep> = Vec::new();
+        let mut alive = 0usize;
+        for (id, main_of) in &by_id {
+            // мёртвый Link (движок его не знает) ничего не держит
+            if let Some(att) = stats(id) {
+                alive += 1;
+                deps.push(Dep { iface: att, main_of: *main_of });
+            }
+        }
+        // подключение без Link: интерфейс пути, если уже выбран, иначе неизвестен
+        for t in self.tickets.values().filter(|t| t.link.is_none()) {
+            deps.push(Dep { iface: t.iface, main_of: None });
+        }
+        let r = drain_verdict(&deps, iface, own, allow_own_main, counted.saturating_sub(alive))?;
+        self.draining.insert(iface);
+        Ok(r)
+    }
+}
+
+/// Аренда: пока жива, интерфейс считается снимаемым. Отпускается, когда носитель снят (или попытка снять отменена).
+struct DrainLease {
+    ctx: Arc<ClientCtx>,
+    iface: usize,
+}
+
+impl Drop for DrainLease {
+    fn drop(&mut self) {
+        self.ctx.drain.lock().unwrap().draining.remove(&self.iface);
+    }
+}
+
+/// Билет подключения Link: пока жив, барьер знает, что идёт подключение (путь ещё не выбран - снятие запрещено).
+struct ConnectTicket {
+    ctx: Arc<ClientCtx>,
+    id: u64,
+}
+
+impl ConnectTicket {
+    fn new(ctx: &Arc<ClientCtx>) -> Self {
+        let id = ctx.drain.lock().unwrap().open();
+        Self { ctx: ctx.clone(), id }
+    }
+    /// false - интерфейс снимается: подключаться по нему нельзя.
+    fn begin(&self, iface: usize) -> bool {
+        self.ctx.drain.lock().unwrap().begin_connect(self.id, iface)
+    }
+    fn set_link(&self, link: LinkId) {
+        self.ctx.drain.lock().unwrap().set_link(self.id, link);
+    }
+}
+
+impl Drop for ConnectTicket {
+    fn drop(&mut self) {
+        self.ctx.drain.lock().unwrap().close(self.id);
     }
 }
 
@@ -2404,7 +3756,7 @@ fn node_bench_rtt(ctx: &NodeCtx) -> Option<f64> {
     n.last_heard.elapsed().lt(&Duration::from_secs(5)).then_some(n.rtt_ms).flatten()
 }
 
-/// Запрос от ноды (`bench/req-<id>.json`, кладёт `rawgd bench`): сосед с живым Link с ролью сервера, одна сессия за раз.
+/// Запрос от ноды (`bench/req-<id>.json`, кладёт `knothopd bench`): сосед с живым Link с ролью сервера, одна сессия за раз.
 fn bench_node_start(ctx: &Arc<NodeCtx>, id: u32, to: &str, mb: u64, timeout: u64) -> std::result::Result<(), String> {
     if mb == 0 || mb > BENCH_MAX_MB {
         return Err(format!("объём: от 1 до {BENCH_MAX_MB} МБ"));
@@ -2550,6 +3902,106 @@ struct LinkInfo {
     /// H10: частота управляющих сообщений
     ctrl: CtrlBucket,
     observation: crate::observations::Subscription,
+    /// Биты `AdmitDiag`, уже записанные в журнал для этого Link: одна строка на Link и причину.
+    diag: u8,
+}
+
+/// Причины, по которым нода раньше молча не допускала клиента (ни записи в журнал, ни T_AUTH_FAIL).
+/// Это только диагностика: решение о допуске принимают права, а не эти значения.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AdmitDiag {
+    /// Link только для зачисления (шифр CBC или не определён - fail-closed, либо прямое зачисление по приглашению).
+    EnrollOnly,
+    /// Клиент прислал T_USE, общей цепочки EXIT/USE пока нет: цепочка может дойти позже, поэтому только запись в журнал.
+    NoChainWait,
+    /// То же после `NO_CHAIN_FAIL_AFTER`: цепочки по-прежнему нет, клиент получает T_AUTH_FAIL.
+    NoChain,
+    /// Допуск не состоялся, хотя Link ещё жив и не допущен (права или Link изменились между оценкой и публикацией).
+    NotAuthorized,
+}
+
+impl AdmitDiag {
+    const fn bit(self) -> u8 {
+        match self {
+            AdmitDiag::EnrollOnly => 1,
+            AdmitDiag::NoChainWait => 2,
+            AdmitDiag::NoChain => 4,
+            AdmitDiag::NotAuthorized => 8,
+        }
+    }
+
+    /// Причина для журнала: без адресов, ключей и полных хешей.
+    const fn note(self) -> &'static str {
+        match self {
+            AdmitDiag::EnrollOnly => "клиент не допущен: Link только для зачисления (шифр CBC/не определён либо приглашение)",
+            AdmitDiag::NoChainWait => "клиент пока не допущен: общей цепочки EXIT/USE нет, жду записи",
+            AdmitDiag::NoChain => "клиент не допущен: общей цепочки EXIT/USE нет",
+            AdmitDiag::NotAuthorized => "клиент не допущен: права или Link изменились до допуска",
+        }
+    }
+
+    /// Фиксированный ответ клиенту; `None` - клиенту не отвечаем.
+    const fn fail(self) -> Option<&'static [u8]> {
+        match self {
+            AdmitDiag::EnrollOnly => Some(b"link not eligible"),
+            AdmitDiag::NoChainWait => None,
+            AdmitDiag::NoChain => Some(b"no common exit chain"),
+            AdmitDiag::NotAuthorized => Some(b"not authorized"),
+        }
+    }
+}
+
+/// Сколько ждать цепочку, прежде чем сообщить клиенту об отказе. Меньше 6 с ожидания клиента (`connect_exit`);
+/// цепочка клиента уходит сразу после identify, поэтому окно допуска почти не сокращается.
+const NO_CHAIN_FAIL_AFTER: Duration = Duration::from_secs(5);
+/// Общий предел строк диагностики допуска: Link с чужими identity создаёт кто угодно, журнал не должен расти от этого.
+const DIAG_MAX_PER_WINDOW: u32 = 16;
+const DIAG_WINDOW_MS: u64 = 10_000;
+
+/// Окно с ограничением числа строк; подавленные строки считаются и сообщаются одной строкой в начале следующего окна.
+struct DiagBudget {
+    window_start_ms: u64,
+    used: u32,
+    dropped: u32,
+}
+
+impl DiagBudget {
+    const fn new() -> Self {
+        DiagBudget { window_start_ms: 0, used: 0, dropped: 0 }
+    }
+
+    /// `(писать ли строку, сколько строк подавлено в прошлом окне - сообщить)`.
+    fn allow(&mut self, now_ms: u64) -> (bool, u32) {
+        let mut report = 0;
+        if now_ms.saturating_sub(self.window_start_ms) >= DIAG_WINDOW_MS {
+            report = std::mem::take(&mut self.dropped);
+            self.window_start_ms = now_ms;
+            self.used = 0;
+        }
+        if self.used < DIAG_MAX_PER_WINDOW {
+            self.used += 1;
+            (true, report)
+        } else {
+            self.dropped += 1;
+            (false, report)
+        }
+    }
+}
+
+static DIAG_BUDGET: Mutex<DiagBudget> = Mutex::new(DiagBudget::new());
+
+/// Помечает причину для Link; `true` - первый раз (запись и ответ положены). Нет Link - `false`.
+fn diag_first(links: &Mutex<HashMap<LinkId, LinkInfo>>, link: LinkId, d: AdmitDiag) -> bool {
+    let mut l = links.lock().unwrap();
+    let Some(i) = l.get_mut(&link) else { return false };
+    let first = i.diag & d.bit() == 0;
+    i.diag |= d.bit();
+    first
+}
+
+/// Клиент (прислал T_USE) с этим ключом по-прежнему ждёт допуска на этом Link.
+fn client_awaiting_admission(links: &Mutex<HashMap<LinkId, LinkInfo>>, link: LinkId, pk: &[u8; 64]) -> bool {
+    links.lock().unwrap().get(&link).is_some_and(|i| i.peer_pk.as_ref() == Some(pk) && i.want_use && matches!(i.role, Role::Unknown))
 }
 
 struct Neighbor {
@@ -2608,6 +4060,9 @@ struct NodeCtx {
     /// клиенты-узлы соседей по T_CINFO: dest -> (имя, тип, когда); не больше CINFO_MAX, живут CINFO_TTL
     peer_clients: Mutex<HashMap<[u8; 16], (String, &'static str, Instant)>>,
     links: Mutex<HashMap<LinkId, LinkInfo>>,
+    /// Legacy registry admission serialization. Model 0013 instead holds Trust -> links across
+    /// role/TUN publication; close shares links, so neither model can resurrect a removed Link.
+    tun_admission: Mutex<()>,
     pending_nr: Mutex<HashMap<LinkId, [u8; 16]>>,
     neigh: Mutex<HashMap<[u8; 16], Neighbor>>,
     reg: Mutex<Registry>,
@@ -2633,7 +4088,7 @@ struct NodeCtx {
 /// Состояние модели 0013 на узле.
 struct T13 {
     /// записи о правах и якоря; порядок блокировок: invite, затем trust
-    trust: Mutex<trust::Trust>,
+    trust: Arc<Mutex<trust::Trust>>,
     /// приглашение, по которому нода ещё не зачислена; после зачисления None
     invite: Mutex<Option<trust::Invite>>,
     /// Link, по которым T_PAIR1 уже отправлен (по одному разу на Link)
@@ -2977,15 +4432,61 @@ impl NodeCtx {
         });
     }
 
-    fn drop_link_state(&self, link: &LinkId) {
-        if let Some(t) = &self.tun {
-            t.disallow(link);
+    /// Одна строка журнала на Link и причину плюс T_AUTH_FAIL с фиксированным текстом (если он положен причине).
+    /// Только сообщает об уже принятом решении: Link не закрывается, права и допуск не меняются.
+    fn admit_diag(self: &Arc<Self>, link: LinkId, pk: &[u8; 64], d: AdmitDiag) {
+        if !diag_first(&self.links, link, d) {
+            return;
         }
+        self.diag_note(link, pk, d);
+        if let Some(reason) = d.fail() {
+            spawn_ctl(&self.node, link, T_AUTH_FAIL, reason.to_vec());
+        }
+    }
+
+    /// Строка журнала в рамках общего бюджета `DIAG_BUDGET`.
+    fn diag_note(&self, link: LinkId, pk: &[u8; 64], d: AdmitDiag) {
+        let (write, dropped) = DIAG_BUDGET.lock().unwrap().allow(now_ms() as u64);
+        if dropped > 0 {
+            self.sh.note(format!("диагностика допуска: подавлено строк {dropped}"));
+        }
+        if write {
+            let who = trust::hash_of(pk).map(|h| hex(&h)[..8].to_string()).unwrap_or_else(|| "?".into());
+            self.sh.note(format!("link {} (id {who}): {}", &hex(link.as_bytes())[..8], d.note()));
+        }
+    }
+
+    /// Клиент без общей цепочки: сразу запись в журнал, отказ клиенту - только если спустя `NO_CHAIN_FAIL_AFTER` Link всё ещё
+    /// ждёт допуска и права по-прежнему нет (запоздавшая цепочка допускает клиента обычным путём через `evaluate`).
+    fn no_chain_watch(self: &Arc<Self>, link: LinkId, pk: [u8; 64]) {
+        if !diag_first(&self.links, link, AdmitDiag::NoChainWait) {
+            return;
+        }
+        // Бит выставлен: повторный вызов `evaluate` не создаст второй таймер.
+        self.diag_note(link, &pk, AdmitDiag::NoChainWait);
+        let c = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(NO_CHAIN_FAIL_AFTER).await;
+            let Some(t) = &c.t13 else { return };
+            let now = now_ms() as u64;
+            let rights = {
+                let tr = t.trust.lock().unwrap();
+                tr.common_with(&pk, trust::EXIT, trust::USE, true, false, now) || tr.common(&pk, trust::EXIT, trust::USE)
+            };
+            if !rights && client_awaiting_admission(&c.links, link, &pk) {
+                c.admit_diag(link, &pk, AdmitDiag::NoChain);
+            }
+        });
+    }
+
+    fn drop_link_state(&self, link: &LinkId) {
+        let removed = remove_link_admission(&self.links, link, || {
+            if let Some(t) = &self.tun { t.disallow(link); }
+        });
         if let Some(t) = &self.t13 {
             t.pair_sent.lock().unwrap().remove(link);
             t.dir_sent.lock().unwrap().remove(link);
         }
-        let removed = self.links.lock().unwrap().remove(link);
         if let Some(l) = removed {
             // неудавшееся серверное рукопожатие: следующий анонс соседа запустит новую попытку
             if let Role::SrvInit { dest, .. } = l.role {
@@ -3046,8 +4547,8 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     let region = detect_region(&a.state).await;
     let _ = REGION.set(region.clone());
     if a.name.is_empty() {
-        // имя вида knothop-<РЕГИОН>-<что угодно>: регион по внешнему IP, хвост - имя хоста (или RAWGD_NAME_SUFFIX)
-        let suffix = std::env::var("RAWGD_NAME_SUFFIX").ok().filter(|v| !v.is_empty()).unwrap_or_else(hostname);
+        // имя вида knothop-<РЕГИОН>-<что угодно>: регион по внешнему IP, хвост - имя хоста (или KNOTHOP_NAME_SUFFIX)
+        let suffix = std::env::var("KNOTHOP_NAME_SUFFIX").ok().filter(|v| !v.is_empty()).unwrap_or_else(hostname);
         a.name = format!("knothop-{region}-{suffix}").chars().take(48).collect();
     }
     // Модель допуска: 0013 (права и якоря доверия; без --secret-file) или legacy (общий серверный секрет). Смешивать нельзя.
@@ -3078,8 +4579,8 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     let identity = load_or_create_identity(&a.state)?;
     let key = iroh_key_from_identity(&identity)?;
     let exit_args = ["--tun-mtu", "1327", "--tun-ip", "10.99.0.1/24", "--tun-txqlen", "10240", "--tun-qdisc", "fq_codel", "--tun-name", a.tun_name.as_str()];
-    let b = start_base("n", &a.state, true, Some(a.port), key, a.quic_cc_mbit, if a.no_exit { &[] } else { &exit_args[..] }, None).await?;
-    let (node, sh, ep, cli, events) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events);
+    let b = start_base("n", &a.state, true, Some(a.port), key, (!legacy).then(|| identity.clone()), a.quic_cc_mbit, if a.no_exit { &[] } else { &exit_args[..] }, None).await?;
+    let (node, sh, ep, cli, events, admin_lxmf) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events, b.admin_lxmf);
 
     let tag = if legacy { group_tag(&a.group) } else { T13_TAG.to_string() };
     let my_pk = identity.public_key_bytes();
@@ -3118,7 +4619,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
                 }
             }
         }
-        Some(T13 { trust: Mutex::new(tr), invite: Mutex::new(inv), pair_sent: Mutex::new(HashSet::new()), pairq_seen: Mutex::new(HashMap::new()),
+        Some(T13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), pair_sent: Mutex::new(HashSet::new()), pairq_seen: Mutex::new(HashMap::new()),
             early: Mutex::new(Vec::new()), trust_dirty: AtomicBool::new(false), admin_seen: Mutex::new(None), relay_try: Mutex::new(HashMap::new()), dir_sent: Mutex::new(HashMap::new()) })
     };
 
@@ -3126,6 +4627,13 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         None
     } else {
         let t = TunState::open(&cli, true)?;
+        let acl_path = a.state.join("host-acl.json");
+        if let Err(error) = t.configure_host_acl(&acl_path) {
+            let status = serde_json::json!({"state":"error","status":"host ACL configuration failed","host_acl":{"ready":false,"error":format!("{error:#}")},"ts_ms":now_ms() as u64});
+            write_atomic(&a.state.join("status.json"), status.to_string().as_bytes());
+            bail!("host ACL configuration failed; refusing to admit clients: {error:#}");
+        }
+        if !t.host_acl_ready() { bail!("host ACL did not become ready; refusing to admit clients"); }
         t.enforce.store(true, Relaxed);
         // обратный маршрут для адресов клиентов; NAT выхода настраивает окружение (контейнер/хост)
         let _ = std::process::Command::new("ip").args(["route", "replace", &net_str(), "dev", &cli.tun_name]).status();
@@ -3134,9 +4642,9 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         Some(t)
     };
 
-    // Адрес узла: флаг/конфиг, затем переменная RAWGD_ADVERTISE (единственное, что может отличаться на узле при одинаковом конфиге;
+    // Адрес узла: флаг/конфиг, затем переменная KNOTHOP_ADVERTISE (единственное, что может отличаться на узле при одинаковом конфиге;
     // для динамического IP - доменное имя `host:порт`), иначе автоопределение глобальных адресов интерфейсов.
-    let env_adv = std::env::var("RAWGD_ADVERTISE").unwrap_or_default();
+    let env_adv = std::env::var("KNOTHOP_ADVERTISE").unwrap_or_default();
     let mut advertise: Vec<String> = [a.advertise.as_str(), env_adv.as_str()].iter().flat_map(|t| t.split(',')).map(str::trim).filter(|s| !s.is_empty()).map(String::from).take(3).collect();
     let mut adv_auto = None;
     if advertise.is_empty() {
@@ -3150,12 +4658,15 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         node: node.clone(), sh: sh.clone(), ep: ep.clone(), state: a.state.clone(), name: a.name.clone(), group: a.group.clone(), tag: tag.clone(),
         identity: node_identity, akey: server_auth_key(&secret, &a.group), my_pk, my_id, my_dest, my_key, ep_id: ep.id().to_string(), advertise: Mutex::new(advertise), adv_auto,
         announce_s: a.announce_s, dead: Duration::from_secs(a.dead_s), path_gate: path::PathGate::default(), client_info: Mutex::new(HashMap::new()), peer_clients: Mutex::new(HashMap::new()),
-        links: Mutex::new(HashMap::new()), pending_nr: Mutex::new(HashMap::new()), neigh: Mutex::new(HashMap::new()), reg: Mutex::new(Registry::load(&a.state.join("clients.json"))),
+        links: Mutex::new(HashMap::new()), tun_admission: Mutex::new(()), pending_nr: Mutex::new(HashMap::new()), neigh: Mutex::new(HashMap::new()), reg: Mutex::new(Registry::load(&a.state.join("clients.json"))),
         tun, started: Instant::now(), announce_at: Default::default(), last_trigger: Mutex::new(Instant::now() - Duration::from_secs(3600)),
         ours_online: Default::default(), listen_port: a.port, public_ids: Mutex::new(HashSet::new()),
         t13,
         bench_sess: Mutex::new(None), bench_serving: AtomicBool::new(false), bench_rate: Mutex::new(HashMap::new()),
     });
+    if let Some(runtime) = admin_lxmf {
+        lxmf_admin::spawn_node_worker(runtime, ctx.clone());
+    }
     if let Some(t) = &ctx.t13 {
         let tr = t.trust.lock().unwrap();
         let inv = t.invite.lock().unwrap();
@@ -3180,7 +4691,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     tokio::spawn(tcpc::listen(node.clone(), sh.clone(), a.port));
     for s in a.seed.split(',').filter(|s| !s.is_empty()) {
         if let Some((id, addrs)) = parse_peer(s) {
-            tokio::spawn(dial_direct(ep.clone(), node.clone(), sh.clone(), format!("seed-{}", id.fmt_short()), id, Addrs::new(addrs), Arc::new(AtomicBool::new(true)), CarrierCtl::new()));
+            tokio::spawn(dial_direct(ep.clone(), node.clone(), sh.clone(), format!("seed-{}", id.fmt_short()), id, Addrs::new(addrs), Arc::new(AtomicBool::new(true)), CarrierCtl::new(), None));
         } else {
             sh.note(format!("bad --seed entry {s:?} (want id@ip:port)"));
         }
@@ -3248,7 +4759,7 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
             NodeEvent::LinkEstablished { link_id, is_initiator, .. } => {
                 ctx.sh.established.lock().unwrap().insert(hex(link_id.as_bytes()));
                 if !is_initiator {
-                    if std::env::var("RAWG_DEBUG").is_ok() {
+                    if std::env::var("KNOTHOP_DEBUG").is_ok() {
                         ctx.sh.note(format!("входящий Link {}", &hex(link_id.as_bytes())[..8]));
                     }
                     // H10: интерфейс носителя известен из состояния Link (если его ещё нет - лимит на интерфейс не применяем, общий работает)
@@ -3264,7 +4775,7 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
                         ctx.close_link(link_id, "слишком много неавторизованных link");
                         continue;
                     }
-                    l.insert(link_id, LinkInfo { role: Role::Unknown, since: Instant::now(), last_heard: Instant::now(), peer_pk: None, want_use: false, enroll_only: cbc, iface, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default() });
+                    l.insert(link_id, LinkInfo { role: Role::Unknown, since: Instant::now(), last_heard: Instant::now(), peer_pk: None, want_use: false, enroll_only: cbc, iface, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 });
                 }
             }
             NodeEvent::LinkClosed { link_id, reason, .. } => {
@@ -3292,7 +4803,7 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
 }
 
 fn on_announce(ctx: &Arc<NodeCtx>, ann: &leviculum_std::ReceivedAnnounce) {
-    if std::env::var("RAWG_DEBUG").is_ok() {
+    if std::env::var("KNOTHOP_DEBUG").is_ok() {
         ctx.sh.note(format!("announce from {} path_response={} data={}", hex(&ann.destination_hash().as_bytes()[..4]), ann.is_path_response(), String::from_utf8_lossy(ann.app_data()).chars().take(60).collect::<String>()));
     }
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(ann.app_data()) else { return };
@@ -3410,7 +4921,7 @@ fn maybe_dial(ctx: &Arc<NodeCtx>, dest: [u8; 16]) {
         let sa: Vec<String> = nb.addrs.get();
         tokio::spawn({
             let (ep, node, sh, label, cc, book) = (ctx.ep.clone(), ctx.node.clone(), ctx.sh.clone(), nb.name.clone(), nb.ctl.clone(), nb.addrs.clone());
-            async move { dial_direct(ep, node, sh, label, id, book, alive, cc).await }
+            async move { dial_direct(ep, node, sh, label, id, book, alive, cc, None).await }
         });
         (id, sa, nb.name.clone())
     };
@@ -3458,7 +4969,7 @@ async fn connect_neighbor(ctx: Arc<NodeCtx>, dest: [u8; 16]) {
         Ok(id) => {
             if ctx.t13.is_some() {
                 // 0013: роль не зависит от инициативы. Сначала identify (ответчик узнаёт нас), затем обе стороны обмениваются цепочками прав
-                ctx.links.lock().unwrap().insert(id, LinkInfo { role: Role::Unknown, since: Instant::now(), last_heard: Instant::now(), peer_pk: Some(pk), want_use: false, enroll_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default() });
+                ctx.links.lock().unwrap().insert(id, LinkInfo { role: Role::Unknown, since: Instant::now(), last_heard: Instant::now(), peer_pk: Some(pk), want_use: false, enroll_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 });
                 let c = ctx.clone();
                 tokio::spawn(async move {
                     let my_id = c.identity.clone();
@@ -3470,7 +4981,7 @@ async fn connect_neighbor(ctx: Arc<NodeCtx>, dest: [u8; 16]) {
                 });
             } else {
                 let nonce_i = rand16();
-                ctx.links.lock().unwrap().insert(id, LinkInfo { role: Role::SrvInit { dest, nonce_i, pub_i: ctx.my_pk, mac_sent: false }, since: Instant::now(), last_heard: Instant::now(), peer_pk: None, want_use: false, enroll_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default() });
+                ctx.links.lock().unwrap().insert(id, LinkInfo { role: Role::SrvInit { dest, nonce_i, pub_i: ctx.my_pk, mac_sent: false }, since: Instant::now(), last_heard: Instant::now(), peer_pk: None, want_use: false, enroll_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 });
                 let mut body = Vec::new();
                 body.extend_from_slice(&nonce_i);
                 body.extend_from_slice(&ctx.my_pk);
@@ -3489,6 +5000,46 @@ async fn connect_neighbor(ctx: Arc<NodeCtx>, dest: [u8; 16]) {
     }
 }
 
+/// Решение вызывающего по результату авторитетного допуска в TUN (`TunState::allow`).
+#[derive(Debug, PartialEq, Eq)]
+enum AdmitOutcome {
+    /// Link и маршрут занесены: можно слать AUTH_OK.
+    SendAuthOk,
+    /// Отказ: слать только AUTH_FAIL с этой причиной и закрыть Link; AUTH_OK недопустим.
+    Refuse { reason: &'static [u8], note: &'static str },
+}
+
+fn admission_outcome(result: Result<Admission, AdmissionError>) -> AdmitOutcome {
+    match result {
+        Ok(_) => AdmitOutcome::SendAuthOk,
+        Err(AdmissionError::AclNotReady) => AdmitOutcome::Refuse { reason: b"exit not ready", note: "host ACL не готов" },
+        Err(AdmissionError::Capacity) => AdmitOutcome::Refuse { reason: b"exit client capacity", note: "exit client capacity" },
+        Err(AdmissionError::AddressInUse) => AdmitOutcome::Refuse { reason: b"address clash", note: "конфликт адреса клиента" },
+        Err(AdmissionError::LinkAddressChanged) => AdmitOutcome::Refuse { reason: b"address changed", note: "адрес Link изменился" },
+    }
+}
+
+/// Legacy admission only. The live Client role stays locked through allow/permission publication;
+/// model 0013 uses promote_client_link with current ordinary Trust authority as well.
+fn admit_into_tun(ctx: &Arc<NodeCtx>, tun: &Arc<TunState>, link: LinkId, ip: u32, publish_host_access: &dyn Fn() -> bool) -> bool {
+    let handle = Arc::new(ctx.node.engine().link_handle(&link));
+    let outcome = {
+        let live = ctx.links.lock().unwrap();
+        if !live.get(&link).is_some_and(|i| matches!(i.role, Role::Client { ip: p, .. } if p == ip)) { return false; }
+        match admission_outcome(tun.allow_with_handle(link, ip, handle)) {
+            AdmitOutcome::SendAuthOk if publish_host_access() => AdmitOutcome::SendAuthOk,
+            AdmitOutcome::SendAuthOk => AdmitOutcome::Refuse { reason: b"admission failed", note: "допуск в TUN не завершён" },
+            refusal => refusal,
+        }
+    };
+    if let AdmitOutcome::Refuse { reason, note } = outcome {
+        spawn_ctl(&ctx.node, link, T_AUTH_FAIL, reason.to_vec());
+        ctx.close_link(link, note);
+        return false;
+    }
+    true
+}
+
 fn on_identified(ctx: &Arc<NodeCtx>, link: LinkId, idh: [u8; 16]) {
     let ok = matches!(ctx.links.lock().unwrap().get(&link).map(|l| &l.role), Some(Role::Unknown));
     if !ok {
@@ -3503,6 +5054,7 @@ fn on_identified(ctx: &Arc<NodeCtx>, link: LinkId, idh: [u8; 16]) {
         }
         return;
     }
+    let _tun_admission = ctx.tun_admission.lock().unwrap();
     let idhex = hex(&idh);
     let rec = ctx.reg.lock().unwrap().active(&idhex).cloned();
     let Some(rec) = rec else {
@@ -3526,7 +5078,16 @@ fn on_identified(ctx: &Arc<NodeCtx>, link: LinkId, idh: [u8; 16]) {
     }
     let ip = client_ip(&idh);
     // один адрес - один активный клиент: чужой Link с тем же адресом не вытесняется
-    let clash = ctx.links.lock().unwrap().iter().any(|(k, l)| *k != link && matches!(l.role, Role::Client { ip: p, id, .. } if p == ip && id != idh));
+    let (clash, full) = {
+        let links=ctx.links.lock().unwrap();
+        (links.iter().any(|(k, l)| *k != link && matches!(l.role, Role::Client { ip: p, id, .. } if p == ip && id != idh)),
+         links.values().filter(|l|matches!(l.role,Role::Client{..})).count()>=256)
+    };
+    if full {
+        spawn_ctl(&ctx.node, link, T_AUTH_FAIL, b"exit client capacity".to_vec());
+        ctx.close_link(link, "exit client capacity");
+        return;
+    }
     if clash {
         spawn_ctl(&ctx.node, link, T_AUTH_FAIL, b"address clash".to_vec());
         ctx.close_link(link, "конфликт адреса клиента");
@@ -3541,7 +5102,9 @@ fn on_identified(ctx: &Arc<NodeCtx>, link: LinkId, idh: [u8; 16]) {
         l.role = Role::Client { id: idh, ip };
     }
     if let Some(t) = &ctx.tun {
-        t.allow(&ctx.node, link, ip);
+        // авторитетен результат allow(), а не проверки выше: при отказе - AUTH_FAIL, очистка и никакого AUTH_OK.
+        // Легаси-модель не выдаёт HOST_ACCESS.
+        if !admit_into_tun(ctx, t, link, ip, &|| t.set_host_access(&link, false)) { return; }
     }
     ctx.sh.note(format!("client {} ({}) admitted on {}", rec.name, &idhex[..8], &hex(link.as_bytes())[..8]));
     let ok = serde_json::json!({"name": ctx.name, "ip": ip_str(ip), "cc": REGION.get().cloned().unwrap_or_default(), "pl": platform()});
@@ -3584,6 +5147,31 @@ fn on_rgp(ctx: &Arc<NodeCtx>, link: LinkId, d: &[u8]) {
     }
 }
 
+/// T_PROBEQ: допущенный клиент просит разрешить эхо датаграмм своему соединению зонда. Только `Role::Client` без `enroll_only` с доказанным ключом
+/// (CBC-Link отсеян выше); сосед-сервер, неопознанный и зачисляемый пир разрешения не получают. Пределы: `qprobe::Grants`. Ответ всегда по тому же Link.
+fn on_probeq(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
+    let Some(ep) = qprobe::parse_probeq(body) else { return };
+    // узел без модели прав (легаси-профиль) разрешений не выдаёт: нечем проверить EXIT/USE
+    let Some(t) = &ctx.t13 else { return };
+    let Some(pk) = ctx.links.lock().unwrap().get(&link).and_then(|i| i.peer_pk) else { return };
+    // QAB-M4: разрешение выдаётся в одной транзакции с актуальной проверкой прав и живого Link (Trust -> links -> grants, без await под guard).
+    // Link закрывается/заменяется/теряет права через `drop_link_state`, который гасит выданные по нему разрешения под тем же замком `links`.
+    let Some(res) = issue_probe_grant(&t.trust, &ctx.links, qprobe::grants(), link, &pk, ep, Instant::now()) else { return };
+    let code = match res {
+        Ok(()) => 0,
+        Err(d) => d.code(),
+    };
+    spawn_ctl(&ctx.node, link, T_PROBER, qprobe::proberr_body(code));
+}
+
+/// Кому можно выдать разрешение на эхо: допущенному клиенту (`Role::Client`, не `enroll_only`) с доказанным ключом. Возвращает хеш ключа (владельца).
+fn probe_owner(l: &LinkInfo) -> Option<[u8; 32]> {
+    match (&l.role, l.enroll_only, l.peer_pk) {
+        (Role::Client { .. }, false, Some(pk)) => Some(Sha256::digest(pk).into()),
+        _ => None,
+    }
+}
+
 fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
     if data.is_empty() {
         return;
@@ -3598,6 +5186,7 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
     }
     match ty {
         T_CINFO => on_cinfo(ctx, link, body),
+        T_PROBEQ => on_probeq(ctx, link, body),
         T_OBSERVE if matches!(body, [0] | [1]) => {
             {
                 let mut links = ctx.links.lock().unwrap();
@@ -3776,13 +5365,13 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
 /// Аспект назначения узлов 0013 один на всех: соседей находят по тегам корней в анонсе, а не по имени группы.
 const T13_TAG: &str = "t13";
 
-/// Имя назначения RNS. Модель 0013 (ADR 0016): нейтральное, без `rawg`/`vpn` - хеш имени виден в каждом анонсе, и по строке
-/// наблюдатель узнал бы наши узлы. Легаси оставляет прежнее имя `rawgvpn.node.<тег группы>`.
+/// Имя назначения RNS. Модель 0013 (ADR 0016): нейтральное, без `KnotHop`/`vpn` - хеш имени виден в каждом анонсе, и по строке
+/// наблюдатель узнал бы наши узлы. Легаси оставляет прежнее имя `knothopvpn.node.<тег группы>`.
 fn new_dest(id: Identity, dir: Direction, tag: &str) -> Result<Destination, String> {
     let r = if tag == T13_TAG {
         Destination::new(Some(id), dir, DestinationType::Single, "node", &["mesh"])
     } else {
-        Destination::new(Some(id), dir, DestinationType::Single, "rawgvpn", &["node", tag])
+        Destination::new(Some(id), dir, DestinationType::Single, "knothopvpn", &["node", tag])
     };
     r.map_err(|e| format!("{e:?}"))
 }
@@ -3809,11 +5398,11 @@ fn dest_from_pub_tag(pk: &[u8; 64], tag: &str) -> [u8; 16] {
     d
 }
 
-/// Прежнее (до ADR 0016) имя назначения модели 0013: `rawgvpn.node.t13`. Нужно только для переноса сохранённых адресов.
+/// Прежнее (до ADR 0016) имя назначения модели 0013: `knothopvpn.node.t13`. Нужно только для переноса сохранённых адресов.
 fn old_dest13(pk: &[u8; 64]) -> [u8; 16] {
     let mut d = [0u8; 16];
     if let Ok(idn) = Identity::from_public_key_bytes(pk) {
-        if let Ok(dd) = Destination::new(Some(idn), Direction::Out, DestinationType::Single, "rawgvpn", &["node", T13_TAG]) {
+        if let Ok(dd) = Destination::new(Some(idn), Direction::Out, DestinationType::Single, "knothopvpn", &["node", T13_TAG]) {
             d = *dd.hash().as_bytes();
         }
     }
@@ -3841,11 +5430,1176 @@ fn server_promotion_allowed(enroll_only: bool, accepts_links: Option<bool>, has_
     !enroll_only && accepts_links != Some(false) && has_transit_rights
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrdinaryAdmission { Client, Server }
+
+/// The authority and live Link state remain locked through publication, not just a snapshot.
+/// Order: Trust -> links -> (neigh OR TUN host_access -> allowed -> routes).
+/// No I/O, await, close_link or reentrant NodeCtx calls in `publish`.
+fn with_authorized_link<R>(
+    authority: &Mutex<trust::Trust>, links: &Mutex<HashMap<LinkId, LinkInfo>>,
+    link: LinkId, pk: &trust::Pk, kind: OrdinaryAdmission, promote: bool,
+    publish: impl FnOnce(&trust::Trust, &mut HashMap<LinkId, LinkInfo>) -> R,
+) -> Option<R> {
+    let tr = authority.lock().unwrap();
+    let mut live = links.lock().unwrap();
+    let i = live.get(&link)?;
+    if i.peer_pk.as_ref() != Some(pk) || i.enroll_only { return None; }
+    let role_ok = if promote {
+        matches!(i.role, Role::Unknown) && match kind {
+            OrdinaryAdmission::Client => i.want_use,
+            OrdinaryAdmission::Server => !i.want_use,
+        }
+    } else {
+        match kind {
+            OrdinaryAdmission::Client => matches!(i.role, Role::Client { .. }),
+            OrdinaryAdmission::Server => matches!(i.role, Role::Server { .. }) && !i.want_use,
+        }
+    };
+    if !role_ok { return None; }
+    let (mine, theirs) = match kind {
+        OrdinaryAdmission::Client => (trust::EXIT, trust::USE),
+        OrdinaryAdmission::Server => (trust::TRANSIT, trust::TRANSIT),
+    };
+    let rights = tr.common_with(pk, mine, theirs, true, false, now_ms() as u64);
+    let authorized = match kind {
+        OrdinaryAdmission::Client => rights,
+        OrdinaryAdmission::Server => server_promotion_allowed(i.enroll_only, None, rights),
+    };
+    if !authorized { return None; }
+    let result = publish(&tr, &mut live);
+    drop(live);
+    drop(tr);
+    Some(result)
+}
+
+/// Poll only while currently authorized. Pending drops both guards; every wake rechecks them.
+/// LinkHandle::send reserves its dispatch slot BEFORE core mutation and has no post-commit await.
+fn poll_authorized_link<R>(
+    authority: &Mutex<trust::Trust>, links: &Mutex<HashMap<LinkId, LinkInfo>>,
+    link: LinkId, pk: &trust::Pk, kind: OrdinaryAdmission, poll: impl FnOnce(&trust::Trust) -> Poll<R>,
+) -> Poll<Option<R>> {
+    match with_authorized_link(authority, links, link, pk, kind, false, |tr, _| poll(tr)) {
+        Some(Poll::Pending) => Poll::Pending,
+        Some(Poll::Ready(r)) => Poll::Ready(Some(r)),
+        None => Poll::Ready(None),
+    }
+}
+
+/// Live T_REC/T_POL push guard. Order Trust -> links, nothing held across an await. It checks only
+/// the live Link (same LinkId, exact peer key, current role): a known peer that dropped to rights=0
+/// must still receive its OWN revoke, so USE/TRANSIT is not demanded here but by the payload
+/// predicate (`live_rec_allowed`/`live_pol_allowed`) evaluated against the same Trust guard.
+fn with_live_forward_link<R>(
+    authority: &Mutex<trust::Trust>, links: &Mutex<HashMap<LinkId, LinkInfo>>,
+    link: LinkId, pk: &trust::Pk, kind: OrdinaryAdmission, check: impl FnOnce(&trust::Trust) -> R,
+) -> Option<R> {
+    let tr = authority.lock().unwrap();
+    let live = links.lock().unwrap();
+    let i = live.get(&link)?;
+    if i.peer_pk.as_ref() != Some(pk) || i.enroll_only { return None; }
+    let role_ok = match kind {
+        OrdinaryAdmission::Client => matches!(i.role, Role::Client { .. }),
+        OrdinaryAdmission::Server => matches!(i.role, Role::Server { .. }) && !i.want_use,
+    };
+    if !role_ok { return None; }
+    Some(check(&tr))
+}
+
+/// Per-poll gate of a queued live push: Ready(false) (nothing polled, future dropped) when the
+/// Link or the payload permission is gone; otherwise the transport poll runs under the guards.
+fn poll_live_forward(
+    authority: &Mutex<trust::Trust>, links: &Mutex<HashMap<LinkId, LinkInfo>>,
+    link: LinkId, pk: &trust::Pk, kind: OrdinaryAdmission,
+    allowed: impl FnOnce(&trust::Trust) -> bool, poll: impl FnOnce() -> Poll<bool>,
+) -> Poll<bool> {
+    with_live_forward_link(authority, links, link, pk, kind, |tr| if allowed(tr) { poll() } else { Poll::Ready(false) })
+        .unwrap_or(Poll::Ready(false))
+}
+
+/// Live T_REC is root-scoped for Clients and Servers alike: a record is pushed only if
+/// `record_visible_to` allows it in ITS root. A Server with TRANSIT in root R therefore receives all
+/// of R (mesh propagation inside one root), a Server with TRANSIT in R and S receives both, and a
+/// Server with TRANSIT only in R never sees S. A peer that lost its rights still gets its own chain
+/// and its own revoke.
+fn live_rec_allowed(tr: &trust::Trust, rec: &trust::Record, pk: &trust::Pk) -> bool {
+    tr.record_visible_to(rec, pk)
+}
+
+/// Current permitted policy projection for the peer (Server rights only while mutual TRANSIT holds).
+fn live_pol_allowed(tr: &trust::Trust, kind: OrdinaryAdmission, pol: &trust::Policy, pk: &trust::Pk, now: u64) -> bool {
+    let rights = if kind == OrdinaryAdmission::Server && tr.common_with(pk, trust::TRANSIT, trust::TRANSIT, true, false, now) {
+        trust::TRANSIT
+    } else {
+        trust::USE
+    };
+    tr.export_policies_for(rights, pk, now).contains(pol)
+}
+
+/// Candidates for live push: admitted Client/Server Links with a known peer key. Only a queueing
+/// hint; the actual permission is `poll_live_forward` at every send poll.
+fn live_forward_targets(links: &Mutex<HashMap<LinkId, LinkInfo>>, except: Option<LinkId>) -> Vec<(LinkId, trust::Pk, OrdinaryAdmission)> {
+    links.lock().unwrap().iter()
+        .filter(|(k, _)| Some(**k) != except)
+        .filter_map(|(k, i)| match (&i.role, i.peer_pk) {
+            (Role::Server { .. }, Some(p)) => Some((*k, p, OrdinaryAdmission::Server)),
+            (Role::Client { .. }, Some(p)) => Some((*k, p, OrdinaryAdmission::Client)),
+            _ => None,
+        }).collect()
+}
+
+/// Enrollment export for a just-enrolled (or repeat-claimed) holder: its own chain first, then the
+/// rest of the root-scoped `records_visible_to` snapshot. Rights are derived per root from the
+/// CURRENT store, so ADD in root R never exports root S, and a USE-only holder gets only its own
+/// chain plus the EXIT chains of the roots in which it is a member. The record must already have
+/// been offered/issued into `tr`. The enrollment Link has no Client/Server role, so these sends stay
+/// on the plain control sender; the snapshot, not a rights scalar, is what bounds the disclosure.
+fn enrollment_export(tr: &trust::Trust, holder: &trust::Pk) -> (Vec<trust::Record>, Vec<trust::Record>) {
+    let visible = tr.records_visible_to(holder);
+    let chain: Vec<trust::Record> = tr.chain_for(holder).into_iter().filter(|r| visible.contains(r)).collect();
+    let rest = visible.into_iter().filter(|r| !chain.contains(r)).collect();
+    (chain, rest)
+}
+
+fn remove_link_admission(
+    links: &Mutex<HashMap<LinkId, LinkInfo>>, link: &LinkId, disallow: impl FnOnce(),
+) -> Option<LinkInfo> {
+    remove_link_admission_in(links, link, qprobe::grants(), disallow)
+}
+
+/// Единственный путь снятия допущенного Link (закрытие, отзыв прав через `evaluate`, замена, `LinkClosed` - всё идёт через `drop_link_state`).
+/// QAB-M4: разрешение на эхо зонда живёт не дольше Link, по которому выдано. Гасится под замком `links`: выдача (`issue_probe_grant`,
+/// Trust -> links -> grants) либо видит Link и успевает до снятия, либо не видит его и не выдаёт - "живого разрешения после снятия" не бывает.
+fn remove_link_admission_in(
+    links: &Mutex<HashMap<LinkId, LinkInfo>>, link: &LinkId, grants: &qprobe::Grants, disallow: impl FnOnce(),
+) -> Option<LinkInfo> {
+    let mut live = links.lock().unwrap();
+    let removed = live.remove(link);
+    disallow(); // no promotion/late allow may slip between removal and TUN cleanup
+    grants.revoke_link(link.as_bytes());
+    removed
+}
+
+/// Выдать разрешение на эхо зонда `ep` допущенному клиенту по его Link (QAB-M4): одна транзакция с проверкой Role::Client, ключа Link,
+/// не-зачисления и EXIT(мы)/USE(он) в общем корне по текущим записям. None - Link мёртв или права сняты, разрешение не выдано и ответа нет.
+fn issue_probe_grant(
+    authority: &Mutex<trust::Trust>, links: &Mutex<HashMap<LinkId, LinkInfo>>, grants: &qprobe::Grants,
+    link: LinkId, pk: &trust::Pk, ep: [u8; 32], now: Instant,
+) -> Option<std::result::Result<(), qprobe::Deny>> {
+    with_authorized_link(authority, links, link, pk, OrdinaryAdmission::Client, false, |_, live| {
+        let owner = live.get(&link).and_then(probe_owner)?;
+        Some(grants.grant(ep, owner, *link.as_bytes(), now))
+    }).flatten()
+}
+
+struct ClientAdmission {
+    id: [u8; 16],
+    ip: u32,
+    replaced: Vec<LinkId>,
+}
+
+/// Actual client promotion transaction; the injected publisher is the authoritative TUN allow.
+fn promote_client_link(
+    authority: &Mutex<trust::Trust>, links: &Mutex<HashMap<LinkId, LinkInfo>>, link: LinkId, pk: &trust::Pk,
+    publish_tun: impl FnOnce(u32, bool, &[LinkId]) -> std::result::Result<(), AdmitOutcome>,
+) -> Option<std::result::Result<ClientAdmission, AdmitOutcome>> {
+    with_authorized_link(authority, links, link, pk, OrdinaryAdmission::Client, true, |tr, live| {
+        let id = id_of_pub(pk).expect("authorized public key");
+        let ip = client_ip(&id);
+        if live.iter().any(|(k, i)| *k != link && matches!(i.role, Role::Client { ip: p, id: h } if p == ip && h != id)) {
+            return Err(AdmitOutcome::Refuse { reason: b"address clash", note: "конфликт адреса клиента" });
+        }
+        if live.values().filter(|i| matches!(i.role, Role::Client { .. })).count() >= 256 {
+            return Err(AdmitOutcome::Refuse { reason: b"exit client capacity", note: "exit client capacity" });
+        }
+        // Прежние живые Link ТОЙ ЖЕ аутентифицированной identity с тем же адресом (зомби после смены носителя): их владение
+        // адресом TUN вытесняет новый Link атомарно в `publish_tun`. Считаем под теми же guard Trust+links, что и публикацию.
+        let evictable: Vec<LinkId> = live.iter()
+            .filter(|(k, i)| **k != link && i.peer_pk.as_ref() == Some(pk) && matches!(i.role, Role::Client { id: h, ip: p } if h == id && p == ip))
+            .map(|(k, _)| *k).collect();
+        live.get_mut(&link).unwrap().role = Role::Client { id, ip };
+        // Trust AND links are still held across role assignment, allow and host permission.
+        if let Err(refusal) = publish_tun(ip, !tr.host_access_roots(pk, &tr.me_hash).is_empty(), &evictable) {
+            live.get_mut(&link).unwrap().role = Role::Unknown;
+            return Err(refusal);
+        }
+        // Вытесненные Link уже убраны из таблиц TUN; из `links` и закрытие - после, вне guard (`admit_client13`).
+        let replaced = live.iter().filter(|(k, i)| **k != link && matches!(i.role, Role::Client { id: h, .. } if h == id)).map(|(k, _)| *k).collect();
+        Ok(ClientAdmission { id, ip, replaced })
+    })
+}
+
+/// Shared neighbor-table publication, including deterministic duplicate-Link selection.
+fn admit_neighbor_state(n: &mut HashMap<[u8; 16], Neighbor>, link: LinkId, dest: [u8; 16], pk: &trust::Pk) -> Option<LinkId> {
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&pk[32..64]);
+    let e = n.entry(dest).or_insert_with(|| Neighbor { dest, key, pk: *pk, name: "?".into(), ep: String::new(), addrs: Addrs::new(vec![]), tags: vec![], accepts_links: true, last_announce: Instant::now(),
+        link: None, last_heard: Instant::now(), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(), last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: LossWin::default(), ping_seq: 0, admitted_at: Instant::now(), seen_gen: 0 });
+    if let Some(old) = e.link {
+        if old != link {
+            let keep_new = link.as_bytes() < old.as_bytes();
+            if keep_new { e.link = Some(link); }
+            e.connecting = false;
+            e.last_heard = Instant::now();
+            return Some(if keep_new { old } else { link });
+        }
+    }
+    e.link = Some(link);
+    e.connecting = false;
+    e.last_heard = Instant::now();
+    e.admitted_at = Instant::now();
+    e.loss.clear();
+    None
+}
+
+fn promote_server_link(
+    authority: &Mutex<trust::Trust>, links: &Mutex<HashMap<LinkId, LinkInfo>>, neigh: &Mutex<HashMap<[u8; 16], Neighbor>>,
+    link: LinkId, pk: &trust::Pk, dest: [u8; 16],
+) -> Option<Option<LinkId>> {
+    with_authorized_link(authority, links, link, pk, OrdinaryAdmission::Server, true, |_, live| {
+        let mut n = neigh.lock().unwrap();
+        let accepts = n.values().find(|n| &n.pk == pk).map(|n| n.accepts_links);
+        // Ordinary mutual TRANSIT is already checked under the SAME guard, not a caller bool.
+        if accepts == Some(false) { return Some(link); }
+        live.get_mut(&link).unwrap().role = Role::Server { dest };
+        admit_neighbor_state(&mut n, link, dest, pk)
+    })
+}
+
 fn peer_of(ctx: &NodeCtx, link: &LinkId) -> Option<[u8; 64]> {
     ctx.links.lock().unwrap().get(link).and_then(|l| l.peer_pk)
 }
 
+#[cfg(test)]
+mod ordinary_admission_tests {
+    use super::*;
+    use std::sync::{TryLockError, mpsc::channel};
+
+    struct Fixture {
+        issuer: trust::Trust,
+        root: trust::Hash,
+        node_pk: trust::Pk,
+        pk: trust::Pk,
+        authority: Arc<Mutex<trust::Trust>>,
+        links: Arc<Mutex<HashMap<LinkId, LinkInfo>>>,
+        neigh: Mutex<HashMap<[u8; 16], Neighbor>>,
+    }
+
+    fn link() -> LinkId { LinkId::new([71; 16]) }
+    fn fixture(client: bool) -> Fixture {
+        let root_id = leviculum_std::api::generate_identity();
+        let node = leviculum_std::api::generate_identity();
+        let peer = leviculum_std::api::generate_identity();
+        let root = *root_id.hash();
+        let (node_pk, pk) = (node.public_key_bytes(), peer.public_key_bytes());
+        let mut issuer = trust::Trust::new(root_id.clone(), None);
+        let node_rec = issuer.issue(root, node_pk, trust::EXIT | trust::TRANSIT).unwrap();
+        let peer_rec = issuer.issue(root, pk, trust::USE | trust::TRANSIT).unwrap();
+        let mut target = trust::Trust::new(node, None);
+        target.add_anchor(&root_id.public_key_bytes()).unwrap();
+        assert_eq!(target.offer(node_rec), trust::Offer::Added);
+        assert_eq!(target.offer(peer_rec), trust::Offer::Added);
+        let links = HashMap::from([(link(), LinkInfo { role: Role::Unknown, since: Instant::now(), last_heard: Instant::now(),
+            peer_pk: Some(pk), want_use: client, enroll_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 })]);
+        Fixture { issuer, root, node_pk, pk, authority: Arc::new(Mutex::new(target)), links: Arc::new(Mutex::new(links)), neigh: Mutex::new(HashMap::new()) }
+    }
+
+    #[derive(Default)]
+    struct TunCore {
+        host: HostAccessSet,
+        allowed: AllowedMap,
+        routes: RouteMap<()>,
+    }
+    impl TunCore {
+        fn publish(&self, ip: u32, host: bool, replaces: &[LinkId]) -> std::result::Result<(), AdmitOutcome> {
+            self.publish_as(link(), ip, host, replaces)
+        }
+        fn publish_as(&self, new: LinkId, ip: u32, host: bool, replaces: &[LinkId]) -> std::result::Result<(), AdmitOutcome> {
+            match admission_outcome(admit_link_replacing(&self.host, &self.allowed, &self.routes, new, ip, (), replaces)) {
+                AdmitOutcome::Refuse { reason, note } => Err(AdmitOutcome::Refuse { reason, note }),
+                AdmitOutcome::SendAuthOk => {
+                    assert!(set_link_host_access(&self.host, &self.allowed, &new, host));
+                    Ok(())
+                }
+            }
+        }
+        fn close(&self) { disallow_link(&self.host, &self.allowed, &self.routes, &link()); }
+        fn sizes(&self) -> (usize, usize, usize) {
+            (self.host.read().unwrap().len(), self.allowed.read().unwrap().len(), self.routes.read().unwrap().len())
+        }
+    }
+
+    #[test]
+    fn ordinary_admission_delayed_client_rechecks_use_exit_and_policy() {
+        for change in 0..3 {
+            let mut f = fixture(true);
+            let tun = Arc::new(TunCore::default());
+            let (paused, ready) = channel();
+            let (resume, resumed) = channel();
+            let (authority, links, pk, old_tun) = (f.authority.clone(), f.links.clone(), f.pk, tun.clone());
+            let old = std::thread::spawn(move || {
+                let cli_ok = authority.lock().unwrap().common_with(&pk, trust::EXIT, trust::USE, true, false, now_ms() as u64);
+                paused.send(cli_ok).unwrap();
+                resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(promote_client_link(&authority, &links, link(), &pk, |ip, host, r| old_tun.publish(ip, host, r)).is_none());
+            });
+            assert!(ready.recv_timeout(Duration::from_secs(5)).unwrap());
+            match change {
+                0 => {
+                    let rec = f.issuer.issue(f.root, f.pk, trust::TRANSIT).unwrap();
+                    assert_eq!(f.authority.lock().unwrap().offer(rec), trust::Offer::Added);
+                }
+                1 => {
+                    let rec = f.issuer.issue(f.root, f.node_pk, trust::TRANSIT).unwrap();
+                    assert_eq!(f.authority.lock().unwrap().offer(rec), trust::Offer::Added);
+                }
+                _ => { f.authority.lock().unwrap().set_my_policy(f.root, trust::TRANSIT, now_ms() as u64).unwrap(); }
+            }
+            resume.send(()).unwrap();
+            old.join().unwrap();
+            assert_eq!(tun.sizes(), (0, 0, 0));
+            assert!(matches!(f.links.lock().unwrap()[&link()].role, Role::Unknown));
+        }
+    }
+
+    #[test]
+    fn ordinary_admission_delayed_server_rechecks_mutual_transit_and_policy() {
+        for change in 0..3 {
+            let mut f = fixture(false);
+            assert!(f.authority.lock().unwrap().common_with(&f.pk, trust::TRANSIT, trust::TRANSIT, true, false, now_ms() as u64));
+            // This is the real callback entry after the 500ms wait, not a timer/sleep model.
+            match change {
+                0 => {
+                    let rec = f.issuer.issue(f.root, f.pk, trust::USE).unwrap();
+                    assert_eq!(f.authority.lock().unwrap().offer(rec), trust::Offer::Added);
+                }
+                1 => {
+                    let rec = f.issuer.issue(f.root, f.node_pk, trust::EXIT).unwrap();
+                    assert_eq!(f.authority.lock().unwrap().offer(rec), trust::Offer::Added);
+                }
+                _ => { f.authority.lock().unwrap().set_my_policy(f.root, trust::EXIT, now_ms() as u64).unwrap(); }
+            }
+            assert!(promote_server_link(&f.authority, &f.links, &f.neigh, link(), &f.pk, dest_from_pub_tag(&f.pk, T13_TAG)).is_none());
+            assert!(f.neigh.lock().unwrap().is_empty());
+            assert!(with_authorized_link(&f.authority, &f.links, link(), &f.pk, OrdinaryAdmission::Server, false,
+                |_, _| panic!("former peer must not reach export_all/T_DIR snapshot")).is_none());
+        }
+    }
+
+    #[test]
+    fn ordinary_admission_rejects_missing_identity_enrollment_role_and_use_changes() {
+        for client in [true, false] {
+            for change in 0..5 {
+                let f = fixture(client);
+                let tun = TunCore::default();
+                if change == 0 {
+                    remove_link_admission(&f.links, &link(), || tun.close());
+                } else {
+                    let mut live = f.links.lock().unwrap();
+                    let i = live.get_mut(&link()).unwrap();
+                    match change {
+                        1 => i.peer_pk = Some(leviculum_std::api::generate_identity().public_key_bytes()),
+                        2 => i.enroll_only = true,
+                        3 => i.role = Role::Client { id: [0; 16], ip: 1 },
+                        _ => i.want_use = !client,
+                    }
+                }
+                if client {
+                    assert!(promote_client_link(&f.authority, &f.links, link(), &f.pk, |_, _, _| panic!("ineligible Link must not reach allow")).is_none());
+                } else {
+                    assert!(promote_server_link(&f.authority, &f.links, &f.neigh, link(), &f.pk, dest_from_pub_tag(&f.pk, T13_TAG)).is_none());
+                    assert!(f.neigh.lock().unwrap().is_empty());
+                }
+                assert_eq!(tun.sizes(), (0, 0, 0));
+            }
+        }
+        let f = fixture(false);
+        let dest = dest_from_pub_tag(&f.pk, T13_TAG);
+        {
+            let mut n = f.neigh.lock().unwrap();
+            admit_neighbor_state(&mut n, LinkId::new([72; 16]), dest, &f.pk);
+            let nb = n.get_mut(&dest).unwrap();
+            nb.link = None;
+            nb.accepts_links = false;
+        }
+        assert_eq!(promote_server_link(&f.authority, &f.links, &f.neigh, link(), &f.pk, dest), Some(Some(link())));
+        assert!(matches!(f.links.lock().unwrap()[&link()].role, Role::Unknown));
+        assert!(f.neigh.lock().unwrap()[&dest].link.is_none());
+    }
+
+    #[test]
+    fn ordinary_admission_role_allow_serializes_revoke_and_close() {
+        let mut f = fixture(true);
+        let tun = Arc::new(TunCore::default());
+        let revoke = f.issuer.issue(f.root, f.pk, trust::TRANSIT).unwrap();
+        let (paused, ready) = channel();
+        let (resume, resumed) = channel();
+        let (authority, links, pk, old_tun) = (f.authority.clone(), f.links.clone(), f.pk, tun.clone());
+        let old = std::thread::spawn(move || {
+            assert!(matches!(promote_client_link(&authority, &links, link(), &pk, |ip, host, r| {
+                paused.send(()).unwrap(); // role assigned; actual allow has not run yet
+                resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+                old_tun.publish(ip, host, r)
+            }), Some(Ok(_))));
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let authority_held = matches!(f.authority.try_lock(), Err(TryLockError::WouldBlock));
+        let link_held = matches!(f.links.try_lock(), Err(TryLockError::WouldBlock));
+        let (attempted, attempt) = channel();
+        let (authority, links, new_tun) = (f.authority.clone(), f.links.clone(), tun.clone());
+        let revoker = std::thread::spawn(move || {
+            attempted.send(()).unwrap();
+            assert_eq!(authority.lock().unwrap().offer(revoke), trust::Offer::Added);
+            remove_link_admission(&links, &link(), || new_tun.close());
+        });
+        let (closing, close_attempt) = channel();
+        let (links, closed_tun) = (f.links.clone(), tun.clone());
+        let closer = std::thread::spawn(move || {
+            closing.send(()).unwrap();
+            remove_link_admission(&links, &link(), || closed_tun.close());
+        });
+        attempt.recv_timeout(Duration::from_secs(5)).unwrap();
+        close_attempt.recv_timeout(Duration::from_secs(5)).unwrap();
+        resume.send(()).unwrap();
+        old.join().unwrap();
+        revoker.join().unwrap();
+        closer.join().unwrap();
+        assert!(authority_held && link_held, "ordinary authority/close must not slip between role and allow");
+        assert_eq!(tun.sizes(), (0, 0, 0));
+        assert!(!f.links.lock().unwrap().contains_key(&link()));
+        // Even a later legitimate regrant cannot resurrect the SAME closed LinkId.
+        let regrant = f.issuer.issue(f.root, f.pk, trust::USE | trust::TRANSIT).unwrap();
+        assert_eq!(f.authority.lock().unwrap().offer(regrant), trust::Offer::Added);
+        assert!(promote_client_link(&f.authority, &f.links, link(), &f.pk, |ip, host, r| tun.publish(ip, host, r)).is_none());
+        assert_eq!(tun.sizes(), (0, 0, 0));
+    }
+
+    fn promoted(f: &Fixture, tun: &TunCore) {
+        assert!(matches!(promote_client_link(&f.authority, &f.links, link(), &f.pk, |ip, host, r| tun.publish(ip, host, r)), Some(Ok(_))));
+    }
+
+    // Диагностика допуска: одна запись на Link и причину, независимо друг от друга; нет Link - нет записи.
+    #[test]
+    fn admit_diag_is_marked_once_per_link_and_reason() {
+        let f = fixture(true);
+        let all = [AdmitDiag::EnrollOnly, AdmitDiag::NoChainWait, AdmitDiag::NoChain, AdmitDiag::NotAuthorized];
+        let mut bits = 0u8;
+        for d in all {
+            assert_eq!(bits & d.bit(), 0, "биты причин не пересекаются");
+            bits |= d.bit();
+        }
+        for d in all {
+            assert!(diag_first(&f.links, link(), d), "{d:?}: первый раз");
+            assert!(!diag_first(&f.links, link(), d), "{d:?}: повтор молчит");
+        }
+        assert!(!diag_first(&f.links, LinkId::new([72; 16]), AdmitDiag::NoChain), "нет Link - нет записи");
+    }
+
+    // Причины фиксированы и безопасны: ответ клиенту - короткий ASCII без данных, журнал - без форматных подстановок и секретов.
+    #[test]
+    fn admit_diag_reasons_are_fixed_and_leak_nothing() {
+        let all = [AdmitDiag::EnrollOnly, AdmitDiag::NoChainWait, AdmitDiag::NoChain, AdmitDiag::NotAuthorized];
+        let mut fails = HashSet::new();
+        for d in all {
+            assert!(!d.note().contains('{') && !d.note().contains("KNOTHOP"), "{d:?}");
+            if let Some(f) = d.fail() {
+                assert!(f.len() <= 32 && f.iter().all(|b| b.is_ascii_lowercase() || *b == b' '), "{d:?}: фиксированный ASCII-текст");
+                assert!(fails.insert(f), "{d:?}: причины клиенту различимы");
+            }
+        }
+        assert_eq!(AdmitDiag::NoChainWait.fail(), None, "ожидание цепочки клиенту не отказ");
+        assert!(AdmitDiag::NoChain.fail().is_some() && AdmitDiag::NotAuthorized.fail().is_some() && AdmitDiag::EnrollOnly.fail().is_some());
+        assert!(NO_CHAIN_FAIL_AFTER < Duration::from_secs(6), "отказ раньше, чем клиент (connect_exit, 6 с) сам уйдёт по таймауту");
+    }
+
+    // Отказ клиенту и запись - только пока Link жив, тот же ключ, прислал T_USE и остаётся Unknown; допущенный/чужой/закрытый молчит.
+    #[test]
+    fn client_awaiting_admission_requires_live_unadmitted_use_link_of_same_key() {
+        let f = fixture(true);
+        let other = [9u8; 64];
+        assert!(client_awaiting_admission(&f.links, link(), &f.pk));
+        assert!(!client_awaiting_admission(&f.links, link(), &other), "ключ Link сменился");
+        assert!(!client_awaiting_admission(&f.links, LinkId::new([72; 16]), &f.pk), "Link закрыт");
+        f.links.lock().unwrap().get_mut(&link()).unwrap().want_use = false;
+        assert!(!client_awaiting_admission(&f.links, link(), &f.pk), "не клиент");
+        f.links.lock().unwrap().get_mut(&link()).unwrap().want_use = true;
+        f.links.lock().unwrap().get_mut(&link()).unwrap().role = Role::Client { id: [1; 16], ip: 1 };
+        assert!(!client_awaiting_admission(&f.links, link(), &f.pk), "проигравший гонку с допуском не получает отказ");
+    }
+
+    // Диагностика не меняет решение: пометки причин на Link не мешают допуску, а Link для зачисления по-прежнему не допускается.
+    #[test]
+    fn admit_diag_marks_do_not_change_the_admission_decision() {
+        let f = fixture(true);
+        let tun = TunCore::default();
+        f.links.lock().unwrap().get_mut(&link()).unwrap().enroll_only = true;
+        assert!(client_awaiting_admission(&f.links, link(), &f.pk), "enroll-only Link ждёт допуска и получит NotAuthorized/EnrollOnly");
+        assert!(promote_client_link(&f.authority, &f.links, link(), &f.pk, |_, _, _| panic!("enroll-only не доходит до allow")).is_none());
+        f.links.lock().unwrap().get_mut(&link()).unwrap().enroll_only = false;
+        f.links.lock().unwrap().get_mut(&link()).unwrap().diag = 0xff;
+        promoted(&f, &tun);
+        assert_eq!(tun.sizes().1, 1, "клиент допущен несмотря на пометки диагностики");
+    }
+
+    #[test]
+    fn diag_budget_caps_lines_per_window_and_reports_suppressed() {
+        let mut b = DiagBudget::new();
+        let t0 = 1_000_000;
+        for i in 0..DIAG_MAX_PER_WINDOW {
+            assert_eq!(b.allow(t0 + i as u64), (true, 0), "строка {i}");
+        }
+        for _ in 0..5 {
+            assert_eq!(b.allow(t0 + 100), (false, 0), "сверх предела окна");
+        }
+        assert_eq!(b.allow(t0 + DIAG_WINDOW_MS - 1), (false, 0), "окно ещё идёт");
+        assert_eq!(b.allow(t0 + DIAG_WINDOW_MS), (true, 6), "новое окно: строка пишется, подавленные сообщены");
+        assert_eq!(b.allow(t0 + DIAG_WINDOW_MS + 1), (true, 0));
+    }
+
+    // QAB-M4: разрешение на эхо - только допущенному клиенту с текущими правами и живым Link
+    #[test]
+    fn probe_grant_is_issued_only_to_an_admitted_client_with_current_rights() {
+        let mut f = fixture(true);
+        let tun = TunCore::default();
+        let t0 = Instant::now();
+        let probe = qprobe::build(0, 1, 40);
+        let g = qprobe::Grants::default();
+        // до допуска (Role::Unknown): нет
+        assert!(issue_probe_grant(&f.authority, &f.links, &g, link(), &f.pk, [9; 32], t0).is_none(), "пред-допусковый Link разрешения не получает");
+        promoted(&f, &tun);
+        // чужой ключ на этом Link: нет
+        let other = leviculum_std::api::generate_identity().public_key_bytes();
+        assert!(issue_probe_grant(&f.authority, &f.links, &g, link(), &other, [9; 32], t0).is_none());
+        assert!(g.echo(&[9; 32], &probe, t0).is_none());
+        // допущен: выдано, эхо есть
+        assert_eq!(issue_probe_grant(&f.authority, &f.links, &g, link(), &f.pk, [9; 32], t0), Some(Ok(())));
+        assert!(g.echo(&[9; 32], &probe, t0).is_some());
+        // права сняты (USE пропал) до следующей выдачи: Link в таблице ещё есть, но выдачи нет
+        let g2 = qprobe::Grants::default();
+        let revoke = f.issuer.issue(f.root, f.pk, trust::TRANSIT).unwrap();
+        assert_eq!(f.authority.lock().unwrap().offer(revoke), trust::Offer::Added);
+        assert!(issue_probe_grant(&f.authority, &f.links, &g2, link(), &f.pk, [8; 32], t0).is_none(), "права сняты - разрешения нет");
+        assert!(g2.echo(&[8; 32], &probe, t0).is_none());
+    }
+
+    // QAB-M4: закрытие/замена/отзыв Link гасит уже выданное разрешение сразу, а память интервала остаётся
+    #[test]
+    fn probe_grant_dies_with_its_link_and_closing_does_not_reset_the_interval() {
+        let f = fixture(true);
+        let tun = TunCore::default();
+        let t0 = Instant::now();
+        let probe = qprobe::build(0, 1, 40);
+        let g = qprobe::Grants::default();
+        promoted(&f, &tun);
+        assert_eq!(issue_probe_grant(&f.authority, &f.links, &g, link(), &f.pk, [9; 32], t0), Some(Ok(())));
+        assert!(g.echo(&[9; 32], &probe, t0).is_some());
+        remove_link_admission_in(&f.links, &link(), &g, || tun.close());
+        assert!(g.echo(&[9; 32], &probe, t0).is_none(), "закрытый Link: выданное разрешение мертво");
+        assert!(issue_probe_grant(&f.authority, &f.links, &g, link(), &f.pk, [9; 32], t0).is_none(), "мёртвому Link не выдаём");
+        // интервал выдачи тому же ключу и владельцу не сброшен закрытием
+        let owner: [u8; 32] = Sha256::digest(f.pk).into();
+        assert_eq!(g.grant([9; 32], owner, [5; 16], t0 + Duration::from_secs(1)), Err(qprobe::Deny::TooSoon));
+    }
+
+    // QAB-M4, конкурентно: выдача и снятие Link из разных потоков; после завершения снятия живого разрешения нет ни при каком чередовании
+    #[test]
+    fn probe_grant_vs_close_and_revoke_leave_no_live_grant_after_removal() {
+        for round in 0..64u8 {
+            let mut f = fixture(true);
+            let tun = Arc::new(TunCore::default());
+            promoted(&f, &tun);
+            let g = Arc::new(qprobe::Grants::default());
+            let t0 = Instant::now();
+            let probe = qprobe::build(0, 1, 40);
+            let ep = [round; 32];
+            let revoke = f.issuer.issue(f.root, f.pk, trust::TRANSIT).unwrap();
+            let (authority, links, pk, g1) = (f.authority.clone(), f.links.clone(), f.pk, g.clone());
+            let issuer = std::thread::spawn(move || issue_probe_grant(&authority, &links, &g1, link(), &pk, ep, t0));
+            let (links, g2, tun2) = (f.links.clone(), g.clone(), tun.clone());
+            let closer = std::thread::spawn(move || { remove_link_admission_in(&links, &link(), &g2, || tun2.close()); });
+            if round % 2 == 0 {
+                // отзыв прав параллельно: сам по себе Link не снимает (это делает evaluate -> drop_link_state), но выдача после него невозможна
+                assert_eq!(f.authority.lock().unwrap().offer(revoke), trust::Offer::Added);
+            }
+            let issued = issuer.join().unwrap();
+            closer.join().unwrap();
+            // Link снят: что бы ни выдал параллельный поток, живого разрешения не осталось
+            assert!(g.echo(&ep, &probe, t0).is_none(), "round {round}: после снятия Link эхо невозможно (issued={issued:?})");
+            // и новая выдача по снятому Link невозможна
+            assert!(issue_probe_grant(&f.authority, &f.links, &g, link(), &f.pk, [0xEE; 32], t0 + Duration::from_secs(60)).is_none());
+        }
+    }
+
+    #[test]
+    fn ordinary_admission_pending_control_cancels_before_commit_after_revoke_or_close() {
+        for client in [true, false] {
+            for close in [true, false] {
+                let mut f = fixture(client);
+                let tun = TunCore::default();
+                let kind = if client { OrdinaryAdmission::Client } else { OrdinaryAdmission::Server };
+                if client {
+                    assert!(matches!(promote_client_link(&f.authority, &f.links, link(), &f.pk, |ip, host, r| tun.publish(ip, host, r)), Some(Ok(_))));
+                } else {
+                    assert_eq!(promote_server_link(&f.authority, &f.links, &f.neigh, link(), &f.pk, dest_from_pub_tag(&f.pk, T13_TAG)), Some(None));
+                }
+                let mut polls = 0;
+                // Injectable transport seam only. The actual production poll guard must NOT
+                // poll the send again after revoke/close, hence no stale queued output.
+                assert!(poll_authorized_link(&f.authority, &f.links, link(), &f.pk, kind, |_| {
+                    polls += 1;
+                    Poll::<bool>::Pending
+                }).is_pending());
+                if close {
+                    remove_link_admission(&f.links, &link(), || tun.close());
+                } else {
+                    let rights = if client { trust::TRANSIT } else { trust::USE };
+                    let revoke = f.issuer.issue(f.root, f.pk, rights).unwrap();
+                    assert_eq!(f.authority.lock().unwrap().offer(revoke), trust::Offer::Added);
+                }
+                assert_eq!(poll_authorized_link(&f.authority, &f.links, link(), &f.pk, kind, |_| {
+                    polls += 1;
+                    Poll::Ready(true) // would commit AUTH_OK / privileged export if polled
+                }), Poll::Ready(None));
+                assert_eq!(polls, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_admission_host_only_revoke_keeps_use_and_allow_refusal_never_authorizes() {
+        let f = fixture(true);
+        let tun = TunCore::default();
+        let scope = f.authority.lock().unwrap().me_hash;
+        let grant = f.issuer.sign_host_access(f.root, scope, f.pk, true).unwrap();
+        let revoke = f.issuer.sign_host_access(f.root, scope, f.pk, false).unwrap();
+        f.authority.lock().unwrap().allow_host_root(f.root, 16);
+        let commit = f.authority.lock().unwrap().prepare_host_access(&grant).unwrap();
+        commit.commit(&f.authority).unwrap();
+        assert!(matches!(promote_client_link(&f.authority, &f.links, link(), &f.pk, |ip, host, r| tun.publish(ip, host, r)), Some(Ok(_))));
+        assert_eq!(tun.sizes(), (1, 1, 1));
+        let commit = f.authority.lock().unwrap().prepare_host_access(&revoke).unwrap();
+        commit.commit(&f.authority).unwrap();
+        assert!(publish_host_access_decision(&f.authority, &f.pk, |_| (), |host| set_link_host_access(&tun.host, &tun.allowed, &link(), host)).1);
+        assert_eq!(tun.sizes(), (0, 1, 1));
+        assert_eq!(poll_authorized_link(&f.authority, &f.links, link(), &f.pk, OrdinaryAdmission::Client, |_| Poll::Ready(true)), Poll::Ready(Some(true)));
+
+        let f = fixture(true);
+        let tun = TunCore::default();
+        let ip = client_ip(&id_of_pub(&f.pk).unwrap());
+        admit_link(&tun.host, &tun.allowed, &tun.routes, LinkId::new([72; 16]), ip, ()).unwrap();
+        assert!(matches!(promote_client_link(&f.authority, &f.links, link(), &f.pk, |ip, host, r| tun.publish(ip, host, r)),
+            Some(Err(AdmitOutcome::Refuse { reason: b"address clash", .. }))));
+        assert!(matches!(f.links.lock().unwrap()[&link()].role, Role::Unknown));
+        assert_eq!(poll_authorized_link(&f.authority, &f.links, link(), &f.pk, OrdinaryAdmission::Client, |_| Poll::Ready(true)), Poll::Ready(None));
+        assert_eq!(tun.sizes(), (0, 1, 1));
+    }
+
+    fn old_link() -> LinkId { LinkId::new([73; 16]) }
+
+    /// Прежний Link (зомби после смены носителя): запись в `links` с заданными peer_pk/ролью и, при `publish`, владение адресом в TUN.
+    fn add_old_client(f: &Fixture, tun: &TunCore, id: LinkId, peer_pk: trust::Pk, role_id: [u8; 16], ip: u32, host: bool) {
+        f.links.lock().unwrap().insert(id, LinkInfo { role: Role::Client { id: role_id, ip }, since: Instant::now(), last_heard: Instant::now(),
+            peer_pk: Some(peer_pk), want_use: true, enroll_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 });
+        assert!(tun.publish_as(id, ip, host, &[]).is_ok());
+    }
+
+    #[test]
+    fn ordinary_admission_same_identity_replaces_stale_link_atomically_without_host_inheritance() {
+        let f = fixture(true);
+        let tun = TunCore::default();
+        let cid = id_of_pub(&f.pk).unwrap();
+        let ip = client_ip(&cid);
+        // у прежнего Link был HOST_ACCESS, у identity в Trust его сейчас нет: новый Link не наследует
+        add_old_client(&f, &tun, old_link(), f.pk, cid, ip, true);
+        assert_eq!(tun.sizes(), (1, 1, 1));
+        let adm = match promote_client_link(&f.authority, &f.links, link(), &f.pk, |ip, host, r| tun.publish(ip, host, r)) {
+            Some(Ok(a)) => a,
+            _ => panic!("same identity must replace its stale Link"),
+        };
+        assert_eq!(adm.replaced, vec![old_link()]);
+        assert_eq!(tun.sizes(), (0, 1, 1), "stale Link removed from allowed/routes/host; new Link has no HOST_ACCESS");
+        assert_eq!(tun.routes.read().unwrap().get(&ip).map(|(l, _)| *l), Some(link()));
+        assert!(!tun.allowed.read().unwrap().contains_key(&old_link()));
+        // закрытие вытесненного Link вне guard (как в admit_client13) не трогает маршрут нового
+        let removed = remove_link_admission(&f.links, &old_link(), || disallow_link(&tun.host, &tun.allowed, &tun.routes, &old_link()));
+        assert!(removed.is_some());
+        assert_eq!(tun.routes.read().unwrap().get(&ip).map(|(l, _)| *l), Some(link()));
+        assert_eq!(tun.sizes(), (0, 1, 1));
+        assert!(matches!(f.links.lock().unwrap()[&link()].role, Role::Client { .. }));
+    }
+
+    #[test]
+    fn ordinary_admission_recomputes_host_access_for_replacing_link() {
+        let f = fixture(true);
+        let tun = TunCore::default();
+        let cid = id_of_pub(&f.pk).unwrap();
+        let ip = client_ip(&cid);
+        let scope = f.authority.lock().unwrap().me_hash;
+        let grant = f.issuer.sign_host_access(f.root, scope, f.pk, true).unwrap();
+        f.authority.lock().unwrap().allow_host_root(f.root, 16);
+        let commit = f.authority.lock().unwrap().prepare_host_access(&grant).unwrap();
+        commit.commit(&f.authority).unwrap();
+        // прежний Link без HOST_ACCESS, у identity он выдан: новый получает его по свежему расчёту
+        add_old_client(&f, &tun, old_link(), f.pk, cid, ip, false);
+        assert!(matches!(promote_client_link(&f.authority, &f.links, link(), &f.pk, |ip, host, r| tun.publish(ip, host, r)), Some(Ok(_))));
+        assert_eq!(tun.sizes(), (1, 1, 1));
+        assert!(tun.host.read().unwrap().contains(&link()) && !tun.host.read().unwrap().contains(&old_link()));
+    }
+
+    #[test]
+    fn ordinary_admission_other_identity_or_unauthenticated_owner_is_never_evicted() {
+        // чужая identity с тем же адресом: address clash до публикации, без мутаций
+        let f = fixture(true);
+        let tun = TunCore::default();
+        let cid = id_of_pub(&f.pk).unwrap();
+        let ip = client_ip(&cid);
+        let other_pk = leviculum_std::api::generate_identity().public_key_bytes();
+        add_old_client(&f, &tun, old_link(), other_pk, [0xaa; 16], ip, true);
+        assert!(matches!(promote_client_link(&f.authority, &f.links, link(), &f.pk, |ip, host, r| tun.publish(ip, host, r)),
+            Some(Err(AdmitOutcome::Refuse { reason: b"address clash", .. }))));
+        assert_eq!(tun.sizes(), (1, 1, 1));
+        assert_eq!(tun.routes.read().unwrap().get(&ip).map(|(l, _)| *l), Some(old_link()));
+        assert!(matches!(f.links.lock().unwrap()[&link()].role, Role::Unknown));
+
+        // та же роль-id, но другой аутентифицированный ключ: не в `replaces`, отказ из таблиц TUN без мутаций
+        let f = fixture(true);
+        let tun = TunCore::default();
+        let ip = client_ip(&id_of_pub(&f.pk).unwrap());
+        let other_pk = leviculum_std::api::generate_identity().public_key_bytes();
+        add_old_client(&f, &tun, old_link(), other_pk, id_of_pub(&f.pk).unwrap(), ip, true);
+        assert!(matches!(promote_client_link(&f.authority, &f.links, link(), &f.pk, |ip, host, r| tun.publish(ip, host, r)),
+            Some(Err(AdmitOutcome::Refuse { reason: b"address clash", .. }))));
+        assert_eq!(tun.sizes(), (1, 1, 1));
+        assert_eq!(tun.routes.read().unwrap().get(&ip).map(|(l, _)| *l), Some(old_link()));
+        assert!(matches!(f.links.lock().unwrap()[&link()].role, Role::Unknown));
+    }
+
+    #[test]
+    fn ordinary_admission_replacement_serializes_with_revoke_and_close() {
+        let mut f = fixture(true);
+        let tun = Arc::new(TunCore::default());
+        let cid = id_of_pub(&f.pk).unwrap();
+        let ip = client_ip(&cid);
+        add_old_client(&f, &tun, old_link(), f.pk, cid, ip, false);
+        let revoke = f.issuer.issue(f.root, f.pk, trust::TRANSIT).unwrap();
+        let (paused, ready) = channel();
+        let (resume, resumed) = channel();
+        let (authority, links, pk, new_tun) = (f.authority.clone(), f.links.clone(), f.pk, tun.clone());
+        let promoter = std::thread::spawn(move || {
+            assert!(matches!(promote_client_link(&authority, &links, link(), &pk, |ip, host, r| {
+                paused.send(()).unwrap(); // role assigned, eviction not yet done
+                resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+                new_tun.publish(ip, host, r)
+            }), Some(Ok(_))));
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let authority_held = matches!(f.authority.try_lock(), Err(TryLockError::WouldBlock));
+        let link_held = matches!(f.links.try_lock(), Err(TryLockError::WouldBlock));
+        let (attempted, attempt) = channel();
+        let (authority, links, closed_tun) = (f.authority.clone(), f.links.clone(), tun.clone());
+        let revoker = std::thread::spawn(move || {
+            attempted.send(()).unwrap();
+            assert_eq!(authority.lock().unwrap().offer(revoke), trust::Offer::Added);
+            remove_link_admission(&links, &link(), || closed_tun.close());
+        });
+        attempt.recv_timeout(Duration::from_secs(5)).unwrap();
+        resume.send(()).unwrap();
+        promoter.join().unwrap();
+        revoker.join().unwrap();
+        assert!(authority_held && link_held, "revoke/close must not slip between role assignment and replacement");
+        // после отзыва у нового Link нет прав, прежний уже вытеснен: в TUN никого
+        assert_eq!(tun.sizes(), (0, 0, 0));
+        assert!(!f.links.lock().unwrap().contains_key(&link()));
+        // последующая замена по отозванным правам невозможна
+        assert!(promote_client_link(&f.authority, &f.links, LinkId::new([74; 16]), &f.pk, |ip, host, r| tun.publish(ip, host, r)).is_none());
+        assert_eq!(tun.sizes(), (0, 0, 0));
+    }
+
+    fn set_role(f: &Fixture, client: bool) {
+        let role = if client {
+            let id = id_of_pub(&f.pk).unwrap();
+            Role::Client { id, ip: client_ip(&id) }
+        } else {
+            Role::Server { dest: dest_from_pub_tag(&f.pk, T13_TAG) }
+        };
+        f.links.lock().unwrap().get_mut(&link()).unwrap().role = role;
+    }
+
+    fn kind(client: bool) -> OrdinaryAdmission {
+        if client { OrdinaryAdmission::Client } else { OrdinaryAdmission::Server }
+    }
+
+    fn offer(f: &Fixture, rec: &trust::Record) {
+        assert_eq!(f.authority.lock().unwrap().offer(rec.clone()), trust::Offer::Added);
+    }
+
+    /// The exact production gate used by `send_live_ctl` for T_REC; `polls` counts transport polls.
+    fn poll_rec(f: &Fixture, client: bool, rec: &trust::Record, polls: &mut u32, result: Poll<bool>) -> Poll<bool> {
+        poll_live_forward(&f.authority, &f.links, link(), &f.pk, kind(client),
+            |tr| live_rec_allowed(tr, rec, &f.pk),
+            || { *polls += 1; result })
+    }
+
+    #[test]
+    fn live_forward_targets_are_admitted_links_with_known_peer_key() {
+        let f = fixture(true);
+        assert!(live_forward_targets(&f.links, None).is_empty(), "unknown-role Link is not a target");
+        set_role(&f, true);
+        assert!(live_forward_targets(&f.links, None) == vec![(link(), f.pk, OrdinaryAdmission::Client)]);
+        assert!(live_forward_targets(&f.links, Some(link())).is_empty(), "except is honoured");
+        set_role(&f, false);
+        assert!(live_forward_targets(&f.links, None) == vec![(link(), f.pk, OrdinaryAdmission::Server)]);
+        f.links.lock().unwrap().get_mut(&link()).unwrap().peer_pk = None;
+        assert!(live_forward_targets(&f.links, None).is_empty());
+    }
+
+    #[test]
+    fn live_forward_queued_sibling_record_is_not_committed_after_add_downgrade() {
+        let mut f = fixture(true);
+        set_role(&f, true);
+        let delegate = f.issuer.issue(f.root, f.pk, trust::USE | trust::ADD).unwrap();
+        offer(&f, &delegate);
+        let sibling = f.issuer.issue(f.root, leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &sibling);
+
+        // Queued while the peer still has ADD (the forward_rec planning predicate), then backpressure.
+        let tr = f.authority.lock().unwrap();
+        assert!(live_rec_allowed(&tr, &sibling, &f.pk));
+        drop(tr);
+        let mut polls = 0;
+        assert!(poll_rec(&f, true, &sibling, &mut polls, Poll::Pending).is_pending());
+        assert_eq!(polls, 1);
+
+        // Signed downgrade ADD -> USE: Link and ordinary admission survive, sibling visibility does not.
+        let downgrade = f.issuer.issue(f.root, f.pk, trust::USE).unwrap();
+        offer(&f, &downgrade);
+        assert!(f.authority.lock().unwrap().common_with(&f.pk, trust::EXIT, trust::USE, true, false, now_ms() as u64));
+        assert!(poll_rec(&f, true, &sibling, &mut polls, Poll::Ready(true)) == Poll::Ready(false));
+        assert_eq!(polls, 1, "the send future must not be polled (committed) after the downgrade");
+    }
+
+    #[test]
+    fn live_forward_delivers_own_chain_and_revoke_after_downgrade_and_rights_zero() {
+        let mut f = fixture(true);
+        set_role(&f, true);
+        let delegate = f.issuer.issue(f.root, f.pk, trust::USE | trust::ADD).unwrap();
+        offer(&f, &delegate);
+        let sibling = f.issuer.issue(f.root, leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &sibling);
+
+        let downgrade = f.issuer.issue(f.root, f.pk, trust::USE).unwrap();
+        offer(&f, &downgrade);
+        let mut polls = 0;
+        assert!(poll_rec(&f, true, &downgrade, &mut polls, Poll::Ready(true)) == Poll::Ready(true), "own record reaches a USE peer");
+        assert!(poll_rec(&f, true, &sibling, &mut polls, Poll::Ready(true)) == Poll::Ready(false));
+        assert_eq!(polls, 1);
+
+        // Pending first, then the peer is revoked to rights=0 and its Link has not been closed yet.
+        let revoke = f.issuer.issue(f.root, f.pk, 0).unwrap();
+        offer(&f, &revoke);
+        assert!(live_forward_targets(&f.links, None).iter().any(|(l, p, k)| *l == link() && *p == f.pk && *k == OrdinaryAdmission::Client));
+        assert!(poll_rec(&f, true, &revoke, &mut polls, Poll::Pending).is_pending());
+        assert!(poll_rec(&f, true, &revoke, &mut polls, Poll::Ready(true)) == Poll::Ready(true), "own revoke still delivered at rights=0");
+        assert_eq!(polls, 3);
+        assert!(poll_rec(&f, true, &sibling, &mut polls, Poll::Ready(true)) == Poll::Ready(false), "former role must not reveal siblings");
+        assert_eq!(polls, 3);
+    }
+
+    #[test]
+    fn live_forward_server_root_export_requires_current_transit_but_keeps_own_revoke() {
+        let mut f = fixture(false);
+        set_role(&f, false);
+        let sibling = f.issuer.issue(f.root, leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &sibling);
+        let mut polls = 0;
+        assert!(poll_rec(&f, false, &sibling, &mut polls, Poll::Pending).is_pending());
+        assert!(poll_rec(&f, false, &sibling, &mut polls, Poll::Ready(true)) == Poll::Ready(true), "TRANSIT neighbour gets the whole root");
+        assert_eq!(polls, 2);
+
+        let queued = f.issuer.issue(f.root, leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &queued);
+        assert!(poll_rec(&f, false, &queued, &mut polls, Poll::Pending).is_pending());
+        let downgrade = f.issuer.issue(f.root, f.pk, trust::USE).unwrap();
+        offer(&f, &downgrade);
+        assert!(poll_rec(&f, false, &queued, &mut polls, Poll::Ready(true)) == Poll::Ready(false));
+        assert_eq!(polls, 3, "queued full-store export is cancelled once TRANSIT is gone");
+        assert!(poll_rec(&f, false, &downgrade, &mut polls, Poll::Ready(true)) == Poll::Ready(true));
+        let revoke = f.issuer.issue(f.root, f.pk, 0).unwrap();
+        offer(&f, &revoke);
+        assert!(poll_rec(&f, false, &revoke, &mut polls, Poll::Ready(true)) == Poll::Ready(true), "ex-neighbour still learns its own revoke");
+        assert_eq!(polls, 5);
+    }
+
+    /// A second accepted root S on the same server (the target is its EXIT/TRANSIT member). Returns (S issuer, S record of a bystander).
+    fn add_second_root(f: &Fixture) -> (trust::Trust, trust::Record) {
+        let root2 = leviculum_std::api::generate_identity();
+        let mut issuer2 = trust::Trust::new(root2.clone(), None);
+        let mut tr = f.authority.lock().unwrap();
+        tr.add_anchor(&root2.public_key_bytes()).unwrap();
+        let node_rec2 = issuer2.issue(*root2.hash(), f.node_pk, trust::EXIT | trust::TRANSIT).unwrap();
+        assert_eq!(tr.offer(node_rec2), trust::Offer::Added);
+        let bystander = issuer2.issue(*root2.hash(), leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+        assert_eq!(tr.offer(bystander.clone()), trust::Offer::Added);
+        (issuer2, bystander)
+    }
+
+    #[test]
+    fn live_forward_server_with_transit_only_in_r_does_not_get_records_of_s() {
+        let mut f = fixture(false);
+        set_role(&f, false);
+        let (_issuer2, s_rec) = add_second_root(&f);
+        let r_rec = f.issuer.issue(f.root, leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &r_rec);
+        let mut polls = 0;
+        assert!(poll_rec(&f, false, &r_rec, &mut polls, Poll::Ready(true)) == Poll::Ready(true), "own root R stays visible");
+        assert!(poll_rec(&f, false, &s_rec, &mut polls, Poll::Ready(true)) == Poll::Ready(false), "foreign root S is not pushed");
+        assert_eq!(polls, 1, "the transport is never polled for the foreign record");
+        // admission / server export uses the same projection
+        let tr = f.authority.lock().unwrap();
+        let admitted = tr.records_visible_to(&f.pk);
+        assert!(admitted.contains(&r_rec) && !admitted.iter().any(|r| r.root == s_rec.root), "admission export carries no root S");
+    }
+
+    #[test]
+    fn live_forward_server_with_transit_in_r_and_s_gets_both_roots() {
+        let mut f = fixture(false);
+        set_role(&f, false);
+        let (mut issuer2, bystander) = add_second_root(&f);
+        let root2 = bystander.root;
+        // the peer is a TRANSIT member of S too
+        let peer_rec2 = issuer2.issue(root2, f.pk, trust::USE | trust::TRANSIT).unwrap();
+        offer(&f, &peer_rec2);
+        let s_rec = issuer2.issue(root2, leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &s_rec);
+        let r_rec = f.issuer.issue(f.root, leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &r_rec);
+        let mut polls = 0;
+        assert!(poll_rec(&f, false, &r_rec, &mut polls, Poll::Ready(true)) == Poll::Ready(true));
+        assert!(poll_rec(&f, false, &s_rec, &mut polls, Poll::Ready(true)) == Poll::Ready(true), "mesh propagation in S is not broken");
+        assert_eq!(polls, 2);
+        let admitted = f.authority.lock().unwrap().records_visible_to(&f.pk);
+        assert!(admitted.contains(&r_rec) && admitted.contains(&s_rec), "admission export carries both roots");
+        // losing TRANSIT in S (signed downgrade) removes S, keeps R
+        let down = issuer2.issue(root2, f.pk, trust::USE).unwrap();
+        offer(&f, &down);
+        let late = issuer2.issue(root2, leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &late);
+        assert!(poll_rec(&f, false, &late, &mut polls, Poll::Ready(true)) == Poll::Ready(false));
+        let r_late = f.issuer.issue(f.root, leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &r_late);
+        assert!(poll_rec(&f, false, &r_late, &mut polls, Poll::Ready(true)) == Poll::Ready(true), "R is still served");
+    }
+
+    #[test]
+    fn live_forward_requires_same_link_peer_and_role_at_every_poll() {
+        for client in [true, false] {
+            let mut f = fixture(client);
+            set_role(&f, client);
+            let sibling = f.issuer.issue(f.root, leviculum_std::api::generate_identity().public_key_bytes(), trust::USE).unwrap();
+            offer(&f, &sibling);
+            // A genuinely permitted record: Client needs ADD to see siblings.
+            if client { let d = f.issuer.issue(f.root, f.pk, trust::USE | trust::ADD).unwrap(); offer(&f, &d); }
+            let mut polls = 0;
+            assert!(poll_rec(&f, client, &sibling, &mut polls, Poll::Pending).is_pending());
+            assert_eq!(polls, 1);
+            for change in 0..4 {
+                let saved = f.links.lock().unwrap().get(&link()).map(|i| (i.peer_pk, i.enroll_only, i.want_use, match i.role {
+                    Role::Client { id, ip } => Role::Client { id, ip }, Role::Server { dest } => Role::Server { dest }, _ => Role::Unknown }));
+                {
+                    let mut live = f.links.lock().unwrap();
+                    let i = live.get_mut(&link()).unwrap();
+                    match change {
+                        0 => i.peer_pk = Some(leviculum_std::api::generate_identity().public_key_bytes()),
+                        1 => i.role = Role::Unknown,
+                        2 => i.enroll_only = true,
+                        _ => { live.remove(&link()); }
+                    }
+                }
+                assert!(poll_rec(&f, client, &sibling, &mut polls, Poll::Ready(true)) == Poll::Ready(false), "change {change}");
+                assert_eq!(polls, 1, "change {change}: no commit after Link/peer/role change");
+                let mut live = f.links.lock().unwrap();
+                if change == 3 { live.insert(link(), LinkInfo { role: Role::Unknown, since: Instant::now(), last_heard: Instant::now(),
+                    peer_pk: None, want_use: false, enroll_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 }); }
+                let i = live.get_mut(&link()).unwrap();
+                let (pk, enroll, want, role) = saved.unwrap();
+                i.peer_pk = pk; i.enroll_only = enroll; i.want_use = want; i.role = role;
+            }
+            assert!(poll_rec(&f, client, &sibling, &mut polls, Poll::Ready(true)) == Poll::Ready(true), "restored Link is eligible again");
+        }
+    }
+
+    #[test]
+    fn live_forward_policy_uses_current_projection() {
+        // Server: a USE-only sibling policy is part of the full TRANSIT export only while TRANSIT holds.
+        let mut f = fixture(false);
+        set_role(&f, false);
+        let holder = leviculum_std::api::generate_identity();
+        let sibling = f.issuer.issue(f.root, holder.public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &sibling);
+        let now = now_ms() as u64;
+        let pol = trust::Policy::sign(&holder, f.root, trust::USE, now, now + 60_000).unwrap();
+        assert_eq!(f.authority.lock().unwrap().offer_policy(pol.clone(), now), trust::Offer::Added);
+        let gate = |f: &Fixture, client: bool, polls: &mut u32, result: Poll<bool>| poll_live_forward(&f.authority, &f.links, link(), &f.pk, kind(client),
+            |tr| live_pol_allowed(tr, kind(client), &pol, &f.pk, now_ms() as u64), || { *polls += 1; result });
+        let mut polls = 0;
+        assert!(gate(&f, false, &mut polls, Poll::Pending).is_pending());
+        let downgrade = f.issuer.issue(f.root, f.pk, trust::USE).unwrap();
+        offer(&f, &downgrade);
+        assert!(gate(&f, false, &mut polls, Poll::Ready(true)) == Poll::Ready(false));
+        assert_eq!(polls, 1);
+
+        // Client: an EXIT holder's policy is visible to USE peers until that holder stops being EXIT.
+        let mut f = fixture(true);
+        set_role(&f, true);
+        let exit = leviculum_std::api::generate_identity();
+        let exit_rec = f.issuer.issue(f.root, exit.public_key_bytes(), trust::EXIT).unwrap();
+        offer(&f, &exit_rec);
+        let pol = trust::Policy::sign(&exit, f.root, trust::EXIT, now, now + 60_000).unwrap();
+        assert_eq!(f.authority.lock().unwrap().offer_policy(pol.clone(), now), trust::Offer::Added);
+        let gate = |f: &Fixture, polls: &mut u32, result: Poll<bool>| poll_live_forward(&f.authority, &f.links, link(), &f.pk, OrdinaryAdmission::Client,
+            |tr| live_pol_allowed(tr, OrdinaryAdmission::Client, &pol, &f.pk, now_ms() as u64), || { *polls += 1; result });
+        let mut polls = 0;
+        assert!(gate(&f, &mut polls, Poll::Pending).is_pending());
+        let no_exit = f.issuer.issue(f.root, exit.public_key_bytes(), trust::USE).unwrap();
+        offer(&f, &no_exit);
+        assert!(gate(&f, &mut polls, Poll::Ready(true)) == Poll::Ready(false));
+        assert_eq!(polls, 1);
+    }
+
+    /// Two accepted roots on one node. R: ADD-capable newcomer candidates, an EXIT holder, a USE sibling.
+    /// S: its own exit and user. Returns (node trust, [rec_r_exit, rec_r_sibling, rec_s_exit, rec_s_user]).
+    fn two_root_store(issuer_r: &mut trust::Trust, (root_r, pk_r): (trust::Hash, trust::Pk), issuer_s: &mut trust::Trust, (root_s, pk_s): (trust::Hash, trust::Pk))
+        -> (trust::Trust, [trust::Record; 4]) {
+        let ident = || leviculum_std::api::generate_identity();
+        let r_exit = issuer_r.issue(root_r, ident().public_key_bytes(), trust::EXIT).unwrap();
+        let r_sib = issuer_r.issue(root_r, ident().public_key_bytes(), trust::USE).unwrap();
+        let s_exit = issuer_s.issue(root_s, ident().public_key_bytes(), trust::EXIT).unwrap();
+        let s_user = issuer_s.issue(root_s, ident().public_key_bytes(), trust::USE | trust::ADD).unwrap();
+        let mut node = trust::Trust::new(ident(), None);
+        node.add_anchor(&pk_r).unwrap();
+        node.add_anchor(&pk_s).unwrap();
+        for r in [&r_exit, &r_sib, &s_exit, &s_user] { assert_eq!(node.offer((*r).clone()), trust::Offer::Added); }
+        (node, [r_exit, r_sib, s_exit, s_user])
+    }
+
+    #[test]
+    fn enrollment_export_is_root_scoped_for_add_and_use_newcomers() {
+        let (root_r, root_s) = (leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity());
+        let (hr, hs) = (*root_r.hash(), *root_s.hash());
+        let (pk_r, pk_s) = (root_r.public_key_bytes(), root_s.public_key_bytes());
+        let mut issuer_r = trust::Trust::new(root_r, None);
+        let mut issuer_s = trust::Trust::new(root_s, None);
+        let (mut node, [r_exit, r_sib, s_exit, s_user]) = two_root_store(&mut issuer_r, (hr, pk_r), &mut issuer_s, (hs, pk_s));
+
+        // ADD newcomer in R: everything in R, nothing from S (the legacy scalar export_for(ADD) leaked S).
+        let adder = leviculum_std::api::generate_identity().public_key_bytes();
+        let adder_rec = issuer_r.issue(hr, adder, trust::USE | trust::ADD).unwrap();
+        assert_eq!(node.offer(adder_rec.clone()), trust::Offer::Added, "offered before the export is built");
+        assert!(node.export_for(trust::ADD, &adder).contains(&s_exit), "documents the legacy cross-root leak");
+        let (chain, rest) = enrollment_export(&node, &adder);
+        assert!(chain == vec![adder_rec.clone()], "own chain first");
+        assert!(rest.contains(&r_exit) && rest.contains(&r_sib), "ADD in R sees R");
+        assert!(!rest.contains(&s_exit) && !rest.contains(&s_user) && !chain.contains(&s_exit), "ADD in R must not export root S");
+        assert!(chain.iter().chain(rest.iter()).all(|r| r.root == hr));
+        assert!(!rest.contains(&adder_rec), "no duplicate of the chain");
+
+        // USE newcomer in R: own chain + EXIT chain of R only.
+        let user = leviculum_std::api::generate_identity().public_key_bytes();
+        let user_rec = issuer_r.issue(hr, user, trust::USE).unwrap();
+        assert_eq!(node.offer(user_rec.clone()), trust::Offer::Added);
+        let (chain, rest) = enrollment_export(&node, &user);
+        assert!(chain == vec![user_rec.clone()]);
+        assert!(rest == vec![r_exit.clone()], "USE newcomer: EXIT chain of its own root and nothing else");
+        assert!(!rest.contains(&r_sib) && !rest.contains(&adder_rec) && !rest.contains(&s_exit) && !rest.contains(&s_user));
+
+        // The rights=0 holder keeps only its own revoke (nothing from siblings or other roots).
+        let revoke = issuer_r.issue(hr, user, 0).unwrap();
+        assert_eq!(node.offer(revoke.clone()), trust::Offer::Added);
+        let (chain, rest) = enrollment_export(&node, &user);
+        assert!(chain == vec![revoke] && rest.is_empty());
+    }
+}
+
 impl NodeCtx {
+    /// Revalidate on EACH poll, including after channel-window/backpressure waits. There is no
+    /// Trust/links guard across an await: send's synchronous commit+enqueue occurs inside poll.
+    /// The driver core emits events through queues; it does not call back into NodeCtx/Trust.
+    async fn send_admitted_ctl(self: &Arc<Self>, link: LinkId, pk: &trust::Pk, kind: OrdinaryAdmission, ty: u8, body: &[u8]) -> bool {
+        let Some(t) = &self.t13 else { return false };
+        let mut message = Vec::with_capacity(1 + body.len());
+        message.push(ty);
+        message.extend_from_slice(body);
+        let handle = self.node.engine().link_handle(&link);
+        let sending = handle.send(&message);
+        tokio::pin!(sending);
+        let result = std::future::poll_fn(|cx| {
+            poll_authorized_link(&t.trust, &self.links, link, pk, kind, |tr| {
+                // A Client may retain USE while losing administrative visibility in one root.
+                // Do not transmit its old privileged snapshot merely because USE still holds.
+                if kind == OrdinaryAdmission::Client {
+                    if ty == T_REC && !trust::Record::parse(body).is_some_and(|r| tr.record_visible_to(&r, pk)) {
+                        return Poll::Ready(false);
+                    }
+                    if ty == T_POL && !trust::Policy::parse(body).is_some_and(|p| tr.export_policies_for(trust::USE, pk, now_ms() as u64).contains(&p)) {
+                        return Poll::Ready(false);
+                    }
+                }
+                sending.as_mut().poll(cx).map(|r| r.is_ok())
+            })
+        }).await;
+        if result == Some(true) {
+            if ty == T_POL {
+                POL_TX.fetch_add(message.len() as u64, Relaxed);
+                POL_TX_N.fetch_add(1, Relaxed);
+            }
+            true
+        } else { false }
+    }
+
+    /// Live T_REC/T_POL push: the same per-poll model as `send_admitted_ctl`, but the payload
+    /// predicate (not USE/TRANSIT alone) decides, so a rights-0 peer still gets its own revoke.
+    /// The Link, peer key, role and predicate are rechecked at EVERY poll, including after
+    /// Busy/pacing/backpressure wakes; a denied poll drops the send future uncommitted.
+    async fn send_live_ctl(self: &Arc<Self>, link: LinkId, pk: &trust::Pk, kind: OrdinaryAdmission, ty: u8, body: &[u8],
+        allowed: impl Fn(&trust::Trust, u64) -> bool) -> bool {
+        let Some(t) = &self.t13 else { return false };
+        let mut message = Vec::with_capacity(1 + body.len());
+        message.push(ty);
+        message.extend_from_slice(body);
+        let handle = self.node.engine().link_handle(&link);
+        let sending = handle.send(&message);
+        tokio::pin!(sending);
+        let sent = std::future::poll_fn(|cx| {
+            poll_live_forward(&t.trust, &self.links, link, pk, kind, |tr| allowed(tr, now_ms() as u64),
+                || sending.as_mut().poll(cx).map(|r| r.is_ok()))
+        }).await;
+        if sent && ty == T_POL {
+            POL_TX.fetch_add(message.len() as u64, Relaxed);
+            POL_TX_N.fetch_add(1, Relaxed);
+        }
+        sent
+    }
+
+    fn send_admitted_records(self: &Arc<Self>, link: LinkId, pk: trust::Pk, kind: OrdinaryAdmission) {
+        let Some(t) = &self.t13 else { return };
+        let Some((recs, pols)) = with_authorized_link(&t.trust, &self.links, link, &pk, kind, false, |tr, _| {
+            match kind {
+                // root-scoped as well: TRANSIT in root R gives all of R (and of every other root where the peer holds rights), never a foreign root
+                OrdinaryAdmission::Server => (tr.records_visible_to(&pk), tr.export_policies_for(trust::TRANSIT, &pk, now_ms() as u64)),
+                OrdinaryAdmission::Client => (tr.records_visible_to(&pk), tr.export_policies_for(trust::USE, &pk, now_ms() as u64)),
+            }
+        }) else { return };
+        let ctx = self.clone();
+        tokio::spawn(async move {
+            for r in recs {
+                if !ctx.send_admitted_ctl(link, &pk, kind, T_REC, &r.wire()).await { return; }
+            }
+            for p in pols {
+                if !ctx.send_admitted_ctl(link, &pk, kind, T_POL, &p.wire()).await { return; }
+            }
+        });
+    }
+
     /// (нужен ли сосед, наша ли очередь открывать Link). Нужны: админ приглашения (открываем мы), соседи-транзиты по записям
     /// (открывает меньший dest) и кандидаты на зачисление (только несём носитель QUIC: Link откроет сам приглашённый).
     fn neighbor_policy(&self, d: &[u8; 16]) -> (bool, bool) {
@@ -3955,6 +6709,14 @@ impl NodeCtx {
     /// Посредник (R6, T_DIR): каталог нод новичку - соседи с правом TRANSIT и адресом, не более DIR_MAX записей, кусками по DIR_CHUNK Б.
     /// Не чаще раза в 60 с на Link (инвариант 6). Адреса - подсказки: допуск по-прежнему по записям.
     fn send_dir(self: &Arc<Self>, link: LinkId) {
+        let server = self.links.lock().unwrap().get(&link)
+            .filter(|i| matches!(i.role, Role::Server { .. })).and_then(|i| i.peer_pk);
+        self.send_dir_checked(link, server);
+    }
+
+    /// Server callers retain the expected identity even after close: never fall back to the
+    /// enrollment directory path merely because the Server Link disappeared while queued.
+    fn send_dir_checked(self: &Arc<Self>, link: LinkId, expected_server: Option<trust::Pk>) {
         let Some(t) = &self.t13 else { return };
         {
             let mut s = t.dir_sent.lock().unwrap();
@@ -3967,8 +6729,7 @@ impl NodeCtx {
             }
             s.insert(link, Instant::now());
         }
-        let list: Vec<serde_json::Value> = {
-            let tr = t.trust.lock().unwrap();
+        let build = |tr: &trust::Trust| {
             let n = self.neigh.lock().unwrap();
             // ADR 0016: анонс адресов не несёт, поэтому первой строкой каталога - сама нода (адрес и имя из первых рук)
             let mut v: Vec<serde_json::Value> = Vec::new();
@@ -3984,6 +6745,12 @@ impl NodeCtx {
                     serde_json::json!({"d": hex(&nb.dest), "k": hex(&nb.pk), "e": nb.ep, "a": a, "n": nb.name})
                 }));
             v
+        };
+        let list = if let Some(pk) = expected_server {
+            let Some(list) = with_authorized_link(&t.trust, &self.links, link, &pk, OrdinaryAdmission::Server, false, |tr, _| build(tr)) else { return };
+            list
+        } else {
+            build(&t.trust.lock().unwrap())
         };
         let mut chunks: Vec<Vec<u8>> = Vec::new();
         let mut cur: Vec<serde_json::Value> = Vec::new();
@@ -4001,10 +6768,14 @@ impl NodeCtx {
         if chunks.is_empty() {
             return;
         }
-        let node = self.node.clone();
+        let ctx = self.clone();
         tokio::spawn(async move {
             for c in chunks {
-                send_ctl(&node, link, T_DIR, &c).await;
+                if let Some(pk) = expected_server {
+                    if !ctx.send_admitted_ctl(link, &pk, OrdinaryAdmission::Server, T_DIR, &c).await { return; }
+                } else {
+                    send_ctl(&ctx.node, link, T_DIR, &c).await;
+                }
             }
         });
     }
@@ -4022,28 +6793,25 @@ impl NodeCtx {
         }
     }
 
-    /// Соседям-серверам - всё; клиентам - только то, что вошло бы в их выгрузку (чужих пользователей клиенту не раскрываем).
+    /// Соседям-серверам и клиентам - root-scoped выгрузка по их действующим правам в корне записи: TRANSIT в корне R даёт весь R,
+    /// но не записи корня, где у соседа прав нет. Клиентская роль сама по себе не делает администратора USE-only и не объединяет права
+    /// разных корней. Видимость проверяется при постановке и ещё раз на каждом poll отправки (`send_live_ctl`).
     fn forward_rec(self: &Arc<Self>, rec: &trust::Record, except: Option<LinkId>) {
         let Some(t) = &self.t13 else { return };
-        let targets: Vec<(LinkId, Option<[u8; 64]>)> = self.links.lock().unwrap().iter()
-            .filter(|(k, _)| Some(**k) != except)
-            .filter_map(|(k, i)| match i.role {
-                Role::Server { .. } => Some((*k, None)),
-                Role::Client { .. } => i.peer_pk.map(|p| (*k, Some(p))),
-                _ => None,
-            }).collect();
+        let targets = live_forward_targets(&self.links, except);
         if targets.is_empty() {
             return;
         }
-        let send: Vec<LinkId> = {
+        let send: Vec<_> = {
             let tr = t.trust.lock().unwrap();
-            targets.into_iter().filter(|(_, pk)| match pk {
-                None => true,
-                Some(p) => tr.export_for(trust::USE, p).contains(rec),
-            }).map(|(k, _)| k).collect()
+            targets.into_iter().filter(|(_, pk, _)| live_rec_allowed(&tr, rec, pk)).collect()
         };
-        for l in send {
-            spawn_ctl(&self.node, l, T_REC, rec.wire());
+        for (l, pk, kind) in send {
+            let (ctx, rec) = (self.clone(), rec.clone());
+            tokio::spawn(async move {
+                let body = rec.wire();
+                ctx.send_live_ctl(l, &pk, kind, T_REC, &body, |tr, _now| live_rec_allowed(tr, &rec, &pk)).await;
+            });
         }
     }
 
@@ -4062,23 +6830,21 @@ impl NodeCtx {
     /// Допущенным Link (соседям и клиентам) - то, что вошло бы в их выгрузку политик. Цикл гасится проверкой `seq` при приёме.
     fn forward_pol(self: &Arc<Self>, pol: &trust::Policy, except: Option<LinkId>) {
         let Some(t) = &self.t13 else { return };
-        let targets: Vec<(LinkId, u16, [u8; 64])> = self.links.lock().unwrap().iter()
-            .filter(|(k, _)| Some(**k) != except)
-            .filter_map(|(k, i)| match (&i.role, i.peer_pk) {
-                (Role::Server { .. }, Some(p)) => Some((*k, trust::TRANSIT, p)),
-                (Role::Client { .. }, Some(p)) => Some((*k, trust::USE, p)),
-                _ => None,
-            }).collect();
+        let targets = live_forward_targets(&self.links, except);
         if targets.is_empty() {
             return;
         }
         let now = now_ms() as u64;
-        let send: Vec<LinkId> = {
+        let send: Vec<_> = {
             let tr = t.trust.lock().unwrap();
-            targets.into_iter().filter(|(_, r, p)| tr.export_policies_for(*r, p, now).contains(pol)).map(|(k, _, _)| k).collect()
+            targets.into_iter().filter(|(_, pk, kind)| live_pol_allowed(&tr, *kind, pol, pk, now)).collect()
         };
-        for l in send {
-            spawn_ctl(&self.node, l, T_POL, pol.wire());
+        for (l, pk, kind) in send {
+            let (ctx, pol) = (self.clone(), pol.clone());
+            tokio::spawn(async move {
+                let body = pol.wire();
+                ctx.send_live_ctl(l, &pk, kind, T_POL, &body, |tr, now| live_pol_allowed(tr, kind, &pol, &pk, now)).await;
+            });
         }
     }
 
@@ -4124,15 +6890,24 @@ impl NodeCtx {
             (pk, kind, i.want_use, i.enroll_only)
         };
         if enroll_only {
+            // Link никогда не станет клиентом: сообщаем об этом пришедшему за выходом, а не оставляем его ждать таймаут
+            if kind == 0 && want_use {
+                self.admit_diag(link, &pk, AdmitDiag::EnrollOnly);
+            }
             return;
         }
         // 0015: своё согласие (политика) учитывается, чужие права - по выдаче (чужой отказ исполняет он сам)
         let now = now_ms() as u64;
-        let (srv_ok, cli_ok, cli_granted) = {
-            let tr = t.trust.lock().unwrap();
+        let ((srv_ok, cli_ok, cli_granted), _) = publish_host_access_decision(&t.trust, &pk, |tr| {
             (tr.common_with(&pk, trust::TRANSIT, trust::TRANSIT, true, false, now), tr.common_with(&pk, trust::EXIT, trust::USE, true, false, now),
              tr.common(&pk, trust::EXIT, trust::USE))
-        };
+        }, |host_ok| {
+            // The Trust guard still covers the setter; close/admission below run after it drops.
+            if kind == 2 {
+                if let Some(tun) = &self.tun { return tun.set_host_access(&link, host_ok); }
+            }
+            true
+        });
         match kind {
             1 => {
                 if !srv_ok {
@@ -4161,6 +6936,9 @@ impl NodeCtx {
                             tokio::time::sleep(Duration::from_millis(300)).await;
                             c.close_link(link, "политика ноды: выход выключен");
                         });
+                    } else {
+                        // ни права USE у пира с EXIT у нас в общем корне, ни выданного права: возможно, цепочка ещё в пути
+                        self.no_chain_watch(link, pk);
                     }
                 } else if srv_ok && !cli_ok {
                     // права однозначно соседские (транзит есть, USE нет) - сразу
@@ -4180,35 +6958,20 @@ impl NodeCtx {
 
     fn admit_server13(self: &Arc<Self>, link: LinkId, pk: [u8; 64]) {
         let Some(t) = &self.t13 else { return };
-        let dest = dest_of_pub(self, &pk);
-        let opted_out = {
-            let mut l = self.links.lock().unwrap();
-            let Some(i) = l.get_mut(&link) else { return };
-            if !matches!(i.role, Role::Unknown) || i.enroll_only {
-                return;
-            }
-            // Check the latest known announcement while holding the role lock. If an
-            // announce changes to lc=false immediately afterward, on_announce waits for this
-            // lock and then closes the newly promoted Server Link.
-            let accepts_links = self.neigh.lock().unwrap().values().find(|n| n.pk == pk).map(|n| n.accepts_links);
-            if !server_promotion_allowed(i.enroll_only, accepts_links, true) {
-                true
-            } else {
-                i.role = Role::Server { dest };
-                false
-            }
-        };
-        if opted_out {
-            self.close_link(link, "пир отказался принимать соседские Link");
+        // Core/public-interface lookup happens before taking Trust/links.
+        if self.link_is_public(&link) {
+            self.close_link(link, "link через публичную сеть");
             return;
         }
-        self.admit_neighbor(link, dest, &pk);
-        let (recs, pols) = {
-            let tr = t.trust.lock().unwrap();
-            (tr.export_all(), tr.export_policies_for(trust::TRANSIT, &pk, now_ms() as u64))
-        };
-        self.send_recs_pols(link, recs, pols);
-        self.send_dir(link);
+        let dest = dest_of_pub(self, &pk);
+        let Some(duplicate) = promote_server_link(&t.trust, &self.links, &self.neigh, link, &pk, dest) else { return };
+        if let Some(drop_id) = duplicate {
+            self.close_link(drop_id, "дубликат либо отказ от серверного Link");
+            if drop_id == link { return; }
+        }
+        self.sh.note(format!("сосед {} допущен (права транзита подтверждены записями)", name_of(self, &dest)));
+        self.send_admitted_records(link, pk, OrdinaryAdmission::Server);
+        self.send_dir_checked(link, Some(pk));
         // Пир мог принять каталог раньше, чем присвоил Link роль Server (записи ещё обрабатываются): повтор через 5 с, помимо лимита 60 с
         let me = self.clone();
         tokio::spawn(async move {
@@ -4216,9 +6979,7 @@ impl NodeCtx {
             if let Some(t) = &me.t13 {
                 t.dir_sent.lock().unwrap().remove(&link);
             }
-            if me.links.lock().unwrap().get(&link).map(|i| matches!(i.role, Role::Server { .. })).unwrap_or(false) {
-                me.send_dir(link);
-            }
+            me.send_dir_checked(link, Some(pk));
         });
     }
 
@@ -4265,9 +7026,9 @@ impl NodeCtx {
 
     /// Раз в 5 минут: каталог (адреса, имена) допущенным соседям-серверам. Анонс адресов не несёт (ADR 0016).
     fn dir_tick(self: &Arc<Self>) {
-        let ids: Vec<LinkId> = self.links.lock().unwrap().iter().filter(|(_, l)| matches!(l.role, Role::Server { .. })).map(|(k, _)| *k).collect();
-        for l in ids {
-            self.send_dir(l);
+        let ids: Vec<(LinkId, trust::Pk)> = self.links.lock().unwrap().iter().filter(|(_, l)| matches!(l.role, Role::Server { .. })).filter_map(|(k, l)| l.peer_pk.map(|pk| (*k, pk))).collect();
+        for (l, pk) in ids {
+            self.send_dir_checked(l, Some(pk));
         }
     }
 
@@ -4286,45 +7047,45 @@ impl NodeCtx {
             });
             return;
         };
-        let Some(idh) = id_of_pub(&pk) else { return };
-        let ip = client_ip(&idh);
-        // H16: проверка адреса и назначение роли - под одной блокировкой links, иначе между ними другой Link займёт адрес
-        let (clash, old): (bool, Vec<LinkId>) = {
-            let mut l = self.links.lock().unwrap();
-            // один адрес - один активный клиент: чужой Link с тем же адресом не вытесняется
-            let clash = l.iter().any(|(k, i)| *k != link && matches!(i.role, Role::Client { ip: p, id, .. } if p == ip && id != idh));
-            if clash {
-                (true, Vec::new())
-            } else {
-                match l.get_mut(&link) {
-                    Some(i) if matches!(i.role, Role::Unknown) => i.role = Role::Client { id: idh, ip },
-                    _ => return,
+        // Constructing a handle touches the driver's completion registry; keep that outside
+        // the authority transaction. The allow half below only touches the TUN tables.
+        let handle = Arc::new(self.node.engine().link_handle(&link));
+        let result = promote_client_link(&t.trust, &self.links, link, &pk, |ip, host_ok, replaces| {
+            match admission_outcome(tun.allow_replacing_with_handle(link, ip, handle, replaces)) {
+                AdmitOutcome::Refuse { reason, note } => Err(AdmitOutcome::Refuse { reason, note }),
+                AdmitOutcome::SendAuthOk if tun.set_host_access(&link, host_ok) => Ok(()),
+                _ => Err(AdmitOutcome::Refuse { reason: b"admission failed", note: "допуск в TUN не завершён" }),
+            }
+        });
+        let admission = match result {
+            Some(Ok(a)) => a,
+            Some(Err(AdmitOutcome::Refuse { reason, note })) => {
+                spawn_ctl(&self.node, link, T_AUTH_FAIL, reason.to_vec());
+                self.close_link(link, note);
+                return;
+            }
+            _ => {
+                // no current ordinary permission/live eligible Link: no allow, no AUTH_OK.
+                // Ответ и запись - только если Link жив и так и не допущен; проигравший гонку с параллельным допуском молчит.
+                if client_awaiting_admission(&self.links, link, &pk) {
+                    self.admit_diag(link, &pk, AdmitDiag::NotAuthorized);
                 }
-                // та же identity с нового Link (смена маршрута): старый Link закрываем
-                let old = l.iter().filter(|(k, i)| **k != link && matches!(i.role, Role::Client { id, .. } if id == idh)).map(|(k, _)| *k).collect();
-                (false, old)
+                return;
             }
         };
-        if clash {
-            spawn_ctl(&self.node, link, T_AUTH_FAIL, b"address clash".to_vec());
-            self.close_link(link, "конфликт адреса клиента");
-            return;
-        }
-        for o in old {
+        for o in admission.replaced {
             self.close_link(o, "новый Link той же identity");
         }
-        tun.allow(&self.node, link, ip);
+        let (idh, ip) = (admission.id, admission.ip);
         let pl = self.client_info.lock().unwrap().get(&link).map(|(_, p)| *p).unwrap_or("?");
         self.sh.note(format!("client {} ({pl}) admitted on {}", &hex(&idh)[..8], &hex(link.as_bytes())[..8]));
-        let recs = t.trust.lock().unwrap().export_for(trust::USE, &pk);
-        let pols = t.trust.lock().unwrap().export_policies_for(trust::USE, &pk, now_ms() as u64);
         let ok = serde_json::json!({"name": self.name, "ip": ip_str(ip), "cc": REGION.get().cloned().unwrap_or_default(), "pl": platform()}).to_string().into_bytes();
         let c = self.clone();
         tokio::spawn(async move {
-            send_ctl(&c.node, link, T_AUTH_OK, &ok).await;
+            if !c.send_admitted_ctl(link, &pk, OrdinaryAdmission::Client, T_AUTH_OK, &ok).await { return; }
             // новому клиенту соседей шлём всегда (0014 R3)
             c.send_nbrs(link);
-            c.send_recs_pols(link, recs, pols);
+            c.send_admitted_records(link, pk, OrdinaryAdmission::Client);
         });
     }
 
@@ -4350,7 +7111,7 @@ impl NodeCtx {
                 }
                 off => {
                     self.sh.note(format!("inbox13: запись {off:?}"));
-                    self.save_trust();
+                    if !self.save_trust() { continue; }
                     let _ = std::fs::remove_file(&p);
                 }
             }
@@ -4844,12 +7605,7 @@ async fn on_pair1(ctx: Arc<NodeCtx>, link: LinkId, body: Vec<u8>) {
         return;
     };
     // Сначала полная цепочка R→…→D→N, затем остальная выгрузка по правам.
-    let (chain, rest) = {
-        let tr = t.trust.lock().unwrap();
-        let chain = tr.chain_for(&holder);
-        let rest: Vec<trust::Record> = tr.export_for(rec.rights, &holder).into_iter().filter(|r| !chain.contains(r)).collect();
-        (chain, rest)
-    };
+    let (chain, rest) = enrollment_export(&t.trust.lock().unwrap(), &holder);
     ctx.send_recs(link, chain);
     ctx.send_recs(link, rest);
     ctx.forward_rec(&rec, Some(link));
@@ -4897,7 +7653,8 @@ fn on_pairq(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
         if from_user {
             let rights = tr.rights_in(&root, &hh);
             if rights != 0 {
-                let mut recs = tr.export_for(rights, &holder);
+                // root-scoped снимок по действующим правам новичка в каждом корне (не скалярная выгрузка по правам одного корня)
+                let mut recs = tr.records_visible_to(&holder);
                 drop(tr);
                 // запись о самом новичке первой: по ней он признаёт админа якорем, остальные записи до этого отклонил бы как чужой корень
                 recs.sort_by_key(|r| !(r.holder == holder && r.root == root));
@@ -4943,35 +7700,17 @@ impl NodeCtx {
             self.close_link(link, "link через публичную сеть");
             return;
         }
-        {
-            let mut n = self.neigh.lock().unwrap();
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&pk[32..64]);
-            let e = n.entry(dest).or_insert_with(|| Neighbor { dest, key, pk: *pk, name: "?".into(), ep: String::new(), addrs: Addrs::new(vec![]), tags: vec![], accepts_links: true, last_announce: Instant::now(),
-                link: None, last_heard: Instant::now(), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(), last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: LossWin::default(), ping_seq: 0, admitted_at: Instant::now(), seen_gen: 0 });
-            // второй Link от того же соседа (встречное рукопожатие): оставляем с меньшим идентификатором, второй закрываем
-            if let Some(old) = e.link {
-                if old != link {
-                    let keep_new = link.as_bytes() < old.as_bytes();
-                    let drop_id = if keep_new { old } else { link };
-                    if keep_new {
-                        e.link = Some(link);
-                    }
-                    e.connecting = false;
-                    e.last_heard = Instant::now();
-                    drop(n);
-                    self.close_link(drop_id, "дубликат серверного link");
-                    self.broadcast_registry();
-                    return;
-                }
-            }
-            e.link = Some(link);
-            e.connecting = false;
-            e.last_heard = Instant::now();
-            e.admitted_at = Instant::now();
-            e.loss.clear();
-            self.sh.note(format!("сосед {} допущен ({})", e.name, if self.t13.is_some() { "права транзита подтверждены записями" } else { "серверный секрет подтверждён взаимно" }));
+        let duplicate = {
+            let live = self.links.lock().unwrap();
+            if !live.get(&link).is_some_and(|i| matches!(i.role, Role::Server { dest: d } if d == dest)) { return; }
+            admit_neighbor_state(&mut self.neigh.lock().unwrap(), link, dest, pk)
+        };
+        if let Some(drop_id) = duplicate {
+            self.close_link(drop_id, "дубликат серверного link");
+            self.broadcast_registry();
+            return;
         }
+        self.sh.note(format!("сосед {} допущен (серверный секрет подтверждён взаимно)", name_of(self, &dest)));
         // с задержкой: реестр не должен обогнать SRV4 на стороне инициатора (там сообщение принимается только от допущенного сервера)
         self.send_registry(link, 400);
     }
@@ -5154,7 +7893,7 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
             }
         }
 
-        // R10: бенч по файлу-запросу (`rawgd bench`); итог - bench/res-<id>.json
+        // R10: бенч по файлу-запросу (`knothopd bench`); итог - bench/res-<id>.json
         if tick % 2 == 0 {
             take_bench_req(&ctx);
         }
@@ -5264,7 +8003,7 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
 pub async fn run_hub(a: HubArgs) -> Result<()> {
     let hub_id = load_or_create_identity(&a.state)?;
     let key = iroh_key_from_identity(&hub_id)?;
-    let b = start_base("h", &a.state, true, Some(a.port), key, 500, &[], Some(a.tcp_port)).await?;
+    let b = start_base("h", &a.state, true, Some(a.port), key, None, 500, &[], Some(a.tcp_port)).await?;
     tokio::spawn(accept_loop(b.ep.clone(), b.node.clone(), b.sh.clone()));
     let mut ev = b.events;
     tokio::spawn(async move { while ev.recv().await.is_some() {} });
@@ -5289,14 +8028,196 @@ fn load_identity_strict(state: &Path) -> Result<Identity> {
 }
 
 /// Подписанная запись отдаётся работающей ноде через inbox13: сам CLI trust.json не пишет (владелец состояния - нода).
-fn put_inbox13(state: &Path, rec: &trust::Record) -> Result<()> {
+const LOCAL_INBOX_LIMIT: usize = 256;
+const CLIENT_INBOX_BATCH: usize = 16;
+
+/// The directory is local control state, not an alternate network trust input.
+/// Serialize CLI writers and maintenance without a lockfile containing identity data.
+fn open_local_inbox(state: &Path, create: bool) -> Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     let dir = state.join("inbox13");
-    std::fs::create_dir_all(&dir)?;
-    let name = format!("{}-{}", now_ms(), &hex(&rec.hh)[..8]);
+    if create {
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let f = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC).open(&dir)?;
+    let meta = f.metadata()?;
+    let euid = unsafe { libc::geteuid() };
+    if !meta.is_dir() || (meta.uid() != euid && meta.uid() != 0) {
+        bail!("inbox13: invalid directory owner/type");
+    }
+    // Upgrade an existing CLI-owned legacy directory; the consumer never relaxes permissions.
+    if create { f.set_permissions(std::fs::Permissions::from_mode(0o700))?; }
+    if f.metadata()?.mode() & 0o077 != 0 { bail!("inbox13: directory is not private"); }
+    Ok(f)
+}
+
+fn lock_local_inbox(dir: &std::fs::File, nonblocking: bool) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    if unsafe { libc::flock(dir.as_raw_fd(), flags) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(()) // File close releases flock, including error/unwind paths.
+}
+
+fn local_inbox_paths(state: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for e in std::fs::read_dir(state.join("inbox13"))?.take(LOCAL_INBOX_LIMIT + 1) {
+        paths.push(e?.path());
+    }
+    if paths.len() > LOCAL_INBOX_LIMIT { bail!("inbox13: directory limit exceeded; records retained"); }
+    Ok(paths)
+}
+
+fn put_inbox13(state: &Path, rec: &trust::Record) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let locked = open_local_inbox(state, true)?;
+    lock_local_inbox(&locked, false)?;
+    if local_inbox_paths(state)?.len() >= LOCAL_INBOX_LIMIT {
+        bail!("inbox13: queue full; existing records retained");
+    }
+    let dir = state.join("inbox13");
+    let name = format!("{}-{:016x}", now_ms(), rand_core::OsRng.next_u64());
     let tmp = dir.join(format!("{name}.tmp"));
-    std::fs::write(&tmp, hex(&rec.wire()))?;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&tmp)?;
+    f.write_all(hex(&rec.wire()).as_bytes())?;
+    f.sync_all()?;
     std::fs::rename(&tmp, dir.join(format!("{name}.rec")))?;
+    locked.sync_all()?;
     Ok(())
+}
+
+fn read_local_inbox_record(path: &Path) -> Result<trust::Record> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path)?;
+    let m = f.metadata()?;
+    let euid = unsafe { libc::geteuid() };
+    let max = (trust::REC_LEN * 2 + 2) as u64;
+    if !m.is_file() || m.len() > max || m.mode() & 0o077 != 0 || (m.uid() != euid && m.uid() != 0) {
+        bail!("inbox13: invalid record file");
+    }
+    let mut text = String::new();
+    f.take(max + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > max { bail!("inbox13: oversized record"); }
+    let text = text.trim();
+    if text.len() != trust::REC_LEN * 2 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("inbox13: malformed record");
+    }
+    trust::Record::parse(&unhex(text)).ok_or_else(|| anyhow::anyhow!("inbox13: malformed record"))
+}
+
+fn reject_local_inbox_record(path: &Path) -> Result<()> {
+    // Unlike rename-over-existing, this never destroys earlier rejection evidence.
+    std::fs::hard_link(path, path.with_extension("rejected"))?;
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct ClientInboxStats { changed: bool, committed: usize, sent: usize, rejected: usize, retained: usize, save_failed: bool }
+
+#[derive(Default)]
+struct ClientInboxProgress { durable: HashSet<Vec<u8>>, cursor: usize }
+
+fn local_record_authorized(tr: &trust::Trust, rec: &trust::Record) -> bool {
+    // Only this state's CLI issues local work. Peer-signed records use on_rec_client.
+    let mine = tr.my_rights_in(&rec.root);
+    let need = if rec.rights == 0 { trust::REMOVE } else { trust::ADD };
+    rec.issuer == tr.me_hash && tr.has_anchor(&rec.root) && mine & need != 0
+        && rec.rights & !mine == 0
+        && tr.depth_in(&rec.root, &rec.issuer).is_some_and(|d| (d as usize) < trust::MAX_DEPTH)
+}
+
+fn local_record_exit_authorized(tr: &trust::Trust, rec: &trust::Record, peer: Option<&trust::Pk>) -> bool {
+    peer.and_then(trust::hash_of).is_some_and(|h|
+        tr.my_rights_in(&rec.root) & trust::USE != 0
+        && tr.effective_in(&rec.root, &h, now_ms() as u64) & trust::EXIT != 0)
+}
+
+/// Actual client consumer, also exercised with injected I/O/transport in narrow tests.
+/// Caller holds live Trust, not a CLI-loaded copy. A successful save precedes every
+/// send/dequeue. No remote ACK is implied; reconnect exports the current signed store.
+fn client_inbox_step(
+    state: &Path, tr: &mut trust::Trust, progress: &mut ClientInboxProgress, peer: Option<&trust::Pk>,
+    save: impl FnOnce(&trust::Trust) -> Result<()>, mut publish: impl FnMut(&trust::Record) -> bool,
+) -> Result<ClientInboxStats> {
+    let mut stats = ClientInboxStats::default();
+    let locked = match open_local_inbox(state, false) {
+        Ok(f) => f,
+        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => return Ok(stats),
+        Err(e) => return Err(e),
+    };
+    // Do not block the phone's existing maintenance task behind a CLI fsync.
+    if lock_local_inbox(&locked, true).is_err() { return Ok(stats); }
+    let mut paths = local_inbox_paths(state)?;
+    paths.retain(|p| p.extension().is_some_and(|e| e == "rec"));
+    paths.sort();
+    if paths.is_empty() { progress.durable.clear(); progress.cursor = 0; return Ok(stats); }
+    let start = progress.cursor % paths.len();
+    paths.rotate_left(start);
+    progress.cursor = (start + CLIENT_INBOX_BATCH.min(paths.len())) % paths.len();
+    let mut pending = Vec::new();
+    for p in paths.iter().take(CLIENT_INBOX_BATCH) {
+        let rec = read_local_inbox_record(p);
+        let off = match rec.as_ref() {
+            Ok(rec) if local_record_authorized(tr, rec) => tr.offer(rec.clone()),
+            _ => trust::Offer::Rejected("invalid local record or current authority"),
+        };
+        match off {
+            trust::Offer::Rejected(_) => {
+                if reject_local_inbox_record(p).is_ok() { stats.rejected += 1; }
+                else { stats.retained += 1; }
+            },
+            off => {
+                stats.changed |= off == trust::Offer::Added;
+                pending.push((p, rec.expect("accepted parsed record")));
+            },
+        }
+    }
+    if pending.is_empty() { return Ok(stats); }
+    // A stale queued grant must never supersede the current revoke on the wire.
+    let all = tr.export_all();
+    let current: Vec<_> = pending.into_iter().filter_map(|(p, r)| all.iter()
+        .find(|x| x.root == r.root && x.hh == r.hh && x.issuer == r.issuer)
+        .map(|r| (p, r))).collect();
+    if current.is_empty() {
+        return Ok(stats);
+    }
+    if stats.changed || current.iter().any(|(_, r)| !progress.durable.contains(&r.wire())) {
+        if save(tr).is_err() { stats.save_failed = true; stats.retained += current.len(); return Ok(stats); }
+        stats.committed = current.len();
+    }
+    // Cache only local-save facts, bounded independently of the network. It avoids
+    // repeated fsync every 4 s while offline; no custody/retransmit protocol is added.
+    for (_, r) in &current {
+        let wire = r.wire();
+        if progress.durable.len() == LOCAL_INBOX_LIMIT && !progress.durable.contains(&wire) {
+            progress.durable.clear();
+        }
+        progress.durable.insert(wire);
+    }
+    let mut sent = HashSet::new();
+    for (p, rec) in current {
+        let wire = rec.wire();
+        if local_record_authorized(tr, rec) && local_record_exit_authorized(tr, rec, peer)
+            && (sent.contains(&wire) || publish(rec)) {
+            sent.insert(wire);
+            stats.sent += 1;
+            if std::fs::remove_file(p).is_err() { stats.retained += 1; }
+        } else {
+            stats.retained += 1; // Keep queued work when no authenticated current exit exists.
+        }
+    }
+    Ok(stats)
 }
 
 /// Проверки выдающего при подготовке делегированного приглашения выполняются до создания pin.
@@ -5379,15 +8300,15 @@ fn holder_by_prefix(prefix: &str, known: &[(String, trust::Pk)]) -> Result<trust
     }
 }
 
-fn admin_grant(a: GrantArgs) -> Result<()> {
-    let id = load_identity_strict(&a.state)?;
-    let rights = trust::parse_rights(&a.rights)?;
-    let mut tr = trust::Trust::load(id, &a.state)?;
-    let root: trust::Hash = match &a.root {
+/// Подписать запись о правах и поставить в локальную очередь inbox13 (общий путь `grant` и экрана «Моя нода»).
+fn grant_to_inbox(state: &Path, root: Option<&str>, holder: &str, rights: u16) -> Result<()> {
+    let id = load_identity_strict(state)?;
+    let mut tr = trust::Trust::load(id, state)?;
+    let root: trust::Hash = match root {
         Some(r) => unhex(r.trim()).try_into().map_err(|_| anyhow::anyhow!("--root: нужен хеш identity админа (32 hex)"))?,
         None => tr.me_hash,
     };
-    let h = a.holder.trim().to_lowercase();
+    let h = holder.trim().to_lowercase();
     let holder: trust::Pk = if h.len() == 128 {
         unhex(&h).try_into().map_err(|_| anyhow::anyhow!("--holder: не публичный ключ"))?
     } else {
@@ -5396,12 +8317,95 @@ fn admin_grant(a: GrantArgs) -> Result<()> {
         holder_by_prefix(&h, &known)?
     };
     let rec = tr.issue(root, holder, rights)?;
-    put_inbox13(&a.state, &rec)?;
-    println!("запись для {} ({}) подписана; нода применит её за ~1 с", &hex(&rec.hh)[..8], trust::rights_text(rights));
+    put_inbox13(state, &rec)
+}
+
+fn admin_grant(a: GrantArgs) -> Result<()> {
+    let rights = trust::parse_rights(&a.rights)?;
+    grant_to_inbox(&a.state, a.root.as_deref(), &a.holder, rights)?;
+    println!("запись ({}) подписана и поставлена в локальную очередь; удалённое применение не подтверждено", trust::rights_text(rights));
     Ok(())
 }
 
-/// `rawgd policy`: записывает желаемую политику в `<state>/policy-want.json` (атомарно); работающая нода или клиент подписывает её и разносит.
+/// Записи в очереди inbox13 (hex хеша держателя -> права), не больше 64 файлов; нечитаемые и чужие по правам пропускаются.
+fn pending_inbox13(state: &Path, root: &trust::Hash) -> (usize, HashMap<String, u16>) {
+    let mut n = 0;
+    let mut by_holder = HashMap::new();
+    let Ok(rd) = std::fs::read_dir(state.join("inbox13")) else { return (0, by_holder) };
+    for p in rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "rec")).take(64) {
+        n += 1;
+        if let Ok(rec) = read_local_inbox_record(&p) {
+            if rec.root == *root { by_holder.insert(hex(&rec.hh), rec.rights); }
+        }
+    }
+    (n, by_holder)
+}
+
+/// Экран «Моя нода»: мои права, участники моей сети (по локальному Trust) и очередь неприменённых записей.
+/// Права «действует» = цепочка до корня (`rights_in`); подписи уже проверены при приёме записей в Trust.
+fn my_node_view(state: &Path) -> Result<String> {
+    let id = load_identity_strict(state)?;
+    let tr = trust::Trust::load(id, state)?;
+    let me = tr.me_hash;
+    // HOST_ACCESS живёт отдельными записями с областью NODE (экран ноды), в корневых правах не показывается и не меняется
+    let mine = tr.my_rights_in(&me) & trust::ALL;
+    let (queued, queue) = pending_inbox13(state, &me);
+    let mut holders: Vec<trust::Hash> = tr.export_all().into_iter().filter(|r| r.root == me && r.hh != me).map(|r| r.hh).collect();
+    holders.sort();
+    holders.dedup();
+    holders.truncate(200);
+    let participants: Vec<_> = holders.iter().map(|h| {
+        let hx = hex(h);
+        let mut p = serde_json::json!({"holder": hx, "rights": tr.rights_in(&me, h) & trust::ALL, "eff": tr.effective_in(&me, h, now_ms() as u64) & trust::ALL});
+        if let Some(q) = queue.get(&hx) { p["queued"] = serde_json::json!(q); }
+        p
+    }).collect();
+    let networks: Vec<_> = tr.anchors().into_iter().filter(|(r, _)| *r != me)
+        .map(|(r, _)| serde_json::json!({"root": hex(&r), "tag": trust::root_tag(&r), "rights": tr.my_rights_in(&r) & trust::ALL})).collect();
+    Ok(serde_json::json!({"version": 1, "me": hex(&me), "root": hex(&me), "my_rights": mine,
+        "can_add": mine & trust::ADD != 0, "can_remove": mine & trust::REMOVE != 0, "grantable": mine,
+        "queued": queued, "participants": participants, "networks": networks}).to_string())
+}
+
+/// Задать права держателя в СВОЕЙ сети (маска без HOST_ACCESS). Полномочия и подмножество своих прав проверяет `Trust::issue`;
+/// запись подписывается и кладётся в inbox13, дальше её подхватит клиент (локальный приём и T_REC на текущий выход).
+fn my_node_rights_set(state: &Path, holder: &str, rights: u16) -> String {
+    let fail = |code: &str, detail: String| serde_json::json!({"version": 1, "accepted": false, "queued": false, "rejected": code, "detail": detail}).to_string();
+    if rights & !trust::ALL != 0 { return fail("invalid_rights", "маска содержит биты вне USE..CONFIG".into()); }
+    if holder.len() != 32 || !holder.bytes().all(|b| b.is_ascii_hexdigit()) { return fail("invalid_holder", "нужен хеш держателя (32 hex)".into()); }
+    match grant_to_inbox(state, None, holder, rights) {
+        Ok(()) => serde_json::json!({"version": 1, "accepted": true, "queued": true, "rights": rights, "holder": holder.to_lowercase(),
+            "detail": "запись подписана и поставлена в локальную очередь; удалённое применение не подтверждено"}).to_string(),
+        Err(e) => fail("backend_refused", format!("{e:#}").chars().take(200).collect()),
+    }
+}
+
+/// `trust-view` и `rights-set` для JNI: фиксированные флаги, state всегда из аргумента `state_dir`.
+fn my_node_cli(words: &[&str], state_dir: &str) -> String {
+    let bad = |why: &str| serde_json::json!({"version": 1, "accepted": false, "queued": false, "error": why, "rejected": why}).to_string();
+    let (mut holder, mut rights) = (None, None);
+    let mut i = 1;
+    while i < words.len() {
+        if i + 1 >= words.len() { return bad("invalid_cli_arguments"); }
+        match words[i] {
+            "--state" => {}
+            "--holder" if words[0] == "rights-set" => holder = Some(words[i + 1]),
+            "--rights" if words[0] == "rights-set" => rights = words[i + 1].parse::<u16>().ok(),
+            _ => return bad("invalid_cli_arguments"),
+        }
+        i += 2;
+    }
+    let state = Path::new(state_dir);
+    if words[0] == "trust-view" {
+        return my_node_view(state).unwrap_or_else(|_| bad("trust_state_unavailable"));
+    }
+    match (holder, rights) {
+        (Some(h), Some(r)) => my_node_rights_set(state, h, r),
+        _ => bad("invalid_cli_arguments"),
+    }
+}
+
+/// `knothopd policy`: записывает желаемую политику в `<state>/policy-want.json` (атомарно); работающая нода или клиент подписывает её и разносит.
 fn admin_policy(a: PolicyArgs) -> Result<()> {
     let offer = trust::parse_rights(&a.rights)?;
     let id = load_identity_strict(&a.state)?;
@@ -5472,7 +8476,7 @@ fn policy_step(tr: &mut trust::Trust, state: &Path, defaults: bool, now: u64) ->
     (out, notes)
 }
 
-/// `rawgd bench`: кладёт запрос в `<state>/bench/req-<id>.json` (атомарно), ждёт `res-<id>.json` от работающей ноды и печатает итог.
+/// `knothopd bench`: кладёт запрос в `<state>/bench/req-<id>.json` (атомарно), ждёт `res-<id>.json` от работающей ноды и печатает итог.
 fn bench_cli(a: BenchArgs) -> Result<()> {
     if a.mb == 0 || a.mb > BENCH_MAX_MB {
         bail!("--mb: от 1 до {BENCH_MAX_MB} МБ");
@@ -5547,6 +8551,9 @@ fn admin_list(state: &Path) -> Result<()> {
 
 pub fn run_admin(cmd: VpnCmd) -> Result<()> {
     match cmd {
+        VpnCmd::AdminSubmit(a) => { println!("{}", admin_submit(a)?); Ok(()) },
+        VpnCmd::AdminStatus(a) => { println!("{}", admin_status(a)?); Ok(()) },
+        VpnCmd::AdminView(a) => { println!("{}", admin_view(a)?); Ok(()) },
         VpnCmd::Keygen(k) => {
             let mut s = [0u8; 32];
             rand_core::OsRng.fill_bytes(&mut s);
@@ -5640,6 +8647,192 @@ pub fn run_admin(cmd: VpnCmd) -> Result<()> {
     }
 }
 
+fn admin_json_error(error: &str, requestid: Option<&str>) -> String {
+    serde_json::json!({"version":1,"accepted":false,"requestid":requestid.unwrap_or(""),"queued":false,"rejected":error}).to_string()
+}
+
+fn admin_submit(a: AdminSubmitArgs) -> Result<String> {
+    match lxmf_admin::submit_from_cli(&a) {
+        Ok(value) => Ok(value.to_string()),
+        Err(error) => {
+            let raw = error.to_string();
+            let code = match raw.as_str() {
+                "unsupported_offline" => "unsupported_offline",
+                "lxmf_runtime_not_ready" => "lxmf_runtime_not_ready",
+                "invalid_target" => "invalid_target",
+                "invalid_root" => "invalid_root",
+                "invalid_request_id" => "invalid_request_id",
+                "scope_must_be_NODE" => "scope_must_be_NODE",
+                "unsupported_operation" => "unsupported_operation",
+                "target_not_in_authenticated_snapshot" => "target_not_in_authenticated_snapshot",
+                "target_identity_unknown" => "target_identity_unknown",
+                "target_not_in_selected_root" => "target_not_in_selected_root",
+                "target_identity_destination_mismatch" => "target_identity_destination_mismatch",
+                "target_capability_unknown" => "target_capability_unknown",
+                "target_capability_stale" => "target_capability_stale",
+                "target_host_access_unavailable" => "target_host_access_unavailable",
+                "target_authority_changed" => "target_authority_changed",
+                "request_id_conflict" => "request_id_conflict",
+                "expired" => "expired",
+                "no_status_authority" => "no_status_authority",
+                "host_access_mask_must_be_exactly_64" => "host_access_mask_must_be_exactly_64",
+                "host_access_mask_must_include_64_and_known_bits_only" => "host_access_mask_must_include_64_and_known_bits_only",
+                "host_access_revoke_mask_must_be_exactly_64" => "host_access_revoke_mask_must_be_exactly_64",
+                "stale_rights_snapshot" => "stale_rights_snapshot",
+                "holder_not_known_in_selected_root" => "holder_not_known_in_selected_root",
+                "insufficient_scoped_authority" => "insufficient_scoped_authority",
+                "client_admin_queue_full" => "client_admin_queue_full",
+                "lxmf_send_queue_full" => "lxmf_send_queue_full",
+                _ => "backend_error",
+            };
+            Ok(admin_json_error(code, Some(&a.request_id)))
+        }
+    }
+}
+
+fn admin_status(a: AdminStatusArgs) -> Result<String> {
+    let id = unhex(&a.request_id);
+    if id.len()!=16 {
+        return Ok(serde_json::json!({"version":1,"requestid":a.request_id,"state":"rejected","rejected":"invalid_request_id","durable_ack":false}).to_string());
+    }
+    Ok(lxmf_admin::status_json(&a.state, &hex(&id))?.to_string())
+}
+
+fn admin_view(a: AdminViewArgs) -> Result<String> {
+    let target = unhex(&a.target);
+    if target.len() != 16 {
+        return Ok(serde_json::json!({"version":1,"error":"invalid_target"}).to_string());
+    }
+    let id = match load_identity_strict(&a.state) {
+        Ok(id) => id,
+        Err(_) => {
+            return Ok(admin_view_json(&a.target, "local_identity_unavailable"));
+        }
+    };
+    let target: [u8;16] = target.try_into().unwrap();
+    let trust = match trust::Trust::load(id, &a.state) {
+        Ok(t) => t,
+        Err(_) => return Ok(admin_view_json(&hex(&target), "trust_state_unavailable")),
+    };
+    if let Ok(Some(cached)) = lxmf_admin::authenticated_target_view(&a.state, &a.target, &trust) {
+        let reply = &cached["reply"];
+        let seen = cached["seen"].as_u64().unwrap_or(0);
+        let stale = (now_ms() as u64 / 1000).saturating_sub(seen) > 600;
+        let status: serde_json::Value = std::fs::read(a.state.join("status.json")).ok()
+            .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let target_identity: Option<[u8;16]> = status["exits"].as_array().and_then(|items| items.iter()
+            .find(|e| e["d"].as_str() == Some(&a.target)).and_then(|e| e["id"].as_str()).and_then(|x| unhex(x).try_into().ok()));
+        let remote_root = reply["root"].as_str().unwrap_or("");
+        let mut authorities=Vec::new();
+        if let Some(target_identity)=target_identity {
+            for (root,_) in trust.anchors() {
+                let Some(pk)=trust.public_key_in(&root,&target_identity) else {continue};
+                if dest_from_pub_tag(&pk,T13_TAG)!=target {continue}
+                if hex(&root)==remote_root { authorities.push(reply["authority"].clone()); }
+                else {
+                    let rights=trust.my_rights_in(&root);
+                    let can_status=rights&(trust::ADD|trust::REMOVE|trust::CONFIG)!=0;
+                    authorities.push(serde_json::json!({"root":hex(&root),"trusted":true,"scope":"NODE","rights":rights,
+                        "can_status":can_status,"can_read":can_status,"can_grant":false,"can_issue":false,"can_revoke":false,
+                        "grantable_rights":0,"revocable_rights":0,"reason":"target_root_status_not_authenticated"}));
+                }
+            }
+        }
+        let mut capabilities=reply["capabilities"].clone();
+        if !lxmf_admin::client_runtime_ready(&a.state) { capabilities["status_get"]=serde_json::json!(false); }
+        if stale {
+            capabilities["admin_commands"]=serde_json::json!(false);
+            capabilities["rights_grant"]=serde_json::json!(false);
+            capabilities["rights_revoke"]=serde_json::json!(false);
+            capabilities["participants_export"]=serde_json::json!(false);
+            capabilities["host_access"]=serde_json::json!(false);
+        }
+        let participants=if capabilities["participants_export"]==true {reply["participants"].clone()} else {serde_json::json!([])};
+        return Ok(serde_json::json!({
+            "version":1,"target":a.target.to_lowercase(),"node":{"status":"authenticated","stale":stale},
+            "capabilities":capabilities,
+            "effective_authority":{"reason":if stale {"last_authenticated_target_status_stale"} else {"authenticated_target_status"},"authorities":authorities},
+            "participants":participants,"commands":lxmf_admin::commands_for_target(&a.state,&a.target)
+        }).to_string());
+    }
+    let status: serde_json::Value = std::fs::read(a.state.join("status.json")).ok()
+        .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let target_identity: Option<[u8;16]> = status["exits"].as_array().and_then(|items| items.iter()
+        .find(|e| e["d"].as_str() == Some(&a.target)).and_then(|e| e["id"].as_str())
+        .and_then(|x| unhex(x).try_into().ok()));
+    let mut authorities = Vec::new();
+    if let Some(target_identity) = target_identity {
+        for (root, _) in trust.anchors() {
+            let Some(pk) = trust.public_key_in(&root, &target_identity) else { continue };
+            if dest_from_pub_tag(&pk, T13_TAG) != target { continue; }
+            let rights = trust.my_rights_in(&root);
+            let can_status = rights & (trust::ADD | trust::REMOVE | trust::CONFIG) != 0;
+            authorities.push(serde_json::json!({"root":hex(&root),"trusted":true,"scope":"NODE","rights":rights,
+                "can_status":can_status,"can_read":can_status,"can_grant":false,"can_issue":false,"can_revoke":false,
+                "grantable_rights":0,"revocable_rights":0,"reason":"target_status_not_authenticated"}));
+        }
+    }
+    let status_bootstrap = lxmf_admin::client_runtime_ready(&a.state) && authorities.iter().any(|v| v["can_status"] == true);
+    Ok(serde_json::json!({"version":1,"target":hex(&target),"node":{"status":"unknown","stale":true},
+        "capabilities":{"host_access":false,"admin_commands":false,"status_get":status_bootstrap,"participants_export":false,"rights_grant":false,"rights_revoke":false},
+        "effective_authority":{"reason":if authorities.is_empty(){"no_accepted_root_chain_for_target"}else{"target_status_not_authenticated"},"authorities":authorities},
+        "participants":[],"commands":lxmf_admin::commands_for_target(&a.state,&a.target)}).to_string())
+}
+
+fn admin_view_json(target: &str, reason: &str) -> String {
+    serde_json::json!({
+        "version":1,"target":target.to_lowercase(),
+        "node":{"status":"unknown","stale":true},
+        "capabilities":{"host_access":false,"admin_commands":false,"status_get":false,"participants_export":false,"rights_grant":false,"rights_revoke":false},
+        "effective_authority":{"reason":reason,"authorities":[]},
+        "participants":[],"commands":[]
+    }).to_string()
+}
+
+/// Narrow JNI bridge for the two admin projection commands. This accepts a fixed argv grammar,
+/// never invokes a shell, and always overrides the caller-supplied state path with `state_dir`.
+pub fn run_cli_json(command: &str, state_dir: &str) -> String {
+    let fail = |why: &str| serde_json::json!({"version":1,"accepted":false,"requestid":"","queued":false,"rejected":why}).to_string();
+    if command.len() > 4096 || state_dir.len() > 4096 || !command.is_ascii() || !state_dir.is_ascii()
+        || command.bytes().any(|b| !(b.is_ascii_alphanumeric() || b.is_ascii_whitespace() || b"/._-".contains(&b)))
+        || state_dir.bytes().any(|b| !(b.is_ascii_alphanumeric() || b"/._-".contains(&b))) {
+        return fail("invalid_cli_input");
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    if words.first().is_some_and(|w| matches!(*w, "trust-view" | "rights-set")) { return my_node_cli(&words, state_dir); }
+    if words.is_empty() || !matches!(words[0], "admin-view" | "admin-submit" | "admin-status") { return fail("unsupported_command"); }
+    let mut argv = vec!["knothopd".to_string(), words[0].to_string()];
+    let mut i = 1;
+    while i < words.len() {
+        let flag = words[i];
+        if flag == "--state" {
+            i += 1;
+            while i < words.len() && !words[i].starts_with("--") { i += 1; }
+            argv.push("--state".into());
+            argv.push(state_dir.to_string());
+            continue;
+        }
+        if !matches!(flag, "--target" | "--root" | "--op" | "--holder" | "--rights" | "--scope" | "--request-id")
+            || i + 1 >= words.len() || words[i + 1].starts_with("--") { return fail("invalid_cli_arguments"); }
+        argv.push(flag.to_string());
+        argv.push(words[i + 1].to_string());
+        i += 2;
+    }
+    if !argv.iter().any(|x| x == "--state") {
+        argv.extend(["--state".into(), state_dir.into()]);
+    }
+    let cli: VpnCli = match clap::Parser::try_parse_from(&argv) {
+        Ok(cli) => cli,
+        Err(_) => return fail("invalid_cli_arguments"),
+    };
+    match cli.cmd {
+        VpnCmd::AdminSubmit(a) => admin_submit(a).unwrap_or_else(|_| fail("backend_error")),
+        VpnCmd::AdminStatus(a) => admin_status(a).unwrap_or_else(|_| fail("backend_error")),
+        VpnCmd::AdminView(a) => admin_view(a).unwrap_or_else(|_| fail("backend_error")),
+        _ => fail("unsupported_command"),
+    }
+}
+
 // ------------------------------------------------------------------------------------------------ клиент
 
 #[derive(Clone)]
@@ -5661,7 +8854,7 @@ struct CServer {
 /// Состояние клиента модели 0013.
 struct C13 {
     /// порядок блокировок: invite, затем trust
-    trust: Mutex<trust::Trust>,
+    trust: Arc<Mutex<trust::Trust>>,
     /// приглашение, по которому клиент ещё не зачислен
     invite: Mutex<Option<trust::Invite>>,
     /// админ отказал в приглашении: повторять бесполезно
@@ -5707,6 +8900,11 @@ struct ClientCtx {
     auth_wait: Mutex<HashMap<LinkId, tokio::sync::oneshot::Sender<std::result::Result<serde_json::Value, String>>>>,
     /// Пробы датаграмм только после AUTH_OK и проверки EXIT: Link -> случайный seq, метка времени, ответ.
     data_wait: Mutex<HashMap<LinkId, (u32, u64, tokio::sync::oneshot::Sender<()>)>>,
+    /// Ответ выхода на T_PROBEQ (разрешён ли зонд): ждёт возврат на QUIC (`return_probe_link`).
+    /// Ответ: (разрешено ли, срок разрешения от получения ответа).
+    probe_wait: Mutex<HashMap<LinkId, tokio::sync::oneshot::Sender<(bool, Duration)>>>,
+    /// Барьер снятия TCP-носителя и билеты подключений (QAB-M1).
+    drain: Mutex<DrainState>,
     cur: Mutex<Option<([u8; 16], LinkId, Instant)>>,
     last_pong: std::sync::atomic::AtomicU64,
     rtt_pong: std::sync::atomic::AtomicU64,
@@ -5730,7 +8928,7 @@ struct ClientCtx {
     loss: Mutex<LossWin>,
     fail_ms: u64,
     path_gate: path::PathGate,
-    /// модель 0013; None - легаси (профиль rawg2-)
+    /// модель 0013; None - легаси (профиль kh2-)
     c13: Option<C13>,
     /// соседи выходов по T_NBRS (0014 R3): недоверенная подсказка, список выходов не меняет
     nbrs: Mutex<NbrsMap>,
@@ -5747,7 +8945,7 @@ struct ClientCtx {
     /// R10: бенч текущего выхода с телефона (одна сессия) и последний итог (для status.json)
     bench_sess: Mutex<Option<BenchSess>>,
     bench_last: Mutex<Option<serde_json::Value>>,
-    /// раздельное туннелирование: действующий конфиг (приоритеты нужны выбору выхода), отчёт о загрузке списков,
+    /// раздельное туннелирование: активные правила и отчёт о загрузке списков,
     /// выходы с идущей попыткой Link и пауза после неудачи
     rcfg: std::sync::RwLock<Arc<route::Cfg>>,
     rreport: Mutex<serde_json::Value>,
@@ -5764,6 +8962,36 @@ struct QStat {
 }
 
 impl ClientCtx {
+    /// Runs only from the existing 4 s policy maintenance; no new phone wakeup.
+    fn take_local_inbox13(&self, progress: &mut ClientInboxProgress) {
+        let Some(c) = &self.c13 else { return };
+        let cur = *self.cur.lock().unwrap();
+        let peer = cur.and_then(|(_, id, _)| c.peers.lock().unwrap().get(&id).copied());
+        let result = {
+            let mut tr = c.trust.lock().unwrap();
+            client_inbox_step(&self.state, &mut tr, progress, peer.as_ref(), trust::Trust::save, |rec| {
+                let Some((dest, id, _)) = cur else { return false };
+                if self.cur.lock().unwrap().as_ref().map(|c| (c.0, c.1)) != Some((dest, id))
+                    || self.admitted_exits.lock().unwrap().get(&id) != Some(&dest)
+                    || c.peers.lock().unwrap().get(&id) != peer.as_ref() {
+                    return false;
+                }
+                spawn_ctl(&self.node, id, T_REC, rec.wire());
+                true // best-effort Channel send, never a remote application ACK.
+            })
+        };
+        match result {
+            Ok(s) => {
+                if s.changed { self.refresh_servers13(); }
+                if s.committed != 0 || s.rejected != 0 || s.sent != 0 || s.save_failed {
+                    self.sh.note(format!("inbox13 client: local_saved={}, link_queued={}, rejected={}, retained={}, save_failed={}; remote apply unconfirmed",
+                        s.committed, s.sent, s.rejected, s.retained, s.save_failed));
+                }
+            },
+            Err(_) => self.sh.note("inbox13 client: очередь недоступна; записи сохранены".to_string()),
+        }
+    }
+
     /// R9: итог попытки Link к выходу
     fn note_link(&self, dest: &[u8; 16], ok: bool) {
         let mut m = self.qstat.lock().unwrap();
@@ -6091,7 +9319,7 @@ impl ClientCtx {
 }
 
 pub async fn run_client(a: ClientArgs) -> Result<()> {
-    // легаси: профиль rawg2- (seed клиента внутри); 0013: своя identity в --state, права и выходы - записями
+    // легаси: профиль kh2- (seed клиента внутри); 0013: своя identity в --state, права и выходы - записями
     let (prof, identity, c13) = match &a.profile_file {
         Some(f) => {
             let prof = decode_profile(&std::fs::read_to_string(f).context("profile file")?)?;
@@ -6137,7 +9365,7 @@ pub async fn run_client(a: ClientArgs) -> Result<()> {
             let prof = Profile { group: String::new(), seed: [0u8; 32], ip: client_ip(id.hash()), s: vec![] };
             let mut hints: HashMap<String, Vec<String>> = std::fs::read(a.state.join("hints.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
             migrate_hints(&mut hints, tr.holders_with(trust::USE | trust::TRANSIT | trust::EXIT).into_iter().chain(tr.anchors().into_iter().map(|(_, pk)| pk)));
-            (prof, id, Some(C13 { trust: Mutex::new(tr), invite: Mutex::new(inv), rejected: Mutex::new(None), peers: Mutex::new(HashMap::new()), hints: Mutex::new(hints),
+            (prof, id, Some(C13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), rejected: Mutex::new(None), peers: Mutex::new(HashMap::new()), hints: Mutex::new(hints),
                 enrollees: Mutex::new(HashMap::new()), enrolled: Mutex::new(HashSet::new()), enroll_try: Mutex::new(HashMap::new()),
                 relays: Mutex::new(HashMap::new()), users: Mutex::new(Vec::new()), early: Mutex::new(Vec::new()) }))
         }
@@ -6149,8 +9377,8 @@ pub async fn run_client(a: ClientArgs) -> Result<()> {
     if a.tun_fd < 0 && c13.is_some() {
         extra.extend(["--tun-ip", &tun_ip]);
     }
-    let b = start_base("c", &a.state, false, None, SecretKey::generate(), a.quic_cc_mbit, &extra, None).await?;
-    let (node, sh, ep, cli, events) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events);
+    let b = start_base("c", &a.state, false, None, SecretKey::generate(), c13.as_ref().map(|_| identity.clone()), a.quic_cc_mbit, &extra, None).await?;
+    let (node, sh, ep, cli, events, admin_lxmf) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events, b.admin_lxmf);
     let tun = TunState::open(&cli, false)?;
     let _ = sh.tun.set(tun.clone());
     tokio::spawn(tun_reader(tun.clone(), node.clone(), sh.clone()));
@@ -6161,12 +9389,18 @@ pub async fn run_client(a: ClientArgs) -> Result<()> {
         bail!("в профиле нет серверов");
     }
     let ctx = Arc::new(ClientCtx { node: node.clone(), sh: sh.clone(), ep: ep.clone(), identity, group: prof.group.clone(), ip: ip_str(prof.ip), servers: Mutex::new(servers.clone()), tun,
-        auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), cur: Mutex::new(None), last_pong: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
+        auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), probe_wait: Mutex::new(HashMap::new()), drain: Mutex::new(DrainState::default()), cur: Mutex::new(None), last_pong: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
         state: a.state.clone(), status: Mutex::new("подключаюсь".into()), dialers: Mutex::new(HashMap::new()),
         carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), hints: Mutex::new(HashMap::new()), platforms: Mutex::new(HashMap::new()), books: Mutex::new(HashMap::new()), table_acc: Mutex::new(HashSet::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
         c13, path_gate: path::PathGate::default(), nbrs: Mutex::new(HashMap::new()), admitted_exits: Mutex::new(HashMap::new()), ctrl: Mutex::new(HashMap::new()), lk_fail: Mutex::new(HashMap::new()), vis: Mutex::new(HashMap::new()), qstat: Mutex::new(HashMap::new()),
         bench_sess: Mutex::new(None), bench_last: Mutex::new(None),
-        rcfg: std::sync::RwLock::new(Arc::new(route::Cfg::default())), rreport: Mutex::new(serde_json::Value::Null), rpending: Mutex::new(HashSet::new()), rback: Mutex::new(HashMap::new()) });
+         rcfg: std::sync::RwLock::new(Arc::new(route::Cfg::default())), rreport: Mutex::new(serde_json::Value::Null), rpending: Mutex::new(HashSet::new()), rback: Mutex::new(HashMap::new()) });
+    let _admin_client_guard = if let (Some(runtime), Some(c13)) = (admin_lxmf, ctx.c13.as_ref()) {
+        let guard = lxmf_admin::register_client_runtime(&a.state, &runtime);
+        let trust = c13.trust.clone();
+        lxmf_admin::spawn_client_worker(runtime, a.state.clone(), ctx.identity.clone(), trust);
+        Some(guard)
+    } else { None };
     if ctx.c13.is_some() {
         // (а) админ без приглашения объявляет свой корень: destination только для анонса, Link к нему не принимаем
         let mut dest = new_dest(ctx.identity.clone(), Direction::In, T13_TAG)
@@ -6844,12 +10078,7 @@ async fn on_pair1_client(ctx: Arc<ClientCtx>, link: LinkId, body: Vec<u8>) {
         send_ctl(&ctx.node, link, T_PAIR_NO, "запись не выдана".as_bytes()).await;
         return;
     };
-    let (chain, rest) = {
-        let tr = c.trust.lock().unwrap();
-        let chain = tr.chain_for(&holder);
-        let rest: Vec<trust::Record> = tr.export_for(rec.rights, &holder).into_iter().filter(|r| !chain.contains(r)).collect();
-        (chain, rest)
-    };
+    let (chain, rest) = enrollment_export(&c.trust.lock().unwrap(), &holder);
     for r in chain { send_ctl(&ctx.node, link, T_REC, &r.wire()).await; }
     for r in rest {
         send_ctl(&ctx.node, link, T_REC, &r.wire()).await;
@@ -6946,13 +10175,8 @@ async fn on_pairq_client(ctx: Arc<ClientCtx>, link: LinkId, body: Vec<u8>) {
             None
         }
     };
-    let Some(rec) = rec else { return };
-    let (chain, rest) = {
-        let tr = c.trust.lock().unwrap();
-        let chain = tr.chain_for(&holder);
-        let rest: Vec<trust::Record> = tr.export_for(rec.rights, &holder).into_iter().filter(|r| !chain.contains(r)).collect();
-        (chain, rest)
-    };
+    if rec.is_none() { return }
+    let (chain, rest) = enrollment_export(&c.trust.lock().unwrap(), &holder);
     for r in chain { send_ctl(&ctx.node, link, T_REC, &r.wire()).await; }
     for r in rest { send_ctl(&ctx.node, link, T_REC, &r.wire()).await; }
     let cur = ctx.cur.lock().unwrap().map(|x| x.1);
@@ -7045,7 +10269,7 @@ fn start_dialer(ctx: &Arc<ClientCtx>, s: &CServer) {
     let cc = CarrierCtl::new();
     *cc.label.lock().unwrap() = s.name.clone();
     ctx.carriers.lock().unwrap().insert(s.dest, cc.clone());
-    tokio::spawn(dial_direct(ctx.ep.clone(), ctx.node.clone(), ctx.sh.clone(), s.name.clone(), id, book, alive, cc));
+    tokio::spawn(dial_direct(ctx.ep.clone(), ctx.node.clone(), ctx.sh.clone(), s.name.clone(), id, book, alive, cc, Some(ReturnHook { ctx: ctx.clone(), dest: s.dest })));
 }
 
 /// Запустить диалеры выходов, у которых появился адрес: после пересборки списка по записям (новая запись работает без перезапуска клиента).
@@ -7110,6 +10334,7 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                 ctx.admitted_exits.lock().unwrap().remove(&link_id);
                 ctx.ctrl.lock().unwrap().remove(&link_id);
                 ctx.data_wait.lock().unwrap().remove(&link_id);
+                ctx.probe_wait.lock().unwrap().remove(&link_id);
                 ctx.sh.closed.lock().unwrap().insert(hex(link_id.as_bytes()), format!("{reason:?}"));
             }
             NodeEvent::MessageReceived { link_id, data, .. } if !data.is_empty() => {
@@ -7145,6 +10370,11 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
                                 ctx.merge_table(&v);
                             }
+                        }
+                    }
+                    T_PROBER => {
+                        if let (Some(reply), Some(tx)) = (qprobe::parse_prober_ttl(body), ctx.probe_wait.lock().unwrap().remove(&link_id)) {
+                            let _ = tx.send(reply);
                         }
                     }
                     T_REC => on_rec_client(&ctx, link_id, body),
@@ -7241,7 +10471,9 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
 /// Наши интерфейсы носителя (QUIC/TCP, входящие и исходящие), online, кроме `skip`. Публичная RNS сюда не входит:
 /// клиент по ней Link не открывает. Публичные интерфейсы клиент не помнит по id (spawn_interface выдаёт tcp_client_N), поэтому отбор по префиксу.
 fn carrier_ifaces(ctx: &ClientCtx, skip: Option<usize>) -> Vec<usize> {
-    own_carrier_ifaces(&ctx.node).into_iter().filter(|i| Some(*i) != skip).collect()
+    // QAB-M1: интерфейс, который снимается, для новых Link недоступен (выбор пути и `path::acceptable` после подключения)
+    let d = ctx.drain.lock().unwrap();
+    own_carrier_ifaces(&ctx.node).into_iter().filter(|i| Some(*i) != skip && !d.draining.contains(i)).collect()
 }
 
 fn own_carrier_ifaces(node: &Arc<Node>) -> Vec<usize> {
@@ -7279,7 +10511,7 @@ fn out_carrier_iface(node: &Arc<Node>, label: &str) -> Option<usize> {
 }
 
 /// Единый порядок выбора пути - одинаковый для ноды (сосед) и для клиента (выход):
-/// 1) прямой путь (1 хоп) по нашему носителю - приоритет;
+/// 1) прямой путь (1 хоп) по нашему носителю - предпочтение RNS path discovery (не пользовательский рейтинг выходов);
 /// 2) если к пиру есть наш носитель, но прямой путь ещё не найден - ждём его, спрашивая путь только по этому носителю;
 /// 3) иначе - транзит через наши ноды (любой путь по нашим носителям).
 /// Публичный RNS - только координация (поиск), носителем VPN-данных он не бывает.
@@ -7374,6 +10606,8 @@ async fn open_link(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usi
 
 async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usize>, est_s: u64, cipher: leviculum_std::api::LinkCipher) -> Result<(LinkId, Arc<leviculum_std::LinkHandle>)> {
     let dest = DestinationHash::new(cand.dest);
+    // QAB-M1: пока идёт подключение (поиск пути, рукопожатие), снимать носитель нельзя; билет закрывается при выходе из функции в любой ветке
+    let ticket = ConnectTicket::new(ctx);
     // CBC enrollment сохраняет публичный fallback. GCM открывается только по нашим носителям.
     let allowed = || if cipher == leviculum_std::api::LinkCipher::Cbc {
         ctx.node.engine().interface_stats().iter().filter(|i| i.online).map(|i| i.interface_id.0).collect()
@@ -7397,6 +10631,12 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
         bail!("нет пути до {}", cand.name);
     }
     let used_iface = ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index);
+    // Атомарно с барьером: интерфейс пути, который уже снимается, не используем; иначе барьер увидит этот выбор и не снимет носитель
+    if let Some(i) = used_iface {
+        if !ticket.begin(i) {
+            bail!("носитель пути до {} снимается, подключаюсь позже", cand.name);
+        }
+    }
     if let Some(p) = ctx.node.engine().get_path_clone(&dest) {
         let iface = ctx.node.engine().interface_stats().iter().find(|i| i.interface_id.0 == p.interface_index).map(|i| i.name.clone()).unwrap_or_default();
         ctx.sh.note(format!("путь к {}: {} хоп, интерфейс {}, транспорт {}", cand.name, p.hops, iface,
@@ -7404,6 +10644,7 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
     }
     let handle = ctx.node.connect_with_key_cipher(&dest, &cand.key, cipher).await?;
     let id = *handle.link_id();
+    ticket.set_link(id);
     let k = hex(id.as_bytes());
     let t = Instant::now();
     while !ctx.sh.established.lock().unwrap().contains(&k) {
@@ -7455,7 +10696,11 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     }
     let dest = DestinationHash::new(cand.dest);
     let t0 = Instant::now();
+    // Внешний билет живёт всю авторизацию и проверку датаграммы: пока Link не готов, он держит TCP (неизвестный интерфейс = отказ снятия, QAB-M1).
+    // Внутренний билет `open_link_wait` закрывается при возврате из `open_link`, поэтому внешний открыт до него и привязывается к Link сразу после.
+    let ticket = ConnectTicket::new(ctx);
     let (id, handle) = open_link(ctx, cand, avoid_iface).await?;
+    ticket.set_link(id);
     let (tx, rx) = tokio::sync::oneshot::channel();
     ctx.auth_wait.lock().unwrap().insert(id, tx);
     if let Some(c) = &ctx.c13 {
@@ -7535,6 +10780,21 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     if let Some(t) = reply.get("table") {
         ctx.merge_table(t);
     }
+    // Лабораторная точка отказа B (QAB-M2): сервер уже вытеснил прежний Link (допуск идёт до AUTH_OK), а новый Link не доходит до рабочего состояния.
+    // Существует только в отладочной сборке (`cfg(debug_assertions)`, лабораторные снимки): в release-бинарниках (deploy/build.sh, ci-build.sh, android build.sh)
+    // блока и имени переменной нет. Читается из окружения процесса, как KNOTHOP_LAB_EXIT_NO_ENFORCE. Не меняет протокол и состояние кроме закрытия этого Link.
+    #[cfg(debug_assertions)]
+    if lab_ret_b_fail(std::env::var_os("KNOTHOP_LAB_RET_B_FAIL").is_some()) && ctx.carriers.lock().unwrap().get(&cand.dest).is_some_and(|c| matches!(c.ret_get(), Ret::Moving { .. })) {
+        let _ = ctx.node.engine().close_link(&id).await;
+        // `quicdead` (QAB-R1): Err отдаётся только после того, как сторож убрал Moving (QUIC умер/таймаут), то есть в порядке "сторож первым"
+        if std::env::var("KNOTHOP_LAB_RET_B_FAIL").as_deref() == Ok("quicdead") {
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(50) && ctx.carriers.lock().unwrap().get(&cand.dest).is_some_and(|c| matches!(c.ret_get(), Ret::Moving { .. })) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        bail!("{}: лабораторный отказ B после AUTH_OK (KNOTHOP_LAB_RET_B_FAIL)", cand.name);
+    }
     // Управляющий Channel может отвечать, пока ненадёжные датаграммы по тому же
     // пути не проходят. Такой Link не должен вытеснять рабочий запасной выход.
     let (seq, ts) = (rand_core::OsRng.next_u32(), now_us());
@@ -7597,11 +10857,6 @@ fn candidates(ctx: &Arc<ClientCtx>, banned: &path::ExitBackoff, only: Option<[u8
             (None, None) => hops(a).cmp(&hops(b)).then(b.pinned.cmp(&a.pinned)).then(a.rtt_ms.unwrap_or(1e9).partial_cmp(&b.rtt_ms.unwrap_or(1e9)).unwrap()),
         }
     });
-    // приоритеты пользователя (вкладка «Маршрутизация»): названные выходы идут первыми по порядку списка, остальные - после, в обычном порядке
-    let rc = ctx.rcfg.read().unwrap().clone();
-    if rc.mode != "auto" && !rc.priority.is_empty() {
-        v.sort_by_key(|s| rc.prio_of(&s.dest));
-    }
     v
 }
 
@@ -7655,7 +10910,7 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
             }).await;
             if let Ok((cfg, r)) = built {
                 *ctx.rreport.lock().unwrap() = serde_json::json!({"warnings": r.warnings, "stats": r.stats});
-                ctx.sh.note(format!("маршрутизация: режим {}, правил {}, ручных {}, приоритетов {}{}", cfg.mode, cfg.rules.len(), cfg.manual.len(), cfg.priority.len(),
+                ctx.sh.note(format!("маршрутизация: режим {}, правил {}, ручных {}{}", cfg.mode, cfg.rules.len(), cfg.manual.len(),
                     if r.warnings.is_empty() { String::new() } else { format!(", предупреждений {}", r.warnings.len()) }));
                 *ctx.tun.router.write().unwrap() = Arc::new(r);
                 ctx.tun.routing.store(cfg.mode == "rules", Relaxed);
@@ -7722,11 +10977,13 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
 async fn client_policy_loop(ctx: Arc<ClientCtx>) {
     let fin = ctx.state.join("fin");
     let Some(c) = &ctx.c13 else { return };
+    let mut inbox_durable = ClientInboxProgress::default();
     while !fin.exists() {
         tokio::time::sleep(Duration::from_secs(4)).await;
         if c.invite.lock().unwrap().is_some() {
             continue;
         }
+        ctx.take_local_inbox13(&mut inbox_durable);
         let (pols, notes) = policy_step(&mut c.trust.lock().unwrap(), &ctx.state, true, now_ms() as u64);
         for n in notes {
             ctx.sh.note(n);
@@ -7760,6 +11017,10 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
     let mut keep_trying: HashMap<[u8; 16], Instant> = HashMap::new();
     // переходы текущего выхода с транзита на прямой путь: не чаще раза в 5 мин на выход (если прямой путь не держится - не зацикливаемся)
     let mut direct_retry: HashMap<[u8; 16], Instant> = HashMap::new();
+    // QAB-M2: перенос на QUIC не удался, а прежний Link мог быть вытеснен сервером; когда начался перенос; восстановленный выход и время
+    let mut ret_recover: Option<RetRecover> = None;
+    let mut ret_mv: Option<RetMove> = None;
+    let mut ret_recovered: Option<([u8; 16], Instant)> = None;
     while !fin.exists() {
         // 0013: сначала зачисление по приглашению (до него права есть только в собственном дереве, выходов нет)
         if ctx.c13.as_ref().map(|c| c.invite.lock().unwrap().is_some()).unwrap_or(false) {
@@ -7810,16 +11071,37 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             match result {
                 Ok((id, h)) => {
                     avoid.remove(&c.dest);
+                    if let Some((_, at)) = ret_recovered.take().filter(|(d, _)| *d == c.dest) {
+                        ctx.sh.note(format!("{}: Link восстановлен через TCP после неудачного переноса, разрыв {} мс от начала переноса", c.name, at.elapsed().as_millis()));
+                    }
+                    if ret_recover.as_ref().is_some_and(|r| r.dest == c.dest) {
+                        ret_recover = None;
+                    }
+                    ret_b_done(&mut ret_mv, &c.dest);
                     ctx.lk_fail.lock().unwrap().remove(&c.dest);
                     ctx.note_link(&c.dest, true);
                     if let Some(cc) = ctx.carriers.lock().unwrap().get(&c.dest) {
                         cc.fails.store(0, Relaxed);
+                        // Link выхода поднят вне TCP-интерфейса, пока шёл возврат: коммит. Режим и `generation` меняются ДО чтения gen_at_connect ниже
+                        let attached = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface());
+                        if cc.ret_commit(attached) {
+                            ctx.sh.note(format!("{}: Link поднят на QUIC, возврат с TCP без паузы носителя", c.name));
+                        }
                     }
                     connected = Some((c, id, h));
                     break;
                 }
                 Err(e) => {
                     ctx.sh.note(format!("выход {}: {e:#}", c.name));
+                    // возврат на QUIC не удался: сторож закроет QUIC и вырастит паузу. Прежний Link на TCP не обязательно цел: сервер вытесняет его при
+                    // допуске нового (раньше AUTH_OK, `admit_link_replacing`), поэтому при неудаче B вооружается восстановление через TCP (QAB-M2)
+                    // QAB-R1: решает контекст начатого B (`ret_mv`), а не текущий `Ret`: сторож мог уже поставить `Idle`
+                    let cc = ctx.carriers.lock().unwrap().get(&c.dest).cloned();
+                    if let Some(rec) = cc.and_then(|cc| ret_b_error(&mut ret_mv, &cc, &c.dest, Instant::now())) {
+                        avoid.remove(&c.dest);
+                        ret_recover = Some(rec);
+                        ctx.sh.note(format!("{}: перенос на QUIC не удался; сервер мог вытеснить прежний Link при допуске нового - если он закрыт, восстановлю через TCP", c.name));
+                    }
                     ctx.lk_fail.lock().unwrap().insert(c.dest, (Instant::now(), format!("{e:#}").chars().take(80).collect()));
                     ctx.note_link(&c.dest, false);
                     // Неудачный путь забываем и через транзит: следующий scoped discovery
@@ -7886,6 +11168,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         let mut last_eval = Instant::now();
         let mut direct_since: Option<Instant> = None;
         let mut last_direct_check = Instant::now();
+        let mut ret_iface: Option<usize> = None;
         let connected_at = ctx.cur.lock().unwrap().map(|c| c.2).unwrap_or_else(Instant::now);
         let reason = loop {
             if fin.exists() {
@@ -7900,24 +11183,9 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                 Some(format!("выбранный выход {name} недоступен: {why}; повтор через {retry} с; работаю через {}", ctx.shown_name(&cand)))
             });
             *ctx.status.lock().unwrap() = unavailable.unwrap_or_else(|| format!("выход: {}", ctx.shown_name(&cand)));
-            // «Авто» пересматривается: если другой выход заметно быстрее по RTT телефона (в 1,4 раза и на 15 мс) 15 с подряд - переходим на него.
-            let rc = ctx.rcfg.read().unwrap().clone();
-            if want.is_none() && rc.mode != "auto" && !rc.priority.is_empty() {
-                // приоритеты: если выход выше по списку доступен 15 с подряд - переходим на него; RTT при этом не сравниваем
-                if last_eval.elapsed() >= Duration::from_secs(3) {
-                    last_eval = Instant::now();
-                    let top = candidates(&ctx, &banned, None).into_iter().next();
-                    match top {
-                        Some(t) if t.dest != cand.dest && rc.prio_of(&t.dest) < rc.prio_of(&cand.dest) => {
-                            let t0 = *better_since.get_or_insert(Instant::now());
-                            if t0.elapsed() >= Duration::from_secs(15) {
-                                break format!("авто: {} выше по приоритету", t.name);
-                            }
-                        }
-                        _ => better_since = None,
-                    }
-                }
-            } else if want.is_none() && last_eval.elapsed() >= Duration::from_secs(3) {
+            // Auto failover remains RTT/backoff based. Manual selection and rule-based routing
+            // are unchanged; legacy user ranking never reorders candidate exits.
+            if want.is_none() && last_eval.elapsed() >= Duration::from_secs(3) {
                 last_eval = Instant::now();
                 let rtt_of = |d: &[u8; 16]| -> Option<f64> {
                     let us = ctx.carriers.lock().unwrap().get(d).map(|c| c.rtt_us.load(Relaxed)).unwrap_or(0);
@@ -7963,6 +11231,26 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             if silent > ctx.fail_ms {
                 break format!("нет ответа {silent} мс");
             }
+            // Возврат TCP -> QUIC (этап B): QUIC уже привязан к RNS рядом с TCP, а Link выхода сидит на TCP - поднимаем новый вне TCP, старый держим
+            let ret_cc = ctx.carriers.lock().unwrap().get(&cand.dest).cloned().filter(|c| matches!(c.ret_get(), Ret::Standby { .. }));
+            if let Some(cc) = ret_cc {
+                let attached = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface());
+                let quic_if = match cc.ret_get() {
+                    Ret::Standby { quic, .. } => quic,
+                    _ => usize::MAX,
+                };
+                match cc.ret_poll(attached) {
+                    RetTick::Move(tcp_if) => {
+                        ret_iface = Some(tcp_if);
+                        // контекст B фиксируется здесь (QAB-R1): дальше сторож может менять `Ret`, но не его
+                        ret_mv = Some(RetMove { dest: cand.dest, link: id, tcp_if, quic_if, attempt: cc.ret_epoch.load(Relaxed), started: Instant::now() });
+                        break format!("возврат на QUIC: {}", cand.name);
+                    }
+                    RetTick::AlreadyOff => ctx.sh.note(format!("{}: Link уже на проверенном QUIC, возврат засчитан", cand.name)),
+                    RetTick::Left => ctx.sh.note(format!("{}: Link ушёл с TCP по другому пути - проверенный QUIC его не несёт, возврат не засчитан", cand.name)),
+                    RetTick::Nothing => {}
+                }
+            }
             if let Some(w) = want {
                 // вернуться к выбранному выходу можно, только если он снова доступен (не забанен и не потерян)
                 let usable = banned.ready(&w, Instant::now())
@@ -8001,8 +11289,26 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             direct_retry.insert(cand.dest, Instant::now());
             keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
         }
-        let user = reason == "выбор пользователя" || reason.starts_with("авто:") || direct_move;
-        if user {
+        // возврат с TCP на QUIC - тоже смена с удержанием старого Link до нового, без бана; новый Link не должен сесть на TCP
+        let return_move = reason.starts_with("возврат на QUIC");
+        if let (true, Some(i)) = (return_move, ret_iface) {
+            keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
+            avoid.insert(cand.dest, i);
+        }
+        let user = reason == "выбор пользователя" || reason.starts_with("авто:") || direct_move || return_move;
+        // QAB-M2: прежний Link закрыт/замолчал вскоре после неудачного переноса - его вытеснил сервер при допуске B; это не отказ выхода и не вина TCP
+        let recovering = !user && recover_decision(ret_recover.as_ref(), &cand.dest, &id, Instant::now());
+        if recovering {
+            let r = ret_recover.take().expect("recover");
+            ctx.sh.note(format!("{}: прежний Link вытеснен сервером при неудачном переносе ({reason}), восстанавливаю через TCP; прошло {} мс от начала переноса, {} мс от неудачи B", cand.name, r.move_at.elapsed().as_millis(), r.armed.elapsed().as_millis()));
+            ctx.failovers.lock().unwrap().push(serde_json::json!({"at_ms": now_ms() as u64, "from": cand.name, "reason": "перенос на QUIC не удался, Link вытеснен сервером"}));
+            keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
+            if let Some(q) = r.quic_if {
+                avoid.insert(cand.dest, q);
+            }
+            ret_recovered = Some((cand.dest, r.move_at));
+            pending_reason = None;
+        } else if user {
             ctx.sh.note(format!("проверка выхода: {reason}"));
             pending_reason = Some(reason.clone());
         } else {
@@ -8010,33 +11316,37 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             ctx.failovers.lock().unwrap().push(serde_json::json!({"at_ms": now_ms() as u64, "from": cand.name, "reason": reason}));
             pending_reason = None;
         }
-        if reason.starts_with("нет ответа") {
-            // тишина по QUIC: вероятно, UDP режется; у этого пира пробуем запасной TCP (если и он не пойдёт, дозвон сам вернётся на QUIC)
+        let carrier_flip = ctx.carriers.lock().unwrap().get(&cand.dest).map(|c| carrier_flipped(c, gen_at_connect)).unwrap_or(false);
+        if reason.starts_with("нет ответа") && !recovering {
+            // Тишина после смены носителя (в том числе нашей: дозвон снял TCP по паузе возврата) объяснена сменой: Link привязан к прежнему
+            // интерфейсу. QUIC в ней не виноват; если Link, поднятый уже на этом QUIC, замолчит снова, пойдёт обычная ветка.
+            // Тишина Link, жившего на текущем QUIC: вероятно, UDP режется; у этого пира пробуем запасной TCP и запоминаем QUIC (health.rs).
             let cc = ctx.carriers.lock().unwrap().get(&cand.dest).cloned();
             if let Some(cc) = cc {
-                if cc.is_quic() && !cc.prefer_tcp.load(Relaxed) {
-                    ctx.sh.note(format!("{}: тишина по QUIC, пробую TCP", cand.name));
-                    cc.prefer_tcp.store(true, Relaxed);
-                    cc.switches.fetch_add(1, Relaxed);
+                match judge_silence(&cc, carrier_flip, Instant::now()) {
+                    SilenceCause::Quic => ctx.sh.note(format!("{}: тишина по QUIC, пробую TCP (QUIC запомню, только если TCP сразу подтвердится)", cand.name)),
+                    SilenceCause::CarrierSwap => ctx.sh.note(format!("{}: тишина после смены носителя, QUIC не виню", cand.name)),
+                    SilenceCause::Other => {}
                 }
             }
         }
         // Выбранный пользователем выход при смене носителя не бросаем: Link закрыт ради TCP, тот же выход поднимется заново за секунды.
         // Если за это время не поднялся — обычный отступ и переход на лучший из остальных.
-        let carrier_flip = ctx.carriers.lock().unwrap().get(&cand.dest).map(|c| c.generation.load(Relaxed) != gen_at_connect).unwrap_or(false);
-        if carrier_flip && !user {
+        if carrier_flip && !user && !recovering {
             keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
             ctx.sh.note(format!("{}: смена носителя, остаюсь на этом выходе", cand.name));
         }
         if !user {
-            // Отказавший выход отступает независимо от работающего запасного.
-            ctx.lk_fail.lock().unwrap().insert(cand.dest, (Instant::now(), reason.chars().take(80).collect()));
-            banned.failed(cand.dest, Instant::now());
-            if let Some(i) = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface()) {
-                avoid.insert(cand.dest, i);
-                let dest = DestinationHash::new(cand.dest);
-                if ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index) == Some(i) {
-                    ctx.node.engine().remove_path(&dest);
+            if !recovering {
+                // Отказавший выход отступает независимо от работающего запасного.
+                ctx.lk_fail.lock().unwrap().insert(cand.dest, (Instant::now(), reason.chars().take(80).collect()));
+                banned.failed(cand.dest, Instant::now());
+                if let Some(i) = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface()) {
+                    avoid.insert(cand.dest, i);
+                    let dest = DestinationHash::new(cand.dest);
+                    if ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index) == Some(i) {
+                        ctx.node.engine().remove_path(&dest);
+                    }
                 }
             }
             active = None;
@@ -8045,5 +11355,464 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             ctx.publish_service();
             let _ = ctx.node.engine().close_link(&id).await;
         }
+    }
+}
+
+/// Этапы A/B make-before-break (раздел 13 отчёта): состояние возврата, допуск эха, откат на этап 0. Без сети.
+#[cfg(test)]
+mod qreturn_tests {
+    use super::*;
+
+    fn tcp_ctl() -> Arc<CarrierCtl> {
+        let cc = CarrierCtl::new();
+        *cc.peer.lock().unwrap() = "p".into();
+        cc.set_mode("tcp");
+        cc.prefer_tcp.store(true, Relaxed);
+        cc
+    }
+
+    fn info(role: Role, enroll_only: bool, pk: Option<[u8; 64]>) -> LinkInfo {
+        LinkInfo { role, since: Instant::now(), last_heard: Instant::now(), peer_pk: pk, want_use: false, enroll_only, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 }
+    }
+
+    // зонд прошёл: Link на TCP -> Move, TCP-интерфейс исключается; пока Link не перенесён, носитель остаётся TCP (данные идут по нему без паузы)
+    #[test]
+    fn standby_moves_link_off_tcp_and_keeps_tcp_mode_until_commit() {
+        let cc = tcp_ctl();
+        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
+        assert_eq!(cc.ret_poll(None), RetTick::Nothing, "интерфейс Link ещё неизвестен");
+        assert_eq!(cc.ret_poll(Some(5)), RetTick::Move(5));
+        assert_eq!(cc.ret_get(), Ret::Moving { tcp: 5, quic: 9 });
+        assert_eq!(cc.ret_poll(Some(5)), RetTick::Nothing, "перенос не запускается дважды");
+        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed), "до коммита носитель TCP: монитор потерь QUIC и тишина по QUIC не срабатывают");
+        let gen_old = cc.generation.load(Relaxed);
+        // новый Link сел на TCP снова (путь ещё не обновился): коммита нет
+        assert!(!cc.ret_commit(Some(5)));
+        assert_eq!(cc.ret_get(), Ret::Moving { tcp: 5, quic: 9 });
+        // новый Link на проверенном QUIC-интерфейсе: коммит; generation растёт ДО чтения gen_at_connect, новый Link не считается пережившим смену
+        assert!(cc.ret_commit(Some(9)));
+        assert_eq!(cc.ret_get(), Ret::Moved);
+        assert!(cc.is_quic() && !cc.prefer_tcp.load(Relaxed));
+        let gen_at_connect = cc.generation.load(Relaxed);
+        assert_ne!(gen_at_connect, gen_old);
+        assert!(!carrier_flipped(&cc, gen_at_connect));
+        assert_eq!(judge_silence(&cc, carrier_flipped(&cc, gen_at_connect), Instant::now()), SilenceCause::Quic, "тишина нового Link - тишина по QUIC");
+        assert!(!cc.ret_commit(Some(9)), "повторный коммит ничего не делает");
+    }
+
+    // Link уже пересобран на проверенный QUIC без нас: перенос засчитан, носитель QUIC
+    #[test]
+    fn standby_with_link_already_on_verified_quic_counts_as_moved() {
+        let cc = tcp_ctl();
+        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
+        assert_eq!(cc.ret_poll(Some(9)), RetTick::AlreadyOff);
+        assert_eq!(cc.ret_get(), Ret::Moved);
+        assert!(cc.is_quic() && !cc.prefer_tcp.load(Relaxed));
+    }
+
+    // QAB-L3: Link ушёл с TCP на ДРУГОЙ интерфейс (не проверенный QUIC): это не возврат, носитель не меняется
+    #[test]
+    fn link_left_tcp_for_another_iface_is_not_a_return() {
+        let cc = tcp_ctl();
+        let gen_old = cc.generation.load(Relaxed);
+        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
+        assert_eq!(cc.ret_poll(Some(7)), RetTick::Left);
+        assert_eq!(cc.ret_get(), Ret::Left);
+        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed) && cc.generation.load(Relaxed) == gen_old, "режим TCP не тронут");
+        // то же при коммите Link, поднятого на постороннем интерфейсе во время Moving
+        let cc = tcp_ctl();
+        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Moving { tcp: 5, quic: 9 });
+        assert!(!cc.ret_commit(Some(7)), "постороннему интерфейсу коммит не положен");
+        assert_eq!(cc.ret_get(), Ret::Left);
+        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed));
+        assert!(!cc.ret_commit(Some(9)), "после Left коммита нет");
+    }
+
+    // перенос не удался: TCP и режим не тронуты, сторож закрывает QUIC
+    #[test]
+    fn failed_move_leaves_tcp_mode_untouched() {
+        let cc = tcp_ctl();
+        let gen_old = cc.generation.load(Relaxed);
+        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Moving { tcp: 5, quic: 9 });
+        cc.ret_fail();
+        assert_eq!(cc.ret_get(), Ret::Failed);
+        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed) && cc.generation.load(Relaxed) == gen_old);
+        let idle = CarrierCtl::new();
+        idle.ret_fail();
+        assert_eq!(idle.ret_get(), Ret::Idle, "из покоя в сбой не переходим");
+    }
+
+    // QUIC потерян после коммита, пока на TCP ещё живы Link: носитель снова TCP, монитор не отключён
+    #[test]
+    fn revert_after_commit_returns_to_tcp() {
+        let cc = tcp_ctl();
+        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
+        assert!(cc.ret_commit(Some(9)));
+        cc.ret_revert();
+        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed));
+    }
+
+    // TCP умер до переноса: усыновление делает QUIC носителем; после коммита режим не трогается (generation остаётся)
+    #[test]
+    fn adopt_makes_quic_the_carrier_without_extra_generation_bump() {
+        let cc = tcp_ctl();
+        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
+        cc.ret_adopt();
+        assert!(cc.is_quic() && !cc.prefer_tcp.load(Relaxed) && cc.ret_get() == Ret::Idle);
+        let cc = tcp_ctl();
+        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
+        assert!(cc.ret_commit(Some(9)));
+        let g = cc.generation.load(Relaxed);
+        cc.ret_adopt();
+        assert_eq!(cc.generation.load(Relaxed), g, "снятие TCP после коммита не меняет носитель второй раз");
+        assert!(cc.is_quic());
+    }
+
+    // QAB-M3: устаревшая попытка не публикует и не затирает состояние, поздний наблюдатель после отмены не воскрешает ресурс
+    #[test]
+    fn stale_attempt_cannot_publish_or_overwrite_after_finish() {
+        let cc = CarrierCtl::new();
+        let slot: Mutex<Option<u32>> = Mutex::new(None);
+        let a1 = cc.ret_begin_attempt();
+        assert!(ret_publish(&cc.ret_epoch, a1, &slot, 7u32, &cc.ret, Ret::Idle).is_ok());
+        assert_eq!(ret_finish(&cc.ret_epoch, &slot, &cc.ret, Ret::Idle), Some(7), "отмена забирает ресурс");
+        assert_eq!(ret_publish(&cc.ret_epoch, a1, &slot, 8u32, &cc.ret, Ret::Moved), Err(8), "поздняя публикация отвергнута, ресурс возвращён");
+        assert!(slot.lock().unwrap().is_none() && cc.ret_get() == Ret::Idle);
+        assert!(!cc.ret_set_if(a1, Ret::Moved), "и состояние старой попытки не пишется");
+        // новая попытка не страдает от хвоста старой
+        let a2 = cc.ret_begin_attempt();
+        assert!(cc.ret_set_if(a2, Ret::Standby { tcp: 5, quic: 9 }));
+        assert!(!cc.ret_set_if(a1, Ret::Idle), "старая попытка не затирает новую");
+        assert_eq!(cc.ret_get(), Ret::Standby { tcp: 5, quic: 9 });
+    }
+
+    // QAB-M3, многопоточно: публикация против отмены - ровно один исход, слот пуст, состояние Idle, ресурс не потерян и не задвоен
+    #[test]
+    fn publish_vs_abort_race_never_leaks_or_overwrites() {
+        for i in 0..400u32 {
+            let cc = CarrierCtl::new();
+            let slot: Arc<Mutex<Option<u32>>> = Arc::default();
+            let a = cc.ret_begin_attempt();
+            let bar = Arc::new(std::sync::Barrier::new(2));
+            let (cc2, slot2, bar2) = (cc.clone(), slot.clone(), bar.clone());
+            let publisher = std::thread::spawn(move || {
+                bar2.wait();
+                ret_publish(&cc2.ret_epoch, a, &slot2, i, &cc2.ret, Ret::Moved)
+            });
+            bar.wait();
+            let taken = ret_finish(&cc.ret_epoch, &slot, &cc.ret, Ret::Idle);
+            let published = publisher.join().unwrap();
+            match (published, taken) {
+                (Ok(()), Some(v)) => assert_eq!(v, i, "публикация успела до отмены: отмена забрала именно её"),
+                (Err(v), None) => assert_eq!(v, i, "отмена раньше: ресурс вернулся издателю"),
+                other => panic!("утечка или дубль ресурса: {other:?}"),
+            }
+            assert!(slot.lock().unwrap().is_none(), "слот пуст");
+            assert_eq!(cc.ret_get(), Ret::Idle, "поздний издатель не затёр Idle");
+        }
+    }
+
+    // M1/L1: два молчания T_PROBER подряд - старый узел; ответ сбрасывает счёт
+    #[test]
+    fn prober_silence_must_repeat_before_peer_is_called_old() {
+        let cc = CarrierCtl::new();
+        let t = Instant::now();
+        assert!(!cc.ret_prober_missed(t), "одна потеря пакета - не старый узел");
+        assert!(!cc.ret_unsupported_now(t));
+        cc.ret_miss.store(0, Relaxed); // пришёл T_PROBER
+        assert!(!cc.ret_prober_missed(t));
+        assert!(cc.ret_prober_missed(t), "второе подряд");
+        assert!(cc.ret_unsupported_now(t));
+    }
+
+    // QAB-M2: окно восстановления привязано к выходу и Link, ограничено по времени
+    #[test]
+    fn recover_decision_is_bound_to_dest_link_and_window() {
+        let (dest, other) = ([1u8; 16], [2u8; 16]);
+        let (l1, l2) = (LinkId::new([11; 16]), LinkId::new([12; 16]));
+        let t0 = Instant::now();
+        let r = RetRecover { dest, link: l1, quic_if: Some(9), move_at: t0, armed: t0 };
+        assert!(recover_decision(Some(&r), &dest, &l1, t0 + Duration::from_secs(5)));
+        assert!(!recover_decision(Some(&r), &other, &l1, t0), "чужой выход");
+        assert!(!recover_decision(Some(&r), &dest, &l2, t0), "другой Link");
+        assert!(!recover_decision(Some(&r), &dest, &l1, t0 + RET_RECOVER_WINDOW + Duration::from_millis(1)), "окно закрыто: это настоящий отказ");
+        assert!(recover_decision(Some(&r), &dest, &l1, t0 + RET_RECOVER_WINDOW));
+        assert!(!recover_decision(None, &dest, &l1, t0));
+    }
+
+    // Отказ B после успешного эха/AUTH: Moving -> Failed (TCP и режим не тронуты), восстановление вооружено только для прежнего Link
+    #[test]
+    fn failure_after_successful_echo_fails_move_and_arms_recovery_only_for_old_link() {
+        let cc = tcp_ctl();
+        let a = cc.ret_begin_attempt();
+        assert!(cc.ret_set_if(a, Ret::Standby { tcp: 5, quic: 9 }));
+        assert_eq!(cc.ret_poll(Some(5)), RetTick::Move(5));
+        cc.ret_fail();
+        assert_eq!(cc.ret_get(), Ret::Failed);
+        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed));
+        let (dest, old, new) = ([3u8; 16], LinkId::new([21; 16]), LinkId::new([22; 16]));
+        let now = Instant::now();
+        let r = RetRecover { dest, link: old, quic_if: Some(9), move_at: now, armed: now };
+        assert!(recover_decision(Some(&r), &dest, &old, now), "вытесненный сервером прежний Link - восстановление");
+        assert!(!recover_decision(Some(&r), &dest, &new, now), "закрытие нового Link - обычный отказ");
+        // сторож разбирает: слот пуст, Idle, эпоха выросла - поздний Failed→Standby невозможен
+        let slot: Mutex<Option<u32>> = Mutex::new(None);
+        let _ = ret_finish(&cc.ret_epoch, &slot, &cc.ret, Ret::Idle);
+        assert!(!cc.ret_set_if(a, Ret::Standby { tcp: 5, quic: 9 }));
+        assert_eq!(cc.ret_get(), Ret::Idle);
+    }
+
+    // QAB-R1: контекст B, как его фиксирует супервизор на тике Move; `Ret` затем меняет сторож
+    fn start_b(cc: &Arc<CarrierCtl>, dest: [u8; 16], old: LinkId, t0: Instant) -> Option<RetMove> {
+        let attempt = cc.ret_begin_attempt();
+        assert!(cc.ret_set_if(attempt, Ret::Standby { tcp: 5, quic: 9 }));
+        assert_eq!(cc.ret_poll(Some(5)), RetTick::Move(5));
+        Some(RetMove { dest, link: old, tcp_if: 5, quic_if: 9, attempt, started: t0 })
+    }
+
+    // (1) сервер вытеснил старый -> QUIC умер -> сторож поставил Idle (ret_finish) -> только потом Err connect_exit: восстановление всё равно вооружается
+    #[test]
+    fn watcher_idle_before_b_error_still_arms_recovery() {
+        let (dest, old) = ([4u8; 16], LinkId::new([31; 16]));
+        let cc = tcp_ctl();
+        let t0 = Instant::now();
+        let mut mv = start_b(&cc, dest, old, t0);
+        let slot: Mutex<Option<u32>> = Mutex::new(Some(1));
+        assert_eq!(ret_finish(&cc.ret_epoch, &slot, &cc.ret, Ret::Idle), Some(1), "сторож закрыл QUIC");
+        assert_eq!(cc.ret_get(), Ret::Idle, "Moving и номера интерфейсов стёрты");
+        let now = t0 + Duration::from_secs(3);
+        let rec = ret_b_error(&mut mv, &cc, &dest, now).expect("контекст пережил сторожа");
+        assert!(recover_decision(Some(&rec), &dest, &old, now + Duration::from_secs(1)), "закрытие прежнего Link - восстановление через TCP");
+        assert_eq!((rec.quic_if, rec.move_at), (Some(9), t0));
+        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed), "режим TCP не тронут");
+    }
+
+    // (2) то же при RET_MOVE_TIMEOUT: сторож по таймауту ставит Idle, Err приходит позже, в пределах срока контекста
+    #[test]
+    fn watcher_move_timeout_idle_before_b_error_still_arms_recovery() {
+        let (dest, old) = ([4u8; 16], LinkId::new([32; 16]));
+        let cc = tcp_ctl();
+        let t0 = Instant::now();
+        let mut mv = start_b(&cc, dest, old, t0);
+        let slot: Mutex<Option<u32>> = Mutex::new(None);
+        let _ = ret_finish(&cc.ret_epoch, &slot, &cc.ret, Ret::Idle);
+        let late = t0 + RET_MOVE_TIMEOUT + Duration::from_secs(2);
+        assert!(ret_b_error(&mut mv, &cc, &dest, late).is_some());
+        // слишком старый контекст не вооружает ничего: решение за обычным отказом
+        let mut mv = start_b(&tcp_ctl(), dest, old, t0);
+        assert!(ret_b_error(&mut mv, &tcp_ctl(), &dest, t0 + RET_MOVE_CTX_TTL + Duration::from_secs(1)).is_none());
+        assert!(mv.is_none(), "и контекст при этом снят");
+    }
+
+    // (3) прежний порядок (супервизор первым, Ret ещё Moving): ret_fail, восстановление ровно одно на попытку
+    #[test]
+    fn supervisor_first_arms_exactly_one_recovery() {
+        let (dest, old) = ([4u8; 16], LinkId::new([33; 16]));
+        let cc = tcp_ctl();
+        let t0 = Instant::now();
+        let mut mv = start_b(&cc, dest, old, t0);
+        assert!(matches!(cc.ret_get(), Ret::Moving { .. }));
+        assert!(ret_b_error(&mut mv, &cc, &[9u8; 16], t0).is_none(), "ошибка другого выхода контекст не трогает");
+        assert!(mv.is_some());
+        let rec = ret_b_error(&mut mv, &cc, &dest, t0 + Duration::from_secs(1));
+        assert!(rec.is_some());
+        assert_eq!(cc.ret_get(), Ret::Failed, "Moving -> Failed, как раньше");
+        assert!(ret_b_error(&mut mv, &cc, &dest, t0 + Duration::from_secs(2)).is_none(), "второй Err той же попытки (или сторож следом) второго восстановления не даёт");
+    }
+
+    // (4) успешный B восстановление не вооружает; позднейшая ошибка другого подключения тоже
+    #[test]
+    fn successful_b_does_not_arm_recovery() {
+        let (dest, old) = ([4u8; 16], LinkId::new([34; 16]));
+        let cc = tcp_ctl();
+        let t0 = Instant::now();
+        let mut mv = start_b(&cc, dest, old, t0);
+        ret_b_done(&mut mv, &[9u8; 16]);
+        assert!(mv.is_some(), "Ok другого выхода контекст не снимает");
+        ret_b_done(&mut mv, &dest);
+        assert!(mv.is_none());
+        assert!(ret_b_error(&mut mv, &cc, &dest, t0 + Duration::from_secs(5)).is_none());
+    }
+
+    // лабораторный отказ B: в отладочной сборке включается только переменной окружения, в release недоступен (там же проверка при компиляции)
+    #[test]
+    fn lab_b_fail_hook_is_debug_only() {
+        assert_eq!(lab_ret_b_fail_allowed(), cfg!(debug_assertions));
+        #[cfg(debug_assertions)]
+        {
+            assert!(lab_ret_b_fail(true) && !lab_ret_b_fail(false));
+        }
+    }
+
+    // QAB-L2: остаток разрешения, бюджет рукопожатия, истечение
+    #[test]
+    fn grant_budget_never_exceeds_the_residual() {
+        let ttl = qprobe::GRANT_TTL;
+        let full = grant_residual(ttl, Duration::ZERO);
+        assert_eq!(full, ttl - RET_GRANT_MARGIN);
+        assert_eq!(grant_residual(ttl, ttl), Duration::ZERO);
+        assert_eq!(grant_residual(Duration::ZERO, Duration::ZERO), Duration::ZERO);
+        let (hs, limited) = handshake_budget(full);
+        assert!(hs + RET_PROBE_RUN <= full, "рукопожатие + прогон укладываются в остаток");
+        assert_eq!(limited, full.saturating_sub(RET_PROBE_RUN) < Duration::from_secs(6));
+        let (hs, limited) = handshake_budget(Duration::from_secs(60));
+        assert_eq!((hs, limited), (Duration::from_secs(6), false), "щедрый остаток: обычный потолок, таймаут значит QUIC");
+        let (hs, limited) = handshake_budget(Duration::from_millis(100));
+        assert_eq!((hs, limited), (Duration::ZERO, true));
+        assert!(grant_expired(0, ttl, ttl) && !grant_expired(0, Duration::from_secs(1), ttl), "истекло только по сроку");
+        assert!(!grant_expired(3, ttl, ttl), "было эхо - причина не срок");
+        assert!(qprobe::MIN_RESIDUAL > RET_PROBE_RUN, "минимальный остаток оставляет время на сам прогон");
+    }
+
+    // ------------------------------------------------------------------------------------------------ барьер снятия TCP (QAB-M1)
+
+    const OWN: [u8; 16] = [0xaa; 16];
+    fn lid(n: u8) -> LinkId { LinkId::new([n; 16]) }
+
+    #[test]
+    fn drain_verdict_blocks_unknown_foreign_and_uncounted() {
+        let main = Dep { iface: Some(5), main_of: Some(OWN) };
+        let other = Dep { iface: Some(5), main_of: None };
+        let away = Dep { iface: Some(9), main_of: Some(OWN) };
+        let unk = Dep { iface: None, main_of: None };
+        assert_eq!(drain_verdict(&[], 5, &OWN, false, 0), Ok(0));
+        assert_eq!(drain_verdict(&[away], 5, &OWN, false, 0), Ok(0), "Link на QUIC TCP не держит");
+        assert_eq!(drain_verdict(&[main], 5, &OWN, false, 0), Err(DrainBlock::Live(1)), "Commit основной Link на TCP не рвёт");
+        assert_eq!(drain_verdict(&[main], 5, &OWN, true, 0), Ok(1), "этап 0: свой основной Link рвётся");
+        assert_eq!(drain_verdict(&[main, other], 5, &OWN, true, 0), Err(DrainBlock::Live(1)), "чужая зависимость блокирует и этап 0");
+        assert_eq!(drain_verdict(&[unk, away], 5, &OWN, true, 0), Err(DrainBlock::Unknown(1)), "неизвестное блокирует всё");
+        assert_eq!(drain_verdict(&[unk, main], 5, &OWN, true, 0), Err(DrainBlock::Unknown(1)), "неизвестное проверяется первым");
+        assert_eq!(drain_verdict(&[], 5, &OWN, true, 2), Err(DrainBlock::Uncounted(2)), "движок знает больше, чем перечислено");
+    }
+
+    fn st(map: &'static [(u8, Option<usize>)]) -> impl Fn(&LinkId) -> Option<Option<usize>> {
+        move |id| map.iter().find(|(n, _)| LinkId::new([*n; 16]) == *id).map(|(_, a)| *a)
+    }
+
+    #[test]
+    fn try_drain_counts_by_actual_iface_and_blocks_transit_exit2_over_exit1() {
+        let mut d = DrainState::default();
+        // основной Link к exit1 уже на QUIC, но допущенный/дополнительный Link к exit2 идёт ТРАНЗИТОМ через TCP к exit1
+        let known = [(lid(1), Some(OWN)), (lid(2), None)];
+        let r = d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9)), (2, Some(5))]), 2);
+        assert_eq!(r, Err(DrainBlock::Live(1)));
+        assert!(!d.draining.contains(&5), "отказ не помечает интерфейс снимаемым");
+        // тот же случай этапа 0: свой основной Link рвётся, но Link к exit2 по-прежнему держит TCP
+        let r = d.try_drain(5, &OWN, true, &known, st(&[(1, Some(5)), (2, Some(5))]), 2);
+        assert_eq!(r, Err(DrainBlock::Live(1)));
+        // когда Link к exit2 переехал, Commit проходит
+        let r = d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9)), (2, Some(9))]), 2);
+        assert_eq!(r, Ok(0));
+        assert!(d.draining.contains(&5));
+    }
+
+    #[test]
+    fn try_drain_ignores_dead_links_but_counts_connecting_tickets() {
+        let mut d = DrainState::default();
+        let known = [(lid(1), Some(OWN)), (lid(2), None)];
+        // Link 2 мёртв (движок его не знает): ничего не держит; counted = 1 (только Link 1)
+        assert_eq!(d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9))]), 1), Ok(0));
+        d.draining.clear();
+        // билет без пути: неизвестный интерфейс блокирует
+        let t = d.open();
+        assert_eq!(d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9))]), 1), Err(DrainBlock::Unknown(1)));
+        // билет выбрал путь по другому интерфейсу: снимать можно
+        assert!(d.begin_connect(t, 9));
+        assert_eq!(d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9))]), 1), Ok(0));
+        d.draining.clear();
+        // билет выбрал путь по TCP: держит
+        let t2 = d.open();
+        assert!(d.begin_connect(t2, 5));
+        assert_eq!(d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9))]), 1), Err(DrainBlock::Live(1)));
+        // билет получил Link: Link учитывается по факту и один раз
+        d.set_link(t2, lid(3));
+        assert_eq!(d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9)), (3, Some(9))]), 2), Ok(0));
+        d.close(t);
+        d.close(t2);
+        assert!(d.tickets.is_empty());
+    }
+
+    #[test]
+    fn draining_iface_forbids_new_bindings_until_lease_ends() {
+        let mut d = DrainState::default();
+        assert_eq!(d.try_drain(5, &OWN, false, &[], |_| None, 0), Ok(0));
+        let t = d.open();
+        assert!(!d.begin_connect(t, 5), "на снимаемый интерфейс не привязываемся");
+        assert!(d.begin_connect(t, 9), "на другой можно");
+        d.draining.remove(&5); // аренда отпущена
+        assert!(d.begin_connect(t, 5));
+    }
+
+    // Гонка: подключение выбирает путь по TCP одновременно со снятием - либо оно привязано и снятие отказано, либо снятие прошло и подключение отказано
+    #[test]
+    fn drain_vs_connect_race_has_exactly_one_winner() {
+        for _ in 0..400 {
+            let d = Arc::new(Mutex::new(DrainState::default()));
+            let t = d.lock().unwrap().open();
+            let bar = Arc::new(std::sync::Barrier::new(2));
+            let (d2, bar2) = (d.clone(), bar.clone());
+            let conn = std::thread::spawn(move || {
+                bar2.wait();
+                d2.lock().unwrap().begin_connect(t, 5)
+            });
+            bar.wait();
+            // снятие может ждать, пока подключение выберет путь (Unknown), поэтому повторяем как в боевом цикле до первого определённого исхода
+            let drained = loop {
+                let r = d.lock().unwrap().try_drain(5, &OWN, false, &[], |_| None, 0);
+                match r {
+                    Err(DrainBlock::Unknown(_)) => std::thread::yield_now(),
+                    other => break other,
+                }
+            };
+            let bound = conn.join().unwrap();
+            match (bound, drained) {
+                (true, Err(DrainBlock::Live(1))) => {}
+                (false, Ok(0)) => {}
+                other => panic!("оба выиграли или оба проиграли: {other:?}"),
+            }
+        }
+    }
+
+    // старый пир: молчание в ответ на T_PROBEQ -> память на RET_UNSUPPORTED_TTL, потом снова пробуем
+    #[test]
+    fn old_peer_is_remembered_as_unsupported_for_a_while() {
+        let cc = CarrierCtl::new();
+        let t0 = Instant::now();
+        assert!(!cc.ret_unsupported_now(t0));
+        cc.ret_mark_unsupported(t0);
+        assert!(cc.ret_unsupported_now(t0 + Duration::from_secs(60)));
+        assert!(!cc.ret_unsupported_now(t0 + RET_UNSUPPORTED_TTL));
+    }
+
+    // согласование: тела T_PROBEQ/T_PROBER строгие; старый узел (on_control: `_ => {}`) тип 23 просто игнорирует
+    #[test]
+    fn probe_types_are_unused_by_older_message_types() {
+        let all = [T_SRV1, T_SRV2, T_SRV3, T_SRV4, T_PING, T_PONG, T_TABLE, T_REGISTRY, T_AUTH_OK, T_AUTH_FAIL, T_REC, T_PAIR1, T_PAIR_NO, T_USE, T_PAIRQ, T_NBRS, T_DIR, T_BENCH, T_BENCH_DATA, T_POL, T_OBSERVE, T_CINFO];
+        assert!(!all.contains(&T_PROBEQ) && !all.contains(&T_PROBER) && T_PROBEQ != T_PROBER);
+        assert_ne!(T_PROBEQ, 0x45, "не похож на IPv4-датаграмму");
+    }
+
+    // эхо получает только допущенный клиент: сервер, зачисляемый, неопознанный и безымянный пир - нет
+    #[test]
+    fn only_admitted_clients_get_a_probe_grant() {
+        let pk = Some([7u8; 64]);
+        assert!(probe_owner(&info(Role::Client { id: [1; 16], ip: 1 }, false, pk)).is_some());
+        assert!(probe_owner(&info(Role::Client { id: [1; 16], ip: 1 }, true, pk)).is_none(), "зачисление");
+        assert!(probe_owner(&info(Role::Client { id: [1; 16], ip: 1 }, false, None)).is_none(), "ключ не доказан");
+        assert!(probe_owner(&info(Role::Unknown, false, pk)).is_none(), "до допуска");
+        assert!(probe_owner(&info(Role::Server { dest: [2; 16] }, false, pk)).is_none(), "сосед-сервер");
+        let a = probe_owner(&info(Role::Client { id: [1; 16], ip: 1 }, false, Some([7; 64]))).unwrap();
+        let b = probe_owner(&info(Role::Client { id: [1; 16], ip: 1 }, false, Some([8; 64]))).unwrap();
+        assert_ne!(a, b, "владелец - хеш ключа");
+    }
+
+    // зонд не создаёт RNS Link и не меняет бюджет: счётчики эха растут только от разрешённых запросов
+    #[test]
+    fn probe_constants_keep_the_wakeup_schedule() {
+        // зонд заменяет прежнюю попытку возврата: расписание back_off то же
+        assert_eq!(grown_back_off(120), 240);
+        assert_eq!(grown_back_off(TCP_BACK_OFF_MAX_S), TCP_BACK_OFF_MAX_S);
+        assert!(qprobe::GRANT_INTERVAL < Duration::from_secs(TCP_BACK_OFF_FIRST_S), "разрешение не ограничивает штатное расписание");
+        assert!(RET_MOVE_TIMEOUT < Duration::from_secs(120));
     }
 }

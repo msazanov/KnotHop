@@ -2,5 +2,5 @@
 # Замените <user@node-ip> адресом из собственной инфраструктуры; файл не содержит инвентаря пилота.
 # StrictHostKeyChecking=yes и BatchMode=yes задаются скриптом; ключи узлов берутся из known_hosts вне репозитория.
 # Разделитель полей — TAB; порядок строк задаёт порядок раскатки.
-node1	<user@node-ip>	rawgd
-node2	<user@node-ip>	rawgd-u2204
+node1	<user@node-ip>	knothopd
+node2	<user@node-ip>	knothopd-u2204

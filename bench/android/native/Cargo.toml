@@ -1,12 +1,12 @@
 [package]
-name = "rawgmeas"
+name = "knothopmeas"
 version = "0.1.0"
 edition = "2024"
 publish = false
 description = "JNI-обёртка над rns-iroh-node для тестового Android-приложения замеров (не клиент)"
 
 [lib]
-name = "rawgmeas"
+name = "knothopmeas"
 crate-type = ["cdylib"]
 
 [dependencies]

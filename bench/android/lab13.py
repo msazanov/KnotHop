@@ -9,13 +9,13 @@
                                       то же для клиента с TUN: ходит на «сайт» и в whoami через выход
   lab13.py restart NAME               перезапуск контейнера (состояние и identity сохраняются, приглашение игнорируется)
   lab13.py wipe NAME                  удалить контейнер вместе с состоянием (переустановка)
-  lab13.py list [NAME]                rawgd list на ноде (права, записи, приглашения)
+  lab13.py list [NAME]                knothopd list на ноде (права, записи, приглашения)
   lab13.py test NAME                  с клиента: curl «сайта» и whoami через туннель
   lab13.py logs NAME [N]              хвост журнала
-  lab13.py down                       убрать контейнеры и сеть (состояние остаётся в ~/.cache/rawg-lab13/lab)
+  lab13.py down                       убрать контейнеры и сеть (состояние остаётся в ~/.cache/knothop-lab13/lab)
 
-Топология: сеть rawg-lab13 172.29.98.0/24, хаб .10 (TCP 4242 изображает публичный узел RNS), «сайт» .50, ноды с .11.
-Бинарь - отладочная сборка из bench/rns-iroh-node/target/debug/rawgd (RAWGD_BIN переопределяет).
+Топология: сеть knothop-lab13 172.29.98.0/24, хаб .10 (TCP 4242 изображает публичный узел RNS), «сайт» .50, ноды с .11.
+Бинарь - отладочная сборка из bench/rns-iroh-node/target/debug/knothopd (KNOTHOP_BIN переопределяет).
 """
 import argparse
 import laptop
@@ -29,12 +29,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 # Имя попадает в имена контейнеров, каталоги state и аргументы rm -rf: только безопасный набор символов.
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
-BIN = Path(os.environ.get("RAWGD_BIN", str(HERE.parent / "rns-iroh-node/target/debug/rawgd")))
-# Отдельный префикс позволяет запускать сценарии на изолированной сети, не затрагивая rawg-lab13.
+BIN = Path(os.environ.get("KNOTHOP_BIN", str(HERE.parent / "rns-iroh-node/target/debug/knothopd")))
+# Отдельный префикс позволяет запускать сценарии на изолированной сети, не затрагивая knothop-lab13.
 PREFIX = os.environ.get("LAB13_PREFIX", "")
-LAB = Path(os.environ.get("LAB13_ROOT", str(Path.home() / ".cache/rawg-lab13/lab")))
-IMAGE = "rawg-bench:l3"
-NET = f"{PREFIX}-net" if PREFIX else "rawg-lab13"
+LAB = Path(os.environ.get("LAB13_ROOT", str(Path.home() / ".cache/knothop-lab13/lab")))
+IMAGE = "knothop-bench:l3"
+NET = f"{PREFIX}-net" if PREFIX else "knothop-lab13"
 SUBNET = os.environ.get("LAB13_SUBNET", "172.29.98.0/24")
 HUB_NAME = f"{PREFIX}-hub" if PREFIX else "l13-hub"
 SITE_NAME = f"{PREFIX}-site" if PREFIX else "l13-site"
@@ -70,8 +70,8 @@ def next_ip():
 def run(name, ip, cmd, state, extra=()):
     sh("docker", "rm", "-f", name, check=False)
     sh("docker", "run", "-d", "--name", name, "--hostname", name, "--network", NET, "--ip", ip, "--cap-add", "NET_ADMIN", "--device", "/dev/net/tun",
-       "--sysctl", "net.ipv4.ip_forward=1", "-e", "RAWG_DEBUG=1", "-e", "RAWGD_ALLOW_PRIVATE_DIAL=1", "-e", "RAWGD_TCP_BACKOFF_S=30",
-       "-v", f"{BIN}:/usr/local/bin/rawgd:ro", "-v", f"{HERE}:/lab:ro", "-v", f"{state}:/state", *extra, "--entrypoint", "sh", IMAGE, "-c", cmd)
+       "--sysctl", "net.ipv4.ip_forward=1", "-e", "KNOTHOP_DEBUG=1", "-e", "KNOTHOP_ALLOW_PRIVATE_DIAL=1", "-e", "KNOTHOP_TCP_BACKOFF_S=30",
+       "-v", f"{BIN}:/usr/local/bin/knothopd:ro", "-v", f"{HERE}:/lab:ro", "-v", f"{state}:/state", *extra, "--entrypoint", "sh", IMAGE, "-c", cmd)
 
 
 def valid_name(s):
@@ -114,12 +114,12 @@ def node_cmd(name, ip, only_ip, has_invite, lan="", auto_adv=False):
             f"iptables -t nat -A POSTROUTING -s {CLIENT_NET} ! -o tun0 -j MASQUERADE; "
             # носитель не должен попадать в собственный туннель (журнал N30)
             f"iptables -I OUTPUT -d {CLIENT_NET} -p udp --sport 47001 -j DROP; "
-            f"{os.environ.get('LAB_NODE_ENV', '')}rawgd node --state /state --name {name} --port 47001{adv} --public-rns-file /state/pub.txt --announce-s 10{inv}{os.environ.get('LAB_NODE_EXTRA', '')} 2>&1 | tee -a /state/node.log")
+            f"{os.environ.get('LAB_NODE_ENV', '')}knothopd node --state /state --name {name} --port 47001{adv} --public-rns-file /state/pub.txt --announce-s 10{inv}{os.environ.get('LAB_NODE_EXTRA', '')} 2>&1 | tee -a /state/node.log")
 
 
 def client_cmd(only_ip, has_invite=True):
     inv = " --invite-file /state/invite.txt" if has_invite else ""
-    return (isolate(only_ip) + f"rawgd client --state /state{inv} --public-rns-file /state/pub.txt >> /state/client.log 2>&1 & "
+    return (isolate(only_ip) + f"{os.environ.get('LAB_CLIENT_ENV', '')}knothopd client --state /state{inv} --public-rns-file /state/pub.txt >> /state/client.log 2>&1 & "
             "until ip link show tun0 >/dev/null 2>&1; do sleep 0.3; done; "
             f"ip route add {SITE_IP}/32 dev tun0; ip route add 10.99.0.1/32 dev tun0; wait")
 
@@ -138,12 +138,12 @@ def wait_file(c, path, secs=40):
 
 def cmd_up(a):
     if not BIN.exists():
-        sys.exit(f"нет {BIN}: cargo build --bin rawgd в bench/rns-iroh-node")
+        sys.exit(f"нет {BIN}: cargo build --bin knothopd в bench/rns-iroh-node")
     if sh("docker", "network", "inspect", NET, check=False).returncode:
         sh("docker", "network", "create", "--subnet", SUBNET, NET)
     hub = state_dir("hub")
     hub_pub = ("-p", f"{HUB_LAN_PORT}:4242/tcp") if a.phone else ()
-    run(HUB_NAME, HUB_IP, "exec rawgd hub --state /state --port 47000 --tcp-port 4242", hub, hub_pub)
+    run(HUB_NAME, HUB_IP, "exec knothopd hub --state /state --port 47000 --tcp-port 4242", hub, hub_pub)
     run(SITE_NAME, SITE_IP, "exec python3 /lab/lab_web.py site", hub)
     if a.no_adm:
         print(f"хаб {HUB_IP}, сайт {SITE_IP}; adm не запущен")
@@ -162,9 +162,9 @@ def cmd_up(a):
 def make_invite(src, rights, label, nodes="", root=""):
     extra = ["--nodes", nodes] if nodes else []
     root_arg = ["--root", root] if root else []
-    # Приглашение не попадает в stdout/логи/argv: rawgd пишет его в файл с mode 0600.
+    # Приглашение не попадает в stdout/логи/argv: knothopd пишет его в файл с mode 0600.
     path = f"/state/.invite-{os.getpid()}"
-    sh("docker", "exec", src, "rawgd", "invite", "--state", "/state", "--rights", rights,
+    sh("docker", "exec", src, "knothopd", "invite", "--state", "/state", "--rights", rights,
        "--label", label, "--out", path, *root_arg, *extra)
     try:
         r = sh("docker", "exec", src, "cat", path)
@@ -225,7 +225,7 @@ def cmd_wipe(a):
 
 
 def cmd_list(a):
-    print(sh("docker", "exec", a.name, "rawgd", "list", "--state", "/state").stdout.split("таблица соседей")[0].strip())
+    print(sh("docker", "exec", a.name, "knothopd", "list", "--state", "/state").stdout.split("таблица соседей")[0].strip())
 
 
 def cmd_test(a):
@@ -254,7 +254,7 @@ sp = ap.add_subparsers(dest="c", required=True)
 x = sp.add_parser("up"); x.add_argument("--phone", action="store_true", help="опубликовать порт adm на LAN-адресе ноутбука для телефона"); x.add_argument("--no-adm", action="store_true", help="без ноды adm (админом будет клиент: lab13.py admin NAME)"); x.set_defaults(f=cmd_up)
 for nm, fn, rt in (("node", cmd_node, "relay"), ("client", cmd_client, "user")):
     x = sp.add_parser(nm); x.add_argument("name", type=valid_name); x.add_argument("--rights", default=rt); x.add_argument("--from", dest="src", type=valid_name, default=ADM_NAME); x.add_argument("--root", default=""); x.add_argument("--only-ip", default=""); x.add_argument("--nodes", default="")
-    x.add_argument("--invite", default="", help="готовое приглашение rawgi-… (например, из приложения на телефоне) вместо выдачи с контейнера --from")
+    x.add_argument("--invite", default="", help="готовое приглашение kh-… (например, из приложения на телефоне) вместо выдачи с контейнера --from")
     x.add_argument("--invite-file", default="", help="файл с готовым приглашением (предпочтительно; секрет не передаётся в argv)")
     x.add_argument("--phone-port", type=int, default=0, help="опубликовать порт ноды на LAN-адресе ноутбука и объявить его (для телефона)")
     x.add_argument("--auto-adv", action="store_true", help="без --advertise: адрес с интерфейса, перепроверка раз в 60 с (смена IP)"); x.set_defaults(f=fn)

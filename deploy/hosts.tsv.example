@@ -1,11 +1,11 @@
-# метка	ssh-цель (из ~/.ssh/config или user@host)	вариант бинарника (rawgd | rawgd-u2204)	[опции ssh/scp через пробел]
+# метка	ssh-цель (из ~/.ssh/config или user@host)	вариант бинарника (knothopd | knothopd-u2204)	[опции ssh/scp через пробел]
 # user@host при user != root -> sudo -n на узле. Опции, например: operator@jump -o UserKnownHostsFile=/путь/known_hosts -o IdentitiesOnly=yes
 # StrictHostKeyChecking=yes и BatchMode=yes ставит сам rollout.sh (ключ узла должен быть в known_hosts заранее).
 # Копируется в hosts.tsv (не коммитить) тем, у кого есть доступ. Порядок строк = порядок раскатки: канарейка первой.
 # Разделитель - TAB. Строки с # пропускаются.
-es	ЗАПОЛНИТЬ	rawgd
-uae	ЗАПОЛНИТЬ	rawgd
-by	ЗАПОЛНИТЬ	rawgd
-ru1	ЗАПОЛНИТЬ	rawgd
-nl1	ЗАПОЛНИТЬ	rawgd
-de	ЗАПОЛНИТЬ	rawgd-u2204
+es	ЗАПОЛНИТЬ	knothopd
+uae	ЗАПОЛНИТЬ	knothopd
+by	ЗАПОЛНИТЬ	knothopd
+ru1	ЗАПОЛНИТЬ	knothopd
+nl1	ЗАПОЛНИТЬ	knothopd
+de	ЗАПОЛНИТЬ	knothopd-u2204

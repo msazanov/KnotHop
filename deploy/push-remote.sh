@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Runs as root on an allowlisted rawg pilot node. Caller streams this helper and rawgd.new.
+# Runs as root on an allowlisted KnotHop pilot node. Caller streams this helper and knothopd.new.
 set -uo pipefail
-STAGE=$1 WANT=$2 DIR=/opt/rawgd-pilot BIN=/opt/rawgd-pilot/rawgd UNIT=rawgd-pilot
-PREV="$DIR/rawgd.prev" TMP="$DIR/.rawgd.push.new" LOCK="$DIR/.rawgd-push.lock"
+STAGE=$1 WANT=$2 DIR=/opt/knothop BIN=/opt/knothop/knothopd UNIT=knothopd
+PREV="$DIR/knothopd.prev" TMP="$DIR/.knothopd.push.new" LOCK="$DIR/.knothop-push.lock"
 BASE_HASH=null BASE_RESTARTS=null BASE_MESH=null BASE_TS=null
-POSTSTART_RESTARTS=null
+POSTSTART_RESTARTS=null HOST_ACL=null HOST_ACL_ERR=
 INSTALLED_HASH=null EXE_HASH=null PID=null RESTARTS=null MESH=null TS=null
 ROLLBACK=not-needed DETAIL=initializing SUCCESS=0 REPLACEMENT_STARTED=0 ROLLBACK_DONE=0 RESULT_EMITTED=0
 
@@ -14,7 +14,7 @@ emit_result() {
   local status=$1 rollback=$2 detail=$3
   INSTALLED_HASH=$(sha "$BIN" || printf null)
   if [[ ${PID:-0} =~ ^[0-9]+$ && $PID -gt 0 && -e /proc/$PID/exe ]]; then EXE_HASH=$(sha "/proc/$PID/exe" || printf null); else EXE_HASH=null; fi
-  python3 - "$status" "$rollback" "$detail" "$INSTALLED_HASH" "$EXE_HASH" "$BASE_HASH" "$PID" "$RESTARTS" "$MESH" "$TS" "$BASE_RESTARTS" "$BASE_MESH" "$BASE_TS" "$POSTSTART_RESTARTS" <<'PY'
+  python3 - "$status" "$rollback" "$detail" "$INSTALLED_HASH" "$EXE_HASH" "$BASE_HASH" "$PID" "$RESTARTS" "$MESH" "$TS" "$BASE_RESTARTS" "$BASE_MESH" "$BASE_TS" "$POSTSTART_RESTARTS" "$HOST_ACL" <<'PY'
 import json, sys
 def number(value):
     try: return int(value)
@@ -28,6 +28,7 @@ print("PUSH_RESULT " + json.dumps({
     "ts": number(sys.argv[10]), "baseline_restarts": number(sys.argv[11]),
     "baseline_mesh": number(sys.argv[12]), "baseline_ts": number(sys.argv[13]),
     "poststart_restarts": number(sys.argv[14]),
+    "host_acl": None if sys.argv[15] == "null" else sys.argv[15],
 }, separators=(",", ":")))
 PY
   RESULT_EMITTED=1
@@ -38,7 +39,7 @@ read_mesh_sample() {
   python3 - <<'PY'
 import json, time
 try:
-    with open('/opt/rawgd-pilot/state/neighbors.json', encoding='utf-8') as f:
+    with open('/opt/knothop/state/neighbors.json', encoding='utf-8') as f:
         d = json.load(f)
     ts = d.get('ts')
     if isinstance(ts, bool) or not isinstance(ts, int): raise ValueError('invalid ts')
@@ -53,6 +54,62 @@ except Exception:
     print('0 0 0')
 PY
 }
+
+# --- host-acl-begin (тесты загружают этот блок отдельно)
+# knothopd с fail-closed host ACL не допускает клиентов без <state>/host-acl.json. Файл обеспечивается ДО замены бинарника:
+# отсутствует - создаётся атомарно (temp в том же каталоге, fsync, ln без перезаписи, rm temp), существующий не меняется.
+# Владелец - пользователь службы (User= юнита): host_acl.rs принимает владельца root или euid службы, а процесс knothopd
+# не прочитает файл root:root 0600. Откат бинарника файл не удаляет: старый knothopd его не читает.
+HOST_ACL_DEFAULT='{"version":1,"aliases":[],"allow":[]}'
+HOST_ACL_NAME='^[A-Za-z_][A-Za-z0-9_.-]*$'
+host_acl_fail() { HOST_ACL=refused; HOST_ACL_ERR=$1; return 1; }
+
+host_acl_state_dir() { # --state из ExecStart юнита, иначе /opt/knothop/state; только буквальный абсолютный путь без ..
+  local exec dir=/opt/knothop/state re='--state[= ]([^ ]+)'
+  exec=$(systemctl show "$UNIT" -p ExecStart --value 2>/dev/null || :)
+  if [[ $exec =~ $re ]]; then dir=${BASH_REMATCH[1]}; fi
+  [[ $dir =~ ^/[A-Za-z0-9._/-]+$ && $dir != *..* ]] || return 1
+  printf '%s' "$dir"
+}
+
+host_acl_owner() { # user:group службы; без User= служба работает от root
+  local u g
+  u=$(systemctl show "$UNIT" -p User --value 2>/dev/null || :)
+  g=$(systemctl show "$UNIT" -p Group --value 2>/dev/null || :)
+  [[ -n $u ]] || u=root
+  [[ $u =~ $HOST_ACL_NAME ]] || return 1
+  [[ -n $g ]] || g=$(id -gn "$u" 2>/dev/null) || return 1
+  [[ $g =~ $HOST_ACL_NAME ]] || return 1
+  printf '%s:%s' "$u" "$g"
+}
+
+ensure_host_acl() { # $1 state-каталог, $2 user:group; HOST_ACL=created|present, иначе refused и код 1
+  local state=$1 owner=$2 acl uid mode size svc_uid tmp
+  acl=$state/host-acl.json
+  [[ -d $state && ! -L $state ]] || { host_acl_fail 'state directory is missing or a symlink'; return 1; }
+  [[ ! -L $acl ]] || { host_acl_fail 'host-acl.json is a symlink'; return 1; }
+  svc_uid=$(id -u "${owner%%:*}" 2>/dev/null) || { host_acl_fail 'service user is unknown'; return 1; }
+  if [[ -e $acl ]]; then
+    [[ -f $acl ]] || { host_acl_fail 'host-acl.json is not a regular file'; return 1; }
+    read -r uid mode size < <(stat -c '%u %a %s' -- "$acl") || { host_acl_fail 'cannot stat host-acl.json'; return 1; }
+    # Существующий файл не правим, но заведомо непригодный (его отвергнет knothopd) не оставляем до замены бинарника.
+    (( 8#$mode & 077 )) && { host_acl_fail 'existing host-acl.json is accessible to group/other'; return 1; }
+    [[ $uid == 0 || $uid == "$svc_uid" ]] || { host_acl_fail 'existing host-acl.json has an unexpected owner'; return 1; }
+    (( size <= 16384 )) || { host_acl_fail 'existing host-acl.json exceeds 16KiB'; return 1; }
+    HOST_ACL=present
+    return 0
+  fi
+  tmp=$(mktemp "$state/.host-acl.json.XXXXXX") || { host_acl_fail 'cannot create temporary file'; return 1; }
+  if printf '%s\n' "$HOST_ACL_DEFAULT" > "$tmp" && chown "$owner" "$tmp" && chmod 0600 "$tmp" \
+      && { sync "$tmp" 2>/dev/null || sync; } && ln -- "$tmp" "$acl"; then
+    rm -f -- "$tmp"
+    HOST_ACL=created
+    return 0
+  fi
+  rm -f -- "$tmp"
+  host_acl_fail 'cannot publish host-acl.json'
+}
+# --- host-acl-end
 
 rollback_previous() {
   ROLLBACK=attempted
@@ -86,15 +143,15 @@ on_exit() {
   fi
   exit "$rc"
 }
-die() { DETAIL=$1; printf 'rawg push: %s\n' "$DETAIL" >&2; exit 1; }
+die() { DETAIL=$1; printf 'knothop push: %s\n' "$DETAIL" >&2; exit 1; }
 early_die() { ROLLBACK=$1; DETAIL=$2; emit_result failed "$ROLLBACK" "$DETAIL"; exit 1; }
 
 [[ $EUID == 0 && -d $DIR && -f $STAGE ]] || early_die unavailable 'root/paths check failed'
 # The lock is acquired before traps or any backup/replacement work. A loser must not
-# touch rawgd.prev/rawgd.new or run a rollback belonging to the lock holder.
-exec 9>>"$LOCK" || early_die unavailable 'cannot open rawg rollout lock'
+# touch knothopd.prev/knothopd.new or run a rollback belonging to the lock holder.
+exec 9>>"$LOCK" || early_die unavailable 'cannot open knothop rollout lock'
 if ! flock -n 9; then
-  emit_result failed lock-busy 'another rawgd-pilot rollout holds the lock'
+  emit_result failed lock-busy 'another knothopd rollout holds the lock'
   exit 75
 fi
 trap on_exit EXIT
@@ -114,6 +171,12 @@ if [[ $baseline_fresh != 1 || ! $BASE_MESH =~ ^[0-9]+$ || $BASE_MESH -lt 1 ]]; t
   ROLLBACK=unavailable
   die "baseline mesh is not fresh/healthy; baseline_mesh=$BASE_MESH baseline_ts=$BASE_TS (not PASS)"
 fi
+
+# host-acl.json обязателен новому knothopd: любой отказ здесь происходит до backup и замены, узел остаётся на старом бинарнике.
+if ! acl_state=$(host_acl_state_dir) || ! acl_owner=$(host_acl_owner); then
+  HOST_ACL=refused; die 'cannot resolve state directory or service user for host-acl.json'
+fi
+ensure_host_acl "$acl_state" "$acl_owner" || die "host-acl.json: $HOST_ACL_ERR (binary not replaced)"
 
 cp -p "$BIN" "$PREV" || die 'cannot preserve previous binary'
 [[ $(sha "$PREV") == "$BASE_HASH" ]] || die 'backup hash mismatch'

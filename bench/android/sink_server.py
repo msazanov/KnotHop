@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Источник и приёмник трафика для замеров VPN-приложения: GET /down?mb=N отдаёт N МБ нулей, POST /up читает и отбрасывает тело.
-Запускается внутри контейнера выхода (rawg-exit) на 10.99.0.1:8099, чтобы мерить тракт, а не интернет."""
+Запускается внутри контейнера выхода (knothop-exit) на 10.99.0.1:8099, чтобы мерить тракт, а не интернет."""
 import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import re

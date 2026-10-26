@@ -1,4 +1,4 @@
-//! Раздельное туннелирование клиента: правила по спискам (формат geoip.dat/geosite.dat проекта v2ray), ручные списки, приоритеты выходов.
+//! Раздельное туннелирование клиента: правила по спискам (формат geoip.dat/geosite.dat проекта v2ray) и ручные списки.
 //!
 //! Конфиг `state/routing.json` пишет приложение, клиент перечитывает его при изменении. Решение принимается по IPv4-адресу назначения:
 //! подсети (geoip, ручные CIDR/IP) сопоставляются сразу, домены (geosite, ручные) - по DNS-ответам, которые проходят через туннель
@@ -23,7 +23,7 @@ const RANK_LIST: u32 = 1_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
-    /// основной выход (по приоритетам)
+    /// основной выход (ручной select либо автоматический выбор supervisor)
     Default,
     /// мимо туннеля
     Direct,
@@ -238,7 +238,7 @@ pub struct ManualCfg {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cfg {
-    /// "auto" | "priority" | "rules"
+    /// "auto" | "rules"; legacy "priority" configs normalize to "auto".
     pub mode: String,
     pub priority: Vec<[u8; 16]>,
     pub rules: Vec<RuleCfg>,
@@ -254,14 +254,10 @@ impl Default for Cfg {
 impl Cfg {
     pub fn parse(s: &str) -> Cfg {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else { return Cfg::default() };
-        let mode = match v["mode"].as_str() {
-            Some(m @ ("priority" | "rules")) => m.to_string(),
-            _ => "auto".to_string(),
-        };
-        let priority = v["priority"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).filter_map(|h| match Action::parse(&format!("exit:{h}")) {
-            Some(Action::Exit(d)) => Some(d),
-            _ => None,
-        }).take(64).collect()).unwrap_or_default();
+        let mode = if v["mode"].as_str() == Some("rules") { "rules".to_string() } else { "auto".to_string() };
+        // Retain the legacy field in the in-memory type for source compatibility, but do not parse
+        // or export user exit rankings. Rules remain independent and keep their own precedence.
+        let priority = Vec::new();
         let rules = v["rules"].as_array().map(|a| a.iter().filter_map(|x| {
             let kind = x["t"].as_str().filter(|t| *t == "geosite" || *t == "geoip")?.to_string();
             let name = x["n"].as_str().filter(|n| !n.is_empty() && n.len() <= 80)?.to_string();
@@ -295,10 +291,6 @@ impl Cfg {
         v
     }
 
-    /// Место выхода в списке приоритетов (меньше - важнее); не названные идут после всех.
-    pub fn prio_of(&self, d: &[u8; 16]) -> usize {
-        self.priority.iter().position(|x| x == d).unwrap_or(usize::MAX)
-    }
 }
 
 // ---------- сопоставление ----------
@@ -792,7 +784,7 @@ mod tests {
     }
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("rawg-route-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("knothop-route-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -968,15 +960,58 @@ mod tests {
         assert_eq!(c.manual[0].value, "a.com");
         assert_eq!(c.exits(), vec![[0xaa; 16]]);
         assert_eq!(Cfg::parse("{not json").mode, "auto");
-        assert_eq!(c.prio_of(&[0xaa; 16]), 0);
-        assert_eq!(c.prio_of(&[1; 16]), usize::MAX);
+        assert!(c.priority.is_empty(), "legacy rankings are ignored");
+        let legacy = Cfg::parse(r#"{"mode":"priority","priority":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}"#);
+        assert_eq!(legacy.mode, "auto");
+        assert!(legacy.priority.is_empty());
     }
 
-    /// Ручная проверка на настоящих файлах: RAWG_RULES_DIR=/путь cargo test --lib real_files -- --ignored --nocapture
+    #[test]
+    fn java_routingcfg_json_activates_only_enabled_rules_and_preserves_order() {
+        // Shape emitted by RoutingCfg.toJson(): disabled and migration metadata are UI-only.
+        const JAVA_JSON: &str = r#"{
+          "mode":"rules","priority":[],
+          "rules":[
+            {"t":"geoip","n":"FIRST","a":"exit:11111111111111111111111111111111"},
+            {"t":"geoip","n":"SECOND","a":"direct"}],
+          "manual":[{"v":"10.1.2.3","a":"default"}],
+          "off_rules":[{"t":"geoip","n":"DISABLED","a":"direct","i":1}],
+          "off_manual":[{"v":"10.2.3.4","a":"direct","i":0}],
+          "ui_legacy":[{"mode":"priority","priority":[],"ack":true}],
+          "future_ui_metadata":{"x":1}
+        }"#;
+        let cfg = Cfg::parse(JAVA_JSON);
+        assert_eq!(cfg.mode, "rules");
+        assert!(cfg.priority.is_empty());
+        assert_eq!(cfg.rules.len(), 2, "off_rules must never become active native rules");
+        assert_eq!(cfg.rules[0].name, "FIRST");
+        assert_eq!(cfg.rules[1].name, "SECOND");
+        assert_eq!(cfg.manual.len(), 1, "off_manual is UI metadata");
+        assert_eq!(cfg.exits(), vec![[0x11; 16]], "only active rule actions are loaded");
+
+        let d = tmp("java-routingcfg");
+        std::fs::write(d.join("geoip.dat"), geoip(&[
+            ("FIRST", vec![([10, 0, 0, 0], 8)]),
+            ("SECOND", vec![([10, 0, 0, 0], 8)]),
+            ("DISABLED", vec![([10, 0, 0, 0], 8)]),
+        ])).unwrap();
+        let router = Router::build(&cfg, &d);
+        let ip = |a: [u8; 4]| u32::from_be_bytes(a);
+        assert_eq!(router.decide(ip([10, 1, 2, 3])), Action::Default, "active manual entry remains above list rules");
+        assert_eq!(router.decide(ip([10, 9, 8, 7])), Action::Exit([0x11; 16]), "first active list rule wins; disabled rule is ignored");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let old = Cfg::parse(r#"{"mode":"priority","priority":["11111111111111111111111111111111"],"rules":[{"t":"geoip","n":"FIRST","a":"direct"}]}"#);
+        assert_eq!(old.mode, "auto");
+        assert!(old.priority.is_empty(), "old exit ranking never affects selection");
+        assert_eq!(old.rules.len(), 1, "legacy mode does not delete the rule data");
+    }
+
+    /// Ручная проверка на настоящих файлах: KNOTHOP_RULES_DIR=/путь cargo test --lib real_files -- --ignored --nocapture
     #[test]
     #[ignore]
     fn real_files() {
-        let d = PathBuf::from(std::env::var("RAWG_RULES_DIR").unwrap());
+        let d = PathBuf::from(std::env::var("KNOTHOP_RULES_DIR").unwrap());
         let t0 = Instant::now();
         let gs = scan(&d.join("geosite.dat")).unwrap();
         let gi = scan(&d.join("geoip.dat")).unwrap();

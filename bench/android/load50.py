@@ -12,7 +12,7 @@
   stop1/restart1  одновременная остановка всех клиентов (docker stop), затем повторный старт волнами
   stop2/restart2  второй такой цикл (повторное подключение всех; рост памяти/потоков adm видно по снимкам)
 
-Фон: docker stats (adm, хаб) и /proc/<rawgd>/status (Threads, VmRSS) adm каждые ~2 с, со снимками по фазам.
+Фон: docker stats (adm, хаб) и /proc/<knothopd>/status (Threads, VmRSS) adm каждые ~2 с, со снимками по фазам.
 
 Нагрузочная точка: CPU/память adm ограничиваются docker update (по умолчанию 1 CPU, 300m - как CPUQuota=100% на узлах).
 Проверка туннеля: ответ сайта должен прийти с адреса adm (you_are), а не с адреса клиента, иначе это прямой путь
@@ -35,9 +35,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LAB13 = HERE / "lab13.py"
-RELEASE_BIN = HERE.parent.parent / "deploy/dist/rawgd"
-DEBUG_BIN = HERE.parent / "rns-iroh-node/target/debug/rawgd"
-NET = "rawg-lab13"
+RELEASE_BIN = HERE.parent.parent / "deploy/dist/knothopd"
+DEBUG_BIN = HERE.parent / "rns-iroh-node/target/debug/knothopd"
+NET = "knothop-lab13"
 ADM, HUB, SITE = "adm", "l13-hub", "l13-site"
 SITE_IP = "172.29.98.50"
 SITE_URL = f"http://{SITE_IP}/"
@@ -46,7 +46,7 @@ PING_COUNT, PING_INTERVAL, PING_DELAY = 20, 0.2, 8  # PING_DELAY - сдвиг п
 STOP_WAIT = 10
 SAMPLE_PERIOD = 2
 LOG_KEYS = ("ошибка", "error", "panic", "отказ", "лимит", "refuse", "close link")
-SECRET_RE = re.compile(r"rawg[0-9a-z]*-\S+")  # приглашения rawgi-…/rawg2-… не должны попасть в JSON и вывод
+SECRET_RE = re.compile(r"knothop[0-9a-z]*-\S+")  # приглашения kh-…/kh2-… не должны попасть в JSON и вывод
 UNIT = {"B": 1, "KB": 1e3, "KIB": 1024, "MB": 1e6, "MIB": 2**20, "GB": 1e9, "GIB": 2**30}
 
 
@@ -104,10 +104,10 @@ def sha256(path):
 
 
 def adm_ip():
-    r = sh("docker", "inspect", "-f", '{{(index .NetworkSettings.Networks "rawg-lab13").IPAddress}}', ADM)
+    r = sh("docker", "inspect", "-f", '{{(index .NetworkSettings.Networks "knothop-lab13").IPAddress}}', ADM)
     ip = r.stdout.strip()
     if r.returncode or not ip:
-        raise RuntimeError("adm не найден в сети rawg-lab13")
+        raise RuntimeError("adm не найден в сети knothop-lab13")
     return ip
 
 
@@ -141,12 +141,12 @@ def docker_stats():
     return out
 
 
-# Процессы rawgd в adm: потоки и RSS (счётчики утечек). Без вывода содержимого файлов состояния.
-PROC_CMD = ('for d in /proc/[0-9]*; do [ "$(cat $d/comm 2>/dev/null)" = rawgd ] && '
+# Процессы knothopd в adm: потоки и RSS (счётчики утечек). Без вывода содержимого файлов состояния.
+PROC_CMD = ('for d in /proc/[0-9]*; do [ "$(cat $d/comm 2>/dev/null)" = knothopd ] && '
             '{ echo "PID ${d#/proc/}"; grep -E "^(Threads|VmRSS):" $d/status; }; done')
 
 
-def rawgd_proc():
+def knothopd_proc():
     r = sh("docker", "exec", ADM, "sh", "-c", PROC_CMD, timeout=20)
     pid = threads = rss = None
     for line in r.stdout.splitlines():
@@ -180,8 +180,8 @@ def log_counts(start):
 
 
 def adm_state():
-    """Записи прав и живые соседи adm. Число Link этим не получить: rawgd list его не печатает."""
-    r = sh("docker", "exec", ADM, "rawgd", "list", "--state", "/state", timeout=60)
+    """Записи прав и живые соседи adm. Число Link этим не получить: knothopd list его не печатает."""
+    r = sh("docker", "exec", ADM, "knothopd", "list", "--state", "/state", timeout=60)
     text = r.stdout.split("таблица соседей")[0]
     m = re.search(r"приглашения \((\d+)\)", text)
     st = {"list_rc": r.returncode, "records": sum(1 for x in text.splitlines() if x.startswith("  корень ")),
@@ -204,7 +204,7 @@ class Sampler(threading.Thread):
     def run(self):
         while not self._halt.is_set():
             st = docker_stats()
-            pr = rawgd_proc()
+            pr = knothopd_proc()
             a, h = st.get(ADM, {}), st.get(HUB, {})
             self.samples.append({"t": round(time.time(), 1), "phase": self.phase,
                                  "adm_cpu": a.get("cpu"), "adm_mem_mib": a.get("mem_mib"), "adm_pids": a.get("pids"),
@@ -385,7 +385,7 @@ def phase(result, sampler, name, fn):
 
 
 def snap(result, label):
-    result["stability"]["snapshots"].append({"label": label, "t": round(time.time(), 1), "proc": rawgd_proc(),
+    result["stability"]["snapshots"].append({"label": label, "t": round(time.time(), 1), "proc": knothopd_proc(),
                                              "state": adm_state(), "stats": docker_stats().get(ADM)})
 
 
@@ -502,7 +502,7 @@ def main():
     ap.add_argument("--udp-mbit", type=float, default=5, help="скорость UDP на клиента, Мбит/с")
     ap.add_argument("--cpus-adm", type=float, default=1, help="docker update --cpus для adm")
     ap.add_argument("--mem-adm", default="300m", help="docker update --memory (и --memory-swap) для adm")
-    ap.add_argument("--out", type=Path, help="JSON-результат (по умолчанию ~/.cache/rawg-bench/load50-<время>.json)")
+    ap.add_argument("--out", type=Path, help="JSON-результат (по умолчанию ~/.cache/knothop-bench/load50-<время>.json)")
     ap.add_argument("--keep", action="store_true", help="не убирать лабораторию в конце (lab13.py down вручную)")
     args = ap.parse_args()
     if not 1 <= args.clients <= 999:
@@ -510,21 +510,21 @@ def main():
     if not 1 <= args.batch:
         ap.error("--batch должен быть >= 1")
 
-    if "RAWGD_BIN" not in os.environ:
-        os.environ["RAWGD_BIN"] = str(RELEASE_BIN if RELEASE_BIN.exists() else DEBUG_BIN)
-    binp = Path(os.environ["RAWGD_BIN"])
+    if "KNOTHOP_BIN" not in os.environ:
+        os.environ["KNOTHOP_BIN"] = str(RELEASE_BIN if RELEASE_BIN.exists() else DEBUG_BIN)
+    binp = Path(os.environ["KNOTHOP_BIN"])
     if not binp.is_file():
-        sys.exit(f"нет бинаря {binp} (RAWGD_BIN); cargo build --bin rawgd в bench/rns-iroh-node")
+        sys.exit(f"нет бинаря {binp} (KNOTHOP_BIN); cargo build --bin knothopd в bench/rns-iroh-node")
 
     busy = sh("docker", "ps", "-a", "--filter", f"network={NET}", "--format", "{{.Names}}")
     if busy.returncode:
         sys.exit("docker недоступен: " + err_text(busy))
     if busy.stdout.strip():
-        sys.exit("лаборатория rawg-lab13 уже поднята (" + " ".join(busy.stdout.split()[:5]) + "...): "
+        sys.exit("лаборатория knothop-lab13 уже поднята (" + " ".join(busy.stdout.split()[:5]) + "...): "
                  "сначала lab13.py down; стенд не трогает чужие контейнеры")
 
     names = [f"u{i:03d}" for i in range(1, args.clients + 1)]
-    out_path = args.out or Path.home() / ".cache/rawg-bench" / f"load50-{datetime.now():%Y%m%d-%H%M%S}.json"
+    out_path = args.out or Path.home() / ".cache/knothop-bench" / f"load50-{datetime.now():%Y%m%d-%H%M%S}.json"
     params = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k != "out"}
     result = {"started": datetime.now().isoformat(timespec="seconds"), "params": params,
               "binary": {"path": str(binp), "sha256": sha256(binp)},

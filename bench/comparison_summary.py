@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-core comparison: rawg (before/after rebase), pure iroh, Xray, AWG.
+"""One-core comparison: KnotHop (before/after rebase), pure iroh, Xray, AWG.
 
 Reads the `m1c-<stack>-<topology>-<n>.json` cells (1 logical CPU per node, client
 included). Medians over valid runs; a run is valid only if its byte-for-byte
@@ -21,7 +21,8 @@ from measure import rtt_summary
 WARMUP_PROBES = 3  # the first idle probes after connection setup are a start-up effect; reported separately
 
 HERE = Path(__file__).resolve().parent
-STACKS = [("rawgpre", "rawg до rebase", "lev"), ("rawg", "rawg после rebase", "lev"),
+# ключи - теги исторических файлов bench/results (m1c-rawg*, m1c-rawgpre*): имя сохранено, подписи - KnotHop
+STACKS = [("rawgpre", "KnotHop до rebase", "lev"), ("rawg", "KnotHop после rebase", "lev"),
           ("iroh", "чистый iroh/QUIC", "cmp"), ("xray", "Xray VLESS+REALITY+Vision", "cmp"),
           ("awg", "AWG 3.1 userspace", "cmp")]
 

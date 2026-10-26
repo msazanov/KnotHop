@@ -19,7 +19,7 @@ from aioquic.asyncio import QuicConnectionProtocol, connect, serve
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ConnectionTerminated, StreamDataReceived
 
-ALPN = ["rawg-probe"]
+ALPN = ["knothop-probe"]
 
 
 def self_signed():
@@ -29,7 +29,7 @@ def self_signed():
     from cryptography.x509.oid import NameOID
 
     key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "rawg-probe")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "knothop-probe")])
     now = datetime.datetime.now(datetime.timezone.utc)
     cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
             .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(minutes=5))

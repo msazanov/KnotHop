@@ -1,5 +1,5 @@
 /* Small HTTP/IPv4 test client for adb shell. Shell traffic traverses the VPN;
- * traffic from com.rawg.vpn itself deliberately does not. No external libraries.
+ * traffic from com.knothop.vpn itself deliberately does not. No external libraries.
  * Measures confirmed body bytes with CLOCK_MONOTONIC, not nc/EOF timing.
  * Build: NDK aarch64-linux-android26-clang -O2 -Wall -Wextra netprobe.c -o netprobe
  * Usage: netprobe down|up HOST PORT PATH BYTES
@@ -91,7 +91,7 @@ int main(int argc, char **argv) {
     double connected = mono();
     char header[4096];
     int len = snprintf(header, sizeof(header),
-        "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: rawg-test/1\r\nConnection: close\r\nAccept-Encoding: identity\r\nContent-Length: %llu\r\n\r\n",
+        "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: knothop-test/1\r\nConnection: close\r\nAccept-Encoding: identity\r\nContent-Length: %llu\r\n\r\n",
         up ? "POST" : "GET", argv[4], argv[2], (unsigned long long)(up ? n : 0));
     if (len < 0 || (size_t)len >= sizeof(header)) die("header too big");
     send_all(fd, header, (size_t)len);

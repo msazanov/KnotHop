@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Сборка rawgd для CI (.github/workflows/ci.yml). Флаги и исходники как в deploy/build.sh:
+# Сборка knothopd для CI (.github/workflows/ci.yml). Флаги и исходники как в deploy/build.sh:
 # SOURCE_DATE_EPOCH из HEAD форка, патч форка на его путь, bfd на хосте, контейнер ubuntu:22.04 для u2204.
 # Отличаются только каталоги сборки (каталог раннера вместо домашнего кэша) и отсутствие пилотных файлов.
 # Использование: ci-build.sh host|u2204 КАТАЛОГ_ВЫВОДА
-#   host   - rawgd на хосте раннера (glibc Ubuntu 24.04); также пишет FORK-MANIFEST.txt
-#   u2204  - rawgd-u2204 в контейнере ubuntu:22.04 (glibc 2.35), образ из deploy/Dockerfile.u2204
+#   host   - knothopd на хосте раннера (glibc Ubuntu 24.04); также пишет FORK-MANIFEST.txt
+#   u2204  - knothopd-u2204 в контейнере ubuntu:22.04 (glibc 2.35), образ из deploy/Dockerfile.u2204
 # Окружение: LEVICULUM_FORK - checkout форка на коммите из deploy/leviculum.ref (обязательно);
 #            CI_TARGET - каталог сборок (по умолчанию $RUNNER_TEMP/knothop-target).
 # Токены и ключи сюда не попадают.
@@ -25,18 +25,21 @@ fi
 # штамп leviculum-core/build.rs: время коммита форка, иначе байты зависят от момента сборки
 SOURCE_DATE_EPOCH="$(git -C "$FORK" log -1 --format=%ct HEAD)"
 export SOURCE_DATE_EPOCH
-PATCH="patch.\"https://codeberg.org/Lew_Palm/Leviculum\".leviculum-std.path=\"$FORK/leviculum-std\""
+# leviculum-std и leviculum-lxmf подставляются из этого checkout (один leviculum-core), см. bench/fork-patch.sh
+# shellcheck source=bench/fork-patch.sh
+source "$ROOT/bench/fork-patch.sh"
+fork_patch_init "$FORK"
 
 case "$MODE" in
 host)
-  echo "== rawgd (хост: $(uname -sr))"
-  LEVICULUM_FORK="$FORK" CARGO_TARGET_DIR="$TARGET/host" bash "$ROOT/bench/build_fork.sh" --bin rawgd
-  install -m 0755 "$TARGET/host/release/rawgd" "$OUT/rawgd"
-  BIN="$OUT/rawgd"
+  echo "== knothopd (хост: $(uname -sr))"
+  LEVICULUM_FORK="$FORK" CARGO_TARGET_DIR="$TARGET/host" bash "$ROOT/bench/build_fork.sh" --bin knothopd
+  install -m 0755 "$TARGET/host/release/knothopd" "$OUT/knothopd"
+  BIN="$OUT/knothopd"
   LEVICULUM_FORK="$FORK" bash "$HERE/fork-manifest.sh" "$OUT/FORK-MANIFEST.txt"
   ;;
 u2204)
-  echo "== rawgd-u2204 (ubuntu:22.04)"
+  echo "== knothopd-u2204 (ubuntu:22.04)"
   CARGO_VOL="$TARGET/u2204-cargo"
   mkdir -p "$CARGO_VOL" "$TARGET/u2204"
   docker build -q -t knothop-build:u2204 -f "$HERE/Dockerfile.u2204" "$HERE" >/dev/null
@@ -57,18 +60,18 @@ u2204)
     -e HOME=/tmp -e CARGO_HOME=/cargo -e RUSTUP_HOME=/cargo/rustup -e CARGO_TARGET_DIR=/target \
     -e PATH=/cargo/bin:/usr/bin:/bin -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -w "$ROOT/bench/rns-iroh-node" knothop-build:u2204 \
-    cargo build --release --bin rawgd --config "$PATCH"
-  install -m 0755 "$TARGET/u2204/release/rawgd" "$OUT/rawgd-u2204"
-  BIN="$OUT/rawgd-u2204"
+    cargo build --release --bin knothopd "${FORK_PATCH_ARGS[@]}"
+  install -m 0755 "$TARGET/u2204/release/knothopd" "$OUT/knothopd-u2204"
+  BIN="$OUT/knothopd-u2204"
   ;;
 *)
   echo "режим: host или u2204" >&2; exit 1
   ;;
 esac
 
-# максимальная версия glibc, которую требует бинарник; rawgd-u2204 должен укладываться в 2.35
+# максимальная версия glibc, которую требует бинарник; knothopd-u2204 должен укладываться в 2.35
 need="$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
 echo "   $(basename "$BIN") требует до ${need:-никакой версии GLIBC}"
 if [ "$MODE" = u2204 ] && [ "$(printf '%s\n' GLIBC_2.35 "$need" | sort -V | tail -1)" != GLIBC_2.35 ]; then
-  echo "rawgd-u2204 требует glibc новее 2.35: на узлах de не запустится" >&2; exit 1
+  echo "knothopd-u2204 требует glibc новее 2.35: на узлах de не запустится" >&2; exit 1
 fi

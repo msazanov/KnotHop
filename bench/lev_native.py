@@ -14,11 +14,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "results" / "lev-native"
 # Бинарь форка по умолчанию лежит на диске: /tmp переполняется каталогами сборки.
-DEFAULT_BIN = str(Path.home() / ".cache/rawg-target/bin/rns-iroh-node")
+DEFAULT_BIN = str(Path.home() / ".cache/knothop-target/bin/rns-iroh-node")
 
 
 def one_run(a, run_idx):
-    work = Path(tempfile.mkdtemp(prefix="rawg-native-", dir="/tmp/opencode"))
+    work = Path(tempfile.mkdtemp(prefix="knothop-native-", dir="/tmp/opencode"))
     state = work / "state"; state.mkdir()
     procs = []
     try:

@@ -1,0 +1,36 @@
+[Unit]
+Description=knothopd pilot node (test pilot, not production)
+After=network-online.target knothop-hostfix.service
+Requires=knothop-hostfix.service
+Wants=network-online.target
+# Requires/After на knothop-hostfix: пилот не стартует без проверенной изоляции nft (fail-closed). Юнит hostfix ставит
+# node-hostfix.sh persist (его вызывает node-migrate.sh). Побочный эффект: restart/reload nftables перезапускает hostfix,
+# а через Requires - и knothopd (кратковременный разрыв пилота; так и задумано, иначе nft-таблицы не вернутся).
+
+[Service]
+Type=simple
+User=knothopd
+Group=knothopd
+EnvironmentFile=-/opt/knothop/knothopd.env
+ExecStart=/opt/knothop/knothopd node --state /opt/knothop/state --config /opt/knothop/node.json
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+DeviceAllow=/dev/net/tun rw
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/knothop/state
+ProtectHome=yes
+PrivateTmp=yes
+# 21.10: жёсткая квота CPU снята владельцем; knothopd уступает Xray/AWG по весу.
+# CPUWeight задаёт относительный приоритет при конкуренции, не ограничение скорости.
+# Предел памяти: node-migrate.sh подставляет предел старого узла (200M или 300M), значение здесь - по умолчанию.
+CPUQuota=
+CPUWeight=50
+MemoryMax=300M
+Nice=10
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

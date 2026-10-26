@@ -21,7 +21,7 @@ use iroh::endpoint::{Connection, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use serde::{Deserialize, Serialize};
 
-const ALPN: &[u8] = b"rawg/bench/0";
+const ALPN: &[u8] = b"knothop/bench/0";
 const CHUNK: usize = 64 * 1024;
 
 #[derive(Parser)]

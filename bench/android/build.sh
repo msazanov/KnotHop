@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Сборка тестового APK (arm64-v8a) без Gradle: cargo (NDK clang) -> javac -> d8 -> aapt2 -> zipalign -> apksigner.
 # Использование: build.sh [meas|vpn]   (meas - приложение замеров, vpn - VPN-приложение)
-# Результат: $OUT/rawgmeas.apk или $OUT/rawgvpn.apk (по умолчанию ~/.cache/rawg-android/)
+# Результат: $OUT/knothop-meas.apk или $OUT/knothop.apk (по умолчанию ~/.cache/knothop-android/)
 # Окружение: KNOTHOP_KS/KNOTHOP_KEY_ALIAS/KNOTHOP_KS_PASS - релизная подпись (PKCS12), KNOTHOP_RELEASE=1 берёт
 # файлы из ~/.config/knothop/release; KNOTHOP_VERSION_CODE/KNOTHOP_VERSION_NAME - версия в рабочей копии манифеста.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP="${1:-meas}"
-case "$APP" in meas) SRC="$HERE/app"; PKG=com/rawg/meas ;; vpn) SRC="$HERE/vpn"; PKG=com/rawg/vpn ;; *) echo "meas|vpn"; exit 1 ;; esac
+case "$APP" in meas) SRC="$HERE/app"; PKG=com/knothop/meas; APK=knothop-meas.apk ;; vpn) SRC="$HERE/vpn"; PKG=com/knothop/vpn; APK=knothop.apk ;; *) echo "meas|vpn"; exit 1 ;; esac
 # Подпись. Без KNOTHOP_KS - локальный debug.keystore, как раньше. Пароль релизного ключа идёт только через
 # окружение (apksigner env:), не в argv и не в журнал. Релизный ключ не сочетается с лабораторными сборками.
 RELEASE_DIR="$HOME/.config/knothop/release"
@@ -19,15 +19,15 @@ if [ "${KNOTHOP_RELEASE:-0}" = 1 ]; then
 fi
 if [ -n "${KNOTHOP_KS:-}" ]; then
   if [ "$APP" != vpn ]; then echo "релизная подпись только для vpn" >&2; exit 1; fi
-  if [ "${RAWG_LAB:-0}" = 1 ] || [ "${RAWG_PROFILEABLE:-0}" = 1 ]; then
-    echo "релизная подпись не совместима с RAWG_LAB и RAWG_PROFILEABLE" >&2; exit 1
+  if [ "${KNOTHOP_LAB:-0}" = 1 ] || [ "${KNOTHOP_PROFILEABLE:-0}" = 1 ]; then
+    echo "релизная подпись не совместима с KNOTHOP_LAB и KNOTHOP_PROFILEABLE" >&2; exit 1
   fi
   : "${KNOTHOP_KEY_ALIAS:?нужен KNOTHOP_KEY_ALIAS}" "${KNOTHOP_KS_PASS:?нужен KNOTHOP_KS_PASS}"
 fi
 # в CI (CI=true выставляет GitHub Actions) собирается только обычная сборка
 if [ "${CI:-}" = true ]; then
-  if [ "${RAWG_LAB:-0}" = 1 ] || [ "${RAWG_PROFILEABLE:-0}" = 1 ]; then
-    echo "в CI запрещены RAWG_LAB и RAWG_PROFILEABLE" >&2; exit 1
+  if [ "${KNOTHOP_LAB:-0}" = 1 ] || [ "${KNOTHOP_PROFILEABLE:-0}" = 1 ]; then
+    echo "в CI запрещены KNOTHOP_LAB и KNOTHOP_PROFILEABLE" >&2; exit 1
   fi
 fi
 # версия проверяется до долгой сборки; подстановка в манифест - ниже
@@ -52,8 +52,8 @@ if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
   SOURCE_DATE_EPOCH="$(git -C "$FORK" log -1 --format=%ct HEAD 2>/dev/null || echo 0)"
   export SOURCE_DATE_EPOCH
 fi
-OUT="${OUT:-$HOME/.cache/rawg-android}"
-TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/rawg-target/android}"
+OUT="${OUT:-$HOME/.cache/knothop-android}"
+TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/knothop-target/android}"
 mkdir -p "$OUT"
 [ -x "$CLANG" ] || { echo "нет $CLANG"; exit 1; }
 
@@ -63,17 +63,21 @@ export AR_aarch64_linux_android="$TOOLCHAIN/bin/llvm-ar"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$TOOLCHAIN/bin/llvm-ar"
 export RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8 -C link-arg=-Wl,-z,max-page-size=16384"
-# RAWG_SYMBOLS=1: .so с символами (для simpleperf), по умолчанию strip
-if [ "${RAWG_SYMBOLS:-0}" = "1" ]; then export CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1; TARGET_DIR="$TARGET_DIR-sym"; fi
+# KNOTHOP_SYMBOLS=1: .so с символами (для simpleperf), по умолчанию strip
+if [ "${KNOTHOP_SYMBOLS:-0}" = "1" ]; then export CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1; TARGET_DIR="$TARGET_DIR-sym"; fi
 EXTRA=()
-# RAWG_UDPSTATS=1: счётчики sendmsg/recvmmsg (локальный patch noq-udp из ~/.cache/rawg-patches), в отдельный каталог сборки
-if [ "${RAWG_UDPSTATS:-0}" = "1" ]; then EXTRA=(--features udp-stats --config "patch.crates-io.noq-udp.path=\"$HOME/.cache/rawg-patches/noq-udp\""); TARGET_DIR="$TARGET_DIR-udp"; fi
-# RAWG_FEATURES="mimalloc ...": дополнительные фичи нативной части, отдельный каталог сборки
-RAWG_FEATURES="${RAWG_FEATURES-mimalloc}"   # mimalloc по умолчанию: -3…-6% циклов на ГиБ (W20); RAWG_FEATURES="" чтобы выключить
-if [ -n "${RAWG_FEATURES:-}" ]; then EXTRA+=(--features "${RAWG_FEATURES// /,}"); TARGET_DIR="$TARGET_DIR-$(echo "$RAWG_FEATURES" | tr " ," "__")"; fi
+# KNOTHOP_UDPSTATS=1: счётчики sendmsg/recvmmsg (локальный patch noq-udp из ~/.cache/knothop-patches), в отдельный каталог сборки
+if [ "${KNOTHOP_UDPSTATS:-0}" = "1" ]; then EXTRA=(--features udp-stats --config "patch.crates-io.noq-udp.path=\"$HOME/.cache/knothop-patches/noq-udp\""); TARGET_DIR="$TARGET_DIR-udp"; fi
+# KNOTHOP_FEATURES="mimalloc ...": дополнительные фичи нативной части, отдельный каталог сборки
+KNOTHOP_FEATURES="${KNOTHOP_FEATURES-mimalloc}"   # mimalloc по умолчанию: -3…-6% циклов на ГиБ (W20); KNOTHOP_FEATURES="" чтобы выключить
+if [ -n "${KNOTHOP_FEATURES:-}" ]; then EXTRA+=(--features "${KNOTHOP_FEATURES// /,}"); TARGET_DIR="$TARGET_DIR-$(echo "$KNOTHOP_FEATURES" | tr " ," "__")"; fi
+# leviculum-std и leviculum-lxmf подставляются из одного checkout форка (общий leviculum-core), см. bench/fork-patch.sh
+# shellcheck source=bench/fork-patch.sh
+source "$HERE/../fork-patch.sh"
+fork_patch_init "$FORK"
 ( cd "$HERE/native" && CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release --target aarch64-linux-android "${EXTRA[@]}" \
-    --config "patch.\"https://codeberg.org/Lew_Palm/Leviculum\".leviculum-std.path=\"$FORK/leviculum-std\"" )
-SO="$TARGET_DIR/aarch64-linux-android/release/librawgmeas.so"
+    "${FORK_PATCH_ARGS[@]}" )
+SO="$TARGET_DIR/aarch64-linux-android/release/libknothopmeas.so"
 ls -l "$SO"
 
 echo "== Java"
@@ -90,10 +94,14 @@ if [ "$APP" = vpn ]; then
   echo "$QR_SHA  $QR_JAR" | sha256sum -c -
   CP="$PLATFORM:$QR_JAR"
 fi
-# RAWG_LAB=1: лабораторные интенты и подробные логи. RAWG_PROFILEABLE=1:
+# KNOTHOP_LAB=1: лабораторные интенты и подробные логи. KNOTHOP_PROFILEABLE=1:
 # только shell-профилирование, без LAB_BUILD, интентов и подробного logcat.
 # Обычная сборка по умолчанию не разрешает ни то ни другое.
 SRC_WORK="$OUT/src-$APP"; rm -rf "$SRC_WORK"; mkdir -p "$SRC_WORK"; cp -r "$SRC"/. "$SRC_WORK"/
+if [ "$APP" = vpn ]; then
+  mkdir -p "$SRC_WORK/res"
+  cp -r "$HERE/vpn/res"/. "$SRC_WORK/res"/
+fi
 # версия подставляется только в рабочую копию манифеста; исходник не меняется; без переменных - как в исходнике
 if [ -n "${KNOTHOP_VERSION_CODE:-}" ]; then
   sed -i "s/android:versionCode=\"[0-9]*\"/android:versionCode=\"$KNOTHOP_VERSION_CODE\"/" "$SRC_WORK/AndroidManifest.xml"
@@ -103,11 +111,11 @@ if [ -n "${KNOTHOP_VERSION_NAME:-}" ]; then
   sed -i "s/android:versionName=\"[^\"]*\"/android:versionName=\"$KNOTHOP_VERSION_NAME\"/" "$SRC_WORK/AndroidManifest.xml"
   grep -q "android:versionName=\"$KNOTHOP_VERSION_NAME\"" "$SRC_WORK/AndroidManifest.xml" || { echo "versionName не подставился" >&2; exit 1; }
 fi
-if [ "${RAWG_LAB:-0}" = "1" ]; then
+if [ "${KNOTHOP_LAB:-0}" = "1" ]; then
   sed -i 's/LAB_BUILD = false/LAB_BUILD = true/' "$SRC_WORK"/java/$PKG/*.java
   grep -rq "LAB_BUILD = true" "$SRC_WORK"/java/$PKG/*.java || { echo "LAB_BUILD не включился: проверь формат строки в Util.java" >&2; exit 1; }
   sed -i 's#<application #<application android:debuggable="false" #' "$SRC_WORK/AndroidManifest.xml"
-elif [ "${RAWG_PROFILEABLE:-0}" != "1" ]; then
+elif [ "${KNOTHOP_PROFILEABLE:-0}" != "1" ]; then
     sed -i '/<profileable/d' "$SRC_WORK/AndroidManifest.xml"
 fi
 SRC="$SRC_WORK"
@@ -118,7 +126,12 @@ DEXIN=$(find "$W/classes" -name '*.class'); [ "$APP" = vpn ] && DEXIN="$DEXIN $Q
 "$BT/d8" --release --min-api $API --lib "$PLATFORM" --output "$W/dex" $DEXIN
 
 echo "== APK"
-"$BT/aapt2" link -o "$W/base.apk" -I "$PLATFORM" --manifest "$SRC/AndroidManifest.xml" --min-sdk-version $API --target-sdk-version 34
+if [ "$APP" = vpn ]; then
+  "$BT/aapt2" compile --dir "$SRC/res" -o "$W/resources.zip"
+  "$BT/aapt2" link -o "$W/base.apk" -I "$PLATFORM" -R "$W/resources.zip" --manifest "$SRC/AndroidManifest.xml" --min-sdk-version $API --target-sdk-version 34
+else
+  "$BT/aapt2" link -o "$W/base.apk" -I "$PLATFORM" --manifest "$SRC/AndroidManifest.xml" --min-sdk-version $API --target-sdk-version 34
+fi
 cp "$W/dex/classes.dex" "$W/stage/"
 if [ "$APP" = vpn ]; then mkdir -p "$W/stage/assets"; cp "$HERE/LICENSE-ZXing.txt" "$W/stage/assets/"; fi
 cp "$SO" "$W/stage/lib/arm64-v8a/"
@@ -128,14 +141,14 @@ bash "$HERE/../../deploy/fork-manifest.sh" "$W/FORK-MANIFEST.txt"
 cp "$W/FORK-MANIFEST.txt" "$W/stage/FORK-MANIFEST.txt"
 ( cd "$W/stage" && zip -q "$W/base.apk" FORK-MANIFEST.txt )
 "$BT/zipalign" -f -p 4 "$W/base.apk" "$W/aligned.apk"
-SIGNED="$OUT/rawg$APP.apk"
+SIGNED="$OUT/$APK"
 if [ -n "${KNOTHOP_KS:-}" ]; then
   "$BT/apksigner" sign --ks "$KNOTHOP_KS" --ks-type PKCS12 --ks-key-alias "$KNOTHOP_KEY_ALIAS" \
     --ks-pass env:KNOTHOP_KS_PASS --key-pass env:KNOTHOP_KS_PASS --out "$SIGNED" "$W/aligned.apk"
   echo "подпись: релизный ключ (PKCS12)"
 else
   KS="$OUT/debug.keystore"
-  [ -f "$KS" ] || keytool -genkeypair -keystore "$KS" -storepass android -keypass android -alias rawg -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=rawg test" >/dev/null 2>&1
+  [ -f "$KS" ] || keytool -genkeypair -keystore "$KS" -storepass android -keypass android -alias knothop -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=knothop test" >/dev/null 2>&1
   "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --out "$SIGNED" "$W/aligned.apk"
   echo "подпись: локальный debug.keystore (не релизная)"
 fi

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Измерительный скрипт для стенда rawg (Python RNS).
+"""Измерительный скрипт для стенда KnotHop (Python RNS).
 
 Роли:
   node    - транспортный узел (пишет конфиг и запускает rnsd в этом процессе);
@@ -152,7 +152,7 @@ def run_server(args):
     write_config(args, transport=False)
     r = RNS.Reticulum(CFG_DIR, loglevel=args.loglevel)
     ident = RNS.Identity()
-    dest = RNS.Destination(ident, RNS.Destination.IN, RNS.Destination.SINGLE, "rawgbench", "node")
+    dest = RNS.Destination(ident, RNS.Destination.IN, RNS.Destination.SINGLE, "knothopbench", "node")
     state = {"link": None, "rx_bytes": 0, "resources": [], "t0": None, "t1": None, "cpu0": None, "cpu1": None}
 
     def echo(path, data, request_id, link_id, remote_identity, requested_at):
@@ -228,7 +228,7 @@ def run_client(args):
     res["t_path_s"] = time.time() - t_start
     res["hops"] = RNS.Transport.hops_to(dest_hash)
     ident = RNS.Identity.recall(dest_hash)
-    dest = RNS.Destination(ident, RNS.Destination.OUT, RNS.Destination.SINGLE, "rawgbench", "node")
+    dest = RNS.Destination(ident, RNS.Destination.OUT, RNS.Destination.SINGLE, "knothopbench", "node")
 
     ev = threading.Event()
     link_box = {}

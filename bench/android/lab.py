@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Лабораторная сеть из нескольких узлов rawg перед деплоем (всё в Docker на этом ноутбуке).
+"""Лабораторная сеть из нескольких узлов KnotHop перед деплоем (всё в Docker на этом ноутбуке).
 
   lab.py up [--nodes 3]     хаб («публичная сеть RNS»), серверы n1..nN одной группы, «сайт»; серверы находят друг друга по тегу группы
-  lab.py pair [--push]      выдать профиль клиента с n1 (строка rawg1-...), сохранить в ~/.cache/rawg-lab/phone.profile; --push - отправить в приложение по adb
+  lab.py pair [--push]      выдать профиль клиента с n1 (строка kh1-...), сохранить в ~/.cache/knothop-lab/phone.profile; --push - отправить в приложение по adb
   lab.py status             таблицы соседей всех узлов и реестр клиентов
   lab.py stop NAME / start NAME   остановить / запустить узел (проверка «потерявшийся узел забывается»)
   lab.py down               убрать всё
 
 Топология: клиент (телефон) подключается к серверам по LAN-адресу ноутбука (опубликованные UDP-порты 47011..), серверы между собой - по
-сети Docker `rawg-lab`. Хаб стоит между ними только для анонсов и первичной связности; клиентский трафик идёт мимо него.
+сети Docker `knothop-lab`. Хаб стоит между ними только для анонсов и первичной связности; клиентский трафик идёт мимо него.
 В каждом сервере: выход в интернет (TUN + NAT), http://10.99.0.1:8080 (кто обслужил) и «сайт» 172.29.99.50 (виден с адреса выхода).
 """
 import argparse
@@ -22,11 +22,11 @@ from pathlib import Path
 import laptop
 
 HERE = Path(__file__).resolve().parent
-LAB = Path.home() / ".cache" / "rawg-lab"
-NET = "rawg-lab"
+LAB = Path.home() / ".cache" / "knothop-lab"
+NET = "knothop-lab"
 SUBNET = "172.29.99.0/24"
-IMAGE = "rawg-bench:l3"
-BIN = Path(os.environ.get("RAWGD_BIN", str(Path.home() / ".cache/rawg-target/dgram/release/rawgd")))
+IMAGE = "knothop-bench:l3"
+BIN = Path(os.environ.get("KNOTHOP_BIN", str(Path.home() / ".cache/knothop-target/dgram/release/knothopd")))
 GROUP = "lab"
 ANNOUNCE_S = 10
 CLIENT_NET = "198.18.0.0/15"
@@ -49,7 +49,7 @@ def node_ip(i):
 def run_container(name, ip, cmd, state, extra=()):
     sh("docker", "rm", "-f", name, check=False)
     sh("docker", "run", "-d", "--name", name, "--network", NET, "--ip", ip, "--cap-add", "NET_ADMIN", "--device", "/dev/net/tun",
-       "--sysctl", "net.ipv4.ip_forward=1", "-e", "RAWG_DEBUG=1", *(() if os.environ.get("LAB_STRICT") else ("-e", "RAWGD_ALLOW_PRIVATE_DIAL=1")), "-e", "RAWGD_TCP_BACKOFF_S=30", "-v", f"{BIN}:/usr/local/bin/rawgd:ro", "-v", f"{HERE}:/lab:ro", "-v", f"{state}:/state",
+       "--sysctl", "net.ipv4.ip_forward=1", "-e", "KNOTHOP_DEBUG=1", *(() if os.environ.get("LAB_STRICT") else ("-e", "KNOTHOP_ALLOW_PRIVATE_DIAL=1")), "-e", "KNOTHOP_TCP_BACKOFF_S=30", "-v", f"{BIN}:/usr/local/bin/knothopd:ro", "-v", f"{HERE}:/lab:ro", "-v", f"{state}:/state",
        "-v", f"{LAB / 'group.key'}:/secret/group.key:ro", *extra, "--entrypoint", "sh", IMAGE, "-c", cmd)
 
 
@@ -59,7 +59,7 @@ def lab_nodes():
 
 def start_node(idx, name, hidden, lan_ip, only_ip=None, adv_env=""):
     """Один и тот же конфиг на всех узлах: ни соседей, ни маршрутов, ни собственного адреса. Узлы находят друг друга только по анонсам через «публичный» узел RNS
-    (TCP-хаб). Имя - имя хоста контейнера. Единственное отличие узла - переменная RAWGD_ADVERTISE (адрес-имя, если IP динамический, или LAN-адрес для телефона).
+    (TCP-хаб). Имя - имя хоста контейнера. Единственное отличие узла - переменная KNOTHOP_ADVERTISE (адрес-имя, если IP динамический, или LAN-адрес для телефона).
     Невидимый напрямую узел: UDP режется, кроме одного соседа (как за NAT/фильтром у провайдера)."""
     state = LAB / name
     state.mkdir(parents=True, exist_ok=True)
@@ -74,8 +74,8 @@ def start_node(idx, name, hidden, lan_ip, only_ip=None, adv_env=""):
            "iptables -t nat -A POSTROUTING -s " + CLIENT_NET + " ! -o tun0 -j MASQUERADE; "
            # носитель не должен попадать в собственный туннель (журнал N30)
            "iptables -I OUTPUT -d " + CLIENT_NET + " -p udp --sport 47001 -j DROP; "
-           "exec rawgd node --state /state --config /state/node.json")
-    env = ("-e", f"RAWGD_REGION={name.rstrip('0123456789').upper()[:2]}") + (("-e", f"RAWGD_ADVERTISE={adv_env}") if adv_env else ())
+           "exec knothopd node --state /state --config /state/node.json")
+    env = ("-e", f"KNOTHOP_REGION={name.rstrip('0123456789').upper()[:2]}") + (("-e", f"KNOTHOP_ADVERTISE={adv_env}") if adv_env else ())
     run_container(name, node_ip(idx), cmd, state, ("--hostname", name, *env, *(("-p", f"{port}:47001/udp", "-p", f"{port}:47001/tcp") if not hidden else ())))
 
 
@@ -104,9 +104,9 @@ def cmd_up(a):
     hub_state = LAB / "hub"
     hub_state.mkdir(parents=True, exist_ok=True)
     os.chmod(hub_state, 0o777)
-    run_container("rawg-hub", HUB_IP, "exec rawgd hub --state /state --port 47000 --tcp-port 4242", hub_state)
+    run_container("knothop-hub", HUB_IP, "exec knothopd hub --state /state --port 47000 --tcp-port 4242", hub_state)
     hub_id = wait_json(hub_state / "hub.json")["id"]
-    run_container("rawg-site", SITE_IP, "exec python3 /lab/lab_web.py site", LAB / "hub")
+    run_container("knothop-site", SITE_IP, "exec python3 /lab/lab_web.py site", LAB / "hub")
     (LAB / "nodes.json").write_text(json.dumps(names))
     via = a.via or (names[0] if names else None)
     for n in names:
@@ -124,7 +124,7 @@ def cmd_up(a):
 
 def cmd_pair(a):
     issuer = a.on or lab_nodes()[0]
-    out = sh("docker", "exec", issuer, "rawgd", "issue", "--state", "/state", "--client-name", a.client_name, "--servers", str(a.servers),
+    out = sh("docker", "exec", issuer, "knothopd", "issue", "--state", "/state", "--client-name", a.client_name, "--servers", str(a.servers),
              *(["--max-addrs", str(a.max_addrs)] if a.max_addrs else []))
     prof = out.stdout.strip()
     print(out.stderr.strip())
@@ -133,7 +133,7 @@ def cmd_pair(a):
     print(f"профиль ({len(prof)} символов) сохранён в {LAB / 'phone.profile'}")
     print(prof)
     if a.push:
-        r = subprocess.run(["adb", "shell", "am", "start", "-n", "com.rawg.vpn/.MainActivity", "--es", "profile", prof], capture_output=True, text=True)
+        r = subprocess.run(["adb", "shell", "am", "start", "-n", "com.knothop.vpn/.MainActivity", "--es", "profile", prof], capture_output=True, text=True)
         print("отправлено в приложение по adb" if r.returncode == 0 else r.stderr)
 
 
@@ -149,7 +149,7 @@ def cmd_status(a):
             tag = "это я" if e.get("self") else f"{e['s']:4s} хопов {e['h']} rtt {('%.1f' % e['r']) if e.get('r') is not None else '-':>5} мс, анонс {e.get('age_s')} с назад, ответ {e.get('heard_s')} с назад"
             print(f"   {e['n']:4s} {e['d'][:8]}  {tag}")
     first = next((x for x in lab_nodes() if x in running), None)
-    r = sh("docker", "exec", first, "rawgd", "list", "--state", "/state", check=False) if first else type("R", (), {"stdout": ""})()
+    r = sh("docker", "exec", first, "knothopd", "list", "--state", "/state", check=False) if first else type("R", (), {"stdout": ""})()
     print(r.stdout.split("таблица соседей")[0].strip())
 
 
@@ -164,7 +164,7 @@ def cmd_start(a):
 
 
 def cmd_down(a):
-    for n in ["rawg-hub", "rawg-site"] + lab_nodes():
+    for n in ["knothop-hub", "knothop-site"] + lab_nodes():
         sh("docker", "rm", "-f", n, check=False)
     sh("docker", "network", "rm", NET, check=False)
     print("убрано (состояние и ключи сохранены в", LAB, ")")
