@@ -1200,14 +1200,18 @@ fn handle_node_message(state: &Path, ctx: &Arc<super::NodeCtx>, message: &Messag
     emit(reply, Some(journal))
 }
 pub fn spawn_client_worker(runtime: AdminRuntime, ctx: Arc<super::ClientCtx>, trust: Arc<Mutex<crate::trust::Trust>>) {
+    // Поток держит клиента только слабой ссылкой: `ClientCtx` владеет узлом, узел владеет процессором, а процессор - отправителем `inbound`,
+    // на котором поток ждёт. Сильная ссылка замыкала бы цикл: после остановки VPN узел и дубликат дескриптора TUN жили бы до конца процесса.
+    let (state, identity, ctx) = (ctx.state.clone(), ctx.identity.clone(), Arc::downgrade(&ctx));
     spawn_runtime_worker("knothop-lxmf-admin-client", move || {
-        let (state, identity) = (ctx.state.clone(), ctx.identity.clone());
         let AdminRuntime { inbound, outbound, transport_events, .. } = runtime;
         requeue_pending(&state,&outbound);
         let mut retry_after=std::time::Instant::now()+std::time::Duration::from_secs(5);
         loop {
+            if ctx.strong_count() == 0 { break; }
             match inbound.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(message) => {
+                    let Some(ctx) = ctx.upgrade() else { break };
                     if message.title == super::enroll_net::TITLE {
                         super::enroll_net::on_lxmf(&state, &message); ctx.refresh_servers13(); super::start_dialers(&ctx);
                     }

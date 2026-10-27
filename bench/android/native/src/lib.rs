@@ -70,8 +70,36 @@ pub extern "system" fn Java_com_knothop_vpn_Native_runVpn<'a>(mut env: JNIEnv<'a
         if workers > 0 {
             b.worker_threads(workers);
         }
+        let is_client = matches!(&cli.cmd, rns_iroh_node::VpnCmd::Client(_));
         let rt = b.build()?;
-        let r = rt.block_on(rns_iroh_node::run_vpn(cli));
+        if !is_client {
+            let r = rt.block_on(rns_iroh_node::run_vpn(cli));
+            rt.shutdown_background();
+            return r;
+        }
+        // Клиент работает до файла `fin`. Корректный выход после него обычно мгновенный, но если какая-то задача его не заметила
+        // (долгое ожидание сети, закрытие носителя), приложение не должно оставаться с живым узлом и дубликатом дескриптора TUN
+        // (VPN висит после «Отключить»): по истечении срока рантайм снимается принудительно, все задачи и их дескрипторы освобождаются.
+        let fin = std::path::PathBuf::from(&state).join("fin");
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.spawn(async move {
+            let _ = tx.send(rns_iroh_node::run_vpn(cli).await);
+        });
+        let mut fin_seen: Option<std::time::Instant> = None;
+        let r = loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                Ok(r) => break r,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err(anyhow::anyhow!("клиент завершился аварийно")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if fin.exists() {
+                        let since = *fin_seen.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() > std::time::Duration::from_secs(5) {
+                            break Ok(());
+                        }
+                    }
+                }
+            }
+        };
         rt.shutdown_background();
         r
     });

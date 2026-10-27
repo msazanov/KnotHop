@@ -44,7 +44,7 @@ public class MainActivity extends Activity {
 
     private LinearLayout pairBox, mainBox, listBox, adminBox;
     private EditText profileField;
-    private TextView pairMsg, header, status, logView, usersView;
+    private TextView pairMsg, header, status, logView, usersView, nodesMsg, updMsg;
     private Button button, benchBtn;
     private TextView benchView;
     /** Предел длины вставляемого или открытого по ссылке приглашения (H4/O6). */
@@ -147,6 +147,19 @@ public class MainActivity extends Activity {
         nodesBtn.setAllCaps(false);
         nodesBtn.setOnClickListener(v -> refreshNodes());
         mainBox.addView(nodesBtn);
+        nodesMsg = new TextView(this);
+        nodesMsg.setTextSize(12);
+        nodesMsg.setVisibility(View.GONE);
+        mainBox.addView(nodesMsg);
+        Button updBtn = new Button(this);
+        updBtn.setText("Проверить обновление");
+        updBtn.setAllCaps(false);
+        updBtn.setOnClickListener(v -> checkUpdate(true));
+        mainBox.addView(updBtn);
+        updMsg = new TextView(this);
+        updMsg.setTextSize(12);
+        updMsg.setText("Версия " + installedName() + " (" + installedCode() + ")");
+        mainBox.addView(updMsg);
         // --- админ: приглашения. Видны только в своей сети (профиль «своя сеть»); пользователь по чужому приглашению их не видит.
         adminBox = new LinearLayout(this);
         adminBox.setOrientation(LinearLayout.VERTICAL);
@@ -202,6 +215,8 @@ public class MainActivity extends Activity {
         }
         handleLink(getIntent());
         handleLabIntent(getIntent());
+        // после показа экрана, в фоновом потоке: старт приложения от сети не зависит
+        if (b == null && !Util.LAB_BUILD) ui.postDelayed(() -> checkUpdate(false), 2000);
     }
 
     @Override
@@ -497,9 +512,69 @@ public class MainActivity extends Activity {
         try {
             File st = new File(getFilesDir(), "state");
             st.mkdirs();
+            final File result = new File(st, "refresh-result.txt");
+            result.delete();
             new File(st, "refresh-nodes").createNewFile();
-            android.widget.Toast.makeText(this, "Запрашиваю остальные ноды у сети", android.widget.Toast.LENGTH_SHORT).show();
+            nodesMsg.setVisibility(View.VISIBLE);
+            nodesMsg.setText("Опрашиваю ноды… (до двух минут)");
+            final long until = System.currentTimeMillis() + 180_000;
+            ui.postDelayed(new Runnable() {
+                public void run() {
+                    if (isFinishing() || isDestroyed()) return;
+                    String r = result.exists() ? Util.read(result).trim() : "";
+                    if (!r.isEmpty()) nodesMsg.setText(r);
+                    else if (System.currentTimeMillis() > until) nodesMsg.setText("Нет ответа от нативной части за 3 мин; повторите позже");
+                    else ui.postDelayed(this, 1000);
+                }
+            }, 1000);
         } catch (Exception ignored) { }
+    }
+
+    private long installedCode() {
+        try {
+            android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return Build.VERSION.SDK_INT >= 28 ? pi.getLongVersionCode() : pi.versionCode;
+        } catch (Exception e) { return 0; }
+    }
+
+    private String installedName() {
+        try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception e) { return "?"; }
+    }
+
+    private static final long UPDATE_EVERY_MS = 12L * 3600 * 1000;
+
+    /**
+     * Свежий релиз на GitHub. Автоматически: при запуске, не чаще раза в 12 часов, молча, если нечего предлагать или нет сети; одну и ту же версию
+     * после «Позже» повторно не предлагаем. Вручную (кнопка): всегда отвечает. Запрос идёт в фоновом потоке, старт экрана не ждёт.
+     */
+    private void checkUpdate(final boolean manual) {
+        if (isFinishing() || isDestroyed()) return;
+        long now = System.currentTimeMillis();
+        if (!manual && now - sp.getLong("upd_ts", 0) < UPDATE_EVERY_MS) return;
+        if (manual) updMsg.setText("Проверяю…");
+        final long have = installedCode();
+        UpdateCheck.run(r -> ui.post(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            if (r.error != null) {
+                if (manual) { updMsg.setText("Не удалось проверить: " + r.error); }
+                return;
+            }
+            sp.edit().putLong("upd_ts", System.currentTimeMillis()).apply();
+            if (r.latest <= have) {
+                if (manual) updMsg.setText("Установлена последняя версия " + installedName() + " (" + have + ")");
+                return;
+            }
+            updMsg.setText("Доступна версия " + r.tag + " (у вас " + installedName() + ", " + have + ")");
+            if (!manual && sp.getLong("upd_dismissed", 0) >= r.latest) return;
+            new AlertDialog.Builder(this).setTitle("Доступно обновление")
+                .setMessage("Вышла версия " + r.tag + ", у вас " + installedName() + ".\nСкачать APK? После загрузки откройте файл и подтвердите установку поверх: профиль и права сохранятся.")
+                .setPositiveButton("Скачать", (d, w) -> {
+                    try { startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(UpdateCheck.APK))); }
+                    catch (Exception e) { android.widget.Toast.makeText(this, "Нет приложения для открытия ссылки", android.widget.Toast.LENGTH_LONG).show(); }
+                })
+                .setNegativeButton("Позже", (d, w) -> sp.edit().putLong("upd_dismissed", r.latest).apply())
+                .show();
+        }));
     }
 
     private final Runnable tick = new Runnable() {

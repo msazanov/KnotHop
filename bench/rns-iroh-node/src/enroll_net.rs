@@ -79,11 +79,12 @@ async fn rpc(node:&Node,link:LinkId,body:&[u8],timeout:u64)->Result<serde_json::
     let result=tokio::time::timeout(Duration::from_millis(timeout+5000),future).await.context("enrollment timeout")?.map_err(|e|anyhow::anyhow!("enrollment response: {e:?}"))?;
     Ok(serde_json::from_slice(unpack(&result.response_data)?)?)
 }
+/// Строка в журнал ноды (`log.txt`) без секретов: только тип запроса, статус и время.
+fn trace(state:&Path,line:&str){crate::append_log(&state.join("log.txt"),&format!("[{}] {line}",now_ms()))}
 pub fn dispatch(state:&Path,link:LinkId,request_id:[u8;16],data:Vec<u8>){
     let Some(s)=find(state)else{return};
     if data.len()>enroll::MAX_WIRE+5{return}
     // Request buffers are bounded before spawning application work. Busy locks never queue unbounded work.
-    let Some(peer)=s.node.get_remote_identity(&link).map(|i|i.public_key_bytes())else{return};
     let body=match unpack(&data){Ok(b)=>b.to_vec(),Err(_)=>return};
     if body.is_empty(){return}
     let service=s.clone();
@@ -92,7 +93,18 @@ pub fn dispatch(state:&Path,link:LinkId,request_id:[u8;16],data:Vec<u8>){
         tokio::spawn(async move{if let Ok(raw)=pack(br#"{"status":"busy"}"#){let _=service.node.send_response(&link,&request_id,&raw).await;}});return};
     tokio::spawn(async move{
         let _permit=permit;
-        let response=service.handle(link,peer,&body).await.unwrap_or_else(|_|serde_json::json!({"status":"unknown"}));
+        // identify клиента мог ещё не дойти до разбора (запрос идёт сразу за ним): короткое ожидание вместо молчаливого отбрасывания,
+        // иначе клиент ждёт ответа до таймаута и Link закрывается сторожем неавторизованных.
+        let mut peer=None;
+        for _ in 0..15{
+            peer=service.node.get_remote_identity(&link).map(|i|i.public_key_bytes());
+            if peer.is_some(){break}
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let Some(peer)=peer else{trace(&service.state,&format!("зачисление: запрос {} без identify, отброшен",body[0]));return};
+        let started=Instant::now();
+        let response=service.handle(link,peer,&body).await.unwrap_or_else(|e|{trace(&service.state,&format!("зачисление: запрос {} не выполнен: {e:#}",body[0]));serde_json::json!({"status":"unknown"})});
+        if body[0]==3{trace(&service.state,&format!("зачисление: опрос расписок обработан за {} мс, статус {}",started.elapsed().as_millis(),response["status"]))}
         let Ok(raw)=serde_json::to_vec(&response).and_then(|b|pack(&b).map_err(serde::ser::Error::custom))else{return};
         if service.node.send_response(&link,&request_id,&raw).await.is_err(){let _=service.node.send_response_resource(&link,&request_id,&raw).await;}
     });
@@ -413,7 +425,8 @@ pub async fn refresh(s:&Arc<Service>)->Result<Option<Vec<serde_json::Value>>>{
             let h=p.rec.scope;
             let r:Result<Vec<serde_json::Value>>=async{
                 let link=s.open(h,false).await?;let mut req=vec![3];req.extend(id);
-                let reply=rpc(&s.node,link,&req,10_000).await;let _=s.node.engine().close_link(&link).await;
+                // Ответ несёт все расписки ноды (десятки КиБ уходят ресурсом); 10 с ему не хватало (RequestTimedOut на телефоне), как у `join` - 70 с.
+                let reply=rpc(&s.node,link,&req,60_000).await;let _=s.node.engine().close_link(&link).await;
                 apply_to(&s.trust,&s.identity,&s.state,id,h,&reply?,Some(&hex(&grant.digest())),false)
             }.await;
             match r{Ok(v)=>{hints.extend(v);last=None;break}Err(e)=>last=Some(e)}

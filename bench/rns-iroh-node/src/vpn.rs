@@ -7585,24 +7585,41 @@ async fn client_enroll_refresh(ctx: Arc<ClientCtx>) {
     // Грант может включать ноду, которая так и не зачислена (расписок всегда меньше): пауза растёт 2 -> 30 мин, пока новых записей нет.
     let (mut last, mut wait) = (Instant::now(), 120u64);
     let count = || c.trust.lock().unwrap().enrollment_proofs(&ctx.identity.public_key_bytes()).len();
+    // Итог опроса по кнопке: приложение читает файл и показывает его (иначе «ничего не изменилось» неотличимо от «ещё идёт»).
+    let result = ctx.state.join("refresh-result.txt");
+    let report = |text: String| { let _ = crate::enroll::write(&result, text.as_bytes()); };
     while !fin.exists() {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let manual = trigger.exists();
-        if (!manual && last.elapsed() < Duration::from_secs(wait)) || c.invite.lock().unwrap().is_some() { continue; }
+        if (!manual && last.elapsed() < Duration::from_secs(wait)) || c.invite.lock().unwrap().is_some() {
+            if manual && c.invite.lock().unwrap().is_some() {
+                let _ = std::fs::remove_file(&trigger);
+                report("Сначала завершите зачисление по приглашению".into());
+            }
+            continue;
+        }
         let _ = std::fs::remove_file(&trigger);
         last = Instant::now();
-        let Some(service) = enroll_net::find(&ctx.state) else { continue };
+        let Some(service) = enroll_net::find(&ctx.state) else {
+            if manual { report("Служба зачисления недоступна".into()); }
+            continue;
+        };
         let before = count();
         let res = enroll_net::refresh(&service).await;
         wait = if manual || count() > before { 120 } else { (wait * 2).min(1800) };
+        let after = count();
         match res {
             Ok(Some(hints)) => {
                 for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.hint_name(e.dest, &e.name); }
                 ctx.sh.note("зачисление: дополучены расписки остальных нод".to_string());
                 ctx.refresh_servers13(); start_dialers(&ctx);
+                if manual { report(format!("Расписок нод: {after} (новых {})", after.saturating_sub(before))); }
             }
-            Ok(None) => {}
-            Err(e) => ctx.sh.note(format!("зачисление: дожим расписок не удался: {e:#}")),
+            Ok(None) => { if manual { report(format!("Список полный: расписок {after}, дожимать нечего")); } }
+            Err(e) => {
+                ctx.sh.note(format!("зачисление: дожим расписок не удался: {e:#}"));
+                if manual { report(format!("Не удалось: {}", format!("{e:#}").chars().take(160).collect::<String>())); }
+            }
         }
     }
 }
