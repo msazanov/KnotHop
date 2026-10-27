@@ -1167,7 +1167,10 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
         nb = nb.add_tcp_server(SocketAddr::from(([0, 0, 0, 0], tp)));
     }
     let pn_identity = transport.then(|| admin_identity.clone()).flatten();
-    let admin_lxmf = admin_identity.map(lxmf_admin::AdminProcessor::new);
+    let admin_lxmf = admin_identity.map(|i| {
+        let (p, r) = lxmf_admin::AdminProcessor::new(i);
+        (if transport { p.with_fetch_ms(lxmf_admin::PN_FETCH_SERVER_MS) } else { p }, r)
+    });
     let (admin_lxmf, nb) = match admin_lxmf {
         Some((processor, runtime)) => {
             let nb = if let Some(identity) = pn_identity {
@@ -7422,6 +7425,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
         tokio::spawn(client_announce(ctx.clone(), dh));
         ctx.refresh_servers13();
         tokio::spawn(client_policy_loop(ctx.clone()));
+        tokio::spawn(client_enroll_refresh(ctx.clone()));
         let note = {
             let c = ctx.c13.as_ref().unwrap();
             let tr = c.trust.lock().unwrap();
@@ -7571,6 +7575,36 @@ async fn pair_client(ctx: &Arc<ClientCtx>) -> Result<()> {
     for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.hint_name(e.dest, &e.name); }
     *c.invite.lock().unwrap() = None;
     ctx.refresh_servers13(); start_dialers(ctx); Ok(())
+}
+
+/// Дожим расписок зачисления (см. `enroll_net::refresh`): раз в 2 мин и сразу по файлу `refresh-nodes` (кнопка приложения).
+/// Найденные адреса - подсказки; права ноды получают только из подписанных записей.
+async fn client_enroll_refresh(ctx: Arc<ClientCtx>) {
+    let Some(c) = &ctx.c13 else { return };
+    let (fin, trigger) = (ctx.state.join("fin"), ctx.state.join("refresh-nodes"));
+    // Грант может включать ноду, которая так и не зачислена (расписок всегда меньше): пауза растёт 2 -> 30 мин, пока новых записей нет.
+    let (mut last, mut wait) = (Instant::now(), 120u64);
+    let count = || c.trust.lock().unwrap().enrollment_proofs(&ctx.identity.public_key_bytes()).len();
+    while !fin.exists() {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let manual = trigger.exists();
+        if (!manual && last.elapsed() < Duration::from_secs(wait)) || c.invite.lock().unwrap().is_some() { continue; }
+        let _ = std::fs::remove_file(&trigger);
+        last = Instant::now();
+        let Some(service) = enroll_net::find(&ctx.state) else { continue };
+        let before = count();
+        let res = enroll_net::refresh(&service).await;
+        wait = if manual || count() > before { 120 } else { (wait * 2).min(1800) };
+        match res {
+            Ok(Some(hints)) => {
+                for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.hint_name(e.dest, &e.name); }
+                ctx.sh.note("зачисление: дополучены расписки остальных нод".to_string());
+                ctx.refresh_servers13(); start_dialers(&ctx);
+            }
+            Ok(None) => {}
+            Err(e) => ctx.sh.note(format!("зачисление: дожим расписок не удался: {e:#}")),
+        }
+    }
 }
 
 /// Запись от узла по Link клиента: завершение зачисления (запись о нас от админа приглашения) и пополнение списка выходов.

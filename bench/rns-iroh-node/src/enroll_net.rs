@@ -395,7 +395,31 @@ async fn join_link(s:&Arc<Service>,invite:&Invite,h:Hash,link:LinkId)->Result<Ve
     Ok(hints)
 }
 fn apply_result(s:&Service,invite:&Invite,commissioner:Hash,result:&serde_json::Value,consent:Option<&str>)->Result<Vec<serde_json::Value>>{
-    apply_to(&s.trust,&s.identity,&s.state,invite,commissioner,result,consent,true)
+    apply_to(&s.trust,&s.identity,&s.state,enroll::invite_id(&invite.pin),commissioner,result,consent,true)
+}
+/// Дожим расписок после зачисления. Окно `join` (30 с) короче времени, за которое остальные ноды гранта закрывают выдачу по LXMF
+/// (при нестабильной mesh это минуты), поэтому телефон мог остаться только с частью нод. Здесь для каждого свежего гранта, по которому
+/// записей меньше, чем нод, спрашиваем (`[3]`) ноды, уже подтвердившие права: их ответ несёт все расписки, что у них есть.
+/// Якорь не ставится (он уже стоит), согласие - digest сохранённого гранта. `None` - дожимать нечего.
+pub async fn refresh(s:&Arc<Service>)->Result<Option<Vec<serde_json::Value>>>{
+    let proofs=s.trust.lock().unwrap().enrollment_proofs(&s.identity.public_key_bytes());
+    let mut ids:Vec<Hash>=vec![];for p in &proofs{if !ids.contains(&p.grant.id){ids.push(p.grant.id)}}
+    let (mut hints,mut worked,mut last)=(vec![],false,None);
+    for id in ids{
+        let have:Vec<&Proof>=proofs.iter().filter(|p|p.grant.id==id).collect();let grant=&have[0].grant;
+        if !grant.fresh(now_ms()as u64/1000)||grant.nodes.iter().all(|n|have.iter().any(|p|p.rec.scope==*n)){continue}
+        worked=true;
+        for p in &have{
+            let h=p.rec.scope;
+            let r:Result<Vec<serde_json::Value>>=async{
+                let link=s.open(h,false).await?;let mut req=vec![3];req.extend(id);
+                let reply=rpc(&s.node,link,&req,10_000).await;let _=s.node.engine().close_link(&link).await;
+                apply_to(&s.trust,&s.identity,&s.state,id,h,&reply?,Some(&hex(&grant.digest())),false)
+            }.await;
+            match r{Ok(v)=>{hints.extend(v);last=None;break}Err(e)=>last=Some(e)}
+        }
+    }
+    match last{Some(e)=>Err(e),None=>Ok(worked.then_some(hints))}
 }
 /// Маркер принятого предложения: пишется перед REDEEM (id приглашения и digest grant, без pin) и живёт до применения ответа.
 /// Нужен, если ответ на REDEEM потерян после погашения: повтор приглашения тогда приходит как `nodes`, а доказательства ещё нет.
@@ -414,16 +438,16 @@ fn repeat_nodes(trust:&Mutex<Trust>,id:&Identity,state:&Path,invite:&Invite,comm
         Some(p)=>(hex(&p.grant.digest()),false),
         None=>(consented_digest(state,&want).context("Нода отвечает, что приглашение уже принято, но на этом устройстве согласия нет; приглашение не применено")?,true),
     };
-    apply_to(trust,id,state,invite,commissioner,offer,Some(&digest),anchor)
+    apply_to(trust,id,state,want,commissioner,offer,Some(&digest),anchor)
 }
 #[allow(clippy::too_many_arguments)]
-fn apply_to(trust:&Mutex<Trust>,id:&Identity,state:&Path,invite:&Invite,commissioner:Hash,result:&serde_json::Value,consent:Option<&str>,add_anchor:bool)->Result<Vec<serde_json::Value>>{
+fn apply_to(trust:&Mutex<Trust>,id:&Identity,state:&Path,want:Hash,commissioner:Hash,result:&serde_json::Value,consent:Option<&str>,add_anchor:bool)->Result<Vec<serde_json::Value>>{
     if !matches!(result["status"].as_str(),Some("result"|"nodes")){bail!("Зачисление не подтверждено нодой")}
     let arr=result["receipts"].as_array().context("result receipts")?;if arr.is_empty()||arr.len()>8{bail!("receipt count")}
     let mut parsed=vec![];let mut seen=HashSet::new();let mut hints=vec![];
     for value in arr{
         let r:Receipt=serde_json::from_value(value.clone())?;let p=Proof::parse(&enroll::raw(&r.proof)?)?;
-        if p.grant.id!=enroll::invite_id(&invite.pin)||p.rec.holder!=id.public_key_bytes()||!p.grant.nodes.contains(&commissioner)||!seen.insert(p.rec.scope){bail!("result binding/duplicate")}
+        if p.grant.id!=want||p.rec.holder!=id.public_key_bytes()||!p.grant.nodes.contains(&commissioner)||!seen.insert(p.rec.scope){bail!("result binding/duplicate")}
         if let Some(consent)=consent{if hex(&p.grant.digest())!=consent{bail!("result changed consented offer")}}
         p.authority(id)?;enroll::verify_closed(&enroll::raw(&r.closed)?,&p,dest_from_pub_tag(&p.rec.node,T13_TAG))?;
         if r.hints.len()>8{bail!("hint quota")};hints.extend(r.hints);parsed.push(p);
@@ -579,6 +603,7 @@ mod tests {
         assert!(receiver.trust.lock().unwrap().common_with(&exit.public_key_bytes(),trust::USE,trust::EXIT,false,true,now_ms()as u64));
         assert!(service.trust.lock().unwrap().common_with(&client.public_key_bytes(),trust::EXIT,trust::USE,true,false,now_ms()as u64));
         assert_eq!(receiver.trust.lock().unwrap().rights_in(root.hash(),client.hash()),0,"no ALL grant from invitation");
+        assert!(refresh(&receiver).await.expect("refresh with every receipt present").is_none(),"one-node grant is complete: nothing to refresh");
         let restored=Trust::load(client.clone(),&base.join("client")).unwrap();assert!(restored.common_with(&exit.public_key_bytes(),trust::USE,trust::EXIT,false,true,now_ms()as u64));
         drop(receiver);drop(service);tokio::time::sleep(Duration::from_secs(2)).await;
         Arc::get_mut(&mut c).unwrap().stop().await.unwrap();Arc::get_mut(&mut e).unwrap().stop().await.unwrap();std::fs::remove_dir_all(base).unwrap();

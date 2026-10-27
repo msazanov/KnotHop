@@ -14,6 +14,10 @@
 
 `deploy/ci-build.sh` перед сборкой проверяет, что HEAD форка совпадает с `deploy/leviculum.ref`. `SOURCE_DATE_EPOCH` берётся из коммита форка, поэтому при одном коммите штамп сборки одинаков.
 
+### Синхронизация с апстримом
+
+`.github/workflows/leviculum-sync.yml` (раз в неделю и вручную) вызывает `deploy/leviculum-sync.sh prepare`: клонирует форк на закреплённом SHA с полной историей, подтягивает `master` апстрима (codeberg `Lew_Palm/Leviculum`) и пробует слияние. Исходы: `uptodate` - ничего; `conflict` - issue со списком файлов; `merged` - сборка и тесты кандидата (`check_fork_graph.sh`, `cargo test --lib`). При красных проверках открывается issue, при зелёных и наличии секрета `LEVICULUM_FORK_DEPLOY_KEY` (deploy key с записью, добавлен только в `msazanov/leviculum`) ветка `knothop/upstream-ДАТА-sha8` пушится в форк и открывается PR в KnotHop, меняющий `deploy/leviculum.ref`. Без секрета - только сводка. В main ничего не сливается само: релиз с main уходит на узлы автообновлением, а код апстрима чужой. В теле PR перечислены затронутые чувствительные пути (crypto, GCM, Link, пакеты, identity). PR от `GITHUB_TOKEN` не запускает CI: запустить вручную. Настройка «Allow GitHub Actions to create and approve pull requests» включена 27.10. Первое слияние (170 коммитов апстрима против 37 наших) даёт конфликты в `link_management.rs` и `packet.rs`, его делают вручную.
+
 ## Сборка бинарников
 
 - `deploy/ci-build.sh host КАТАЛОГ` - `knothopd` на хосте раннера (Ubuntu 24.04); пишет также `FORK-MANIFEST.txt`.

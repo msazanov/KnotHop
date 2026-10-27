@@ -86,6 +86,8 @@ pub enum TransportEvent {
 const PN_FALLBACK_SECS: u64 = if cfg!(test) { 3 } else { 30 };
 /// Плановая выборка почты с PN: по расписанию анонса, без новых пробуждений телефона.
 const PN_FETCH_MS: u64 = 600_000;
+/// Узлы-серверы (постоянная связь, без батареи) забирают почту чаще: закрытие зачисления между нодами иначе ждёт до 10 минут.
+pub const PN_FETCH_SERVER_MS: u64 = 120_000;
 /// Не чаще раза в 30 с, как бы ни менялся выбор PN.
 const PN_FETCH_SPACING_MS: u64 = 30_000;
 const PN_REFRESH_MS: u64 = 5_000;
@@ -184,6 +186,7 @@ pub struct AdminProcessor {
     pn_checked_ms: u64,
     pn_fetch_due: bool,
     last_fetch_ms: u64,
+    fetch_ms: u64,
     stamp_jobs: SyncSender<PropagationStampRequest>,
     stamp_results: Receiver<(PropagationStampRequest, [u8; 32])>,
 }
@@ -259,11 +262,15 @@ impl AdminProcessor {
             pn_checked_ms: 0,
             pn_fetch_due: false,
             last_fetch_ms: 0,
+            fetch_ms: PN_FETCH_MS,
             stamp_jobs: stamp_tx,
             stamp_results: stamp_out_rx,
         };
         (processor, AdminRuntime { pn, inbound: in_rx, outbound: out_tx, transport_events: event_rx, ready, sync:sync_tx })
     }
+
+    /// Период плановой выборки почты с PN (по умолчанию `PN_FETCH_MS`).
+    pub fn with_fetch_ms(mut self, ms: u64) -> Self { self.fetch_ms = ms; self }
 
     fn register(&mut self, core: &mut StdNodeCore, out: &mut TickOutput) -> Result<ProcessorState> {
         let destination = LxmfNode::delivery_destination(self.identity.clone()).map_err(|e| anyhow::anyhow!("LXMF delivery destination: {e:?}"))?;
@@ -458,7 +465,7 @@ impl AdminProcessor {
         for (request, stamp) in self.stamp_results.try_iter().take(4) {
             if let Ok(output) = router.set_outbound_propagation_stamp_result(&request, stamp, now) { outputs.push(output); }
         }
-        let periodic = now.saturating_sub(self.last_fetch_ms) >= PN_FETCH_MS;
+        let periodic = now.saturating_sub(self.last_fetch_ms) >= self.fetch_ms;
         if router.outbound_propagation_node().is_some() && (self.pn_fetch_due || periodic)
             && (self.last_fetch_ms == 0 || now.saturating_sub(self.last_fetch_ms) >= PN_FETCH_SPACING_MS) {
             if let Ok(output) = router.request_messages_from_propagation_node(core, None) { outputs.push(output); }

@@ -6,6 +6,7 @@
 #   rollout.sh migrate [--dry-run] МЕТКА... одноразовая миграция rawgd -> knothop (node-migrate.sh): снять старое, поставить knothopd + persist, запустить; с откатом
 #   rollout.sh install [--dry-run] МЕТКА... заменить бинарник с откатом (node-install.sh); метки обязательны, «все сразу» не бывает
 #   rollout.sh hostfix apply|persist|revert МЕТКА...   (нужен stage: скрипт и nft берутся с узла)
+#   rollout.sh autoupdate install|remove МЕТКА...   автообновление knothopd из релиза GitHub (node-autoupdate.sh); status [метки] - read-only
 # Список узлов - deploy/hosts.tsv, колонки через TAB:
 #   метка | ssh-цель | вариант бинарника (knothopd | knothopd-u2204) | [опции ssh/scp, через пробел, напр. operator@host -o UserKnownHostsFile=/путь/known_hosts]
 # Пользователь, не равный root (user@host), получает sudo -n для всего, что пишет в /root или меняет систему; загрузка идёт в ~/.knothopd-up/ и
@@ -112,6 +113,21 @@ case "$CMD" in
       hf() { rsh "$SUDO bash $RD/node-hostfix.sh $ACT"; }
       each hf "$@"
     fi ;;
+  autoupdate)
+    # Автообновление knothopd из релиза GitHub (node-autoupdate.sh): install|remove|status. Скрипт идёт по stdin из репозитория
+    # (не из dist: это не артефакт сборки), копия на узле - /opt/knothop/knothop-autoupdate.sh; службу knothopd действие не трогает.
+    ACT="${1:?install|remove|status}"; shift
+    case "$ACT" in install|remove|status) ;; *) echo "autoupdate: install | remove | status"; exit 64 ;; esac
+    [ "$ACT" = status ] || [ $# -gt 0 ] || { echo "autoupdate $ACT: назовите узлы явно"; exit 64; }
+    AU_SELF=/opt/knothop/knothop-autoupdate.sh
+    au() {
+      case "$ACT" in
+        install) rsh_in "$SUDO install -m 0755 /dev/stdin $AU_SELF" < "$HERE/node-autoupdate.sh" && rsh "$SUDO $AU_SELF install $V" ;;
+        remove) rsh "$SUDO $AU_SELF remove" ;;
+        status) rsh_in "$SUDO bash -s -- status" < "$HERE/node-autoupdate.sh" ;;
+      esac
+    }
+    each au "$@" ;;
   hostpolicy)
     ACT="${1:?show|add-root}"; shift
     case "$ACT" in

@@ -142,6 +142,11 @@ public class MainActivity extends Activity {
         rightsBtn.setAllCaps(false);
         rightsBtn.setOnClickListener(v -> startActivity(new Intent(this, PolicyActivity.class)));
         mainBox.addView(rightsBtn);
+        Button nodesBtn = new Button(this);
+        nodesBtn.setText("Обновить список нод");
+        nodesBtn.setAllCaps(false);
+        nodesBtn.setOnClickListener(v -> refreshNodes());
+        mainBox.addView(nodesBtn);
         // --- админ: приглашения. Видны только в своей сети (профиль «своя сеть»); пользователь по чужому приглашению их не видит.
         adminBox = new LinearLayout(this);
         adminBox.setOrientation(LinearLayout.VERTICAL);
@@ -480,6 +485,20 @@ public class MainActivity extends Activity {
             File st = new File(getFilesDir(), "state");
             st.mkdirs();
             java.nio.file.Files.write(new File(st, "select").toPath(), dest.getBytes("UTF-8"));
+        } catch (Exception ignored) { }
+    }
+
+    /** Дожим расписок зачисления: файл refresh-nodes читает нативная часть (раз в 5 с); сама она делает это и раз в 2 мин. Нужен подключённый VPN. */
+    private void refreshNodes() {
+        if (!(active() || KnotHopVpnService.tunHeld)) {
+            android.widget.Toast.makeText(this, "Сначала подключитесь", android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            File st = new File(getFilesDir(), "state");
+            st.mkdirs();
+            new File(st, "refresh-nodes").createNewFile();
+            android.widget.Toast.makeText(this, "Запрашиваю остальные ноды у сети", android.widget.Toast.LENGTH_SHORT).show();
         } catch (Exception ignored) { }
     }
 
