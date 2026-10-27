@@ -6,7 +6,6 @@
 //! права же вычисляются при запросе по цепочке до корня, поэтому отзыв звена сразу обесценивает выданное им.
 
 use super::*;
-use hmac::{Hmac, Mac};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,12 +34,10 @@ pub const MAX_DEPTH: usize = 8;
 const STEP_BUDGET: u32 = 20_000;
 /// Инвариант 6: всё ограничено.
 pub const MAX_RECS_PER_ROOT: usize = 512;
+const MAX_ENROLL_RECS: usize = 512;
 /// Не больше записей одного издателя в корне (кроме самого корня): одиночный участник не забивает хранилище (H1).
 pub const MAX_RECS_PER_ISSUER: usize = 64;
 pub const MAX_ROOTS: usize = 8;
-pub const MAX_PINS: usize = 64;
-/// Срок приглашения и неиспользованного pin: 30 дней (0014 R6, решение владельца).
-pub const INVITE_TTL_S: u64 = 30 * 24 * 3600;
 /// seq - время в мс; запись из далёкого будущего не принимаем (иначе издатель мог бы заранее занять свой слот).
 const SEQ_FUTURE_MS: u64 = 10 * 60 * 1000;
 
@@ -99,13 +96,6 @@ pub fn root_tag(root: &Hash) -> String {
     hex(&d[..6])
 }
 
-fn hmac32(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("hmac key");
-    for p in parts {
-        m.update(p);
-    }
-    m.finalize().into_bytes().into()
-}
 
 /// Создать новый файл только для владельца (0600) и только если его ещё нет: O_EXCL не проходит по symlink.
 fn create_private(p: &Path) -> std::io::Result<std::fs::File> {
@@ -273,11 +263,6 @@ impl Record {
         Ok(r)
     }
 
-    /// Подписана ли запись этим ключом (для завершения зачисления: ключ админа ещё не в якорях).
-    pub fn signed_by(&self, issuer_pk: &Pk) -> bool {
-        self.sig_ok(issuer_pk)
-    }
-
     fn sig_ok(&self, issuer_pk: &Pk) -> bool {
         let mut m = REC_MSG.to_vec();
         m.extend_from_slice(&self.payload());
@@ -303,6 +288,7 @@ pub const POLICY_TTL_MS: u64 = 48 * 3600 * 1000;
 /// Источник переподписывает политику, когда ей больше этого возраста (0015: запас на два пропущенных обновления).
 pub const POLICY_REFRESH_MS: u64 = 12 * 3600 * 1000;
 /// Права, при наличии любого из которых нода видна другим (0015, п.4: остальные скрыты).
+#[cfg(test)]
 const VISIBLE_BITS: u16 = USE | TRANSIT | EXIT;
 
 /// Подписанное самой нодой «что я согласна делать» в сети с корнем `root`. Только сужает выдачу: действующие права = выдача ∩ offer.
@@ -390,6 +376,8 @@ pub struct Trust {
     anchors: BTreeMap<Hash, Pk>,
     /// (корень, хеш держателя, хеш издателя) -> последняя запись
     recs: HashMap<(Hash, Hash, Hash), Record>,
+    /// ADR 0019: (root, holder, issuing node). Never a delegation source for Record v1.
+    enroll_recs: BTreeMap<(Hash, Hash, Hash), crate::enroll::Proof>,
     /// (корень, хеш) -> полный ключ: из записей, чтобы проверять подписи издателей
     holders: HashMap<(Hash, Hash), Pk>,
     /// (корень, хеш держателя) -> последняя политика (0015). Число ограничено числом известных держателей, то есть записями корня.
@@ -526,7 +514,7 @@ impl Trust {
         let me_hash = *me.hash();
         let mut anchors = BTreeMap::new();
         anchors.insert(me_hash, me_pk);
-        Trust { path, me, me_pk, me_hash, anchors, recs: HashMap::new(), holders: HashMap::new(), pols: HashMap::new(), my_offer: BTreeMap::new(), host_recs: BTreeMap::new(),
+        Trust { path, me, me_pk, me_hash, anchors, recs: HashMap::new(), enroll_recs: BTreeMap::new(), holders: HashMap::new(), pols: HashMap::new(), my_offer: BTreeMap::new(), host_recs: BTreeMap::new(),
             host_policy: BTreeMap::new(), host_version: 0, host_commit: Arc::new(Mutex::new(())), io_gate: Arc::new(Mutex::new(())),
             disk_generation: Arc::new(AtomicU64::new(0)) }
     }
@@ -663,6 +651,20 @@ impl Trust {
                 Err(e) => bail!("host-access.json: read failed: {e}"),
             }
         }
+        let ep = state.join("enroll-records.json");
+        match std::fs::read(&ep) {
+            Ok(bytes) => {
+                if bytes.len() > 16*1024*1024 { bail!("enroll-records.json: too large"); }
+                let wires: Vec<String> = serde_json::from_slice(&bytes).context("enroll-records.json")?;
+                if wires.len() > 512 { bail!("enroll-records.json: quota"); }
+                for wire in wires {
+                    let proof = crate::enroll::Proof::parse(&crate::enroll::raw(&wire)?)?;
+                    t.offer_enrollment_checked(proof, false).context("enroll-records.json: invalid evidence")?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e).context("enroll-records.json"),
+        }
         Ok(t)
     }
 
@@ -682,6 +684,8 @@ impl Trust {
         let _io = self.io_gate.lock().unwrap_or_else(|e| e.into_inner());
         self.disk_generation.fetch_add(1, Ordering::AcqRel);
         write_atomic(p, &bytes)?;
+        let scoped: Vec<String> = self.enroll_recs.values().map(|p| crate::enroll::hex(&p.wire())).collect();
+        write_atomic(&p.with_file_name("enroll-records.json"), &serde_json::to_vec(&scoped)?)?;
         // host-access.json пишет только commit host-записей (prepare/finish): так общий save() под блокировкой trust
         // не конкурирует с записью, идущей вне блокировки, и не перезаписывает файл более старым состоянием.
         Ok(())
@@ -729,12 +733,102 @@ impl Trust {
     }
 
     /// Теги корней, которые нода объявляет в анонсе (по ним соседи узнают «свою» сеть).
+    #[cfg(test)]
     pub fn tags(&self) -> Vec<String> {
         self.anchors.keys().map(root_tag).collect()
     }
 
     pub fn record_count(&self) -> usize {
-        self.recs.len()
+        self.recs.len() + self.enroll_recs.len()
+    }
+
+    pub fn enrollment_proofs(&self, holder: &Pk) -> Vec<crate::enroll::Proof> {
+        self.enroll_recs.values().filter(|p| p.rec.holder == *holder).cloned().collect()
+    }
+
+    pub fn offer_enrollment(&mut self, p: crate::enroll::Proof) -> Result<bool> {
+        self.offer_enrollment_checked(p, true)
+    }
+
+    fn offer_enrollment_checked(&mut self, p: crate::enroll::Proof, fresh: bool) -> Result<bool> {
+        let hh = hash_of(&p.rec.holder).ok_or_else(||anyhow::anyhow!("enrollment holder"))?;
+        let key = (p.grant.root, hh, p.rec.scope);
+        if self.enroll_recs.get(&key) == Some(&p) { return Ok(false); }
+        if !self.has_anchor(&p.grant.root) || self.pub_of(&p.grant.root, &p.grant.root) != Some(p.root) { bail!("enrollment root not anchored"); }
+        p.authority(&self.me)?;
+        if fresh && !p.grant.fresh(now_ms() as u64 / 1000) { bail!("enrollment first seen after expiry; no rights"); }
+        for r in &p.chain { if r.root != p.grant.root { bail!("cross-root enrollment chain"); } }
+        for _ in 0..=MAX_DEPTH { for r in &p.chain { self.offer(r.clone()); } }
+        if fresh { p.verify(self)?; }
+        if let Some(old) = self.enroll_recs.get(&key) {
+            if old.rec.seq >= p.rec.seq { return Ok(false); }
+        } else if !self.enrollment_room(&key.0) { bail!("enrollment record quota"); }
+        self.holders.insert((p.grant.root, hh), p.rec.holder);
+        self.holders.insert((p.grant.root, p.rec.scope), p.rec.node);
+        self.enroll_recs.insert(key, p);
+        Ok(true)
+    }
+
+    /// R-2 «Забыть профиль»: оставить только собственный корень. Чужие якоря, их записи, доказательства зачисления, политики,
+    /// host-записи и потолки удаляются из памяти; `save()` перепишет `trust.json` и `enroll-records.json`, а `host-access.json`
+    /// переписывается здесь без чужих записей. Записи собственного корня (админа этого устройства) не трогаются. Возвращает число
+    /// забытых якорей. Вызывать только при остановленном узле: файл держит живой процесс.
+    pub fn forget_foreign_roots(&mut self) -> Result<usize> {
+        let me = self.me_hash;
+        let before = self.anchors.len();
+        self.anchors.retain(|h, _| *h == me);
+        self.recs.retain(|(r, _, _), _| *r == me);
+        self.enroll_recs.retain(|(r, _, _), _| *r == me);
+        self.holders.retain(|(r, _), _| *r == me);
+        self.pols.retain(|(r, _), _| *r == me);
+        self.my_offer.retain(|r, _| *r == me);
+        self.host_recs.retain(|(r, _, _), _| *r == me);
+        self.host_policy.retain(|r, _| *r == me);
+        self.host_version += 1;
+        self.save()?;
+        if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) {
+            let hp = dir.join("host-access.json");
+            if hp.exists() {
+                let records: Vec<String> = self.host_recs.values().map(|r| hex(&r.wire())).collect();
+                write_atomic(&hp, &serde_json::to_vec(&serde_json::json!({"v":1,"records":records}))?)?;
+            }
+        }
+        Ok(before - self.anchors.len())
+    }
+
+    /// Тест: забить хранилище копиями одного доказательства под разными ключами (без проверок, ради скорости).
+    #[cfg(test)]
+    pub(crate) fn test_fill_enrollments(&mut self, p: &crate::enroll::Proof, n: usize) {
+        for i in 0..n { let mut h = [0u8; 16]; h[..8].copy_from_slice(&(i as u64).to_le_bytes()); self.enroll_recs.insert((p.grant.root, h, p.rec.scope), p.clone()); }
+    }
+
+    /// Есть ли место под новое доказательство зачисления в корне `root` (общий предел 512 и предел корня). При нехватке вытесняет
+    /// доказательства, которые сейчас ничего не дают (подписант выдачи потерял ADD/глубину или цепочка разорвана отзывом).
+    /// Действующие записи и отзывы не трогает (AGENTS, правило 3). Вызывать ДО необратимого погашения приглашения (R-4).
+    pub fn enrollment_room(&mut self, root: &Hash) -> bool {
+        while self.enroll_recs.len() >= MAX_ENROLL_RECS || self.root_count(root) >= MAX_RECS_PER_ROOT {
+            if !self.evict_dead_enrollment() { return false; }
+        }
+        true
+    }
+
+    fn evict_dead_enrollment(&mut self) -> bool {
+        // Подпись grant проверяется один раз на (grant, подписант): у одного приглашения до 8 записей, у одного админа их много.
+        let mut alive: HashMap<([u8; 64], Pk), bool> = HashMap::new();
+        let dead = self.enroll_recs.iter()
+            .filter(|(_, p)| !*alive.entry((p.grant.sig, p.admin)).or_insert_with(|| p.grant.verify(self, &p.admin).is_ok()))
+            .min_by_key(|(_, p)| p.rec.seq).map(|(k, _)| *k);
+        dead.is_some_and(|k| self.enroll_recs.remove(&k).is_some())
+    }
+
+    /// Rights of holder h AT endpoint scope. ALL alone remains the delegation source.
+    pub fn rights_at(&self, root: &Hash, h: &Hash, scope: &Hash) -> u16 {
+        let all = self.rights_in(root, h);
+        let Some(p) = self.enroll_recs.get(&(*root,*h,*scope)) else { return all };
+        let Ok(depth) = p.grant.verify(self, &p.admin) else { return all };
+        let mut budget = STEP_BUDGET;
+        if self.best(root,h,&mut Vec::new(),&mut budget).is_some_and(|(r,d)| r.rights==0 && d.saturating_add(1)<=depth) { return 0; }
+        all | p.rec.rights
     }
 
     fn pub_of(&self, root: &Hash, h: &Hash) -> Option<Pk> {
@@ -786,7 +880,7 @@ impl Trust {
     }
 
     fn root_count(&self, root: &Hash) -> usize {
-        self.recs.keys().filter(|k| k.0 == *root).count()
+        self.recs.keys().filter(|k| k.0 == *root).count() + self.enroll_recs.keys().filter(|k| k.0 == *root).count()
     }
 
     fn issuer_count(&self, root: &Hash, issuer: &Hash) -> usize {
@@ -898,7 +992,7 @@ impl Trust {
     /// Права ключа: объединение по всем якорям ноды.
     pub fn rights(&self, pk: &Pk) -> u16 {
         let Some(h) = hash_of(pk) else { return 0 };
-        self.anchors.keys().fold(0, |a, root| a | self.rights_in(root, &h))
+        self.anchors.keys().fold(0, |a, root| a | self.rights_at(root, &h, &self.me_hash))
     }
 
     /// Есть ли корень, в котором у меня есть право `mine`, а у собеседника - `theirs`: так сосед-транзит (TRANSIT/TRANSIT)
@@ -914,8 +1008,12 @@ impl Trust {
     pub fn common_with(&self, peer: &Pk, mine: u16, theirs: u16, my_eff: bool, their_eff: bool, now: u64) -> bool {
         let Some(h) = hash_of(peer) else { return false };
         self.anchors.keys().any(|root| {
-            let m = if my_eff { self.effective_in(root, &self.me_hash, now) } else { self.rights_in(root, &self.me_hash) };
-            let t = if their_eff { self.effective_in(root, &h, now) } else { self.rights_in(root, &h) };
+            // A client presents USE scoped to the exit, NOT USE scoped to itself.
+            let endpoint = if mine == USE && theirs == EXIT { h } else { self.me_hash };
+            let m = if mine == USE { self.rights_at(root, &self.me_hash, &endpoint) } else { self.rights_in(root, &self.me_hash) };
+            let t = self.rights_at(root, &h, &endpoint);
+            let m = if my_eff { m & self.offer_in(root, &self.me_hash, now) } else { m };
+            let t = if their_eff { t & self.offer_in(root, &h, now) } else { t };
             m & mine != 0 && t & theirs != 0
         })
     }
@@ -1101,6 +1199,9 @@ impl Trust {
             }
         }
         out.sort();
+        for p in self.enroll_recs.values() {
+            if p.rec.holder != self.me_pk && self.rights_at(&p.grant.root, &hash_of(&p.rec.holder).unwrap(), &self.me_hash) & bit != 0 && !out.contains(&p.rec.holder) { out.push(p.rec.holder); }
+        }
         out
     }
 
@@ -1198,11 +1299,15 @@ impl Trust {
     /// Действующие права `h` в корне: выдача ∩ политика. Нет политики - выдача целиком (нода без поддержки 0015).
     /// Просроченная политика сужает до USE: устаревшее «EXIT включён» не должно жить вечно, а возврат к выдаче расширил бы права.
     pub fn effective_in(&self, root: &Hash, h: &Hash, now: u64) -> u16 {
-        let grant = self.rights_in(root, h);
+        let grant = self.rights_at(root, h, &self.me_hash);
+        grant & self.offer_in(root, h, now)
+    }
+
+    fn offer_in(&self, root: &Hash, h: &Hash, now: u64) -> u16 {
         match self.pols.get(&(*root, *h)) {
-            None => grant,
-            Some(p) if p.valid_until > now => grant & p.offer,
-            Some(_) => grant & USE,
+            None => KNOWN,
+            Some(p) if p.valid_until > now => p.offer,
+            Some(_) => USE,
         }
     }
 
@@ -1213,6 +1318,7 @@ impl Trust {
     }
 
     /// Видна ли нода другим: есть действующие USE, TRANSIT или EXIT хотя бы в одном корне.
+    #[cfg(test)]
     pub fn visible(&self, pk: &Pk, now: u64) -> bool {
         self.effective(pk, now) & VISIBLE_BITS != 0
     }
@@ -1346,6 +1452,7 @@ impl Trust {
 
     /// То, что нода отдаёт собеседнику после проверки его прав: члены с TRANSIT/ADD/REMOVE/CONFIG видят всё хранилище,
     /// пользователь с одним USE - только цепочки выходов и свою (чужих пользователей не раскрываем).
+    #[cfg(test)]
     pub fn export_for(&self, peer_rights: u16, peer: &Pk) -> Vec<Record> {
         if peer_rights & (TRANSIT | ADD | REMOVE | CONFIG) != 0 {
             return self.export_all();
@@ -1385,7 +1492,7 @@ impl Trust {
     }
 
     fn visible_record_keys_in_root(&self, root: &Hash, peer: &Hash) -> HashSet<(Hash, Hash, Hash)> {
-        let rights = self.rights_in(root, peer);
+        let rights = self.rights_at(root, peer, &self.me_hash);
         if rights & (TRANSIT | ADD | REMOVE | CONFIG) != 0 {
             return self.recs.keys().filter(|(r, _, _)| r == root).copied().collect();
         }
@@ -1428,437 +1535,8 @@ impl Trust {
     }
 }
 
-/// Проверить временную цепочку зачисления до заданного корня, не изменяя постоянное состояние.
-pub fn verify_enrollment(me: &Identity, root_pk: &Pk, created: u64, cand: &Record, chain: &[Record]) -> Result<Vec<Record>> {
-    let root = hash_of(root_pk).ok_or_else(|| anyhow::anyhow!("ключ корня не разобран"))?;
-    let me_pk = me.public_key_bytes();
-    let me_hash = *me.hash();
-    if root == me_hash || cand.holder != me_pk || cand.root != root || cand.rights == 0
-        || cand.seq < created.saturating_mul(1000)
-    {
-        bail!("запись зачисления не соответствует приглашению");
-    }
-    let mut t = Trust::new(me.clone(), None);
-    t.add_anchor(root_pk)?;
-    // Просматриваем вход без полной копии и повторяем проходы для записей в любом порядке.
-    // Число принятых издателей ограничено глубиной цепочки; присланный мусор не съедает квоту.
-    for _ in 0..=MAX_DEPTH {
-        let mut changed = false;
-        for r in chain.iter().chain(std::iter::once(cand)).filter(|r| r.root == root) {
-            let equivocation = chain.iter().chain(std::iter::once(cand)).any(|other|
-                other.root == root && other.issuer == r.issuer && other.hh == r.hh && other.seq == r.seq && other.rights != r.rights);
-            if equivocation { continue; }
-            let known_issuers = t.recs.keys().filter(|(rt, _, _)| *rt == root).map(|(_, _, issuer)| *issuer)
-                .collect::<std::collections::HashSet<_>>();
-            if known_issuers.len() >= MAX_DEPTH && !known_issuers.contains(&r.issuer) { continue; }
-            if t.offer(r.clone()) == Offer::Added { changed = true; }
-        }
-        if !changed { break; }
-    }
-    let rights = t.rights_in(&root, &me_hash);
-    if rights == 0 || cand.rights & !rights != 0 { bail!("цепочка не подтверждает выданные права"); }
-    Ok(t.chain_for(&me_pk))
-}
 
-// ------------------------------------------------------------------------------------------------ приглашение
-
-/// `kh-` + base64url(v=3 | flags(bit0=delegated) | inviter(64) | [root_pk(64)] | pin(16) | rights(2 LE) | created(8 BE) | адреса | число нод(0..8)+хеши(16) | sha256[..4]).
-/// Не содержит ключей приёмника: нода генерирует свою identity сама. pin одноразовый и гасится админом.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Invite {
-    pub admin: Pk,
-    /// Публичный ключ корня только для делегированного приглашения; None означает корень-приглашающего.
-    pub root_pk: Option<Pk>,
-    pub pin: [u8; 16],
-    pub rights: u16,
-    pub created: u64,
-    pub addrs: Vec<String>,
-    /// identity-хеши нод, выбранных приглашающим как входные: пусто — к любой ноде корня.
-    pub nodes: Vec<Hash>,
-}
-
-pub const MAX_INVITE_NODES: usize = 8;
-
-fn b64e(b: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-}
-
-fn b64d(s: &str) -> Result<Vec<u8>> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim()).map_err(|e| anyhow::anyhow!("base64: {e}"))
-}
-
-impl Invite {
-    /// Строка для сервера и QR: `kh-` + base64url (совместимость; серверы отдают только её).
-    pub fn encode(&self) -> Result<String> {
-        Ok(format!("kh-{}", b64e(&self.body()?)))
-    }
-
-    /// Каноническая base64url-форма приглашения.
-    pub fn to_base64(s: &str) -> Result<String> {
-        Invite::parse(s)?.encode()
-    }
-
-    fn body(&self) -> Result<Vec<u8>> {
-        if self.rights & !ALL != 0 { bail!("приглашение: права приглашения ограничены прежней маской"); }
-        if self.nodes.len() > MAX_INVITE_NODES { bail!("приглашение: число нод больше {MAX_INVITE_NODES}"); }
-        if self.nodes.iter().collect::<std::collections::HashSet<_>>().len() != self.nodes.len() {
-            bail!("приглашение: повтор ноды");
-        }
-        if self.addrs.len() > 4 { bail!("приглашение: не более 4 адресов"); }
-        if self.addrs.iter().any(|a| a.len() > 200) { bail!("приглашение: адрес длиннее 200 байт"); }
-        let admin_hash = hash_of(&self.admin).ok_or_else(|| anyhow::anyhow!("ключ приглашающего не разобран"))?;
-        if let Some(root) = &self.root_pk {
-            let rh = hash_of(root).ok_or_else(|| anyhow::anyhow!("ключ корня не разобран"))?;
-            if rh == admin_hash { bail!("делегированный корень совпадает с приглашающим"); }
-        }
-        let nodes: Vec<&Hash> = self.nodes.iter().collect();
-        let mut b = vec![3u8, u8::from(self.root_pk.is_some())];
-        b.extend_from_slice(&self.admin);
-        if let Some(root_pk) = &self.root_pk { b.extend_from_slice(root_pk); }
-        b.extend_from_slice(&self.pin);
-        b.extend_from_slice(&self.rights.to_le_bytes());
-        b.extend_from_slice(&self.created.to_be_bytes());
-        let addrs: Vec<&String> = self.addrs.iter().collect();
-        b.push(addrs.len() as u8);
-        for a in addrs {
-            b.push(a.len() as u8);
-            b.extend_from_slice(a.as_bytes());
-        }
-        b.push(nodes.len() as u8);
-        for h in nodes { b.extend_from_slice(h); }
-        let ck = Sha256::digest(&b);
-        b.extend_from_slice(&ck[..4]);
-        Ok(b)
-    }
-
-    pub fn parse(s: &str) -> Result<Invite> {
-        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        let b = match s.strip_prefix("kh-") {
-            Some(body) => b64d(body)?,
-            None => bail!("не приглашение (нужен префикс kh-)"),
-        };
-        if b.len() < 2 + 64 + 16 + 2 + 8 + 1 + 1 + 4 {
-            bail!("приглашение слишком короткое");
-        }
-        let (j, ck) = b.split_at(b.len() - 4);
-        if Sha256::digest(j)[..4] != *ck {
-            bail!("контрольная сумма приглашения не сошлась (строка повреждена при копировании?)");
-        }
-        if j[0] != 3 {
-            bail!("версия приглашения не поддерживается");
-        }
-        if j[1] & !1 != 0 { bail!("приглашение: неизвестные флаги"); }
-        let delegated = j[1] & 1 != 0;
-        let admin: Pk = j[2..66].try_into().unwrap();
-        hash_of(&admin).ok_or_else(|| anyhow::anyhow!("ключ админа в приглашении не разобран"))?;
-        let mut i = 66;
-        let root_pk = if delegated {
-            let pk: Pk = j.get(i..i+64).ok_or_else(|| anyhow::anyhow!("приглашение обрезано"))?.try_into().unwrap();
-            let rh = hash_of(&pk).ok_or_else(|| anyhow::anyhow!("ключ корня в приглашении не разобран"))?;
-            if rh == hash_of(&admin).unwrap() { bail!("делегированный корень совпадает с приглашающим"); }
-            i += 64;
-            Some(pk)
-        } else { None };
-        let pin: [u8; 16] = j.get(i..i+16).ok_or_else(|| anyhow::anyhow!("приглашение обрезано"))?.try_into().unwrap(); i += 16;
-        let rights = u16::from_le_bytes(j.get(i..i+2).ok_or_else(|| anyhow::anyhow!("приглашение обрезано"))?.try_into().unwrap()); i += 2;
-        if rights & !ALL != 0 {
-            bail!("приглашение: неизвестные права");
-        }
-        let created = u64::from_be_bytes(j.get(i..i+8).ok_or_else(|| anyhow::anyhow!("приглашение обрезано"))?.try_into().unwrap()); i += 8;
-        let n = *j.get(i).ok_or_else(|| anyhow::anyhow!("приглашение обрезано"))? as usize; i += 1;
-        if n > 4 { bail!("приглашение: слишком много адресов"); }
-        let mut addrs = Vec::new();
-        for _ in 0..n {
-            let l = *j.get(i).ok_or_else(|| anyhow::anyhow!("приглашение обрезано"))? as usize;
-            if l > 200 { bail!("приглашение: адрес длиннее 200 байт"); }
-            let a = j.get(i + 1..i + 1 + l).ok_or_else(|| anyhow::anyhow!("приглашение обрезано"))?;
-            addrs.push(String::from_utf8(a.to_vec()).context("адрес в приглашении")?);
-            i += 1 + l;
-        }
-        let mut nodes: Vec<Hash> = Vec::new();
-        {
-            let m = *j.get(i).ok_or_else(|| anyhow::anyhow!("приглашение обрезано"))? as usize;
-            i += 1;
-            if m > MAX_INVITE_NODES {
-                bail!("приглашение: число нод больше {MAX_INVITE_NODES}");
-            }
-            for _ in 0..m {
-                let h: Hash = j.get(i..i + 16).ok_or_else(|| anyhow::anyhow!("приглашение обрезано"))?.try_into().unwrap();
-                if nodes.contains(&h) {
-                    bail!("приглашение: повтор ноды");
-                }
-                nodes.push(h);
-                i += 16;
-            }
-        }
-        if i != j.len() {
-            bail!("лишние данные в приглашении");
-        }
-        Ok(Invite { admin, root_pk, pin, rights, created, addrs, nodes })
-    }
-
-    /// Свежее ли приглашение: ставим окно в обе стороны (часы телефона бывают неточными).
-    pub fn fresh(&self, now_s: u64) -> bool {
-        self.created <= now_s.saturating_add(3600) && self.created.saturating_add(INVITE_TTL_S) > now_s
-    }
-
-    /// Доказательство владения pin, привязанное к ключу приёмника и админу: pin по сети не ходит.
-    pub fn mac(&self, holder: &Pk) -> Result<[u8; 32]> {
-        Ok(pair_mac(&self.pin, holder, &self.admin, &self.root()?))
-    }
-
-    pub fn root(&self) -> Result<Hash> {
-        hash_of(self.root_pk.as_ref().unwrap_or(&self.admin)).ok_or_else(|| anyhow::anyhow!("ключ корня приглашения не разобран"))
-    }
-    pub fn root_pk(&self) -> Result<Pk> { let pk = self.root_pk.unwrap_or(self.admin); hash_of(&pk).ok_or_else(|| anyhow::anyhow!("ключ корня приглашения не разобран"))?; Ok(pk) }
-
-    /// Дешёвый фильтр записи-кандидата до проверки полной цепочки.
-    pub fn enroll_hit(&self, me: &Pk, rec: &Record) -> bool {
-        rec.holder == *me && self.root().map(|root| rec.root == root).unwrap_or(false)
-            && self.admin_hash().map(|h| rec.issuer == h).unwrap_or(false)
-            && rec.signed_by(&self.admin) && rec.rights != 0 && rec.rights & !self.rights == 0
-            && rec.seq >= self.created.saturating_mul(1000)
-    }
-
-    pub fn admin_hash(&self) -> Result<Hash> {
-        hash_of(&self.admin).ok_or_else(|| anyhow::anyhow!("ключ приглашающего не разобран"))
-    }
-}
-
-pub fn pair_mac(pin: &[u8; 16], holder: &Pk, admin: &Pk, root: &Hash) -> [u8; 32] {
-    hmac32(pin, &[b"knothop-pair-v3", holder, admin, root])
-}
-
-pub fn mac_eq(key_pin: &[u8; 16], holder: &Pk, admin: &Pk, root: &Hash, tag: &[u8]) -> bool {
-    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key_pin).expect("hmac key");
-    m.update(b"knothop-pair-v3");
-    m.update(holder);
-    m.update(admin);
-    m.update(root);
-    m.verify_slice(tag).is_ok()
-}
-
-// ------------------------------------------------------------------------------------------------ учёт pin у админа
-
-/// Что нашлось на запрос зачисления.
-#[derive(Debug, PartialEq)]
-pub enum Claim {
-    /// pin свежий и только что погашен за этим держателем; права из приглашения
-    New { rights: u16, root: Hash },
-    /// тот же держатель повторяет уже погашенный pin (потерян ответ): запись пересылается, права не повышаются
-    Repeat { root: Hash },
-    /// pin уже погашен другим
-    Spent,
-    Expired,
-    Unknown,
-}
-
-fn pins_dir(state: &Path) -> PathBuf {
-    state.join("pins")
-}
-
-/// Замок учёта pin в процессе: погашение и создание pin идут по одному (S1). Межпроцессная гонка закрыта `create_new`
-/// на файле `.spent`: второй захват получает `AlreadyExists`.
-static PIN_LOCK: Mutex<()> = Mutex::new(());
-
-fn pin_lock() -> std::sync::MutexGuard<'static, ()> {
-    PIN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Каталог pin закрытый (0700): имя файла содержит pin, а это секрет.
-fn ensure_pins_dir(state: &Path) -> Result<PathBuf> {
-    let dir = pins_dir(state);
-    let created = match std::fs::create_dir(&dir) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(e) => return Err(e).context("создание закрытого каталога pin"),
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if created {
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).context("настройка прав каталога pin")?;
-        } else if std::fs::metadata(&dir).map(|m| m.permissions().mode() & 0o777).ok() != Some(0o700) {
-            bail!("каталог pin должен иметь права 0700");
-        }
-    }
-    Ok(dir)
-}
-
-/// Убрать неиспользованные pin старше срока (иначе просроченные файлы вечно занимают слоты MAX_PINS).
-/// Погашенные (`.spent`) держим в пределах того же срока: в это время возможен повтор держателя. Остатки временных файлов тоже убираем.
-fn pin_sweep(state: &Path, now_s: u64) {
-    let Ok(rd) = std::fs::read_dir(pins_dir(state)) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
-        let field = match p.extension().and_then(|x| x.to_str()) {
-            Some("json") => "c",
-            Some("spent") => "t",
-            Some("tmp") => {
-                let _ = std::fs::remove_file(&p);
-                continue;
-            }
-            _ => continue,
-        };
-        let stamp = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v[field].as_u64()).unwrap_or(0);
-        if now_s > stamp.saturating_add(INVITE_TTL_S) {
-            let _ = std::fs::remove_file(&p);
-        }
-    }
-}
-
-/// Создать одноразовый pin (файл `pins/<hex>.json`): запущенная нода подхватывает его при зачислении.
-pub fn pin_create(state: &Path, root: &Hash, rights: u16, label: &str, now_s: u64) -> Result<[u8; 16]> {
-        if rights & !ALL != 0 { bail!("приглашение: права приглашения ограничены прежней маской"); }
-    let _g = pin_lock();
-    let dir = ensure_pins_dir(state)?;
-    pin_sweep(state, now_s);
-    let open = std::fs::read_dir(&dir)?.flatten().filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false)).count();
-    if open >= MAX_PINS {
-        bail!("слишком много неиспользованных приглашений (не больше {MAX_PINS}): отзовите лишние");
-    }
-    let mut pin = [0u8; 16];
-    rand_core::OsRng.fill_bytes(&mut pin);
-    let body = serde_json::json!({"c": now_s, "r": rights, "l": label.chars().take(64).collect::<String>(), "root": hex(root)});
-    write_atomic(&dir.join(format!("{}.json", hex(&pin))), body.to_string().as_bytes())?;
-    Ok(pin)
-}
-
-/// Найти pin по доказательству `tag` и погасить за `holder`. Гашение атомарно: `.spent` создаётся с `create_new`,
-/// поэтому выиграть может только один захват. Повторное предъявление тем же держателем - `Repeat`, другим - `Spent`.
-/// Если выдача записи после `New` не удалась, вызывающий обязан вызвать `pin_unclaim` с теми же аргументами.
-pub fn pin_claim(state: &Path, admin: &Pk, holder: &Pk, tag: &[u8], now_s: u64) -> Claim {
-    let _g = pin_lock();
-    let dir = pins_dir(state);
-    let Ok(rd) = std::fs::read_dir(&dir) else { return Claim::Unknown };
-    for e in rd.flatten() {
-        let p = e.path();
-        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
-        if ext != "json" && ext != "spent" {
-            continue;
-        }
-        let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(String::from) else { continue };
-        let Ok(pin): std::result::Result<[u8; 16], _> = unhex(&stem).try_into() else { continue };
-        let Some(v) = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { continue };
-        let Ok(root): std::result::Result<Hash, _> = unhex(v["root"].as_str().unwrap_or("")).try_into() else { continue };
-        if !mac_eq(&pin, holder, admin, &root, tag) { continue; }
-        let spent = dir.join(format!("{stem}.spent"));
-        if spent.exists() {
-            let who = std::fs::read(&spent).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|v| v["h"].as_str().map(String::from)).unwrap_or_default();
-            let created = std::fs::read(&spent).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|v| v["c"].as_u64()).unwrap_or(0);
-            if now_s > created.saturating_add(INVITE_TTL_S) { return Claim::Expired; }
-            return if who == hex(holder) { Claim::Repeat { root } } else { Claim::Spent };
-        }
-        let open = dir.join(format!("{stem}.json"));
-        let created = v["c"].as_u64().unwrap_or(0);
-        if now_s.saturating_add(3600) < created || now_s > created.saturating_add(INVITE_TTL_S) {
-            return Claim::Expired;
-        }
-        let Some(raw_rights) = v["r"].as_u64() else { return Claim::Unknown };
-        if raw_rights > u16::MAX as u64 || (raw_rights as u16) & !ALL != 0 { return Claim::Unknown; }
-        let rights = raw_rights as u16;
-        // в метке сохраняем срок создания: при откате pin вернётся с тем же сроком
-        let mark = serde_json::json!({"h": hex(holder), "t": now_s, "c": created, "r": rights, "l": v["l"], "root": hex(&root)});
-        match write_new(&spent, mark.to_string().as_bytes()) {
-            Ok(()) => {}
-            // другой процесс погасил раньше
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Claim::Spent,
-            Err(_) => return Claim::Unknown,
-        }
-        sync_dir(&dir);
-        let _ = std::fs::remove_file(&open);
-        return Claim::New { rights, root };
-    }
-    Claim::Unknown
-}
-
-/// Откат гашения (H8): если выдача не удалась либо после `Repeat` ещё не найдена запись, pin возвращается.
-/// Возвращает `true` только если откат выполнен для того же держателя, который погасил pin.
-pub fn pin_unclaim(state: &Path, admin: &Pk, holder: &Pk, tag: &[u8]) -> bool {
-    let _g = pin_lock();
-    let dir = pins_dir(state);
-    let Ok(rd) = std::fs::read_dir(&dir) else { return false };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("spent") {
-            continue;
-        }
-        let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(String::from) else { continue };
-        let Ok(pin): std::result::Result<[u8; 16], _> = unhex(&stem).try_into() else { continue };
-        let Some(v) = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { return false };
-        let Ok(root): std::result::Result<Hash, _> = unhex(v["root"].as_str().unwrap_or("")).try_into() else { continue };
-        if !mac_eq(&pin, holder, admin, &root, tag) { continue; }
-        if v["h"].as_str() != Some(hex(holder).as_str()) {
-            return false;
-        }
-        // сначала возвращаем открытый файл, потом снимаем метку: при сбое между шагами pin остаётся погашенным (безопасная сторона)
-        let body = serde_json::json!({"c": v["c"], "r": v["r"], "l": v["l"], "root": hex(&root)});
-        match write_new(&dir.join(format!("{stem}.json")), body.to_string().as_bytes()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return false,
-        }
-        sync_dir(&dir);
-        if std::fs::remove_file(&p).is_err() {
-            // При частичном откате сохраняем погашенное состояние: оно всегда имеет приоритет над открытым файлом.
-            let _ = std::fs::remove_file(dir.join(format!("{stem}.json")));
-            sync_dir(&dir);
-            return false;
-        }
-        sync_dir(&dir);
-        return true;
-    }
-    false
-}
-
-/// Сводка pin для `list`: (hex pin без середины, состояние, метка).
-pub fn pin_list(state: &Path) -> Vec<(String, &'static str, String)> {
-    let _g = pin_lock();
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(pins_dir(state)) {
-        for e in rd.flatten() {
-            let p = e.path();
-            let st = if p.extension().map(|x| x == "spent").unwrap_or(false) { "погашен" } else { "свежий" };
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let label = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v["l"].as_str().map(String::from)).unwrap_or_default();
-            out.push((format!("{}…", &stem[..8.min(stem.len())]), st, label));
-        }
-    }
-    out.sort();
-    out
-}
-
-/// Корни со свежими, ещё не погашенными приглашениями. Ошибочные файлы пропускаются.
-pub fn pin_roots_fresh(state: &Path) -> Vec<Hash> {
-    let _g = pin_lock();
-    let now_s = now_ms() as u64 / 1000;
-    let mut roots = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(pins_dir(state)) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().map(|x| x == "json").unwrap_or(false) {
-                if p.with_extension("spent").exists() { continue; }
-                let root = std::fs::read(&p).ok()
-                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                    .and_then(|v| {
-                        let created = v["c"].as_u64()?;
-                        if now_s > created.saturating_add(INVITE_TTL_S) { return None; }
-                        <[u8; 16]>::try_from(unhex(v["root"].as_str()?)).ok()
-                    });
-                if let Some(root) = root {
-                    if !roots.contains(&root) { roots.push(root); }
-                }
-            }
-        }
-    }
-    roots.sort();
-    roots
-}
+pub use crate::enroll::Invite;
 
 #[cfg(test)]
 mod tests {
@@ -2759,230 +2437,21 @@ mod tests {
         assert!(tu.common(&r1.public_key_bytes(), USE, EXIT));
     }
 
-    #[test]
-    fn invite_roundtrip_checksum_and_ttl() {
-        let a = ident();
-        let inv = Invite { admin: a.public_key_bytes(), root_pk: None, pin: [7; 16], rights: PRESET_RELAY, created: 1_000_000, addrs: vec!["203.0.113.5:47001".into(), "example.org:47001".into()], nodes: vec![] };
-        let s = inv.encode().unwrap();
-        assert!(s.starts_with("kh-"));
-        assert_eq!(Invite::parse(&s).unwrap(), inv);
-        assert_eq!(Invite::parse(&format!(" {}\n", s.replace("-", "-"))).unwrap(), inv);
-        let mut bad = s.clone();
-        let last = bad.pop().unwrap();
-        bad.push(if last == 'A' { 'B' } else { 'A' });
-        assert!(Invite::parse(&bad).is_err());
-        assert!(Invite::parse("kh-").is_err());
-        assert!(Invite::parse("kha-AAAA").is_err());
-        assert!(inv.fresh(1_000_000 + 10));
-        assert!(!inv.fresh(1_000_000 + INVITE_TTL_S + 1));
-        assert!(!inv.fresh(1_000_000 - 7200), "из будущего");
-        let far_future = Invite { created: u64::MAX, ..inv.clone() };
-        assert!(!far_future.fresh(1_000_000), "переполнение не делает дальнее будущее свежим");
-        // pin в строке есть, но MAC от него не раскрывает pin
-        let m = inv.mac(&ident().public_key_bytes()).unwrap();
-        assert_ne!(&m[..16], &inv.pin);
-    }
 
-    #[test]
-    fn invite_v3_nodes_roundtrip_and_limits() {
-        let a = ident();
-        let mut inv = Invite { admin: a.public_key_bytes(), root_pk: None, pin: [9; 16], rights: PRESET_USER, created: 5_000_000, addrs: vec![], nodes: vec![[1; 16], [2; 16]] };
-        let s = inv.encode().unwrap();
-        assert_eq!(Invite::parse(&s).unwrap(), inv);
-        assert_eq!(Invite::parse(&s).unwrap().nodes.len(), 2);
-        // Без нод формат остаётся v3 с обязательным нулевым счётчиком.
-        inv.nodes.clear();
-        let v1 = inv.encode().unwrap();
-        assert_eq!(Invite::parse(&v1).unwrap(), inv);
-        assert!(v1.len() < s.len());
-        // больше 8 нод не обрезается молча
-        inv.nodes = (0..12u8).map(|i| [i + 1; 16]).collect();
-        assert!(inv.encode().is_err());
-        // повтор ноды отклоняется (собираем строку вручную)
-        let mut b = vec![2u8];
-        b.extend_from_slice(&inv.admin);
-        b.extend_from_slice(&inv.pin);
-        b.extend_from_slice(&inv.rights.to_le_bytes());
-        b.extend_from_slice(&inv.created.to_be_bytes());
-        b.push(0);
-        b.push(2);
-        b.extend_from_slice(&[3; 16]);
-        b.extend_from_slice(&[3; 16]);
-        let ck = Sha256::digest(&b);
-        b.extend_from_slice(&ck[..4]);
-        assert!(Invite::parse(&format!("kh-{}", b64e(&b))).is_err());
-    }
 
-    #[test]
-    fn invite_v3_delegated_worst_case_and_rejections() {
-        let admin = ident();
-        let root_id = ident();
-        let inv = Invite {
-            admin: admin.public_key_bytes(), root_pk: Some(root_id.public_key_bytes()), pin: [8; 16], rights: ALL,
-            created: 9_000_000, addrs: vec!["x".repeat(200); 4], nodes: (1..=8).map(|x| [x; 16]).collect(),
-        };
-        let b64 = inv.encode().unwrap();
-        assert_eq!(Invite::parse(&b64).unwrap(), inv);
-        assert_eq!(inv.root().unwrap(), *root_id.hash());
-        assert_eq!(inv.root_pk().unwrap(), root_id.public_key_bytes());
 
-        fn packed(mut b: Vec<u8>) -> String {
-            let n = b.len();
-            b.truncate(n - 4);
-            let ck = Sha256::digest(&b);
-            b.extend_from_slice(&ck[..4]);
-            format!("kh-{}", b64e(&b))
-        }
-        let own = Invite { root_pk: None, addrs: vec![], nodes: vec![], ..inv.clone() };
-        let base = own.body().unwrap();
-        for version in [1, 2] {
-            let mut b = base.clone(); b[0] = version;
-            assert!(Invite::parse(&packed(b)).is_err());
-        }
-        let mut b = base.clone(); b[1] = 2; assert!(Invite::parse(&packed(b)).is_err(), "лишние флаги");
-        let mut b = inv.body().unwrap(); b[66..130].copy_from_slice(&inv.admin); assert!(Invite::parse(&packed(b)).is_err(), "корень совпал с приглашающим");
-        let invalid = (0..=255u8).map(|x| [x; 64]).find(|pk| hash_of(pk).is_none()).expect("найдётся некорректный Ed25519-ключ");
-        let mut b = inv.body().unwrap(); b[66..130].copy_from_slice(&invalid);
-        assert!(Invite::parse(&packed(b)).is_err(), "неразбираемый root_pk");
-        let mut b = base.clone(); b.truncate(b.len() - 5); assert!(Invite::parse(&packed(b)).is_err(), "обрезка");
-        let mut b = base.clone(); b.insert(b.len() - 4, 0); assert!(Invite::parse(&packed(b)).is_err(), "лишние данные");
-        let mut b = base.clone(); b[82] = 0xff; b[83] = 0xff; assert!(Invite::parse(&packed(b)).is_err(), "лишние биты прав");
-        let mut b = base.clone(); b[base.len() - 5] = 9; assert!(Invite::parse(&packed(b)).is_err(), "больше 8 нод");
-        let duplicate_nodes = Invite { nodes: vec![[4;16], [4;16]], ..own.clone() };
-        assert!(duplicate_nodes.encode().is_err(), "повтор ноды");
-        let mut b = base.clone(); *b.last_mut().unwrap() ^= 1; assert!(Invite::parse(&format!("kh-{}", b64e(&b))).is_err(), "контрольная сумма");
-    }
 
-    #[test]
-    fn pair_mac_v3_binds_root_admin_holder_and_rejects_v1() {
-        let admin = ident().public_key_bytes(); let h = ident().public_key_bytes();
-        let (r1, r2) = ([1;16], [2;16]); let pin = [7;16];
-        let tag = pair_mac(&pin, &h, &admin, &r1);
-        assert!(mac_eq(&pin, &h, &admin, &r1, &tag));
-        assert!(!mac_eq(&pin, &h, &admin, &r2, &tag));
-        let h2 = ident().public_key_bytes(); assert!(!mac_eq(&pin, &h2, &admin, &r1, &tag));
-        let a2 = ident().public_key_bytes(); assert!(!mac_eq(&pin, &h, &a2, &r1, &tag));
-        let old = hmac32(&pin, &[b"knothop-pair-v1", &h, &admin]);
-        assert!(!mac_eq(&pin, &h, &admin, &r1, &old));
-    }
 
-    #[test]
-    fn delegated_enrollment_checks_full_chain_and_order() {
-        let (root_id, d, n) = (ident(), ident(), ident());
-        let root = *root_id.hash();
-        let mut rt = tr(&root_id);
-        let rd = rt.issue(root, d.public_key_bytes(), USE | ADD).unwrap();
-        let mut dt = tr(&d); dt.add_anchor(&root_id.public_key_bytes()).unwrap(); dt.offer(rd.clone());
-        let created = now_ms() as u64 / 1000;
-        let cand = dt.issue(root, n.public_key_bytes(), USE).unwrap();
-        assert!(cand.seq >= created.saturating_mul(1000));
-        let accepted = verify_enrollment(&n, &root_id.public_key_bytes(), 0, &cand, &[rd.clone()]).unwrap();
-        assert_eq!(accepted.len(), 2);
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &cand, &[]).is_err(), "нет R→D");
-        let mut wrong = cand.clone(); wrong.root = *ident().hash();
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &wrong, &[rd.clone()]).is_err());
-        let mut shuffled = vec![cand.clone(), rd.clone()];
-        assert_eq!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &cand, &shuffled).unwrap(), accepted);
-        shuffled.clear();
-        let inv = Invite { admin: d.public_key_bytes(), root_pk: Some(root_id.public_key_bytes()), pin: [1;16], rights: USE, created, addrs: vec![], nodes: vec![] };
-        assert!(inv.enroll_hit(&n.public_key_bytes(), &cand));
-        assert!(!inv.enroll_hit(&ident().public_key_bytes(), &cand));
-        let forged = Record::sign(&ident(), root, n.public_key_bytes(), USE, cand.seq + 1).unwrap();
-        assert!(!inv.enroll_hit(&n.public_key_bytes(), &forged));
 
-        let (d1, d2, n2) = (ident(), ident(), ident());
-        let mut rtrust = tr(&root_id); let rd1 = rtrust.issue(root, d1.public_key_bytes(), ALL).unwrap();
-        let mut d1trust = tr(&d1); d1trust.add_anchor(&root_id.public_key_bytes()).unwrap(); d1trust.offer(rd1.clone());
-        let rd2 = d1trust.issue(root, d2.public_key_bytes(), USE | ADD).unwrap();
-        let mut d2trust = tr(&d2); d2trust.add_anchor(&root_id.public_key_bytes()).unwrap();
-        d2trust.offer(rd1.clone()); d2trust.offer(rd2.clone());
-        let cand2 = d2trust.issue(root, n2.public_key_bytes(), USE).unwrap();
-        assert!(verify_enrollment(&n2, &root_id.public_key_bytes(), 0, &cand2, &[rd2.clone(), rd1.clone()]).is_ok(), "R→D1→D2→N, обратный порядок");
-    }
 
-    #[test]
-    fn enrollment_binds_holder_root_age_and_rejects_equivocation() {
-        let (root_id, d, n) = (ident(), ident(), ident());
-        let root = *root_id.hash();
-        let mut rt = tr(&root_id);
-        let rd = rt.issue(root, d.public_key_bytes(), USE | ADD).unwrap();
-        let created = now_ms() as u64 / 1000;
-        let cand = Record::sign(&d, root, n.public_key_bytes(), USE, now_ms() as u64).unwrap();
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), created, &cand, &[rd.clone()]).is_ok());
-        let mut noisy_chain = vec![rd.clone()];
-        for _ in 0..20 { noisy_chain.push(rt.issue(root, ident().public_key_bytes(), USE).unwrap()); }
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), created, &cand, &noisy_chain).is_ok(),
-            "много проверенных записей одного издателя не блокируют действующую цепочку");
-        assert!(verify_enrollment(&root_id, &root_id.public_key_bytes(), created, &cand, &[rd.clone()]).is_err(), "собственный root не может быть принят как зачисление");
-        assert!(verify_enrollment(&ident(), &root_id.public_key_bytes(), created, &cand, &[rd.clone()]).is_err(), "держатель обязан совпасть с identity");
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), created + 1, &cand, &[rd.clone()]).is_err(), "seq ниже created");
-        let future = Record::sign(&d, root, n.public_key_bytes(), USE, now_ms() as u64 + SEQ_FUTURE_MS + 10_000).unwrap();
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), created, &future, &[rd.clone()]).is_err(), "seq из будущего");
-        let conflicting = Record::sign(&d, root, n.public_key_bytes(), USE | ADD, cand.seq).unwrap();
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), created, &cand, &[rd, conflicting]).is_err(), "одна версия с разными правами отвергается целиком");
-    }
 
-    #[test]
-    fn invite_vectors_for_jvm_parser() {
-        let a = Identity::from_private_key_bytes(&[0x31; 64]).expect("только синтетический тестовый ключ");
-        let root = Identity::from_private_key_bytes(&[0x52; 64]).expect("только синтетический тестовый ключ");
-        let own = Invite { admin: a.public_key_bytes(), root_pk: None, pin: [0x11; 16], rights: USE, created: 1_800_000_000, addrs: vec![], nodes: vec![] };
-        let delegated = Invite { admin: a.public_key_bytes(), root_pk: Some(root.public_key_bytes()), pin: [0x22; 16], rights: USE | ADD,
-            created: 1_800_000_001, addrs: vec![], nodes: vec![] };
-        let content = format!("own\t{}\ndelegated\t{}\n", own.encode().unwrap(), delegated.encode().unwrap());
-        assert_eq!(Invite::parse(&own.encode().unwrap()).unwrap(), own);
-        assert_eq!(Invite::parse(&delegated.encode().unwrap()).unwrap(), delegated);
-        // Экспорт синтетических векторов нужен только внешней JVM-проверке.
-        // Обычный тест не зависит от доступности каталога конкретной сессии агента.
-        if let Some(path) = std::env::var_os("KNOTHOP_JVM_VECTORS") {
-            let path = Path::new(&path);
-            if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).unwrap(); }
-            std::fs::write(path, content).unwrap();
-        }
-    }
 
-    #[test]
-    fn enrollment_rejects_missing_authority_wrong_signature_and_revocation() {
-        let (root_id, d, n) = (ident(), ident(), ident()); let root = *root_id.hash();
-        let mut rt = tr(&root_id);
-        let no_add = rt.issue(root, d.public_key_bytes(), USE).unwrap();
-        let forged_grant = Record::sign(&d, root, n.public_key_bytes(), USE, now_ms() as u64).unwrap();
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &forged_grant, &[no_add]).is_err(), "издателю нужен ADD");
 
-        let rd = rt.issue(root, d.public_key_bytes(), USE | ADD).unwrap();
-        let cand = Record::sign(&d, root, n.public_key_bytes(), USE, now_ms() as u64).unwrap();
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &cand, &[rd.clone()]).is_ok());
-        let overgrant = Record::sign(&d, root, n.public_key_bytes(), EXIT, now_ms() as u64).unwrap();
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &overgrant, &[rd.clone()]).is_err(), "D не имеет EXIT");
-        assert!(verify_enrollment(&n, &ident().public_key_bytes(), 0, &cand, &[rd.clone()]).is_err(), "не тот root_pk");
-        let mut bad_sig = cand.clone(); bad_sig.sig[0] ^= 1;
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &bad_sig, &[rd.clone()]).is_err());
-        let mut bad_issuer = cand.clone(); bad_issuer.issuer = *root_id.hash();
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &bad_issuer, &[rd.clone()]).is_err());
-        let too_old = Record::sign(&d, root, n.public_key_bytes(), USE, 1).unwrap();
-        let inv = Invite { admin: d.public_key_bytes(), root_pk: Some(root_id.public_key_bytes()), pin: [0;16], rights: USE,
-            created: now_ms() as u64 / 1000, addrs: vec![], nodes: vec![] };
-        assert!(!inv.enroll_hit(&n.public_key_bytes(), &too_old), "seq раньше приглашения");
 
-        rt.issue(root, d.public_key_bytes(), 0).unwrap();
-        let mut chain = rt.export_all(); chain.push(rd.clone());
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &cand, &chain).is_err(), "свежий отзыв D корнем");
-        rt.issue(root, n.public_key_bytes(), 0).unwrap();
-        let mut chain = rt.export_all(); chain.push(rd.clone());
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &cand, &chain).is_err(), "корневой отзыв N перекрывает выдачу D");
-        let noise_root = ident(); let noise_holder = ident();
-        let noise = Record::sign(&noise_root, *noise_root.hash(), noise_holder.public_key_bytes(), USE, 5).unwrap();
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &cand, &[rd.clone(), noise]).is_ok(), "посторонняя сеть игнорируется");
 
-        let ids: Vec<Identity> = (0..9).map(|_| ident()).collect();
-        let mut deep = Vec::new();
-        deep.push(Record::sign(&root_id, root, ids[0].public_key_bytes(), ALL, now_ms() as u64).unwrap());
-        for i in 1..ids.len() {
-            deep.push(Record::sign(&ids[i - 1], root, ids[i].public_key_bytes(), ALL, now_ms() as u64 + i as u64).unwrap());
-        }
-        let deep_cand = Record::sign(ids.last().unwrap(), root, n.public_key_bytes(), USE, now_ms() as u64 + 20).unwrap();
-        assert!(verify_enrollment(&n, &root_id.public_key_bytes(), 0, &deep_cand, &deep).is_err(), "цепочка глубины 9 недействительна");
-    }
+
+
+
 
     #[test]
     fn issue_requires_add_subset_and_depth_budget() {
@@ -3014,60 +2483,9 @@ mod tests {
         assert!(e.contains("глубин"), "понятная ошибка глубины: {e}");
     }
 
-    #[test]
-    fn pins_spend_once_and_repeat_only_for_same_holder() {
-        let dir = std::env::temp_dir().join(format!("knothop-pins-{}-{}", std::process::id(), now_ms()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let admin = ident();
-        let (n1, n2) = (ident(), ident());
-        let now = 5_000_000u64;
-        let root = *admin.hash();
-        let pin = pin_create(&dir, &root, PRESET_RELAY, "n1", now).unwrap();
-        let inv = Invite { admin: admin.public_key_bytes(), root_pk: None, pin, rights: PRESET_RELAY, created: now, addrs: vec![], nodes: vec![] };
-        let (p1, p2) = (n1.public_key_bytes(), n2.public_key_bytes());
-        let missing_root_pin = pin_create(&dir, &root, USE, "missing-root", now).unwrap();
-        let missing_path = pins_dir(&dir).join(format!("{}.json", hex(&missing_root_pin)));
-        let mut missing: serde_json::Value = serde_json::from_slice(&std::fs::read(&missing_path).unwrap()).unwrap();
-        missing.as_object_mut().unwrap().remove("root");
-        std::fs::write(&missing_path, missing.to_string()).unwrap();
-        let missing_mac = pair_mac(&missing_root_pin, &p1, &inv.admin, &root);
-        assert_eq!(pin_claim(&dir, &inv.admin, &p1, &missing_mac, now), Claim::Unknown, "старый pin без корня отвергается");
-        // неверный pin
-        let wrong = pair_mac(&[1; 16], &p1, &inv.admin, &root);
-        assert_eq!(pin_claim(&dir, &inv.admin, &p1, &wrong, now), Claim::Unknown);
-        // доказательство привязано к держателю: чужой MAC не сойдётся
-        assert_eq!(pin_claim(&dir, &inv.admin, &p2, &inv.mac(&p1).unwrap(), now), Claim::Unknown);
-        assert_eq!(pin_claim(&dir, &inv.admin, &p1, &inv.mac(&p1).unwrap(), now), Claim::New { rights: PRESET_RELAY, root });
-        // второй сервер с тем же приглашением (свой ключ) - отказ
-        assert_eq!(pin_claim(&dir, &inv.admin, &p2, &inv.mac(&p2).unwrap(), now), Claim::Spent);
-        // тот же держатель повторяет - пересылка записи
-        assert_eq!(pin_claim(&dir, &inv.admin, &p1, &inv.mac(&p1).unwrap(), now), Claim::Repeat { root });
-        // просроченный
-        let old = pin_create(&dir, &root, USE, "old", now).unwrap();
-        let inv2 = Invite { pin: old, ..inv.clone() };
-        assert_eq!(pin_claim(&dir, &inv2.admin, &p2, &inv2.mac(&p2).unwrap(), now + INVITE_TTL_S + 10), Claim::Expired);
-        assert!(pin_list(&dir).iter().any(|(_, st, l)| *st == "погашен" && l == "n1"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    #[test]
-    fn expired_unspent_pins_free_slots() {
-        let dir = std::env::temp_dir().join(format!("knothop-pinsweep-{}-{}", std::process::id(), now_ms()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let t0 = 5_000_000u64;
-        // заполняем все слоты, затем срок истёк: новый pin создаётся, старые неиспользованные удалены
-        let root = [0x55; 16];
-        for _ in 0..MAX_PINS {
-            pin_create(&dir, &root, USE, "old", t0).unwrap();
-        }
-        assert!(pin_create(&dir, &root, USE, "full", t0).is_err());
-        let later = t0 + INVITE_TTL_S + 10;
-        let fresh = pin_create(&dir, &root, USE, "new", later).unwrap();
-        let open = std::fs::read_dir(pins_dir(&dir)).unwrap().flatten().filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false)).count();
-        assert_eq!(open, 1);
-        assert!(pin_list(&dir).iter().any(|(s, st, l)| *st == "свежий" && l == "new" && s.starts_with(&hex(&fresh)[..8])));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+
+
 
     #[test]
     fn tags_cover_all_anchors() {
@@ -3250,118 +2668,21 @@ mod tests {
 
     /// S6: файлы состояния 0600, каталог pin 0700.
     #[cfg(unix)]
-    #[test]
-    fn state_files_are_private() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("knothop-trust-mode-{}-{}", std::process::id(), now_ms()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let a = ident();
-        let t = Trust::new(a.clone(), Some(dir.join("trust.json")));
-        t.save().unwrap();
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&dir.join("trust.json")), 0o600);
-        pin_create(&dir, &[9; 16], USE, "m", 5_000_000).unwrap();
-        assert_eq!(mode(&pins_dir(&dir)), 0o700);
-        let f = std::fs::read_dir(pins_dir(&dir)).unwrap().flatten().next().unwrap().path();
-        assert_eq!(mode(&f), 0o600);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+
 
     /// S1: восемь держателей стартуют одновременно с одним pin: ровно один получает New, остальные Spent.
-    #[test]
-    fn concurrent_claims_give_one_pin_to_one_holder() {
-        let dir = std::env::temp_dir().join(format!("knothop-pin-race-{}-{}", std::process::id(), now_ms()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let admin = ident();
-        let now = 5_000_000u64;
-        let root = *admin.hash();
-        let pin = pin_create(&dir, &root, PRESET_USER, "race", now).unwrap();
-        let inv = Invite { admin: admin.public_key_bytes(), root_pk: None, pin, rights: PRESET_USER, created: now, addrs: vec![], nodes: vec![] };
-        let holders: Vec<Pk> = (0..8).map(|_| ident().public_key_bytes()).collect();
-        let barrier = std::sync::Barrier::new(holders.len());
-        let res: Vec<Claim> = std::thread::scope(|s| {
-            let hs: Vec<_> = holders.iter().map(|h| {
-                let (dir, inv, barrier) = (&dir, &inv, &barrier);
-                s.spawn(move || {
-                    let tag = inv.mac(h).unwrap();
-                    barrier.wait();
-                    pin_claim(dir, &inv.admin, h, &tag, now)
-                })
-            }).collect();
-            hs.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        assert_eq!(res.iter().filter(|c| matches!(c, Claim::New { .. })).count(), 1, "{res:?}");
-        assert_eq!(res.iter().filter(|c| **c == Claim::Spent).count(), holders.len() - 1, "{res:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+
 
     /// H8: если выдача после New не удалась, pin возвращается; откат чужим держателем не действует.
-    #[test]
-    fn unclaim_returns_pin_after_failed_issue() {
-        let dir = std::env::temp_dir().join(format!("knothop-pin-unclaim-{}-{}", std::process::id(), now_ms()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let admin = ident();
-        let (n1, n2) = (ident(), ident());
-        let now = 5_000_000u64;
-        let root = *admin.hash();
-        let pin = pin_create(&dir, &root, PRESET_USER, "u", now).unwrap();
-        let inv = Invite { admin: admin.public_key_bytes(), root_pk: None, pin, rights: PRESET_USER, created: now, addrs: vec![], nodes: vec![] };
-        let (p1, p2) = (n1.public_key_bytes(), n2.public_key_bytes());
-        assert_eq!(pin_claim(&dir, &inv.admin, &p1, &inv.mac(&p1).unwrap(), now), Claim::New { rights: PRESET_USER, root });
-        assert!(!pin_unclaim(&dir, &inv.admin, &p2, &inv.mac(&p2).unwrap()), "чужой держатель откатить не может");
-        assert_eq!(pin_claim(&dir, &inv.admin, &p1, &inv.mac(&p1).unwrap(), now), Claim::Repeat { root }, "имитация падения до issue");
-        assert!(pin_unclaim(&dir, &inv.admin, &p1, &inv.mac(&p1).unwrap()));
-        assert_eq!(pin_claim(&dir, &inv.admin, &p2, &inv.mac(&p2).unwrap(), now), Claim::New { rights: PRESET_USER, root });
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+
 
     /// Погашенный pin помнится в пределах срока (повтор держателя), после срока уборка его убирает.
-    #[test]
-    fn spent_pin_repeat_within_ttl_then_dropped() {
-        let dir = std::env::temp_dir().join(format!("knothop-pin-ttl-{}-{}", std::process::id(), now_ms()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let admin = ident();
-        let n1 = ident().public_key_bytes();
-        let now = 5_000_000u64;
-        let root = *admin.hash();
-        let pin = pin_create(&dir, &root, PRESET_USER, "t", now).unwrap();
-        let inv = Invite { admin: admin.public_key_bytes(), root_pk: None, pin, rights: PRESET_USER, created: now, addrs: vec![], nodes: vec![] };
-        assert!(matches!(pin_claim(&dir, &inv.admin, &n1, &inv.mac(&n1).unwrap(), now), Claim::New { .. }));
-        assert_eq!(pin_claim(&dir, &inv.admin, &n1, &inv.mac(&n1).unwrap(), now + 60), Claim::Repeat { root });
-        assert_eq!(pin_claim(&dir, &inv.admin, &n1, &inv.mac(&n1).unwrap(), now + INVITE_TTL_S + 1), Claim::Expired,
-            "Repeat после срока не должен оживлять приглашение");
-        pin_create(&dir, &root, USE, "sweep", now + INVITE_TTL_S + 10).unwrap();
-        assert_eq!(pin_claim(&dir, &inv.admin, &n1, &inv.mac(&n1).unwrap(), now + INVITE_TTL_S + 10), Claim::Unknown);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    #[test]
-    fn invite_encoding_is_strict_and_pin_rights_are_bounded() {
-        let admin = ident();
-        let invalid = Invite { admin: admin.public_key_bytes(), root_pk: None, pin: [1; 16], rights: USE, created: 1,
-            addrs: vec!["a".into(); 5], nodes: vec![] };
-        assert!(invalid.encode().unwrap_err().to_string().contains("4 адресов"));
-        let invalid = Invite { addrs: vec!["x".repeat(201)], ..invalid.clone() };
-        assert!(invalid.encode().is_err());
-        let dir = std::env::temp_dir().join(format!("knothop-pin-rights-{}-{}", std::process::id(), now_ms()));
-        assert!(pin_create(&dir, admin.hash(), ALL | 0x8000, "bad", 5_000_000).is_err());
-    }
+
+
 
     #[cfg(unix)]
-    #[test]
-    fn pin_errors_do_not_disclose_pin_filename() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("knothop-pin-redact-{}-{}", std::process::id(), now_ms()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = [0x73; 16];
-        let pin = pin_create(&dir, &root, USE, "safe", 5_000_000).unwrap();
-        std::fs::set_permissions(pins_dir(&dir), std::fs::Permissions::from_mode(0o500)).unwrap();
-        let err = pin_create(&dir, &root, USE, "failure", 5_000_001).unwrap_err();
-        let rendered = format!("{err:#}");
-        assert!(!rendered.contains(&hex(&pin)), "ошибка не должна раскрывать hex имени pin");
-        std::fs::set_permissions(pins_dir(&dir), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+
 
     // ----------------------------------------------------------------- политика (0015)
 

@@ -32,24 +32,20 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Приглашение в три страницы: 1) входные ноды (где у вас права администратора; по умолчанию ничего не выбрано, одна галочка «все»),
- * 2) права (по умолчанию пресет «Пользователь»), 3) готовое приглашение: QR и строка.
+ * Приглашение v4 (ADR 0019) в три страницы: 1) ноды, которые выдадут права (1-8; где у вас права администратора; по умолчанию ничего не выбрано, одна галочка «все»),
+ * 2) права (USE, TRANSIT, EXIT; по умолчанию пресет «Пользователь»), 3) готовое приглашение: QR и строка. Приглашение действует 48 часов.
  * Подтверждение выпуска — обычное подтверждение в интерфейсе; системная биометрия не используется. Приглашение живёт только в памяти этого экрана: при выходе (назад, смена приложения)
  * строка и картинка стираются, экран закрыт от снимков (FLAG_SECURE), в буфер обмена само ничего не кладётся, в журнал не пишется.
- * Одноразовый pin остаётся на телефоне до зачисления (state/pins): без него приглашение нечем погасить.
+ * Каждая выбранная нода сама хранит одноразовое разрешение (хеш pin): держать телефон подключённым после выпуска не нужно.
  */
 public final class InviteActivity extends Activity {
-    private static final String[] R_NAME = {"use", "transit", "exit", "add", "remove", "config"};
+    private static final String[] R_NAME = {"use", "transit", "exit"};
     private static final String[] R_TEXT = {
         "USE — пользоваться сетью",
         "TRANSIT — пропускать чужой трафик",
-        "EXIT — быть выходом в интернет",
-        "ADD — зачислять новых",
-        "REMOVE — отзывать права",
-        "CONFIG — менять настройки сети"};
-    private static final boolean[] P_USER = {true, false, false, false, false, false};
-    private static final boolean[] P_SERVER = {true, true, true, true, false, false};
-    private static final boolean[] P_ADMIN = {true, true, true, true, true, true};
+        "EXIT — быть выходом в интернет"};
+    private static final boolean[] P_USER = {true, false, false};
+    private static final boolean[] P_SERVER = {true, true, true};
 
     private LinearLayout box;
     private int page;
@@ -122,10 +118,12 @@ public final class InviteActivity extends Activity {
         nodeBoxes.clear();
         box.addView(text("Пригласить: шаг 1 из 2", 20, true));
         if (nodes.isEmpty()) {
-            box.addView(text("Нод с правами администратора пока не видно. Нажмите «Подключить» на главном экране и подождите, пока появятся ноды. "
-                    + "Если в сети ещё нет ни одной ноды, приглашение можно выпустить без выбора: оно подойдёт для первой ноды.", 14, false));
+            box.addView(text("Нод с правами администратора пока не видно. Нажмите «Подключить» на главном экране и подождите, пока появятся ноды: "
+                    + "приглашение выдают сами ноды, выбрать нужно хотя бы одну.", 14, false));
+            box.addView(button("Назад", v -> finish()));
+            return;
         } else {
-            box.addView(text("Выберите ноды, через которые приглашённый сможет войти. К остальным он обращаться не будет.", 14, false));
+            box.addView(text("Выберите ноды (от 1 до 8): каждая из них сама выдаст приглашённому права. К остальным он обращаться не будет.", 14, false));
             CheckBox all = new CheckBox(this);
             all.setText("Выбрать все");
             box.addView(all);
@@ -155,7 +153,7 @@ public final class InviteActivity extends Activity {
         box.addView(button("Далее", v -> {
             chosen.clear();
             for (CheckBox c : nodeBoxes) if (c.isChecked()) chosen.add((String) c.getTag());
-            if (!nodes.isEmpty() && chosen.isEmpty()) {
+            if (chosen.isEmpty()) {
                 android.widget.Toast.makeText(this, "Отметьте хотя бы одну ноду", android.widget.Toast.LENGTH_SHORT).show();
                 return;
             }
@@ -173,15 +171,13 @@ public final class InviteActivity extends Activity {
         page = 2;
         box.removeAllViews();
         box.addView(text("Пригласить: шаг 2 из 2", 20, true));
-        box.addView(text("Права приглашённого. По умолчанию — обычный пользователь: только пользоваться выходом.", 14, false));
+        box.addView(text("Права приглашённого. По умолчанию — обычный пользователь: только пользоваться выходом. Право приглашать и менять настройки по приглашению не выдаётся.", 14, false));
         RadioGroup g = new RadioGroup(this);
         RadioButton rUser = radio("Пользователь (только выход)");
-        RadioButton rServer = radio("Сервер (relay: выход, транзит, зачисление)");
-        RadioButton rAdmin = radio("Администратор (все права)");
+        RadioButton rServer = radio("Сервер (выход и транзит)");
         RadioButton rCustom = radio("Свой набор");
         g.addView(rUser);
         g.addView(rServer);
-        g.addView(rAdmin);
         g.addView(rCustom);
         box.addView(g);
         final CheckBox[] cb = new CheckBox[R_NAME.length];
@@ -198,14 +194,14 @@ public final class InviteActivity extends Activity {
             box.addView(cb[i]);
         }
         g.setOnCheckedChangeListener((grp, id) -> {
-            boolean[] src = id == rUser.getId() ? P_USER : id == rServer.getId() ? P_SERVER : id == rAdmin.getId() ? P_ADMIN : null;
+            boolean[] src = id == rUser.getId() ? P_USER : id == rServer.getId() ? P_SERVER : null;
             if (src == null) return;
             bulk[0] = true;
             for (int i = 0; i < cb.length; i++) { rights[i] = src[i]; cb[i].setChecked(src[i]); }
             bulk[0] = false;
         });
         g.check(rUser.getId());
-        TextView warn = text("Выдать можно только те права, что есть у вас. Приглашение одноразовое и действует 30 дней.", 12, false);
+        TextView warn = text("Выдать можно только те права, что есть у вас. Приглашение одноразовое и действует 48 часов.", 12, false);
         box.addView(warn);
         box.addView(button("Создать приглашение", v -> {
             if (busy) return;
@@ -233,13 +229,12 @@ public final class InviteActivity extends Activity {
 
     // ---------------------------------------------------------------- выпуск и страница 3
 
-    // TODO: выбор сети (--root <hash>) для делегированного приглашения: появится вместе с CLI (этап B). Тогда здесь брать корень, где у меня есть ADD; пока всегда свой корень.
+    // Корень сети - свой: приглашение выпускает администратор своей сети.
     private void create() {
         busy = true;
         box.removeAllViews();
         box.addView(text("Создаю приглашение…", 16, false));
         final String r = rightsText();
-        final String label = "use".equals(r) ? "user" : "relay".equals(r) ? "server" : "custom";
         final String nodeArg = String.join(",", chosen);
         new Thread(() -> {
             File st = new File(getFilesDir(), "state");
@@ -249,8 +244,8 @@ public final class InviteActivity extends Activity {
             out.delete();
             int rc = Native.runVpn("whoami --state " + sd, sd);
             if (rc == 0) {
-                rc = Native.runVpn("invite --state " + sd + " --rights " + r + " --label " + label
-                        + (nodeArg.isEmpty() ? "" : " --nodes " + nodeArg) + " --out " + out.getAbsolutePath(), sd);
+                rc = Native.runVpn("invite --state " + sd + " --rights " + r
+                        + " --nodes " + nodeArg + " --out " + out.getAbsolutePath(), sd);
             }
             final String res = rc == 0 ? Util.read(out).trim() : "ошибка: " + Util.read(new File(st, "error.txt"));
             out.delete();
@@ -276,12 +271,12 @@ public final class InviteActivity extends Activity {
         box.removeAllViews();
         box.addView(text("Приглашение готово", 20, true));
         box.addView(text("Отсканируйте QR камерой второго телефона (кнопка «Сканировать QR» в приложении) или отправьте строку. "
-                + "Приглашение одноразовое, 30 дней. Пока приглашённый не зачислится, держите приложение подключённым. "
+                + "Приглашение одноразовое, действует 48 часов; новичок увидит права и срок и должен согласиться. "
                 + "При выходе с этого экрана приглашение исчезнет и больше нигде не хранится.", 13, false));
         qrView = new ImageView(this);
         qrView.setAdjustViewBounds(true);
         try {
-            // v3 делегированное: ~440 символов base64 (своё ~130); при 900 px ZXing берёт версию QR сам (449 символов - v16, 1468 - v32)
+            // v4: от 59 (1 нода) до 208 (8 нод) символов; при 900 px ZXing берёт версию QR сам
             qr = renderQr(Profile.LINK + inv.substring(3), 900);
             qrView.setImageBitmap(qr);
         } catch (Throwable e) {

@@ -46,6 +46,7 @@ impl Wire {
 
 #[derive(Clone)]
 pub struct Outbound {
+    pub title: Vec<u8>,
     pub pk: Pk,
     pub content: Vec<u8>,
     pub gate: Gate,
@@ -67,7 +68,7 @@ pub fn register(state: &Path, sender: Sender) -> Guard {
     RUNTIMES.get_or_init(Default::default).lock().unwrap().insert(key.clone(), sender);
     Guard(key)
 }
-fn submit(state: &Path, command: Command) -> bool {
+pub(super) fn submit(state: &Path, command: Command) -> bool {
     RUNTIMES.get().and_then(|r| r.lock().unwrap().get(&key(state)).cloned())
         .is_some_and(|s| s.try_send(command).is_ok())
 }
@@ -81,7 +82,7 @@ pub fn send(state: &Path, pk: Pk, records: &[Record], policies: &[Policy], gate:
         policies:policies.iter().map(|p| super::hex(&p.wire())).collect(), ack:None, dir:vec![] };
     let Ok(content) = serde_json::to_vec(&wire) else { return false };
     if content.len() > super::lxmf_admin::MAX_ADMIN_CONTENT { return false; }
-    submit(state, Command::Send(Outbound { pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
+    submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
 }
 
 /// Каталог нод одним сообщением. Gate проверяет, что получатель всё ещё допустимый адресат: без ожидания mutex, как у записей.
@@ -94,7 +95,7 @@ pub fn send_dir(state: &Path, pk: Pk, mut dir: Vec<serde_json::Value>, gate: Gat
         if content.len() <= super::lxmf_admin::MAX_ADMIN_CONTENT { break content; }
         dir.pop();
     };
-    submit(state, Command::Send(Outbound { pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
+    submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
 }
 
 pub fn policy_visible(tr: &trust::Trust, p: &Policy, peer: &Pk) -> bool {
@@ -137,7 +138,7 @@ pub fn authenticated(message: &Message, me: &[u8;16], pk: &Pk) -> bool {
 
 pub fn acknowledge(state: &Path, message: &Message, pk: Pk) {
     let content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some(digest(&message.content)), dir:vec![] }).unwrap();
-    submit(state, Command::Send(Outbound { pk, content, gate:Arc::new(|| Some(true)), exp:super::now_ms() as u64/1000+TTL, ack:true }));
+    submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate:Arc::new(|| Some(true)), exp:super::now_ms() as u64/1000+TTL, ack:true }));
 }
 pub fn received_ack(state: &Path, source: [u8;16], digest: String) {
     submit(state, Command::Acknowledged { source, digest });
@@ -201,40 +202,176 @@ impl<A: leviculum_std::api::CoreProcessor, B: leviculum_std::api::CoreProcessor>
     }
 }
 
-/// Штатный PN engine, а не ещё один протокол хранилища. Только серверы;
-/// постоянный store вне стираемого lev-role, 8 МиБ, bounded transfer/fetch.
-pub fn propagation_processor(state: &Path, identity: Identity) -> anyhow::Result<impl leviculum_std::api::CoreProcessor> {
+/// Потолок PN-хранилища. Медиана записи ≈272 Б (T_REC/T_POL, закрытия, proof), т. е. ≈7,7 тыс. сообщений;
+/// при переполнении движок сам вытесняет (`make_room`), корректность прав от PN не зависит (trust.json, enroll Store).
+pub const PN_CAP_BYTES: u64 = 2 * 1024 * 1024;
+/// Сколько файлов вообще имеет смысл открывать: потолок / минимально реальная запись (≈256 Б). Остальное удаляется по имени, без чтения.
+pub const PN_MAX_FILES: usize = 8192;
+const PN_LOADING: u8 = 1;
+const PN_READY: u8 = 2;
+const PN_FAILED: u8 = 3;
+
+/// Состояние PN для status.json. Пишет фоновая загрузка и процессор, читает только статус (не горячий путь).
+#[derive(Default)]
+pub struct PnStatus {
+    state: std::sync::atomic::AtomicU8,
+    load_ms: std::sync::atomic::AtomicU64,
+    trimmed: std::sync::atomic::AtomicU64,
+    files: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+static PN_CURRENT: Mutex<Option<Arc<PnStatus>>> = Mutex::new(None);
+
+/// Поля `pn_*` для блока `pol` в status.json.
+pub fn pn_status() -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let current = PN_CURRENT.lock().ok().and_then(|g| g.clone());
+    let Some(s) = current else { return serde_json::json!({"pn_state":"off","pn_ready":false,"pn_load_ms":0,"pn_trimmed":0,"pn_files":0,"pn_bytes":0}) };
+    let state = s.state.load(Relaxed);
+    serde_json::json!({"pn_state":match state { PN_LOADING=>"loading", PN_READY=>"ready", PN_FAILED=>"failed", _=>"off" },
+        "pn_ready":state == PN_READY, "pn_load_ms":s.load_ms.load(Relaxed), "pn_trimmed":s.trimmed.load(Relaxed),
+        "pn_files":s.files.load(Relaxed), "pn_bytes":s.bytes.load(Relaxed)})
+}
+
+/// (received_at, sequence) из имени файла хранилища `<64hex>_<received_at>[_<stamp>[_<seq>]]`; чужие имена — `None`.
+fn name_key(name: &str) -> Option<(u64, u64)> {
+    let mut parts = name.split('_');
+    let id = parts.next()?;
+    if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+    let raw = parts.next()?;
+    let ts = match raw.parse::<u64>() {
+        Ok(t) => t,
+        Err(_) => { let f = raw.parse::<f64>().ok()?; if !f.is_finite() || f < 0.0 || f >= u64::MAX as f64 { return None; } f.trunc() as u64 }
+    };
+    let _stamp = parts.next();
+    let seq = parts.next().map_or(Some(0), |s| s.parse::<u64>().ok())?;
+    parts.next().is_none().then_some((ts, seq))
+}
+
+/// Предварительная чистка каталога по ИМЕНАМ, без чтения и stat: просроченные (`expiry`) и самые старые сверх `max_files`.
+/// `FilePropagationStore::open` читает каждый файл (на вращающемся диске ≈165 файл/с), поэтому лишнее удаляется до него.
+/// Непарсящиеся имена (временные, маркер, чужие) не трогаются. Возвращает число удалённых файлов.
+fn trim_by_name(dir: &Path, now: u64, expiry: u64, max_files: usize) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let (mut keep, mut removed) = (Vec::new(), 0);
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Some((ts, seq)) = name_key(&name) else { continue };
+        if now.saturating_sub(ts) > expiry {
+            if std::fs::remove_file(entry.path()).is_ok() { removed += 1; }
+        } else { keep.push((ts, seq, entry.path())); }
+    }
+    if keep.len() > max_files {
+        keep.sort_unstable();
+        for (_, _, path) in &keep[..keep.len() - max_files] { if std::fs::remove_file(path).is_ok() { removed += 1; } }
+    }
+    removed
+}
+
+/// Вытеснить самые старые записи, пока сумма размеров > `cap`. Сумму считаем сами: `free_space()` при `used > capacity`
+/// у файлового хранилища вычитает с переполнением, а `open` потолок не проверяет.
+fn fit<S: leviculum_lxmf::propagation_store::PropagationStore>(store: &mut S, cap: u64) -> usize {
+    let (mut used, mut all) = (0u64, Vec::new());
+    let _ = store.for_each(&mut |m| { used += m.size as u64; all.push((m.received_at, m.sequence, m.transient_id, m.size)); });
+    if used <= cap { return 0; }
+    all.sort_unstable_by_key(|e| (e.0, e.1));
+    let mut purged = 0;
+    for (_, _, id, size) in all {
+        if used <= cap { break; }
+        // purge убирает запись из индекса и при ошибке удаления файла: учёт верен в обоих случаях
+        let _ = store.purge(&id);
+        used -= size as u64;
+        purged += 1;
+    }
+    purged
+}
+
+struct Loaded { engine: lnpnd::engine::Engine<leviculum_std::FilePropagationStore>, events: mpsc::Receiver<lnpnd::engine::EngineEvent> }
+enum PnPhase { Loading(mpsc::Receiver<Loaded>), Ready(Box<Loaded>), Failed }
+
+/// PN-движок, собираемый в фоне: `FilePropagationStore::open` читает каждый файл, на вращающемся диске это минуты
+/// и раньше блокировало старт узла (W110). Пока движок не готов, события и тики PN-части пропускаются; на горячем пути
+/// только `try_recv` без блокировок.
+pub struct PnProcessor { phase: PnPhase, status: Arc<PnStatus> }
+impl PnProcessor {
+    /// Забрать готовый движок, если фон закончил. `true` — PN обслуживает события.
+    pub fn poll_ready(&mut self) -> bool {
+        if let PnPhase::Loading(rx) = &self.phase {
+            let got = rx.try_recv();
+            match got {
+                Ok(loaded) => { self.phase = PnPhase::Ready(Box::new(loaded)); self.status.state.store(PN_READY, std::sync::atomic::Ordering::Relaxed); }
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => { self.phase = PnPhase::Failed; self.status.state.store(PN_FAILED, std::sync::atomic::Ordering::Relaxed); }
+            }
+        }
+        matches!(self.phase, PnPhase::Ready(_))
+    }
+    #[cfg(test)]
+    fn status(&self) -> Arc<PnStatus> { self.status.clone() }
+}
+impl leviculum_std::api::CoreProcessor for PnProcessor {
+    fn on_event(&mut self, core: &mut leviculum_std::api::StdNodeCore, event: &leviculum_std::api::NodeEvent) -> leviculum_std::api::TickOutput {
+        if !self.poll_ready() { return leviculum_std::api::TickOutput::empty(); }
+        let PnPhase::Ready(l) = &mut self.phase else { return leviculum_std::api::TickOutput::empty() };
+        let out = l.engine.on_event(core, event);
+        while l.events.try_recv().is_ok() {}
+        out
+    }
+    fn on_tick(&mut self, core: &mut leviculum_std::api::StdNodeCore, now: u64) -> leviculum_std::api::TickOutput {
+        if !self.poll_ready() { return leviculum_std::api::TickOutput::empty(); }
+        let PnPhase::Ready(l) = &mut self.phase else { return leviculum_std::api::TickOutput::empty() };
+        let out = l.engine.on_tick(core, now);
+        while l.events.try_recv().is_ok() {}
+        out
+    }
+}
+
+/// Штатный PN engine, а не ещё один протокол хранилища. Только серверы; постоянный store вне стираемого lev-role,
+/// `PN_CAP_BYTES`, bounded transfer/fetch. Возвращается сразу: хранилище открывается и подрезается в потоке `lxmf-pn-load`.
+pub fn propagation_processor(state: &Path, identity: Identity) -> anyhow::Result<PnProcessor> { spawn_pn(state, identity, None) }
+
+/// `hold` — тестовые ворота: фон не начинает загрузку, пока не придёт сигнал (или не закроется канал).
+fn spawn_pn(state: &Path, identity: Identity, hold: Option<mpsc::Receiver<()>>) -> anyhow::Result<PnProcessor> {
     use lnpnd::engine::{Engine, EngineConfig};
     use leviculum_lxmf::{PropagationNodeConfig, peering::{PeeringConfig, MemoryPeerStore}};
-    use leviculum_std::{FilePropagationStore, api::{CoreProcessor, StdNodeCore, NodeEvent, TickOutput}};
+    use leviculum_std::FilePropagationStore;
+    use std::{os::unix::fs::PermissionsExt, sync::atomic::Ordering::Relaxed};
     let dir = state.join("lxmf/propagation");
     std::fs::create_dir_all(&dir)?;
-    use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    let store = FilePropagationStore::open(&dir, 8*1024*1024).map_err(|e| anyhow::anyhow!("LXMF PN store: {e:?}"))?;
-    let (engine, events) = Engine::new(EngineConfig {
-        identity, store,
-        node_config: PropagationNodeConfig { transfer_limit_kb:16, sync_limit_kb:64,
-            serve_cap_bytes:Some(64*1024), name:None, ..Default::default() },
-        announce_interval_secs:600, announce_delay_secs:if cfg!(test) {2} else {20}, announce_at_start:false,
-        peering:PeeringConfig { max_peers:8, max_inbound_syncs:2, ..Default::default() },
-        peer_store:Box::new(MemoryPeerStore::default()), control_allowed:vec![], auth_allowed:None,
-        mailbox:None, store_limit_bytes:8*1024*1024, delivery_limit_kb:8,
-    });
-    struct Processor { engine:Engine<FilePropagationStore>, events:mpsc::Receiver<lnpnd::engine::EngineEvent> }
-    impl CoreProcessor for Processor {
-        fn on_event(&mut self, core:&mut StdNodeCore, event:&NodeEvent) -> TickOutput {
-            let out = self.engine.on_event(core, event);
-            while self.events.try_recv().is_ok() {}
-            out
-        }
-        fn on_tick(&mut self, core:&mut StdNodeCore, now:u64) -> TickOutput {
-            let out = self.engine.on_tick(core, now);
-            while self.events.try_recv().is_ok() {}
-            out
-        }
-    }
-    Ok(Processor { engine, events })
+    let status = Arc::new(PnStatus::default());
+    status.state.store(PN_LOADING, Relaxed);
+    if let Ok(mut current) = PN_CURRENT.lock() { *current = Some(status.clone()); }
+    let (tx, rx) = mpsc::sync_channel(1);
+    let st = status.clone();
+    std::thread::Builder::new().name("lxmf-pn-load".into()).spawn(move || {
+        if let Some(hold) = hold { let _ = hold.recv(); }
+        let t0 = std::time::Instant::now();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let mut trimmed = trim_by_name(&dir, now, crate::enroll::TTL, PN_MAX_FILES);
+        let mut store = match FilePropagationStore::open(&dir, PN_CAP_BYTES) {
+            Ok(store) => store,
+            Err(_) => { st.state.store(PN_FAILED, Relaxed); return; }
+        };
+        trimmed += fit(&mut store, PN_CAP_BYTES);
+        let (mut files, mut bytes) = (0u64, 0u64);
+        let _ = leviculum_lxmf::propagation_store::PropagationStore::for_each(&store, &mut |m| { files += 1; bytes += m.size as u64; });
+        let (engine, events) = Engine::new(EngineConfig {
+            identity, store,
+            node_config: PropagationNodeConfig { transfer_limit_kb:16, sync_limit_kb:64,
+                serve_cap_bytes:Some(64*1024), message_expiry_secs:crate::enroll::TTL, name:None, ..Default::default() },
+            announce_interval_secs:600, announce_delay_secs:if cfg!(test) {2} else {20}, announce_at_start:false,
+            peering:PeeringConfig { max_peers:8, max_inbound_syncs:2, ..Default::default() },
+            peer_store:Box::new(MemoryPeerStore::default()), control_allowed:vec![], auth_allowed:None,
+            mailbox:None, store_limit_bytes:PN_CAP_BYTES, delivery_limit_kb:8,
+        });
+        st.trimmed.store(trimmed as u64, Relaxed);
+        st.files.store(files, Relaxed);
+        st.bytes.store(bytes, Relaxed);
+        st.load_ms.store(t0.elapsed().as_millis() as u64, Relaxed);
+        let _ = tx.send(Loaded { engine, events });
+    })?;
+    Ok(PnProcessor { phase: PnPhase::Loading(rx), status })
 }
 
 #[cfg(test)]
@@ -242,6 +379,121 @@ mod tests {
     use super::*;
     use leviculum_std::api::{generate_identity, NodeBuilder};
     use std::time::{Duration, Instant};
+
+    fn now_secs() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() }
+
+    /// `n` файлов хранилища по 272 Б: `ago` секунд назад, ещё по секунде на запись (разный порядок), валидные имена и тело.
+    fn prefill(dir: &Path, n: usize, now: u64, ago: u64) {
+        std::fs::create_dir_all(dir).unwrap();
+        for i in 0..n {
+            let id = Sha256::digest((i as u64).to_le_bytes());
+            let mut body = vec![(i % 251) as u8; 272];
+            body[..16].copy_from_slice(&[7u8; 16]);
+            let name = format!("{}_{}_0_{}", super::super::hex(&id), now - ago - (n - i) as u64, i + 1);
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+    }
+
+    fn dir_totals(dir: &Path) -> (usize, u64) {
+        std::fs::read_dir(dir).unwrap().flatten().filter(|e| name_key(&e.file_name().to_string_lossy()).is_some())
+            .fold((0, 0), |(n, b), e| (n + 1, b + e.metadata().unwrap().len()))
+    }
+
+    #[test]
+    fn name_key_parses_store_names_only() {
+        let id = "ab".repeat(32);
+        assert_eq!(name_key(&format!("{id}_100_0_5")), Some((100, 5)));
+        assert_eq!(name_key(&format!("{id}_100.75_3_9")), Some((100, 9)));
+        assert_eq!(name_key(&format!("{id}_100")), Some((100, 0)));
+        for bad in [".tmp-x".to_string(), ".stamp-values-true".into(), "garbage".into(), format!("{id}_x_0_1"), format!("{id}_1_0_1_2"), format!("{}_1_0_1", "ab".repeat(31))] {
+            assert_eq!(name_key(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn trim_by_name_drops_expired_then_oldest_and_keeps_foreign_names() {
+        let dir = std::env::temp_dir().join(format!("kh-pn-trim-{}", now_secs() ^ std::process::id() as u64));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = 10_000_000;
+        prefill(&dir, 5, now, 600_000); // просрочены при expiry 500 000 с
+        prefill(&dir, 10, now, 0); // свежие: ts = now-10 .. now-1
+        for foreign in [".tmp-abc", ".stamp-values-true", "notes.txt"] { std::fs::write(dir.join(foreign), b"x").unwrap(); }
+        assert_eq!(trim_by_name(&dir, now, 500_000, 6), 5 + 4, "5 просроченных + 4 самых старых сверх лимита 6");
+        let keep: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().filter_map(|e| name_key(&e.file_name().to_string_lossy())).collect();
+        assert_eq!(keep.len(), 6);
+        assert!(keep.iter().all(|(ts, _)| *ts >= now - 6), "остались самые новые: {keep:?}");
+        for foreign in [".tmp-abc", ".stamp-values-true", "notes.txt"] { assert!(dir.join(foreign).exists(), "{foreign}"); }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fit_evicts_oldest_down_to_cap_when_opened_over_capacity() {
+        use leviculum_std::FilePropagationStore;
+        use leviculum_lxmf::propagation_store::PropagationStore;
+        let dir = std::env::temp_dir().join(format!("kh-pn-fit-{}", now_secs() ^ std::process::id() as u64));
+        let _ = std::fs::remove_dir_all(&dir);
+        prefill(&dir, 100, now_secs(), 0);
+        // open ёмкость не проверяет: 100 × 272 Б при потолке 10 КБ даёт used > capacity (free_space() здесь переполнялся бы)
+        let mut store = FilePropagationStore::open(&dir, 10_000).unwrap();
+        assert_eq!(fit(&mut store, 10_000), 100 - 36);
+        assert_eq!(store.free_space(), 10_000 - 36 * 272);
+        let (files, bytes) = dir_totals(&dir);
+        assert_eq!((files, bytes), (36, 36 * 272));
+        let mut oldest = u64::MAX;
+        store.for_each(&mut |m| oldest = oldest.min(m.sequence)).unwrap();
+        assert_eq!(oldest, 100 - 36 + 1, "вытеснены самые старые");
+        assert_eq!(fit(&mut store, 10_000), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Построение процессора не ждёт загрузки хранилища: при удержанном фоне оно уже возвращено, PN ещё не готов
+    /// и события пропускает; после снятия ворот фон подрезает 12 тыс. файлов до потолка и отдаёт движок.
+    #[test]
+    fn pn_processor_returns_before_store_load_and_becomes_ready() {
+        let base = std::env::temp_dir().join(format!("kh-pn-bg-{}", now_secs() ^ std::process::id() as u64));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("lxmf/propagation");
+        prefill(&dir, 12_000, now_secs(), 0);
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let t0 = Instant::now();
+        let mut pn = spawn_pn(&base, generate_identity(), Some(gate_rx)).unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(5), "конструктор ждал загрузки");
+        assert!(!pn.poll_ready());
+        let status = pn.status();
+        assert_eq!(status.state.load(std::sync::atomic::Ordering::Relaxed), PN_LOADING);
+        assert_eq!(dir_totals(&dir).0, 12_000, "до сигнала фон ничего не трогает");
+        gate_tx.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(60);
+        while !pn.poll_ready() { assert!(Instant::now() < until, "PN не стал готов"); std::thread::sleep(Duration::from_millis(10)); }
+        assert_eq!(status.state.load(std::sync::atomic::Ordering::Relaxed), PN_READY);
+        let (files, bytes) = dir_totals(&dir);
+        assert!(files <= PN_MAX_FILES && bytes <= PN_CAP_BYTES, "{files} файлов, {bytes} Б");
+        assert_eq!(status.files.load(std::sync::atomic::Ordering::Relaxed) as usize, files);
+        assert_eq!(status.bytes.load(std::sync::atomic::Ordering::Relaxed), bytes);
+        assert_eq!(status.trimmed.load(std::sync::atomic::Ordering::Relaxed) as usize, 12_000 - files);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pn_processor_goes_failed_when_loader_dies() {
+        let base = std::env::temp_dir().join(format!("kh-pn-fail-{}", now_secs() ^ std::process::id() as u64));
+        let _ = std::fs::remove_dir_all(&base);
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let mut pn = spawn_pn(&base, generate_identity(), Some(gate_rx)).unwrap();
+        // каталог-файл вместо каталога: open() вернёт ошибку, узел при этом не падает
+        std::fs::remove_dir_all(base.join("lxmf/propagation")).unwrap();
+        std::fs::write(base.join("lxmf/propagation"), b"x").unwrap();
+        gate_tx.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(!pn.poll_ready());
+            if matches!(pn.phase, PnPhase::Failed) { break; }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(pn.status().state.load(std::sync::atomic::Ordering::Relaxed), PN_FAILED);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn sync_codec_signature_and_scope_are_not_authority() {
@@ -351,9 +603,11 @@ mod tests {
         let (sender, recipient, server) = (generate_identity(), generate_identity(), generate_identity());
         let base = std::env::temp_dir().join(format!("kh-pn-offline-{}", super::super::hex(sender.hash())));
         let _ = std::fs::remove_dir_all(&base);
+        // как на ES: накопленное хранилище сверх потолка; фон должен подрезать его, а PN после этого - принять и отдать письмо
+        prefill(&base.join("server/lxmf/propagation"), 12_000, now_secs(), 0);
         let (pa, ra) = super::super::lxmf_admin::AdminProcessor::new(sender.clone());
         let (pb, rb) = super::super::lxmf_admin::AdminProcessor::new(recipient.clone());
-        let (ps, rs) = super::super::lxmf_admin::AdminProcessor::new(server.clone());
+        let (ps, _rs) = super::super::lxmf_admin::AdminProcessor::new(server.clone());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);

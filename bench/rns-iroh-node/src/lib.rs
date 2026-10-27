@@ -34,6 +34,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 mod meas;
 mod vpn;
 mod trust;
+mod enroll;
 mod tcpc;
 mod health;
 mod bgwrite;
@@ -42,11 +43,7 @@ mod observations;
 mod route;
 mod host_acl;
 mod qprobe;
-/// Приглашение любой принятой формы -> kh-… (мобильная оболочка).
-pub fn invite_to_base64(s: &str) -> anyhow::Result<String> {
-    trust::Invite::to_base64(s)
-}
-pub use vpn::{VpnCli, VpnCmd, decode_profile, encode_profile};
+pub use vpn::{VpnCli, VpnCmd};
 
 /// Fixed non-shell admin CLI bridge used by the Android JNI wrapper.
 pub fn admin_cli_json(command: &str, state_dir: &str) -> String {
@@ -58,7 +55,7 @@ pub async fn run_vpn(cli: VpnCli) -> Result<()> {
     match cli.cmd {
         VpnCmd::Node(a) => vpn::run_node(a).await,
         VpnCmd::Hub(a) => vpn::run_hub(a).await,
-        VpnCmd::Client(a) => vpn::run_client(a).await,
+        VpnCmd::Client(a) => vpn::run_client13(a).await,
         other => vpn::run_admin(other),
     }
 }
@@ -2258,6 +2255,7 @@ impl TunState {
         serde_json::json!({
             "unauth_drops": self.c.unauth_drops.load(Relaxed),
             "host_acl_ready": self.host_acl_ready.load(std::sync::atomic::Ordering::Relaxed),
+            "host_nft": crate::host_acl::nft_stats(),
             "from_tun_pkts": self.c.from_tun_pkts.load(Relaxed), "from_tun_bytes": self.c.from_tun_bytes.load(Relaxed),
             "to_tun_pkts": self.c.to_tun_pkts.load(Relaxed), "to_tun_bytes": self.c.to_tun_bytes.load(Relaxed),
             "tun_write_drops": self.c.tun_write_drops.load(Relaxed), "route_miss": self.c.route_miss.load(Relaxed),

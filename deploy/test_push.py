@@ -326,7 +326,7 @@ FAKE_TOOLS = {
     "stat": 'echo "0:600"\n',
     "mktemp": 'exec /usr/bin/mktemp "$TMPDIR/hostfix.XXXXXX"\n',
     "iptables": 'echo "iptables $*" >> "$LOG"\ncase "$1" in\n  -S) [ -n "$2" ] && echo "-P $2 DROP" ;;\n  -C) exit 1 ;;\nesac\nexit 0\n',
-    "nft": 'echo "nft $*" >> "$LOG"\ncase "$*" in\n  "list table"*) [ "$NFT_OK" = 1 ] || exit 1; echo "client->node client->internal client-ipv6 client->own-endpoint carrier-loop-guard knothop-user-no-tunnel masquerade" ;;\n  "list set"*) [ "$NFT_OK" = 1 ] ;;\n  "-c -f "*|"-f "*) [ "$NFT_OK" = 1 ] ;;\n  *) exit 1 ;;\nesac\nexit 0\n',
+    "nft": 'echo "nft $*" >> "$LOG"\ncase "$*" in\n  "list table"*) [ "$NFT_OK" = 1 ] || exit 1; echo "client->node client->host-access-tcp client->internal client-ipv6 client->own-endpoint carrier-loop-guard knothop-user-no-tunnel masquerade" ;;\n  "list set inet knothop host_access"*) [ "$NFT_OK" = 1 ] && [ "$NFT_HOST_SETS" = 1 ] || exit 1; echo "type ipv4_addr; flags timeout; timeout 3s; size 256" ;;\n  "list set"*) [ "$NFT_OK" = 1 ] ;;\n  "-c -f "*|"-f "*) [ "$NFT_OK" = 1 ] ;;\n  *) exit 1 ;;\nesac\nexit 0\n',
     "sysctl": "echo 1\n",
     "ss": "exit 0\n",
 }
@@ -335,7 +335,7 @@ FAKE_TOOLS = {
 class HostfixFakeToolsTests(unittest.TestCase):
     """node-hostfix.sh apply с подменёнными nft/iptables: iptables не трогается, пока nft не проверен."""
 
-    def run_apply(self, nft_ok: bool, endpoint_content="8.8.8.8\n"):
+    def run_apply(self, nft_ok: bool, endpoint_content="8.8.8.8\n", host_sets=True):
         with tempfile.TemporaryDirectory() as td:
             bindir = Path(td) / "bin"
             bindir.mkdir()
@@ -349,6 +349,7 @@ class HostfixFakeToolsTests(unittest.TestCase):
                 tool.chmod(0o755)
             log = Path(td) / "calls.log"
             env = {"PATH": f"{bindir}:/usr/bin:/bin", "LOG": str(log), "NFT_OK": "1" if nft_ok else "0",
+                   "NFT_HOST_SETS": "1" if host_sets else "0",
                    "KNOTHOP_OWN_ENDPOINTS": str(endpoints), "TMPDIR": td}
             r = subprocess.run(["bash", str(HERE / "node-hostfix.sh"), "apply"], env=env, capture_output=True,
                                text=True, timeout=60)
@@ -378,6 +379,94 @@ class HostfixFakeToolsTests(unittest.TestCase):
         self.assertIn("nft -c -f", calls)
         self.assertIn("nft -f", calls)
         self.assertLess(calls.index("nft -f"), calls.index("iptables -I"))
+
+    def test_missing_host_access_sets_never_open_iptables(self):
+        r, calls = self.run_apply(nft_ok=True, host_sets=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("host_access_v4", calls)
+        self.assertNotIn("iptables -I", calls)
+
+
+def nft_ready_block(script: str) -> str:
+    src = (HERE / script).read_text()
+    return src[src.index("# --- nft-ready-begin"):src.index("# --- nft-ready-end")]
+
+
+class NftHostReadyTests(unittest.TestCase):
+    """B1: HOST_ACCESS-шаблон nft и hostfix проверяются до backup/остановки службы."""
+
+    MARK = "client->host-access-tcp"
+
+    def run_ready(self, script="push-remote.sh", nft_ok=True, host_sets=True, systemctl_active=True,
+                  hostfix_mark=True, template_mark=True, template_present=True):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bindir = root / "bin"
+            bindir.mkdir()
+            for name, body in {"nft": FAKE_TOOLS["nft"],
+                               "systemctl": 'echo "systemctl $*" >> "$LOG"\n[ "$SYSTEMCTL_ACTIVE" = 1 ]\n'}.items():
+                (bindir / name).write_text("#!/bin/sh\n" + body)
+                (bindir / name).chmod(0o755)
+            hostfix = root / "knothop-hostfix"
+            hostfix.write_text(f"NFT_MARKS=({self.MARK if hostfix_mark else 'old'})\n")
+            template = root / "knothop.nft"
+            if template_present:
+                template.write_text(f'comment "{self.MARK if template_mark else "old"}"\n')
+            log = root / "calls.log"
+            driver = (nft_ready_block(script) +
+                      f'HOSTFIX_BIN={hostfix}\nNFT_STAGE_TEMPLATE={template}\n'
+                      'if nft_host_ready; then echo READY; else echo "REFUSED: $NFT_READY_ERR"; exit 1; fi\n')
+            env = {"PATH": f"{bindir}:/usr/bin:/bin", "LOG": str(log), "NFT_OK": "1" if nft_ok else "0",
+                   "NFT_HOST_SETS": "1" if host_sets else "0", "SYSTEMCTL_ACTIVE": "1" if systemctl_active else "0"}
+            r = subprocess.run(["bash", "-c", driver], env=env, capture_output=True, text=True, timeout=30)
+            calls = log.read_text() if log.exists() else ""
+        return r, calls
+
+    def test_ready_node_passes_in_both_helpers(self):
+        for script in ("push-remote.sh", "node-install.sh"):
+            with self.subTest(script=script):
+                r, _ = self.run_ready(script)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("READY", r.stdout)
+
+    def test_each_missing_prerequisite_refuses(self):
+        cases = {
+            "table not loaded": dict(nft_ok=False),
+            "NFT_HOST_SETS=0": dict(host_sets=False),
+            "hostfix inactive": dict(systemctl_active=False),
+            "persist copy has old marks": dict(hostfix_mark=False),
+            "staged template is old": dict(template_mark=False),
+            "staged template missing": dict(template_present=False),
+        }
+        for script in ("push-remote.sh", "node-install.sh"):
+            for label, kwargs in cases.items():
+                with self.subTest(script=script, case=label):
+                    r, _ = self.run_ready(script, **kwargs)
+                    self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                    self.assertIn("REFUSED:", r.stdout)
+                    self.assertNotIn("READY\n", r.stdout)
+
+    def test_check_is_read_only(self):
+        _, calls = self.run_ready()
+        self.assertNotRegex(calls, r"nft (-f|-c|add|delete|flush)|systemctl (stop|start|restart|enable)")
+
+    def test_blocks_are_identical_in_both_helpers(self):
+        # первая строка (маркер) различается только пояснением
+        self.assertEqual(nft_ready_block("push-remote.sh").split("\n", 1)[1],
+                         nft_ready_block("node-install.sh").split("\n", 1)[1])
+
+    def test_check_precedes_backup_stop_and_replacement(self):
+        push = (HERE / "push-remote.sh").read_text()
+        call = push.index("nft_host_ready || {")
+        for later in ('ensure_host_acl "$acl_state"', 'cp -p "$BIN" "$PREV"', "REPLACEMENT_STARTED=1\n",
+                      'systemctl stop "$UNIT" ||'):
+            self.assertLess(call, push.index(later), later)
+        self.assertIn("ROLLBACK=unavailable", push[call:call + 120])
+        install = (HERE / "node-install.sh").read_text()
+        call = install.index("if nft_host_ready; then")
+        for later in ('cp -a "$BIN" "$BIN.prev"', 'systemctl stop "$UNIT" ||', 'mv -f "$BIN.new" "$BIN"'):
+            self.assertLess(call, install.index(later), later)
+        self.assertIn("exit 2", install[call:call + 600])
 
 
 class StaticDeployChecks(unittest.TestCase):

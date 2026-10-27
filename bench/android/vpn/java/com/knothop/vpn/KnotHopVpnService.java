@@ -9,6 +9,8 @@ import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
 import android.net.IpPrefix;
 import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.FileObserver;
@@ -27,7 +29,8 @@ import java.nio.file.Files;
 
 /**
  * VPN-сервис: поднимает TUN с адресом из профиля, отдаёт дескриптор нативной части (knothopd client) и следит за ней.
- * Своё приложение исключено из туннеля (addDisallowedApplication), поэтому QUIC-носитель идёт мимо VPN и не зацикливается.
+ * Процесс привязан к физической сети до создания TUN: TCP/QUIC-носители не уходят в свой VPN.
+ * Сокеты теста скорости явно привязаны к VPN Network (включая DNS), без fallback.
  * Сервера и ключи берутся только из профиля (после спаривания), ничего не запрашивается по сети до подключения.
  */
 public class KnotHopVpnService extends VpnService {
@@ -50,6 +53,9 @@ public class KnotHopVpnService extends VpnService {
     private String extraArgs = "";
     private ConnectivityManager cm;
     private ConnectivityManager.NetworkCallback netCb;
+    private Network carrierNetwork;
+    private int excludedRouteCount;
+    private static volatile KnotHopVpnService live;
     private final Handler serviceUi = new Handler(Looper.getMainLooper());
     private FileObserver serviceObserver;
     private Object watchSession;
@@ -72,11 +78,10 @@ public class KnotHopVpnService extends VpnService {
         foreground("подключаюсь");
         state = new File(getFilesDir(), "state");
         state.mkdirs();
-        File[] old = state.listFiles();
-        // identity.key, trust.json и hints.json - постоянное состояние клиента (модель 0013): ключ, якоря с записями, адреса выходов; names.json - имена узлов, сообщённые ими по допущенному Link. Всё остальное - след прошлого запуска.
-        // Preserve user-selected exit as well as routing config. The rules/ directory is not traversed here.
-        java.util.Set<String> keep = new java.util.HashSet<>(java.util.Arrays.asList("identity.key", "trust.json", "hints.json", "routing.json", "select", "names.json"));
-        if (old != null) for (File f : old) if (f.isFile() && !keep.contains(f.getName())) f.delete();
+        // Only known transient publications. Never infer that an unfamiliar file is disposable:
+        // identity, Trust, HOST_ACCESS, journals, pins and future enrollment state must survive APK updates.
+        for (String name : new String[]{"fin", "status.json", "service.json", "whoami.json", "error.txt", "log.txt"})
+            new File(state, name).delete();
         lastError = "";
         phase = "connecting";
         startedMs = System.currentTimeMillis();
@@ -109,9 +114,8 @@ public class KnotHopVpnService extends VpnService {
             Files.write(pf.toPath(), prof.raw.getBytes(StandardCharsets.UTF_8));
             pf.setReadable(false, false);
             pf.setReadable(true, true);
-            String tunIp = prof.ip;
+            String tunIp;
             String clientArgs;
-            if (prof.invite) {
                 // 0013: ключ клиента создаёт нативная часть сама (identity.key в state), адрес в туннеле выводится из него
                 if (Native.runVpn("whoami --state " + state.getAbsolutePath(), state.getAbsolutePath()) != 0) {
                     throw new IllegalStateException("не удалось создать ключ: " + Util.read(new File(state, "error.txt")));
@@ -122,12 +126,10 @@ public class KnotHopVpnService extends VpnService {
                 String labPub = Util.LAB_BUILD ? getSharedPreferences("p", MODE_PRIVATE).getString("lab_pub", "") : "";
                 Files.write(pub.toPath(), (labPub.isEmpty() ? Util.PUBLIC_RNS : labPub + "\n").getBytes(StandardCharsets.UTF_8));
                 clientArgs = "--invite-file " + pf.getAbsolutePath() + " --public-rns-file " + pub.getAbsolutePath();
-            } else {
-                clientArgs = "--profile-file " + pf.getAbsolutePath();
-            }
 
             synchronized (this) {
                 if (watchSession != session) return;
+                bindCarrierBeforeTun();
                 phase = "tun";
             }
             Builder b;
@@ -139,6 +141,7 @@ public class KnotHopVpnService extends VpnService {
                 try {
                     excluded = addExcluded(b = newBuilder(tunIp), direct, excluded);
                     tun = b.establish();
+                    excludedRouteCount = excluded;
                     break;
                 } catch (Throwable t) {
                     if (excluded == 0) throw t;
@@ -229,8 +232,58 @@ public class KnotHopVpnService extends VpnService {
                 .addDnsServer("1.1.1.1").addDnsServer("8.8.8.8").setMetered(false);
         // IPv6 туннелем не переносится: маршрут по умолчанию загоняет его в туннель, где пакеты отбрасываются (нет утечки мимо VPN).
         b.addAddress("fd99:99::2", 128).addRoute("::", 0);
-        b.addDisallowedApplication(getPackageName());
         return b;
+    }
+
+    /** Process binding replaces UID exclusion. Never clear it while TUN exists (loop guard). */
+    private void bindCarrierBeforeTun() {
+        cm = (ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);
+        Network candidate = cm.getActiveNetwork();
+        NetworkCapabilities caps = candidate == null ? null : cm.getNetworkCapabilities(candidate);
+        if (caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN))
+            throw new IllegalStateException("Нет физической сети для носителя VPN");
+        if (!cm.bindProcessToNetwork(candidate)) throw new IllegalStateException("Не удалось привязать носитель к сети");
+        carrierNetwork = candidate;
+        live = this;
+    }
+
+    static final class SpeedPath {
+        final KnotHopVpnService service;
+        final Object session;
+        final Network network;
+        final String exit;
+        SpeedPath(KnotHopVpnService service, Network network) {
+            this.service = service; this.session = service.watchSession; this.network = network;
+            this.exit = service.serviceKey;
+        }
+        boolean valid() {
+            synchronized (service) {
+                NetworkCapabilities caps = service.cm.getNetworkCapabilities(network);
+                return live == service && service.watchSession == session && service.tun != null
+                        && "up".equals(phase) && !tunHeld && exit.equals(service.serviceKey)
+                        && caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN);
+            }
+        }
+    }
+
+    /** Only our current VPN, never the default/physical Network. Ambiguity is an error. */
+    static SpeedPath speedPath() {
+        KnotHopVpnService s = live;
+        if (s == null) return null;
+        synchronized (s) {
+            if (!"up".equals(phase) || tunHeld || s.tun == null || s.watchSession == null) return null;
+            // excludeRoute can intentionally bypass VPN; do not claim a through-VPN measurement in that mode.
+            if (s.excludedRouteCount != 0) return null;
+            Network selected = null;
+            for (Network n : s.cm.getAllNetworks()) {
+                NetworkCapabilities caps = s.cm.getNetworkCapabilities(n);
+                if (caps == null || !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue;
+                if (Build.VERSION.SDK_INT >= 29 && caps.getOwnerUid() != android.os.Process.myUid()) continue;
+                if (selected != null) return null;
+                selected = n;
+            }
+            return selected == null ? null : new SpeedPath(s, selected);
+        }
     }
 
     /** Исключает первые `n` подсетей из списка; возвращает, сколько действительно исключено. */
@@ -325,17 +378,36 @@ public class KnotHopVpnService extends VpnService {
                     Native.networkChanged();
                 }
             }
-            @Override public void onAvailable(Network n) { poke(); }
-            @Override public void onLost(Network n) { poke(); }
+            @Override public void onAvailable(Network n) {
+                synchronized (KnotHopVpnService.this) {
+                    if (watchSession != session) return;
+                    NetworkCapabilities caps = cm.getNetworkCapabilities(n);
+                    if (caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) return;
+                    if (!cm.bindProcessToNetwork(n)) { fail("Носитель потерял физическую сеть", session); return; }
+                    carrierNetwork = n;
+                    setUnderlyingNetworks(new Network[]{n});
+                }
+                poke();
+            }
+            @Override public void onLost(Network n) {
+                // Do NOT unbind: new native sockets must not fall back into our TUN.
+                poke();
+            }
         };
-        cm.registerDefaultNetworkCallback(netCb);
+        cm.registerNetworkCallback(new NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN).build(), netCb);
     }
 
     private synchronized void cleanup() {
         stopServiceWatcher();
         unwatch();
-        try { if (tun != null) tun.close(); } catch (Throwable ignored) { }
+        boolean closed = true;
+        try { if (tun != null) tun.close(); } catch (Throwable ignored) { closed = false; }
         tun = null;
+        if (closed && cm != null && carrierNetwork != null) cm.bindProcessToNetwork(null);
+        carrierNetwork = null;
+        if (live == this) live = null;
         tunHeld = false;
         dropProfile();
     }

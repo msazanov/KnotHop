@@ -49,12 +49,6 @@ pub extern "system" fn Java_com_knothop_meas_Native_run<'a>(mut env: JNIEnv<'a>,
     run_impl(&mut env, args, state)
 }
 
-/// Приложение VPN (com.knothop.vpn).
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_knothop_vpn_Native_run<'a>(mut env: JNIEnv<'a>, _c: JClass<'a>, args: JString<'a>, state: JString<'a>) -> jint {
-    run_impl(&mut env, args, state)
-}
-
 /// VPN-клиент нового образца (knothopd client): аргументы - как у командной строки, `state` - каталог состояния.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_knothop_vpn_Native_runVpn<'a>(mut env: JNIEnv<'a>, _c: JClass<'a>, args: JString<'a>, state: JString<'a>) -> jint {
@@ -100,14 +94,6 @@ pub extern "system" fn Java_com_knothop_vpn_Native_setUiVisible(_env: JNIEnv, _c
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_knothop_vpn_Native_networkChanged(_env: JNIEnv, _c: JClass) {
     rns_iroh_node::mobile::network_changed();
-}
-
-/// Приглашение в каноническую строку kh-… для QR и совместимости; при ошибке - пустая строка.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_knothop_vpn_Native_toBase64<'a>(mut env: JNIEnv<'a>, _c: JClass<'a>, s: JString<'a>) -> jstring {
-    let s: String = env.get_string(&s).map(|s| s.into()).unwrap_or_default();
-    let out = rns_iroh_node::invite_to_base64(&s).unwrap_or_default();
-    env.new_string(out).map(|j| j.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 /// Narrow non-shell JSON admin bridge. The command parser accepts only fixed admin verbs/flags;

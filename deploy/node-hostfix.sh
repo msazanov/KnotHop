@@ -40,7 +40,7 @@ rules_forward() { printf '%s\n' "FORWARD -i $TUN -j ACCEPT" "FORWARD -o $TUN -m 
 present() { iptables -C $1 >/dev/null 2>&1; }
 
 # Метки - комментарии правил в nft: по ним проверяется, что загружен наш файл, а не чужая таблица с тем же именем.
-NFT_MARKS=("client->node" "client->internal" "client-ipv6" "client->own-endpoint" "carrier-loop-guard" "knothop-user-no-tunnel")
+NFT_MARKS=("client->node" "client->host-access-tcp" "client->internal" "client-ipv6" "client->own-endpoint" "carrier-loop-guard" "knothop-user-no-tunnel")
 nft_loaded() { nft list table inet knothop >/dev/null 2>&1 && nft list table ip knothop_nat >/dev/null 2>&1; }
 nft_verified() {
   local t mark
@@ -48,10 +48,14 @@ nft_verified() {
   for mark in "${NFT_MARKS[@]}"; do printf '%s\n' "$t" | grep -qF "$mark" || return 1; done
   nft list table ip knothop_nat 2>/dev/null | grep -q masquerade \
     && nft list set inet knothop own_public_v4 >/dev/null 2>&1 \
-    && nft list set inet knothop own_public_v6 >/dev/null 2>&1
+    && nft list set inet knothop own_public_v6 >/dev/null 2>&1 \
+    && nft list set inet knothop host_access_v4 2>/dev/null | grep -q 'timeout 3s' \
+    && nft list set inet knothop host_access_dest_v4 2>/dev/null | grep -q 'timeout 3s'
 }
 
 nft_swap() { # add+delete объявляют таблицу и тут же удаляют её, если её нет: один файл = одна транзакция nft, проверка -c до загрузки
+  # Dynamic HOST_ACCESS sets are deliberately NOT copied: knothopd revalidates
+  # connected holders and host-acl destinations after replacement/reload.
   local tmp elements r; tmp=$(mktemp /root/.knothopd-nft.XXXXXX) || return 1
   elements=$(mktemp /root/.knothopd-endpoints.XXXXXX) || { rm -f "$tmp"; return 1; }
   if ! endpoint_elements > "$elements"; then rm -f "$tmp" "$elements"; return 1; fi

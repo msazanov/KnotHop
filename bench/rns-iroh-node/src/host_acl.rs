@@ -180,6 +180,224 @@ fn is_private_or_special(ip: u32) -> bool {
 
 fn is_public(ip: u32) -> bool { !is_private_or_special(ip) }
 
+// The nft worker never runs on the packet path and never logs addresses or nft's
+// diagnostics (which contain the input script). Kernel leases are defense in
+// depth; the per-Link TUN ACL remains authoritative, including for active flows.
+const NFT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+const NFT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+const NFT_MIN_UPDATE: std::time::Duration = std::time::Duration::from_millis(100);
+// Холодный exec nft на загруженном 1-CPU хосте (Nice=10) дольше штатных 500 мс: стартовая очистка получает запас и повторы.
+const NFT_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const NFT_STARTUP_TRIES: u32 = 3;
+#[cfg(not(test))]
+const NFT_STARTUP_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const NFT_STARTUP_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+const NFT_CLEAR: &str = "flush set inet knothop host_access_v4\nflush set inet knothop host_access_dest_v4\n";
+static NFT_WAKE: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>> = std::sync::OnceLock::new();
+
+// Счётчики worker для status.json (без адресов): отказ публикации закрывает доступ всем, это должно быть видно владельцу.
+static NFT_PUBLISH_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NFT_PUBLISH_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NFT_FALLBACK_CLEARS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NFT_LAST_OK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn notify_nft() {
+    if let Some(wake) = NFT_WAKE.get() { let _ = wake.try_send(()); }
+}
+
+/// Диагностика worker: `active` = контроллер запущен; `last_ok_ms` = unix-время последней успешной публикации (0 - не было).
+pub(crate) fn nft_stats() -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    serde_json::json!({
+        "active": NFT_WAKE.get().is_some(),
+        "publish_ok": NFT_PUBLISH_OK.load(Relaxed), "publish_fail": NFT_PUBLISH_FAIL.load(Relaxed),
+        "fallback_clears": NFT_FALLBACK_CLEARS.load(Relaxed), "last_ok_ms": NFT_LAST_OK_MS.load(Relaxed),
+    })
+}
+
+/// One writer, fresh snapshots only, bounded CLI lifetime, no shell or PATH lookup.
+pub(crate) struct NftHostAccess {
+    program: &'static str,
+    pool: (u32, u8),
+}
+
+impl NftHostAccess {
+    /// Clear stale leases before admitting any clients. An absent/old firewall is
+    /// a startup error, not an excuse to create a broader or partial ruleset.
+    pub(crate) fn new(pool: (u32, u8)) -> Result<Self> {
+        validate_pool(pool)?;
+        let program = ["/usr/sbin/nft", "/usr/bin/nft"].into_iter()
+            .find(|p| Path::new(p).is_file()).context("nft executable unavailable")?;
+        let controller = Self { program, pool };
+        controller.clear_startup()?;
+        Ok(controller)
+    }
+
+    /// Первый вызов при старте: увеличенный таймаут и повторы. Постоянная ошибка (нет таблицы/наборов) по-прежнему ошибка старта.
+    fn clear_startup(&self) -> Result<()> {
+        let mut last = None;
+        for attempt in 0..NFT_STARTUP_TRIES {
+            if attempt > 0 { std::thread::sleep(NFT_STARTUP_PAUSE); }
+            match run_nft(self.program, NFT_CLEAR, NFT_STARTUP_TIMEOUT) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("at least one attempt")).context("clear host-access nft sets at startup")
+    }
+
+    fn clear(&self) -> Result<()> { run_nft(self.program, NFT_CLEAR, NFT_TIMEOUT) }
+
+    /// `peers` only returns authenticated, live, non-enrollment client Links.
+    /// Called with Trust held (Trust -> links -> host_access -> allowed); no I/O
+    /// under those locks. Only the single worker publishes snapshots to nft.
+    pub(crate) fn start(
+        self, tun: &std::sync::Arc<crate::TunState>,
+        authority: std::sync::Arc<std::sync::Mutex<crate::trust::Trust>>,
+        peers: impl Fn() -> Option<Vec<(leviculum_std::api::LinkId, crate::trust::Pk)>> + Send + 'static,
+    ) -> Result<()> {
+        let tun = std::sync::Arc::downgrade(tun);
+        let (send, recv) = std::sync::mpsc::sync_channel(1);
+        // knothopd runs one node per process; do not silently install two writers.
+        NFT_WAKE.set(send).map_err(|_| anyhow::anyhow!("nft worker already configured"))?;
+        std::thread::Builder::new().name("host-nft-refresh".into()).spawn(move || {
+            let mut failing = false;
+            let mut next_update = std::time::Instant::now();
+            loop {
+                // Coalesce event storms: at most ten publications/s, including
+                // authenticated reconnect churn; unauthenticated close is not a wakeup.
+                std::thread::sleep(next_update.saturating_duration_since(std::time::Instant::now()));
+                let _ = recv.try_recv(); // capacity is one; never spin on concurrent senders
+                let Some(tun) = tun.upgrade() else { let _ = self.clear(); break };
+                let snapshot = {
+                    let tr = authority.lock().unwrap();
+                    let Some(peers) = peers() else { break };
+                    let permissions = tun.host_access.read().unwrap();
+                    let allowed = tun.allowed.read().unwrap();
+                    let clients = authorized_clients(&tr, &peers, &permissions, &allowed);
+                    let inventory = tun.host_inventory.read().unwrap().clone();
+                    if tun.host_acl_ready() { inventory.map(|inv| (clients, inv)) } else { None }
+                };
+                let script = match snapshot {
+                    Some((clients, inventory)) => nft_batch(self.pool, &clients, &inventory),
+                    None => Ok(NFT_CLEAR.to_owned()),
+                };
+                let success = script.and_then(|script| run_nft(self.program, &script, NFT_TIMEOUT)).is_ok();
+                use std::sync::atomic::Ordering::Relaxed;
+                if success {
+                    NFT_PUBLISH_OK.fetch_add(1, Relaxed);
+                    NFT_LAST_OK_MS.store(crate::now_ms() as u64, Relaxed);
+                } else {
+                    NFT_PUBLISH_FAIL.fetch_add(1, Relaxed);
+                    NFT_FALLBACK_CLEARS.fetch_add(1, Relaxed);
+                    // Atomic nft transactions leave the old state on failure.
+                    // Clear it immediately; even if that fails leases expire.
+                    let _ = self.clear();
+                    if !failing { eprintln!("HOST_ACCESS nft update failed; host TCP remains fail-closed"); }
+                }
+                failing = !success;
+                drop(tun);
+                next_update = std::time::Instant::now() + NFT_MIN_UPDATE;
+                let _ = recv.recv_timeout(NFT_TICK);
+            }
+            let _ = self.clear();
+        }).context("start host-access nft worker")?;
+        Ok(())
+    }
+}
+
+fn authorized_clients(
+    tr: &crate::trust::Trust,
+    peers: &[(leviculum_std::api::LinkId, crate::trust::Pk)],
+    permissions: &HashSet<leviculum_std::api::LinkId>,
+    allowed: &std::collections::HashMap<leviculum_std::api::LinkId, u32>,
+) -> HashSet<u32> {
+    let now = crate::now_ms() as u64;
+    peers.iter().filter(|(link, pk)| {
+        permissions.contains(link) && !tr.host_access_roots(pk, &tr.me_hash).is_empty()
+            && tr.common_with(pk, crate::trust::EXIT, crate::trust::USE, true, false, now)
+    }).filter_map(|(link, _)| allowed.get(link).copied()).collect()
+}
+
+fn validate_pool((base, prefix): (u32, u8)) -> Result<()> {
+    if !(8..=24).contains(&prefix) || base & (u32::MAX >> prefix) != 0 || is_martian(base) {
+        bail!("invalid host-access client pool");
+    }
+    Ok(())
+}
+
+fn valid_client(ip: u32, (base, prefix): (u32, u8)) -> bool {
+    let host_mask = u32::MAX >> prefix;
+    !is_martian(ip) && ip & !host_mask == base && ip & host_mask != 0 && ip & host_mask != host_mask
+}
+
+fn nft_batch(pool: (u32, u8), clients: &HashSet<u32>, inventory: &Inventory) -> Result<String> {
+    validate_pool(pool)?;
+    if clients.len() > 256 || inventory.host_allow.len() > 256
+        || clients.iter().any(|ip| !valid_client(*ip, pool))
+        || inventory.host_allow.iter().any(|ip| is_martian(*ip) || !inventory.owned.contains(ip)) {
+        bail!("invalid or oversized host-access nft snapshot");
+    }
+    let mut script = NFT_CLEAR.to_owned();
+    for (name, entries) in [("host_access_v4", clients), ("host_access_dest_v4", &inventory.host_allow)] {
+        if entries.is_empty() { continue; }
+        let mut entries: Vec<_> = entries.iter().copied().collect();
+        entries.sort_unstable();
+        let elements = entries.into_iter().map(|ip| format!("{} timeout 3s", Ipv4Addr::from(ip))).collect::<Vec<_>>().join(", ");
+        script.push_str(&format!("add element inet knothop {name} {{ {elements} }}\n"));
+    }
+    Ok(script)
+}
+
+fn run_nft(program: &str, script: &str, timeout: std::time::Duration) -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::process::{Command, Stdio};
+    if script.len() > 32 * 1024 { bail!("host-access nft batch too large"); }
+    // Окружение юнита (EnvironmentFile: KNOTHOP_*, возможные LD_*) nft не нужно; программа - абсолютный путь.
+    let mut child = Command::new(program).args(["-f", "-"]).env_clear()
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null())
+        .spawn().context("start nft host-access update")?;
+    let deadline = std::time::Instant::now() + timeout;
+    let result = (|| -> Result<()> {
+        let mut input = child.stdin.take().context("nft stdin unavailable")?;
+        // Nonblocking writes include a stalled stdin reader in the same deadline.
+        let fd = input.as_raw_fd();
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+            bail!("cannot make nft input nonblocking");
+        }
+        let mut rest = script.as_bytes();
+        while !rest.is_empty() {
+            if std::time::Instant::now() >= deadline { bail!("nft host-access update timed out"); }
+            match input.write(rest) {
+                Ok(0) => bail!("nft input closed"),
+                Ok(n) => rest = &rest[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(2)),
+                Err(_) => bail!("cannot write nft host-access input"),
+            }
+        }
+        drop(input);
+        loop {
+            if let Some(status) = child.try_wait().context("wait for nft host-access update")? {
+                if !status.success() { bail!("nft host-access transaction rejected"); }
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline { bail!("nft host-access update timed out"); }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        // Ограниченное ожидание: процесс в состоянии D не должен подвесить единственный worker.
+        for _ in 0..50 {
+            if !matches!(child.try_wait(), Ok(None)) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +448,135 @@ mod tests {
             assert_eq!(classify_destination(ip(addr), &Inventory::default()), DestinationDecision::Deny);
         }
         assert_eq!(classify_source(ip("192.168.1.2"), &Inventory::default()), SourceDecision::Deny);
+    }
+
+    #[test]
+    fn nft_snapshot_is_exact_bounded_and_always_replaces_both_sets() {
+        let pool = (ip("198.18.0.0"), 15);
+        let client = ip("198.18.1.7");
+        let host = ip("8.8.4.4");
+        let private = ip("10.1.2.3");
+        let inv = Inventory { owned: [host, private].into(), host_allow: [host, private].into(), ..Default::default() };
+        let batch = nft_batch(pool, &[client].into(), &inv).unwrap();
+        assert!(batch.starts_with(NFT_CLEAR));
+        assert_eq!(batch.matches("add element").count(), 2);
+        assert_eq!(batch.matches("timeout 3s").count(), 3);
+        assert!(!batch.contains("table ip knothop_nat"));
+        assert!(!batch.contains("chain"));
+        // Revoke/disconnect clears clients without retaining any previous source.
+        let revoke = nft_batch(pool, &HashSet::new(), &inv).unwrap();
+        assert!(!revoke.contains("add element inet knothop host_access_v4"));
+        assert_eq!(nft_batch(pool, &HashSet::new(), &Inventory::default()).unwrap(), NFT_CLEAR);
+        let mut bad = inv.clone();
+        bad.host_allow.insert(ip("10.1.2.4"));
+        assert!(nft_batch(pool, &[client].into(), &bad).is_err(), "not owned");
+        let too_many: HashSet<_> = (1..=257).map(|n| pool.0 + n).collect();
+        assert!(nft_batch(pool, &too_many, &inv).is_err());
+    }
+
+    #[test]
+    fn nft_clients_are_only_usable_literal_pool_addresses() {
+        let pool = (ip("198.18.0.0"), 15);
+        for value in ["198.18.0.0", "198.19.255.255", "198.20.0.1", "127.0.0.1", "10.1.1.1"] {
+            assert!(nft_batch(pool, &[ip(value)].into(), &Inventory::default()).is_err());
+        }
+        for prefix in [0, 7, 25, 32, 255] {
+            assert!(nft_batch((pool.0, prefix), &HashSet::new(), &Inventory::default()).is_err());
+        }
+        assert!(validate_pool((pool.0 + 1, 15)).is_err());
+        assert!(valid_client(ip("198.18.0.1"), pool));
+        assert!(valid_client(ip("198.19.255.254"), pool));
+    }
+
+    #[test]
+    fn nft_authorization_rechecks_scoped_trust_not_just_cached_tun_bits() {
+        use crate::trust::{Trust, USE};
+        let node = leviculum_std::api::generate_identity();
+        let holder = leviculum_std::api::generate_identity().public_key_bytes();
+        let root = *node.hash();
+        let mut tr = Trust::new(node, None);
+        tr.issue(root, holder, USE).unwrap();
+        let link = leviculum_std::api::LinkId::new([71; 16]);
+        let peers = [(link, holder)];
+        let permissions = [link].into();
+        let allowed = [(link, ip("198.18.1.7"))].into();
+        assert!(authorized_clients(&tr, &peers, &permissions, &allowed).is_empty());
+        // A signed record for a different node is never a fallback grant.
+        let other = tr.sign_host_access(root, [42; 16], holder, true).unwrap();
+        assert!(tr.accept_host_access(other).is_err());
+        assert!(authorized_clients(&tr, &peers, &permissions, &allowed).is_empty());
+        let grant = tr.sign_host_access(root, root, holder, true).unwrap();
+        tr.accept_host_access(grant).unwrap();
+        assert_eq!(authorized_clients(&tr, &peers, &permissions, &allowed).len(), 1);
+        assert!(authorized_clients(&tr, &[], &permissions, &allowed).is_empty(), "closed Link");
+        assert!(authorized_clients(&tr, &peers, &permissions, &Default::default()).is_empty(), "disallowed Link");
+        let revoke = tr.sign_host_access(root, root, holder, false).unwrap();
+        tr.accept_host_access(revoke).unwrap();
+        assert!(authorized_clients(&tr, &peers, &permissions, &allowed).is_empty(), "stale TUN bits cannot restore revoke");
+    }
+
+    #[test]
+    fn nft_cli_failure_timeout_and_stalled_stdin_are_bounded_and_silent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kh-nft-cli-{}-{}", std::process::id(), crate::now_ms()));
+        fs::create_dir(&dir).unwrap();
+        let tool = dir.join("nft");
+        fs::write(&tool, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(run_nft(tool.to_str().unwrap(), NFT_CLEAR, NFT_TIMEOUT).is_ok());
+        fs::write(&tool, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(run_nft(tool.to_str().unwrap(), NFT_CLEAR, NFT_TIMEOUT).is_err());
+        // A child which neither reads stdin nor exits must also be killed/reaped.
+        fs::write(&tool, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        let start = std::time::Instant::now();
+        let error = run_nft(tool.to_str().unwrap(), &"x".repeat(32 * 1024), std::time::Duration::from_millis(80)).unwrap_err();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(error.to_string(), "nft host-access update timed out");
+        assert!(run_nft("/does-not-exist", NFT_CLEAR, NFT_TIMEOUT).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nft_child_does_not_inherit_service_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kh-nft-env-{}-{}", std::process::id(), crate::now_ms()));
+        fs::create_dir(&dir).unwrap();
+        let (tool, out) = (dir.join("nft"), dir.join("env.out"));
+        fs::write(&tool, format!("#!/bin/sh\ncat >/dev/null\nenv > {}\nexit 0\n", out.display())).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: тестовая переменная с уникальным именем; другие тесты её не читают.
+        unsafe { std::env::set_var("KNOTHOP_TEST_SECRET_ENV", "leak") };
+        run_nft(tool.to_str().unwrap(), NFT_CLEAR, NFT_TIMEOUT).unwrap();
+        let seen = fs::read_to_string(&out).unwrap();
+        assert!(!seen.contains("KNOTHOP_TEST_SECRET_ENV") && !seen.contains("leak"), "{seen}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_clear_retries_transient_failure_but_not_a_permanent_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kh-nft-start-{}-{}", std::process::id(), crate::now_ms()));
+        fs::create_dir(&dir).unwrap();
+        let (tool, count) = (dir.join("nft"), dir.join("count"));
+        // Первые два запуска отказывают (холодный старт), третий проходит.
+        fs::write(&tool, format!("#!/bin/sh\ncat >/dev/null\necho x >> {c}\n[ $(wc -l < {c}) -ge 3 ]\n", c = count.display())).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+        let program: &'static str = Box::leak(tool.to_str().unwrap().to_owned().into_boxed_str());
+        let ctl = NftHostAccess { program, pool: (ip("198.18.0.0"), 15) };
+        ctl.clear_startup().unwrap();
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 3);
+        // Постоянная ошибка (нет таблицы/набора) остаётся ошибкой старта после NFT_STARTUP_TRIES попыток.
+        fs::write(&tool, "#!/bin/sh\ncat >/dev/null\nexit 1\n").unwrap();
+        assert!(ctl.clear_startup().is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nft_stats_carry_only_counters() {
+        let stats = nft_stats();
+        for key in ["active", "publish_ok", "publish_fail", "fallback_clears", "last_ok_ms"] {
+            assert!(stats.get(key).is_some(), "{key}");
+        }
+        assert_eq!(stats.as_object().unwrap().len(), 5);
     }
 }

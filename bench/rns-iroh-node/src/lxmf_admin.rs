@@ -316,7 +316,7 @@ impl AdminProcessor {
                     RouterEvent::MessageReceived(message) => {
                         let message = *message;
                         // Propagated - почта с PN сети; подпись и права всё равно проверяет Trust
-                        if message.verification != Verification::Valid || !matches!(message.method, DeliveryMethod::Direct | DeliveryMethod::Propagated)
+                        if (message.verification != Verification::Valid && message.title != super::enroll_net::TITLE) || !matches!(message.method, DeliveryMethod::Direct | DeliveryMethod::Propagated)
                             || message.content.len() > MAX_ADMIN_CONTENT {
                             continue;
                         }
@@ -512,7 +512,7 @@ impl AdminProcessor {
                 if let Some(identity) = lxmf_sync::public_identity(&pending.request.pk) {
                     let destination = lxmf_destination(identity.hash());
                     core.remember_identity(DestinationHash::new(destination), identity);
-                    if let Ok(message) = router.create_message(core, destination, lxmf_sync::TITLE.to_vec(), pending.request.content.clone(), Vec::new(), DeliveryMethod::Propagated) {
+                    if let Ok(message) = router.create_message(core, destination, pending.request.title.clone(), pending.request.content.clone(), Vec::new(), DeliveryMethod::Propagated) {
                         let copy = message.message_id;
                         if let Ok(output) = router.enqueue(core, message) {
                             outputs.push(output);
@@ -532,7 +532,7 @@ impl AdminProcessor {
             let Some(identity) = lxmf_sync::public_identity(&pending.request.pk) else { remove.push(id.clone()); continue };
             let destination = lxmf_destination(identity.hash());
             core.remember_identity(DestinationHash::new(destination), identity);
-            if let Ok(message) = router.create_message(core, destination, lxmf_sync::TITLE.to_vec(), pending.request.content.clone(), Vec::new(), DeliveryMethod::Direct) {
+            if let Ok(message) = router.create_message(core, destination, pending.request.title.clone(), pending.request.content.clone(), Vec::new(), DeliveryMethod::Direct) {
                 let transport = message.message_id;
                 let bytes = message.pack().len() as u64;
                 if let Ok(output) = router.enqueue(core, message) {
@@ -812,6 +812,11 @@ pub fn spawn_node_worker(runtime: AdminRuntime, ctx: Arc<super::NodeCtx>) {
         loop {
             match inbound.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(message) => {
+                    if message.title == super::enroll_net::TITLE {
+                        super::enroll_net::on_lxmf(&state, &message);
+                        ctx.enforce_rights();
+                        continue;
+                    }
                     if message.title == super::lxmf_sync::TITLE {
                         super::on_sync_node(&ctx, &message);
                         continue;
@@ -1196,7 +1201,10 @@ pub fn spawn_client_worker(runtime: AdminRuntime, ctx: Arc<super::ClientCtx>, tr
         loop {
             match inbound.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(message) => {
-                    if message.title == super::lxmf_sync::TITLE { super::on_sync_client(&ctx, &message); }
+                    if message.title == super::enroll_net::TITLE {
+                        super::enroll_net::on_lxmf(&state, &message); ctx.refresh_servers13(); super::start_dialers(&ctx);
+                    }
+                    else if message.title == super::lxmf_sync::TITLE { super::on_sync_client(&ctx, &message); }
                     else { handle_client_reply(&state, &identity, &trust, &message); }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}

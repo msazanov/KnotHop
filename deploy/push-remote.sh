@@ -111,6 +111,30 @@ ensure_host_acl() { # $1 state-каталог, $2 user:group; HOST_ACL=created|p
 }
 # --- host-acl-end
 
+# --- nft-ready-begin (тесты загружают этот блок отдельно; тот же блок в node-install.sh)
+# knothopd с HOST_ACCESS-nft очищает наборы inet knothop при старте: без нового шаблона старт падает, узел уходит в рестарты и откат.
+# Поэтому ДО backup и остановки службы требуем: загруженная таблица с правилом TCP и обоими наборами с timeout 3s, активный
+# knothop-hostfix, persist-копия и шаблон reload/boot с новой меткой. Порядок на узле: rollout.sh stage -> hostfix apply -> hostfix persist
+# -> systemctl start knothop-hostfix -> только потом бинарник (docs/development.md). NFT_READY_ERR - причина отказа без адресов.
+HOSTFIX_BIN=/usr/local/sbin/knothop-hostfix
+NFT_STAGE_TEMPLATE=/root/knothop-stage/knothop.nft
+NFT_HOST_MARK='client->host-access-tcp'
+NFT_READY_ERR=
+nft_host_ready() {
+  local t s
+  NFT_READY_ERR=
+  t=$(nft list table inet knothop 2>/dev/null) || { NFT_READY_ERR='таблица inet knothop не загружена'; return 1; }
+  grep -qF "$NFT_HOST_MARK" <<<"$t" || { NFT_READY_ERR='в таблице нет правила client->host-access-tcp (старый шаблон)'; return 1; }
+  for s in host_access_v4 host_access_dest_v4; do
+    # вывод в переменную: `| grep -q` при pipefail даёт ложный отказ, когда grep закрывает pipe раньше, чем nft допишет
+    t=$(nft list set inet knothop "$s" 2>/dev/null) && grep -qF 'timeout 3s' <<<"$t" || { NFT_READY_ERR="нет набора $s с timeout 3s"; return 1; }
+  done
+  systemctl is-active --quiet knothop-hostfix.service 2>/dev/null || { NFT_READY_ERR='knothop-hostfix.service не active'; return 1; }
+  grep -qF "$NFT_HOST_MARK" "$HOSTFIX_BIN" 2>/dev/null || { NFT_READY_ERR="$HOSTFIX_BIN не знает новой метки (нужен hostfix persist)"; return 1; }
+  grep -qF "$NFT_HOST_MARK" "$NFT_STAGE_TEMPLATE" 2>/dev/null || { NFT_READY_ERR="$NFT_STAGE_TEMPLATE без нового правила (нужен stage)"; return 1; }
+}
+# --- nft-ready-end
+
 rollback_previous() {
   ROLLBACK=attempted
   trap - EXIT HUP INT TERM
@@ -171,6 +195,9 @@ if [[ $baseline_fresh != 1 || ! $BASE_MESH =~ ^[0-9]+$ || $BASE_MESH -lt 1 ]]; t
   ROLLBACK=unavailable
   die "baseline mesh is not fresh/healthy; baseline_mesh=$BASE_MESH baseline_ts=$BASE_TS (not PASS)"
 fi
+
+# Шаблон nft и hostfix проверяются ДО backup/stop: узел остаётся на старом бинарнике, простоя нет.
+nft_host_ready || { ROLLBACK=unavailable; die "nft-шаблон/hostfix не готов к HOST_ACCESS: $NFT_READY_ERR; сначала rollout.sh stage, hostfix apply/persist, start knothop-hostfix (бинарник не заменён)"; }
 
 # host-acl.json обязателен новому knothopd: любой отказ здесь происходит до backup и замены, узел остаётся на старом бинарнике.
 if ! acl_state=$(host_acl_state_dir) || ! acl_owner=$(host_acl_owner); then

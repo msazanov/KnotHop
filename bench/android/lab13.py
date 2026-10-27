@@ -114,7 +114,7 @@ def node_cmd(name, ip, only_ip, has_invite, lan="", auto_adv=False):
             f"iptables -t nat -A POSTROUTING -s {CLIENT_NET} ! -o tun0 -j MASQUERADE; "
             # носитель не должен попадать в собственный туннель (журнал N30)
             f"iptables -I OUTPUT -d {CLIENT_NET} -p udp --sport 47001 -j DROP; "
-            f"{os.environ.get('LAB_NODE_ENV', '')}knothopd node --state /state --name {name} --port 47001{adv} --public-rns-file /state/pub.txt --announce-s 10{inv}{os.environ.get('LAB_NODE_EXTRA', '')} 2>&1 | tee -a /state/node.log")
+            f"{os.environ.get('LAB_NODE_ENV', '')}knothopd node --state /state --name {name} --port 47001 --no-host-nft{adv} --public-rns-file /state/pub.txt --announce-s 10{inv}{os.environ.get('LAB_NODE_EXTRA', '')} 2>&1 | tee -a /state/node.log")
 
 
 def client_cmd(only_ip, has_invite=True):

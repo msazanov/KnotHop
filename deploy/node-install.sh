@@ -34,6 +34,32 @@ if [ "$cur" = "$WANT" ]; then
   systemctl is-active "$UNIT" >/dev/null && ok "юнит active" || bad "юнит не active"
   exit 0
 fi
+# --- nft-ready-begin (тот же блок, что в push-remote.sh; тест test_push сверяет идентичность)
+# knothopd с HOST_ACCESS-nft очищает наборы inet knothop при старте: без нового шаблона старт падает, узел уходит в рестарты и откат.
+# Поэтому ДО backup и остановки службы требуем: загруженная таблица с правилом TCP и обоими наборами с timeout 3s, активный
+# knothop-hostfix, persist-копия и шаблон reload/boot с новой меткой. Порядок на узле: rollout.sh stage -> hostfix apply -> hostfix persist
+# -> systemctl start knothop-hostfix -> только потом бинарник (docs/development.md). NFT_READY_ERR - причина отказа без адресов.
+HOSTFIX_BIN=/usr/local/sbin/knothop-hostfix
+NFT_STAGE_TEMPLATE=/root/knothop-stage/knothop.nft
+NFT_HOST_MARK='client->host-access-tcp'
+NFT_READY_ERR=
+nft_host_ready() {
+  local t s
+  NFT_READY_ERR=
+  t=$(nft list table inet knothop 2>/dev/null) || { NFT_READY_ERR='таблица inet knothop не загружена'; return 1; }
+  grep -qF "$NFT_HOST_MARK" <<<"$t" || { NFT_READY_ERR='в таблице нет правила client->host-access-tcp (старый шаблон)'; return 1; }
+  for s in host_access_v4 host_access_dest_v4; do
+    # вывод в переменную: `| grep -q` при pipefail даёт ложный отказ, когда grep закрывает pipe раньше, чем nft допишет
+    t=$(nft list set inet knothop "$s" 2>/dev/null) && grep -qF 'timeout 3s' <<<"$t" || { NFT_READY_ERR="нет набора $s с timeout 3s"; return 1; }
+  done
+  systemctl is-active --quiet knothop-hostfix.service 2>/dev/null || { NFT_READY_ERR='knothop-hostfix.service не active'; return 1; }
+  grep -qF "$NFT_HOST_MARK" "$HOSTFIX_BIN" 2>/dev/null || { NFT_READY_ERR="$HOSTFIX_BIN не знает новой метки (нужен hostfix persist)"; return 1; }
+  grep -qF "$NFT_HOST_MARK" "$NFT_STAGE_TEMPLATE" 2>/dev/null || { NFT_READY_ERR="$NFT_STAGE_TEMPLATE без нового правила (нужен stage)"; return 1; }
+}
+# --- nft-ready-end
+if nft_host_ready; then ok "nft-шаблон и hostfix готовы к HOST_ACCESS"; else
+  bad "nft-шаблон/hostfix не готов к HOST_ACCESS: $NFT_READY_ERR; сначала rollout.sh stage, hostfix apply/persist, start knothop-hostfix (бинарник не заменён)"; exit 2
+fi
 [ "$DRY" = 1 ] && { ok "dry-run: заменил бы $cur -> $WANT"; exit 0; }
 
 cp -a "$BIN" "$BIN.prev" || { bad "не удалось сохранить knothopd.prev"; exit 4; }

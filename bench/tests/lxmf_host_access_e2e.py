@@ -147,7 +147,7 @@ def exit_cmd(name, ip, acl, policy_root=None):
         pol = json.dumps({"v": 1, "roots": [{"root": policy_root, "max_holders": 16}]}, separators=(",", ":"))
         pre += f"[ -e /state/host-policy.json ] || printf '%s' '{pol}' > /state/host-policy.json; chmod 600 /state/host-policy.json; "
     return (EXIT_NET_SETUP + pre +
-            f"knothopd node --state /state --name {name} --port 47001 --tun-name khd0 --advertise {ip}:47001 "
+            f"knothopd node --state /state --name {name} --port 47001 --tun-name khd0 --no-host-nft --advertise {ip}:47001 "
             "--public-rns-file /state/pub.txt --announce-s 10 --invite-file /state/invite.txt 2>&1 | tee -a /state/node.log")
 
 

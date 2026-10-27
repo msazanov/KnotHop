@@ -1,18 +1,15 @@
-//! knothopd: серверный узел группы, хаб и клиент VPN с авторизацией по identity (решение D2 v2, docs/decisions/0004).
+//! knothopd: узел и клиент VPN с индивидуальными правами 0013/0014.
 //!
 //! Роли:
-//!   hub     - узел-ретранслятор RNS без группы: в лаборатории изображает публичную сеть RNS (только связность и обнаружение);
-//!   node    - сервер группы: постоянная identity, анонс по тегу группы, взаимная проверка по серверному секрету с соседями,
-//!             таблица соседей (забывает потерявшихся), реестр клиентов (синхронизируется), выход в интернет (TUN + NAT);
-//!   client  - клиент: профиль-строка, закреплённые серверы, выбор выхода, смена выхода при отказе.
+//!   hub     - лабораторный ретранслятор RNS;
+//!   node    - постоянная identity, права/политики Trust, TUN + NAT;
+//!   client  - локальные identity и Trust, обнаружение RNS, выбор выхода и failover.
 //!
 //! Записи прав и политики идут по LXMF; оставшееся Link-управление — Channel [тип u8][тело]. Пакеты туннеля — datagrams Link.
-//! Секреты не попадают в журнал и в аргументы: серверный секрет читается из файла, профиль - из файла.
+//! Секреты не попадают в журнал; приглашение читается из приватного файла.
 
 use super::*;
-use base64::Engine as _;
 use clap::{Args, Subcommand};
-use hmac::{Hmac, Mac};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 #[path = "vpn_path.rs"]
@@ -21,12 +18,13 @@ mod path;
 mod lxmf_admin;
 #[path = "lxmf_sync.rs"]
 mod lxmf_sync;
+#[path = "enroll_net.rs"]
+mod enroll_net;
 
 #[cfg(test)]
 #[path = "../../tests/client_inbox13_tests.rs"]
 mod client_inbox13_tests;
 
-type HmacSha = Hmac<Sha256>;
 
 // ------------------------------------------------------------------------------------------------ команды
 
@@ -43,7 +41,7 @@ pub enum VpnCmd {
     Node(NodeArgs),
     /// ретранслятор RNS (лабораторная «публичная сеть»)
     Hub(HubArgs),
-    /// клиент VPN (читает профиль из файла)
+    /// клиент VPN (identity и права из state, опциональное приглашение)
     Client(ClientArgs),
     /// отозвать держателя (запись с пустыми правами)
     Revoke(RevokeArgs),
@@ -55,10 +53,12 @@ pub enum VpnCmd {
     Grant(GrantArgs),
     /// что эта нода согласна делать в сети (0015): политика подписывается ею самой и сужает выданные права; нода применит за несколько секунд
     Policy(PolicyArgs),
-    /// синтетический бенч пути RNS до соседа с живым Link (0014 R10): запрос кладётся файлом, нода меряет и пишет результат
-    Bench(BenchArgs),
     /// создать identity, если её ещё нет, и записать `whoami.json` (хеш и адрес в туннеле): приложению адрес нужен до создания TUN
     Whoami(StateArg),
+    /// привязать якорь корня на НОВОЙ ноде (оператор на самой ноде, узел остановлен): публичный ключ корня из файла или `-`, сверка с отпечатком
+    TrustAnchor(TrustAnchorArgs),
+    /// «Забыть сеть» на устройстве: оставить только собственный корень, удалить чужие якоря и записи зачисления (узел остановлен)
+    ForgetNetwork(StateArg),
     /// безопасный native bridge: пока LXMF executor не активен, submit отклоняется как unavailable
     AdminSubmit(AdminSubmitArgs),
     /// прочитать состояние команды из bounded durable journal
@@ -69,6 +69,15 @@ pub enum VpnCmd {
     RulesList(StateArg),
     /// подсети правил «мимо туннеля» в `direct.cidr` и отчёт `rules-report.json`
     RulesCompile(StateArg),
+}
+
+#[derive(Args, Clone)]
+pub struct TrustAnchorArgs {
+    #[arg(long)] pub state: PathBuf,
+    /// файл с публичным ключом корня (128 hex, поле `pk` из `knothopd whoami` админа) или `-` для stdin
+    #[arg(long)] pub root_key_file: PathBuf,
+    /// отпечаток корня (32 hex, `hash` из `whoami`), полученный другим каналом: ключ с иным хешем отклоняется
+    #[arg(long)] pub fingerprint: String,
 }
 
 #[derive(Args, Clone)]
@@ -137,6 +146,9 @@ pub struct NodeArgs {
     /// без выхода в интернет (только сосед/ретранслятор)
     #[arg(long)]
     pub no_exit: bool,
+    /// лаборатория без таблицы `inet knothop`: не управлять nft-наборами HOST_ACCESS (TCP к хосту остаётся закрытым); только CLI, не node.json
+    #[arg(long)]
+    pub no_host_nft: bool,
     /// период анонса, с. При публичной сети анонсы дороги для чужих узлов: после трёх стартовых (0, 20, 40 с) идёт этот период
     #[arg(long, default_value_t = 600)]
     pub announce_s: u64,
@@ -153,7 +165,7 @@ pub struct NodeArgs {
     /// подсеть адресов клиентов; одинакова на всех узлах группы и не должна пересекаться с сетями узлов
     #[arg(long, default_value = "198.18.0.0/15")]
     pub client_net: String,
-    /// модель 0013: приглашение `kh-…` (одноразовое; после зачисления игнорируется). Без приглашения нода сама себе админ
+    /// приглашение `kh-…`: нода по нему только допускает анонсы нод приглашения (сама не зачисляется; якорь корня на новой ноде ставит `knothopd trust-anchor`). Без якорей чужих корней нода сама себе админ
     #[arg(long, default_value = "")]
     pub invite: String,
     /// то же приглашение из файла
@@ -472,9 +484,6 @@ pub struct HubArgs {
 pub struct ClientArgs {
     #[arg(long)]
     pub state: PathBuf,
-    /// файл с профилем легаси-модели (строка kh2-...); без него клиент работает по модели 0013 (своя identity в --state, права записями)
-    #[arg(long)]
-    pub profile_file: Option<PathBuf>,
     /// модель 0013: приглашение `kh-…` (одноразовое; после зачисления игнорируется)
     #[arg(long, default_value = "")]
     pub invite: String,
@@ -509,22 +518,16 @@ pub struct InviteArgs {
     /// каталог состояния ноды-админа (identity и trust.json там же)
     #[arg(long)]
     pub state: PathBuf,
-    /// права приглашаемого: user | relay | admin, число или список (USE+EXIT)
+    /// права приглашаемого: подмножество USE|TRANSIT|EXIT, число или список (USE+EXIT), user = USE
     #[arg(long, default_value = "user")]
     pub rights: String,
     /// корень сети (хеш identity, 32 hex); по умолчанию свой
     #[arg(long)]
     pub root: Option<String>,
-    /// метка для списка (не секрет)
-    #[arg(long, default_value = "")]
-    pub label: String,
-    /// адрес админа для первого дозвона (ip:порт), можно несколько; по умолчанию - адреса из server.json
-    #[arg(long = "addr")]
-    pub addrs: Vec<String>,
     /// записать приглашение в файл (для оболочки Android, у которой нет stdout), права 0600
     #[arg(long)]
     pub out: Option<PathBuf>,
-    /// входные ноды: identity-хеши (32 hex), через запятую, не более 8; приглашённый обратится за зачислением только к ним
+    /// ноды, которые выдадут права: identity-хеши (32 hex), через запятую, от 1 до 8
     #[arg(long, value_delimiter = ',')]
     pub nodes: Vec<String>,
 }
@@ -544,31 +547,12 @@ pub struct GrantArgs {
     pub rights: String,
 }
 
-#[derive(Args, Clone)]
-pub struct BenchArgs {
-    /// каталог состояния запрашивающей ноды (запрос кладётся в его bench/)
-    #[arg(long)]
-    pub state: PathBuf,
-    /// имя соседа, dest (32 hex) или его префикс не короче 8 hex
-    #[arg(long)]
-    pub to: String,
-    /// сколько МБ (10^6 байт) тянуть, от 1 до 100
-    #[arg(long)]
-    pub mb: u64,
-    /// сколько ждать результата, с (10..900)
-    #[arg(long, default_value_t = 120)]
-    pub timeout: u64,
-}
-
 // ------------------------------------------------------------------------------------------------ вспомогательное
 
 const T_AUTH_OK: u8 = 9;
 const T_AUTH_FAIL: u8 = 10;
 // модель прав (решение 0013): записи о правах, зачисление по приглашению
-const T_PAIR1: u8 = 12;    // нода -> админ: holder pub(64) | mac32(pin); цепочка ответа — LXMF
-const T_PAIR_NO: u8 = 13;  // админ -> нода: отказ в зачислении (тело - причина)
 const T_USE: u8 = 14;      // клиент -> сервер: «я пришёл за выходом» (иначе Link - сосед-транзит)
-const T_PAIRQ: u8 = 15;    // новичок -> нода-посредник -> (соседи) -> админ: root(16) | inviter(16) | holder pub(64) | mac32(pin)
 const T_NBRS: u8 = 16;     // выход -> клиент: соседи с живым Link {"n":[{"d","r"}]} (0014 R3); список выходов не меняет
 // 17 свободен: каталог нод (бывший T_DIR) идёт по LXMF, см. lxmf_sync::send_dir
 /// Advisory observations are bounded by both count and negotiated Channel MDU.
@@ -591,64 +575,20 @@ const BOOK_MAX: usize = 32;
 static BOOK_LAST: Mutex<String> = Mutex::new(String::new());
 /// 0015: подписанная политика ноды (`trust::Policy`, 163 Б). Принимается только на допущенном Link (сосед или клиент); верна по подписи самой ноды,
 /// поэтому путь доставки не важен. Ничего не расширяет: действующие права = выдача ∩ политика.
-/// R10: бенч. T_BENCH по Channel: запрос {"id","n","sz"}, ответы {"id","busy"|"rate"|"done"}. T_BENCH_DATA - датаграмма Link
-/// [19][id u32 LE][seq u32 LE][t_ms u64 LE][заполнение]: первый байт не совпадает с IPv4 (0x4_) и с RGP ('R').
-const T_BENCH: u8 = 18;
-const T_BENCH_DATA: u8 = 19;
-/// Объём бенча до 1000 МБ (решение владельца 21.10: объём тестов выбирает агент, прежний предел 100 МБ снят).
-const BENCH_MAX_MB: u64 = 1000;
-const BENCH_MAX_N: u64 = BENCH_MAX_MB * 1_000_000;
-/// n counts wire bytes including the 17-byte header; final datagram pads to 17 bytes, so n_sent may exceed n by at most 16.
-/// минимальный размер датаграммы бенча (заголовок 17 байт + заполнение)
-const BENCH_SZ_MIN: usize = 32;
-const BENCH_HDR: usize = 17;
-/// не чаще раза в эту пору на пира отдаём бенч
-const BENCH_RATE: Duration = Duration::from_secs(60);
-const BENCH_RATE_MAX: usize = 256;
-/// нет ни одного пакета столько - блокировка (0 байт)
-const BENCH_BLOCK: Duration = Duration::from_secs(30);
-/// пауза между пакетами не меньше этой - остановка
-const BENCH_STALL: Duration = Duration::from_secs(10);
-/// после done ждём опоздавших датаграмм столько
-const BENCH_GRACE: Duration = Duration::from_secs(3);
-
 const UNAUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_UNAUTH_LINKS: usize = 64;
 /// H10: неаутентифицированных Link через один интерфейс носителя (глобально - MAX_UNAUTH_LINKS).
 const MAX_UNAUTH_PER_IFACE: usize = 8;
 /// H10: управляющие сообщения на Link (MessageReceived): ведро CTRL_RATE/с, запас CTRL_BURST. Сверх - отбрасываются.
-/// Непрерывное нарушение CTRL_VIOLATION_CLOSE подряд - Link закрывается. LinkDataReceived (VPN, бенч) сюда не относится.
+/// Непрерывное нарушение CTRL_VIOLATION_CLOSE подряд - Link закрывается. VPN LinkDataReceived сюда не относится.
 const CTRL_RATE: f64 = 50.0;
 const CTRL_BURST: f64 = 100.0;
 const CTRL_VIOLATION_CLOSE: Duration = Duration::from_secs(10);
-/// C13 (клиент): попытки зачисления (`enroll_try`): записи старше TTL выкидываем, новых ключей сверх MAX не вставляем.
-const ENROLL_TRY_TTL: Duration = Duration::from_secs(600);
-const ENROLL_TRY_MAX: usize = 64;
 /// B (клиент): ведро управляющих сообщений заводим не более чем на столько Link; сообщения с новых Link сверх лимита отбрасываются.
 const CLIENT_CTRL_LINKS: usize = 64;
 const MAX_NEIGHBORS: usize = 64;
 /// S2/S3: записи соседей без TRANSIT по записям и без живого Link. Отдельный лимит, чтобы публичные анонсы не заняли таблицу.
 const MAX_UNTRUSTED_NEIGHBORS: usize = 32;
-/// H9: буфер `early` - всего и на один Link; новые запросы на pairq - на один Link за 60 с. Мусор одного пира не вытесняет чужое.
-const EARLY_MAX: usize = 64;
-const EARLY_PER_LINK: usize = EARLY_MAX;
-const PAIRQ_PER_LINK: usize = 8;
-
-fn b64e(b: &[u8]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-}
-
-fn b64d(s: &str) -> Result<Vec<u8>> {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim()).map_err(|e| anyhow::anyhow!("base64: {e}"))
-}
-
-fn mac32(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut m = <HmacSha as Mac>::new_from_slice(key).expect("hmac key");
-    for p in parts {
-        m.update(p);
-    }
-    m.finalize().into_bytes().into()
-}
 
 fn rand16() -> [u8; 16] {
     let mut b = [0u8; 16];
@@ -746,153 +686,19 @@ fn dest32(d: &str) -> Option<[u8; 16]> {
     unhex(d).try_into().ok()
 }
 
-// ------------------------------------------------------------------------------------------------ профиль клиента
-
-/// Закреплённый сервер: хеш назначения и ключ подписи (он же iroh EndpointId узла: узел использует свой ключ RNS для QUIC).
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProfServer {
-    pub n: String,
-    pub d: [u8; 16],
-    pub k: [u8; 32],
-    /// `ip:порт` или `имя:порт`; имена разрешаются при каждом дозвоне (у узла может быть динамический IP)
-    pub a: Vec<String>,
-}
-
-/// Профиль клиента. Содержит секрет (seed ключа клиента): профиль - секрет целиком.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Profile {
-    pub group: String,
-    /// 32 случайных байта; из них выводятся оба ключа identity клиента (`client_identity`)
-    pub seed: [u8; 32],
-    /// адрес клиента в туннеле (выведен из identity, хранится ради приложения, которое не считает ключи)
-    pub ip: u32,
-    pub s: Vec<ProfServer>,
-}
-
-/// Identity клиента из seed: два независимых ключа через HMAC (X25519 и Ed25519), так что в профиле 32 байта вместо 64.
-fn client_identity(seed: &[u8; 32]) -> Result<Identity> {
-    let mut b = [0u8; 64];
-    b[..32].copy_from_slice(&mac32(seed, &[b"knothop-client-x25519-v1"]));
-    b[32..].copy_from_slice(&mac32(seed, &[b"knothop-client-ed25519-v1"]));
-    Identity::from_private_key_bytes(&b).map_err(|e| anyhow::anyhow!("identity клиента: {e:?}"))
-}
-
-/// Формат (v2, бинарный, затем base64url): `kh2-` + base64(
-///   версия(1)=2 | seed(32) | ip(4) | len+имя группы | n(1) | n x [ len+имя | d(16) | k(32) | m(1) | m x (тип(1)=4|6, ip, порт u16 BE) ] | sha256[..4] ).
-pub fn encode_profile(p: &Profile) -> String {
-    let mut b = vec![2u8];
-    b.extend_from_slice(&p.seed);
-    b.extend_from_slice(&p.ip.to_be_bytes());
-    b.push(p.group.len().min(255) as u8);
-    b.extend_from_slice(&p.group.as_bytes()[..p.group.len().min(255)]);
-    b.push(p.s.len().min(255) as u8);
-    for s in p.s.iter().take(255) {
-        b.push(s.n.len().min(255) as u8);
-        b.extend_from_slice(&s.n.as_bytes()[..s.n.len().min(255)]);
-        b.extend_from_slice(&s.d);
-        b.extend_from_slice(&s.k);
-        b.push(s.a.len().min(255) as u8);
-        for a in s.a.iter().take(255) {
-            match a.parse::<SocketAddr>() {
-                Ok(SocketAddr::V4(v)) => {
-                    b.push(4);
-                    b.extend_from_slice(&v.ip().octets());
-                    b.extend_from_slice(&v.port().to_be_bytes());
-                }
-                Ok(SocketAddr::V6(v)) => {
-                    b.push(6);
-                    b.extend_from_slice(&v.ip().octets());
-                    b.extend_from_slice(&v.port().to_be_bytes());
-                }
-                Err(_) => {
-                    // имя: тип 3, длина, `имя:порт` как есть
-                    let t = a.as_bytes();
-                    b.push(3);
-                    b.push(t.len().min(255) as u8);
-                    b.extend_from_slice(&t[..t.len().min(255)]);
-                }
-            }
-        }
-    }
-    let ck = Sha256::digest(&b);
-    b.extend_from_slice(&ck[..4]);
-    format!("kh2-{}", b64e(&b))
-}
-
-pub fn decode_profile(s: &str) -> Result<Profile> {
-    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    let body = s.strip_prefix("kh2-").ok_or_else(|| anyhow::anyhow!("не профиль KnotHop (нет префикса kh2-)"))?;
-    let b = b64d(body)?;
-    if b.len() < 8 {
-        bail!("профиль слишком короткий");
-    }
-    let (j, ck) = b.split_at(b.len() - 4);
-    if Sha256::digest(j)[..4] != *ck {
-        bail!("контрольная сумма профиля не сошлась (строка повреждена при копировании?)");
-    }
-    let mut r = Rd { b: j, i: 0 };
-    if r.u8()? != 2 {
-        bail!("версия профиля не поддерживается");
-    }
-    let seed: [u8; 32] = r.take(32)?.try_into().unwrap();
-    let ip = u32::from_be_bytes(r.take(4)?.try_into().unwrap());
-    let gl = r.u8()? as usize;
-    let group = String::from_utf8(r.take(gl)?.to_vec()).context("имя группы")?;
-    let n = r.u8()? as usize;
-    let mut servers = Vec::new();
-    for _ in 0..n {
-        let nl = r.u8()? as usize;
-        let name = String::from_utf8(r.take(nl)?.to_vec()).context("имя сервера")?;
-        let d: [u8; 16] = r.take(16)?.try_into().unwrap();
-        let k: [u8; 32] = r.take(32)?.try_into().unwrap();
-        let m = r.u8()? as usize;
-        let mut a = Vec::new();
-        for _ in 0..m {
-            match r.u8()? {
-                4 => {
-                    let ip = std::net::IpAddr::from(<[u8; 4]>::try_from(r.take(4)?).unwrap());
-                    a.push(SocketAddr::new(ip, u16::from_be_bytes(r.take(2)?.try_into().unwrap())).to_string());
-                }
-                6 => {
-                    let ip = std::net::IpAddr::from(<[u8; 16]>::try_from(r.take(16)?).unwrap());
-                    a.push(SocketAddr::new(ip, u16::from_be_bytes(r.take(2)?.try_into().unwrap())).to_string());
-                }
-                3 => {
-                    let l = r.u8()? as usize;
-                    a.push(String::from_utf8(r.take(l)?.to_vec()).context("адрес-имя")?);
-                }
-                _ => bail!("тип адреса в профиле"),
-            }
-        }
-        servers.push(ProfServer { n: name, d, k, a });
-    }
-    if r.i != j.len() {
-        bail!("лишние данные в профиле");
-    }
-    Ok(Profile { group, seed, ip, s: servers })
-}
-
-struct Rd<'a> {
-    b: &'a [u8],
-    i: usize,
-}
-impl<'a> Rd<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.i + n > self.b.len() {
-            bail!("профиль обрезан");
-        }
-        let s = &self.b[self.i..self.i + n];
-        self.i += n;
-        Ok(s)
-    }
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_cli_protocols_are_not_accepted() {
+        for args in [
+            vec!["knothopd", "bench", "--state", "/unused", "--to", "x", "--mb", "1"],
+            vec!["knothopd", "keygen", "--out", "/unused"],
+            vec!["knothopd", "issue", "--state", "/unused"],
+            vec!["knothopd", "client", "--state", "/unused", "--profile-file", "/unused"],
+        ] { assert!(VpnCli::try_parse_from(args).is_err()); }
+    }
 
     #[test]
     fn admin_cli_is_non_shell_and_never_claims_queue_or_apply() {
@@ -1003,33 +809,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_roundtrip_and_size() {
-        let mk = |n: &str, i: u8| ProfServer { n: n.into(), d: [i; 16], k: [i + 1; 32], a: vec!["203.0.113.7:47001".into(), "[2001:db8::1]:47001".into(), "ru1.example.org:47001".into()] };
-        let p = Profile { group: "lab".into(), seed: [9; 32], ip: 0x0a8a0102, s: vec![mk("de", 1), mk("ru1", 2), mk("nl1", 3)] };
-        let s = encode_profile(&p);
-        assert_eq!(decode_profile(&s).unwrap(), p);
-        assert!(s.len() < 600, "profile {} chars", s.len());
-        // порча одного символа ловится контрольной суммой
-        let mut bad = s.clone().into_bytes();
-        let n = bad.len() - 5;
-        bad[n] = if bad[n] == b'A' { b'B' } else { b'A' };
-        assert!(decode_profile(std::str::from_utf8(&bad).unwrap()).is_err());
-        assert!(decode_profile("kh1-xxxx").is_err());
-    }
-
-    #[test]
-    fn bench_req_token() {
-        // req= необязателен; кривой токен отвергает весь запрос (ответ без совпадения id не должен выглядеть как чужой)
-        assert_eq!(parse_bench_req("100MB req=ab-12_X"), Some((None, 100, Some("ab-12_X".to_string()))));
-        assert_eq!(parse_bench_req("req=abc 5MB").map(|x| x.2), Some(Some("abc".to_string())));
-        assert!(parse_bench_req("5MB req=").is_none());
-        assert!(parse_bench_req("5MB req=a.b").is_none());
-        assert!(parse_bench_req(&format!("5MB req={}", "x".repeat(33))).is_none());
-        assert!(parse_bench_req(&format!("5MB req={}", "x".repeat(32))).is_some());
-        assert!(!bench_req_ok(""));
-    }
-
-    #[test]
     fn global_ip_special_ranges() {
         let g = |s: &str| is_global_ip(&s.parse().unwrap());
         // публичные адреса проходят
@@ -1100,24 +879,6 @@ mod tests {
     }
 
     #[test]
-    fn enroll_try_limit_and_ttl() {
-        let t0 = Instant::now();
-        let mut t: HashMap<[u8; 16], Instant> = HashMap::new();
-        // полная таблица свежих записей: новый ключ не вставляется, размер не растёт
-        for i in 0..ENROLL_TRY_MAX as u8 {
-            assert!(enroll_try_put(&mut t, [i; 16], t0));
-        }
-        assert!(!enroll_try_put(&mut t, [200; 16], t0));
-        assert_eq!(t.len(), ENROLL_TRY_MAX);
-        // известный ключ обновляется и на предел не влияет
-        assert!(enroll_try_put(&mut t, [0; 16], t0 + Duration::from_secs(1)));
-        assert_eq!(t.len(), ENROLL_TRY_MAX);
-        // через TTL записи выкидываются, место освобождается
-        assert!(enroll_try_put(&mut t, [200; 16], t0 + ENROLL_TRY_TTL + Duration::from_secs(1)));
-        assert_eq!(t.len(), 1);
-    }
-
-    #[test]
     fn client_ctrl_bucket_per_link_and_link_cap() {
         let t0 = Instant::now();
         let mut m: HashMap<u8, CtrlBucket> = HashMap::new();
@@ -1181,201 +942,19 @@ mod tests {
         assert!(holder_by_prefix("cccccccc", &known).is_err());
     }
 
-    #[test]
-    fn early_buffer_has_per_link_quota() {
-        let rec = trust::Record { rights: 0, seq: 0, root: [0; 16], holder: [0; 64], issuer: [0; 16], sig: [0; 64], hh: [0; 16] };
-        let other = [1; 16];
-        let (l1, l2) = (LinkId::new([1; 16]), LinkId::new([2; 16]));
-        let mut buf = Vec::new();
-        for _ in 0..EARLY_PER_LINK {
-            assert!(early_push(&mut buf, l1, rec.clone(), &rec.root));
-        }
-        // мусор от одного Link упёрся в квоту, а чужой Link ещё может записать
-        assert!(early_push(&mut buf, l1, rec.clone(), &rec.root));
-        assert!(early_push(&mut buf, l2, rec.clone(), &rec.root));
-        assert!(!early_push(&mut buf, l2, rec.clone(), &other));
-        for i in 3..=(EARLY_MAX as u8) {
-            let _ = early_push(&mut buf, LinkId::new([i; 16]), rec.clone(), &rec.root);
-        }
-        assert_eq!(buf.len(), EARLY_MAX);
-        assert!(!early_push(&mut buf, LinkId::new([200; 16]), rec.clone(), &other));
-        assert!(early_push(&mut buf, LinkId::new([200; 16]), rec, &[0; 16]));
-    }
 
-    #[test]
-    fn relay_match_uses_invite_root_and_node_allowlist() {
-        let root = leviculum_std::api::generate_identity();
-        let inviter = leviculum_std::api::generate_identity();
-        let relay = leviculum_std::api::generate_identity();
-        let other = leviculum_std::api::generate_identity();
-        let root_h = *root.hash();
-        let inv = trust::Invite { admin: inviter.public_key_bytes(), root_pk: Some(root.public_key_bytes()), pin: [0; 16],
-            rights: trust::USE, created: 1, addrs: vec![], nodes: vec![*relay.hash()] };
-        let tag = trust::root_tag(&root_h);
-        assert!(relay_match(&inv, &relay.public_key_bytes(), &[tag.clone()]));
-        assert!(!relay_match(&inv, &inviter.public_key_bytes(), &[tag.clone()]));
-        assert!(!relay_match(&inv, &other.public_key_bytes(), &[tag]));
-        let mut direct = inv.clone();
-        direct.addrs.push("203.0.113.2:47001".into());
-        assert!(!relay_match(&direct, &relay.public_key_bytes(), &[trust::root_tag(&root_h)]));
-    }
 
-    #[test]
-    fn pairq_v3_roundtrip_and_exact_length() {
-        let root = [1; 16];
-        let inviter = [2; 16];
-        let holder = [3; 64];
-        let mac = [4; 32];
-        let body = pairq_body(root, inviter, &holder, &mac);
-        assert_eq!(body.len(), 128);
-        assert_eq!(parse_pairq(&body), Some((root, inviter, holder, mac)));
-        assert!(parse_pairq(&body[..127]).is_none());
-        let mut long = body.clone(); long.push(0);
-        assert!(parse_pairq(&long).is_none());
-    }
 
-    #[test]
-    fn pairq_client_rejects_foreign_inviter_and_root_substitution() {
-        let me = [1; 16];
-        let other = [2; 16];
-        let root = [3; 16];
-        let requested = [4; 16];
-        assert!(pairq_client_matches(&me, &me, &root, &root));
-        assert!(!pairq_client_matches(&other, &me, &root, &root));
-        assert!(!pairq_client_matches(&me, &me, &requested, &root));
-    }
 
-    #[test]
-    fn invite_rights_require_add_subset_anchor_and_depth() {
-        let root_id = leviculum_std::api::generate_identity();
-        let mut root = trust::Trust::new(root_id.clone(), None);
-        let root_h = *root_id.hash();
-        assert!(validate_invite_rights(&root, &root_h, trust::USE).is_ok());
-        let no_add = leviculum_std::api::generate_identity();
-        root.issue(root_h, no_add.public_key_bytes(), trust::USE).unwrap();
-        let mut no_add_trust = trust::Trust::new(no_add.clone(), None);
-        no_add_trust.add_anchor(&root_id.public_key_bytes()).unwrap();
-        for r in root.export_all() { no_add_trust.offer(r); }
-        assert!(validate_invite_rights(&no_add_trust, &root_h, trust::USE).is_err(), "нет ADD");
-        let member = leviculum_std::api::generate_identity();
-        root.issue(root_h, member.public_key_bytes(), trust::USE | trust::ADD).unwrap();
-        let mut member_trust = trust::Trust::new(member.clone(), None);
-        member_trust.add_anchor(&root_id.public_key_bytes()).unwrap();
-        for r in root.export_all() { member_trust.offer(r); }
-        assert!(validate_invite_rights(&member_trust, &root_h, trust::ALL).is_err(), "нельзя делегировать шире своих прав");
-        assert!(validate_invite_rights(&member_trust, &[0x44; 16], trust::USE).is_err(), "неякорный корень");
 
-        let ids: Vec<_> = (0..8).map(|_| leviculum_std::api::generate_identity()).collect();
-        let mut net = trust::Trust::new(root_id.clone(), None);
-        let mut previous = root_id.clone();
-        for id in &ids {
-            let mut issuer = trust::Trust::new(previous.clone(), None);
-            if previous.hash() != root_id.hash() { issuer.add_anchor(&root_id.public_key_bytes()).unwrap(); }
-            for r in net.export_all() { issuer.offer(r); }
-            let rec = issuer.issue(root_h, id.public_key_bytes(), trust::ALL).unwrap();
-            net.offer(rec);
-            previous = id.clone();
-        }
-        let mut deepest = trust::Trust::new(previous.clone(), None);
-        deepest.add_anchor(&root_id.public_key_bytes()).unwrap();
-        for r in net.export_all() { deepest.offer(r); }
-        assert_eq!(deepest.depth_in(&root_h, &deepest.me_hash), Some(8));
-        assert!(validate_invite_rights(&deepest, &root_h, trust::USE).is_err(), "глубина 8 не может породить ещё одно звено");
-    }
 
-    #[test]
-    fn delegated_invite_used_check_binds_root_inviter_holder_and_time() {
-        let root = leviculum_std::api::generate_identity();
-        let inviter = leviculum_std::api::generate_identity();
-        let me = leviculum_std::api::generate_identity();
-        let inv = trust::Invite { admin: inviter.public_key_bytes(), root_pk: Some(root.public_key_bytes()), pin: [0; 16],
-            rights: trust::USE, created: 10, addrs: vec![], nodes: vec![] };
-        let mut rec = trust::Record { rights: trust::USE, seq: 10_000, root: inv.root().unwrap(), holder: me.public_key_bytes(),
-            issuer: inv.admin_hash().unwrap(), sig: [0; 64], hh: *me.hash() };
-        assert!(invite_used(&inv, &me.public_key_bytes(), &[rec.clone()]));
-        rec.root = *inviter.hash();
-        assert!(!invite_used(&inv, &me.public_key_bytes(), &[rec.clone()]));
-        rec.root = inv.root().unwrap(); rec.holder = inviter.public_key_bytes();
-        assert!(!invite_used(&inv, &me.public_key_bytes(), &[rec.clone()]));
-        rec.holder = me.public_key_bytes(); rec.seq -= 1;
-        assert!(!invite_used(&inv, &me.public_key_bytes(), &[rec]));
-    }
 
-    #[test]
-    fn delegated_repeat_returns_chain_until_revocation() {
-        let (root_id, delegate, holder) = (leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity());
-        let root = *root_id.hash();
-        let mut authority = trust::Trust::new(root_id.clone(), None);
-        let rd = authority.issue(root, delegate.public_key_bytes(), trust::USE | trust::ADD).unwrap();
-        let mut dt = trust::Trust::new(delegate.clone(), None);
-        dt.add_anchor(&root_id.public_key_bytes()).unwrap();
-        dt.offer(rd.clone());
-        let dn = dt.issue(root, holder.public_key_bytes(), trust::USE).unwrap();
-        authority.offer(dn);
-        let mut receiver = trust::Trust::new(leviculum_std::api::generate_identity(), None);
-        receiver.add_anchor(&root_id.public_key_bytes()).unwrap();
-        for r in authority.export_all() { receiver.offer(r); }
-        let chain = repeat_record(&receiver, &root, &holder.public_key_bytes(), delegate.hash()).unwrap();
-        assert_eq!(chain.issuer, *delegate.hash());
-        assert!(receiver.chain_for(&holder.public_key_bytes()).len() >= 2, "в ответе есть делегирующая цепочка до корня");
-        authority.issue(root, delegate.public_key_bytes(), 0).unwrap();
-        let mut revoked = trust::Trust::new(leviculum_std::api::generate_identity(), None);
-        revoked.add_anchor(&root_id.public_key_bytes()).unwrap();
-        for r in authority.export_all() { revoked.offer(r); }
-        assert!(repeat_record(&revoked, &root, &holder.public_key_bytes(), delegate.hash()).is_none(), "отозванный участник не получает Repeat");
-    }
 
-    #[test]
-    fn bench_acc_counts_loss_reorder_dup() {
-        let mut a = BenchAcc::default();
-        for s in [0u32, 1, 3, 2, 2, 5] {
-            a.expected = 6;
-            a.on_pkt(s, BENCH_HDR, BENCH_SZ_MIN);
-        }
-        assert_eq!((a.uniq, a.dup, a.reord), (5, 1, 1)); // 2 пришёл после 3 (перестановка), второй 2 - дубль
-        assert_eq!(a.lost(7), 2); // из 0..7 не пришли 4 и 6
-        assert!(!a.on_pkt(BENCH_MAX_PKTS, BENCH_HDR, BENCH_SZ_MIN));
-        assert_eq!(a.bad, 1);
-    }
 
-    #[test]
-    fn bench_req_and_match() {
-        assert_eq!(parse_bench_req("100 MB"), Some((None, 100, None)));
-        let d = "0123456789abcdef0123456789abcdef";
-        let (dest, mb, _) = parse_bench_req(&format!("{d} 7MB")).unwrap();
-        assert_eq!((dest.map(|x| hex(&x)), mb), (Some(d.to_string()), 7));
-        assert!(parse_bench_req("hello").is_none());
-        let b: [u8; 16] = unhex(d).try_into().unwrap();
-        assert!(bench_match("knothop-ru-1", "knothop-ru-1", &b));
-        assert!(bench_match("01234567", "x", &b));
-        assert!(!bench_match("0123", "x", &b)); // короткий префикс не годится
-        assert!(!bench_match("ffffffff", "x", &b));
-        assert_eq!(bench_id(&serde_json::json!({"id": u32::MAX})), Some(u32::MAX));
-        assert_eq!(bench_id(&serde_json::json!({"id": u64::from(u32::MAX) + 1})), None);
-        assert_eq!(bench_id(&serde_json::json!({"id": -1})), None);
-        assert_eq!(parse_bench_req("0MB"), None);
-        assert_eq!(parse_bench_req("1000MB"), Some((None, 1000, None)));
-        assert_eq!(parse_bench_req("1001MB"), None);
-        assert!(bench_done_valid(1_000_000, 1400, 715, 1400, 1_000_000));
-        assert!(!bench_done_valid(1_000_000, 1400, 715, 1401, 1_000_000));
-        assert!(!bench_done_valid(1_000_000, 1400, 715, 1400, 2_000_000));
-        let now = Instant::now();
-        let mut done = None;
-        bench_note_done(&mut done, 10, now);
-        bench_note_done(&mut done, 10, now + Duration::from_secs(2));
-        assert_eq!(done.unwrap().1, now);
-        assert!(bench_timeout_reached(now, now + Duration::from_secs(11), Duration::from_secs(10)));
-        let mut bounded = BenchAcc::default();
-        bounded.expected = 2;
-        assert!(!bounded.on_pkt(2, BENCH_HDR, BENCH_SZ_MIN));
-        assert!(!bounded.on_pkt(1, BENCH_HDR - 1, BENCH_SZ_MIN));
-        assert_eq!(bounded.seen.len(), 0);
-        assert_eq!(bounded.bad, 2);
-        let mut rate = HashMap::new();
-        for i in 0..BENCH_RATE_MAX { rate.insert([i as u8; 16], now); }
-        assert!(!bench_rate_admit(&mut rate, [255; 16], now));
-        assert!(bench_rate_admit(&mut rate, [255; 16], now + BENCH_RATE));
-    }
+
+
+
+
 
     #[test]
     fn dial_filter_rejects_internal_ranges() {
@@ -1413,12 +992,22 @@ mod tests {
     }
 
     #[test]
-    fn client_identity_is_deterministic_and_distinct() {
-        let a = client_identity(&[1; 32]).unwrap();
-        let b = client_identity(&[1; 32]).unwrap();
-        let c = client_identity(&[2; 32]).unwrap();
-        assert_eq!(a.hash(), b.hash());
-        assert_ne!(a.hash(), c.hash());
+    fn client_identity_and_enrollment_survive_restart_without_profile() {
+        let dir = std::env::temp_dir().join(format!("kh-client13-{}", hex(&rand16())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = load_or_create_identity(&dir).unwrap();
+        let root = leviculum_std::api::generate_identity();
+        let mut issuer = trust::Trust::new(root.clone(), None);
+        let grant = issuer.issue(*root.hash(), first.public_key_bytes(), trust::USE).unwrap();
+        let mut tr = trust::Trust::new(first.clone(), Some(dir.join("trust.json")));
+        tr.add_anchor(&root.public_key_bytes()).unwrap();
+        assert_eq!(tr.offer(grant), trust::Offer::Added);
+        tr.save().unwrap();
+        let second = load_or_create_identity(&dir).unwrap();
+        assert_eq!(first.public_key_bytes(), second.public_key_bytes());
+        let loaded = trust::Trust::load(second.clone(), &dir).unwrap();
+        assert_eq!(loaded.effective(&second.public_key_bytes(), now_ms() as u64) & trust::USE, trust::USE);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1462,6 +1051,36 @@ mod tests {
         assert_eq!(dest_from_pub_tag(&pk, "grp"), *legacy.hash().as_bytes());
     }
 
+    #[test]
+    fn trust_anchor_cli_binds_root_only_with_matching_fingerprint_and_stopped_node() {
+        let dir = std::env::temp_dir().join(format!("kh-anchor-{}", hex(&rand16())));
+        let (state, keyf) = (dir.join("state"), dir.join("root.pk"));
+        std::fs::create_dir_all(&state).unwrap();
+        let node = load_or_create_identity(&state).unwrap();
+        let root = leviculum_std::api::generate_identity();
+        std::fs::write(&keyf, format!("{}\n", hex(&root.public_key_bytes()))).unwrap();
+        let args = |fp: String| TrustAnchorArgs { state: state.clone(), root_key_file: keyf.clone(), fingerprint: fp };
+        assert!(trust_anchor_cmd(args(hex(&[7u8; 16]))).is_err(), "чужой отпечаток");
+        assert!(!trust::Trust::load(node.clone(), &state).unwrap().has_anchor(root.hash()));
+        write_atomic(&state.join("status.json"), b"{}");
+        assert!(trust_anchor_cmd(args(hex(root.hash()))).is_err(), "узел работает");
+        std::fs::remove_file(state.join("status.json")).unwrap();
+        trust_anchor_cmd(args(hex(root.hash()))).unwrap();
+        trust_anchor_cmd(args(hex(root.hash()).to_uppercase())).unwrap();
+        let tr = trust::Trust::load(node, &state).unwrap();
+        assert!(tr.has_anchor(root.hash()) && tr.anchors().len() == 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn hint_addresses_are_syntax_and_scope_checked_before_storing() {
+        for ok in ["example.com:443", "node-1.example.org:47001", "8.8.8.8:47001", "[2001:4860:4860::8888]:443"] {
+            assert!(sane_hint_addr(ok), "{ok}");
+        }
+        let long = format!("{}:1", "a".repeat(64));
+        for bad in ["127.0.0.1:1", "10.0.0.1:80", "192.168.1.1:80", "169.254.1.1:1", "[::1]:1", "host", "a.b:0", "a.b:99999", "bad host:1", "evil..com:1", "-x.com:1", ":1", long.as_str()] {
+            assert!(!sane_hint_addr(bad), "{bad}");
+        }
+    }
     #[test]
     fn hints_migrate_from_old_dest_name() {
         let id = leviculum_std::api::generate_identity();
@@ -2328,6 +1947,22 @@ impl Addrs {
     }
 }
 
+/// R-5: подсказка адреса должна быть `IP:порт` (публичный IP; лаборатория `KNOTHOP_ALLOW_PRIVATE_DIAL` снимает это) или `имя:порт`
+/// с нормальным DNS-именем; не длиннее 64 байт. Подсказки приходят от пира, поэтому мусор не пишется в `hints.json`;
+/// имена всё равно перепроверяются после разрешения в `resolve_addrs`.
+fn sane_hint_addr(a: &str) -> bool {
+    if a.len() > 64 {
+        return false;
+    }
+    if let Ok(sa) = a.parse::<SocketAddr>() {
+        return sa.port() != 0 && (std::env::var("KNOTHOP_ALLOW_PRIVATE_DIAL").is_ok() || is_global_ip(&sa.ip()));
+    }
+    let Some((host, port)) = a.rsplit_once(':') else { return false };
+    port.parse::<u16>().is_ok_and(|p| p != 0)
+        && !host.is_empty()
+        && host.split('.').all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
 /// Разрешить адрес `host:порт` (IP или доменное имя) в список сокетов; IPv4 вперёд. Вызывается при каждой попытке, поэтому смена IP у домена подхватывается.
 async fn resolve_addrs(addrs: &[String]) -> Vec<SocketAddr> {
     let mut out: Vec<SocketAddr> = Vec::new();
@@ -3153,9 +2788,12 @@ static POL_TX_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static POL_RX_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn pol_counters() -> serde_json::Value {
-    serde_json::json!({"tx_b": POL_TX.load(Relaxed), "tx_n": POL_TX_N.load(Relaxed), "rx_b": POL_RX.load(Relaxed), "rx_n": POL_RX_N.load(Relaxed),
+    let mut v = serde_json::json!({"tx_b": POL_TX.load(Relaxed), "tx_n": POL_TX_N.load(Relaxed), "rx_b": POL_RX.load(Relaxed), "rx_n": POL_RX_N.load(Relaxed),
         "sync_tx_lxmf_b":lxmf_sync::TX_BYTES.load(Relaxed), "sync_rx_lxmf_b":lxmf_sync::RX_BYTES.load(Relaxed),
-        "sync_tx_n":lxmf_sync::TX_MESSAGES.load(Relaxed), "sync_rx_n":lxmf_sync::RX_MESSAGES.load(Relaxed)})
+        "sync_tx_n":lxmf_sync::TX_MESSAGES.load(Relaxed), "sync_rx_n":lxmf_sync::RX_MESSAGES.load(Relaxed)});
+    // PN грузится в фоне (W110): pn_ready/pn_load_ms показывают, когда встроенный PN начал обслуживать пиров
+    if let (Some(o), serde_json::Value::Object(pn)) = (v.as_object_mut(), lxmf_sync::pn_status()) { o.extend(pn); }
+    v
 }
 
 async fn send_ctl(node: &Arc<Node>, link: LinkId, ty: u8, body: &[u8]) {
@@ -3289,553 +2927,6 @@ fn spawn_ctl(node: &Arc<Node>, link: LinkId, ty: u8, body: Vec<u8>) {
     tokio::spawn(async move { send_ctl(&node, link, ty, &body).await });
 }
 
-// ------------------------------------------------------------------------------------------------ бенч (0014 R10)
-
-/// Больше пакетов в одном бенче не бывает: 100 МБ при размере 32 Б.
-const BENCH_MAX_PKTS: u32 = 40_000_000;
-
-/// Учёт пакетов бенча по seq: уникальные, дубли, перестановки, потери. Без сети, для теста.
-#[derive(Default)]
-struct BenchAcc {
-    /// битмап принятых seq
-    seen: Vec<u64>,
-    uniq: u64,
-    dup: u64,
-    /// пришёл раньше уже принятого большего seq
-    reord: u64,
-    /// seq вне диапазона - не учитываем
-    bad: u64,
-    max_seq: Option<u32>,
-    expected: u32,
-    sizes: Vec<u16>,
-}
-
-impl BenchAcc {
-    /// Учесть пакет; true - пакет новый.
-    fn on_pkt(&mut self, seq: u32, len: usize, max_len: usize) -> bool {
-        if seq >= self.expected || seq >= BENCH_MAX_PKTS || len < BENCH_HDR || len > max_len {
-            self.bad += 1;
-            return false;
-        }
-        let (w, bit) = ((seq / 64) as usize, 1u64 << (seq % 64));
-        if self.seen.len() <= w {
-            self.seen.resize(w + 1, 0);
-        }
-        if self.seen[w] & bit != 0 {
-            self.dup += 1;
-            return false;
-        }
-        self.seen[w] |= bit;
-        if self.sizes.len() <= seq as usize { self.sizes.resize(seq as usize + 1, 0); }
-        self.sizes[seq as usize] = len.min(u16::MAX as usize) as u16;
-        self.uniq += 1;
-        if self.max_seq.map_or(true, |m| seq > m) {
-            self.max_seq = Some(seq);
-        } else {
-            self.reord += 1;
-        }
-        true
-    }
-
-    /// Потери относительно числа отправленных (total из done).
-    fn lost(&self, total: u64) -> u64 {
-        total.saturating_sub(self.uniq)
-    }
-}
-
-/// Сессия запроса бенча на стороне запрашивающего: нода (файл из CLI) или телефон (`bench-req`). Одна за раз.
-struct BenchSess {
-    id: u32,
-    link: LinkId,
-    dest: [u8; 16],
-    /// имя (или dest8) для результата
-    to: String,
-    /// байт запрошено
-    n: u64,
-    /// размер датаграммы бенча
-    sz: u64,
-    timeout: Duration,
-    started: Instant,
-    first: Option<Instant>,
-    last: Option<Instant>,
-    /// байт уникальных пакетов
-    bytes: u64,
-    acc: BenchAcc,
-    stalls: u64,
-    stall_ms: u64,
-    /// total из done и когда пришёл
-    done: Option<(u64, Instant)>,
-    drain_timed_out: bool,
-    n_sent: Option<u64>,
-    negotiated_sz: u64,
-    requested_total: u32,
-    /// busy | rate - отказ отвечающей стороны
-    reply: Option<&'static str>,
-    rtt_idle: Option<f64>,
-    rtt_load: Vec<f64>,
-    rtt_at: Instant,
-    /// путь до узла (hops, vis) для результата
-    path: serde_json::Value,
-    /// `req=` из файла запроса, возвращается в результате как есть
-    req: Option<String>,
-}
-
-fn r3(x: f64) -> f64 {
-    (x * 1000.0).round() / 1000.0
-}
-
-impl BenchSess {
-    /// `mb` - миллионы байт (10^6), `sz` - размер датаграммы (не больше MDU Link).
-    fn new(id: u32, link: LinkId, dest: [u8; 16], to: String, mb: u64, sz: u64, timeout: Duration) -> Self {
-        let now = Instant::now();
-        let n = mb * 1_000_000;
-        let total = n.div_ceil(sz.max(1));
-        let mut acc = BenchAcc::default();
-        acc.expected = n.div_ceil(BENCH_SZ_MIN as u64).min(BENCH_MAX_PKTS as u64) as u32;
-        BenchSess { id, link, dest, to, n, sz, timeout, started: now, first: None, last: None, bytes: 0, acc,
-            stalls: 0, stall_ms: 0, done: None, drain_timed_out: false, n_sent: None, negotiated_sz: sz,
-            requested_total: total.min(BENCH_MAX_PKTS as u64) as u32, reply: None, rtt_idle: None, rtt_load: Vec::new(), rtt_at: now, path: serde_json::Value::Null, req: None }
-    }
-
-    fn on_pkt(&mut self, now: Instant, seq: u32, len: usize) {
-        if seq >= self.acc.expected || len < BENCH_HDR || len > self.sz as usize { self.acc.bad += 1; return; }
-        if let Some(l) = self.last {
-            let gap = now.duration_since(l);
-            if gap >= BENCH_STALL {
-                self.stalls += 1;
-                self.stall_ms += gap.as_millis() as u64;
-            }
-        }
-        self.first.get_or_insert(now);
-        self.last = Some(now);
-        if self.acc.on_pkt(seq, len, self.sz as usize) {
-            self.bytes += len as u64;
-        }
-    }
-
-    /// Решение на тике: None - идём дальше; Some(вердикт) - сессия закончена.
-    fn poll(&mut self, now: Instant, closed: bool, rtt: Option<f64>) -> Option<&'static str> {
-        // RTT под нагрузкой: пинги идут по тому же Link, их ответы стоят в очереди за данными; берём раз в 2 с
-        if now.duration_since(self.rtt_at) >= Duration::from_secs(2) {
-            self.rtt_at = now;
-            if let Some(r) = rtt {
-                self.rtt_load.push(r);
-            }
-        }
-        if let Some(r) = self.reply {
-            return Some(r);
-        }
-        if bench_timeout_reached(self.started, now, self.timeout) {
-            self.drain_timed_out = self.done.is_some() && self.acc.uniq < self.done.map(|d| d.0).unwrap_or(0);
-            if let Some((total, _)) = self.done {
-                return Some(if self.acc.uniq == total { "ok" } else { "timeout" });
-            }
-            return Some("timeout");
-        }
-        if let Some((total, at)) = self.done {
-            if self.acc.uniq >= total || now.duration_since(at) >= BENCH_GRACE {
-                self.drain_timed_out = self.acc.uniq < total;
-                return Some(if self.acc.uniq == total && self.stalls == 0 { "ok" } else { "partial" });
-            }
-            return None;
-        }
-        if self.first.is_none() && now.duration_since(self.started) >= BENCH_BLOCK {
-            return Some("blocked");
-        }
-        if closed {
-            return Some(if self.first.is_none() { "no-link" } else { "stalled" });
-        }
-        None
-    }
-
-    /// Итог (0014 R10). Непришедшие пакеты считаются от done, а без него - от ожидаемого числа по n и sz.
-    fn result(&self, now: Instant, verdict: &str) -> serde_json::Value {
-        let secs = match (self.first, self.last) {
-            (Some(a), Some(b)) => b.duration_since(a).as_secs_f64(),
-            _ => 0.0,
-        };
-        let total = self.done.map(|d| d.0).unwrap_or(self.requested_total as u64);
-        // тишина от последнего пакета до конца считается остановкой, если done не пришёл
-        let (mut stalls, mut stall_ms) = (self.stalls, self.stall_ms);
-        if self.done.is_none() {
-            if let Some(l) = self.last {
-                let gap = now.duration_since(l);
-                if gap >= BENCH_STALL {
-                    stalls += 1;
-                    stall_ms += gap.as_millis() as u64;
-                }
-            }
-        }
-        let mut rl = self.rtt_load.clone();
-        rl.sort_by(|a, b| a.total_cmp(b));
-        let rtt_load = rl.get(rl.len() / 2).map(|x| r3(*x));
-        let per_s = |x: f64| if secs > 0.0 { r3(x / secs) } else { 0.0 };
-        serde_json::json!({
-            "id": self.id, "req": self.req.clone(), "to": self.to.clone(), "verdict": verdict, "path": self.path.clone(),
-            "n_req": self.n, "n_sent": self.n_sent, "bytes_payload": self.bytes.saturating_sub(self.acc.uniq * BENCH_HDR as u64), "sz": self.negotiated_sz, "done": self.done.is_some(),
-            "bytes_rx": self.bytes, "pkts_rx": self.acc.uniq, "dup": self.acc.dup, "pkts_lost": self.done.map(|_| self.acc.lost(total)), "reordered": self.acc.reord,
-            "complete": self.done.is_some() && self.acc.uniq == total, "drain_timeout": self.drain_timed_out,
-            "partial": (self.first.is_some() || self.done.is_some()) && !(self.done.is_some() && self.acc.uniq == total), "rate_unreliable": secs < 1.0,
-            "secs": r3(secs), "mbps": per_s(self.bytes as f64 / 1e6), "pps": per_s(self.acc.uniq as f64),
-            "ttfb_ms": self.first.map(|f| f.duration_since(self.started).as_millis() as u64),
-            "rtt_ms_idle": self.rtt_idle.map(r3), "rtt_ms_load": rtt_load,
-            "stalls": stalls, "stall_s": r3(stall_ms as f64 / 1000.0),
-        })
-    }
-}
-
-/// Датаграмма бенча у запрашивающего: учитываем только пакеты его сессии (тот же Link и id).
-fn bench_rx(slot: &Mutex<Option<BenchSess>>, link: LinkId, d: &[u8]) {
-    if d.len() < BENCH_HDR {
-        return;
-    }
-    let id = u32::from_le_bytes(d[1..5].try_into().unwrap());
-    let seq = u32::from_le_bytes(d[5..9].try_into().unwrap());
-    let mut g = slot.lock().unwrap();
-    if let Some(s) = g.as_mut().filter(|s| s.link == link && s.id == id) {
-        s.on_pkt(Instant::now(), seq, d.len());
-    }
-}
-
-/// Ответ отвечающей стороны на наш запрос: busy, rate или done (число отправленных пакетов).
-fn bench_msg(slot: &Mutex<Option<BenchSess>>, link: LinkId, v: &serde_json::Value) {
-    let mut g = slot.lock().unwrap();
-    let Some(s) = g.as_mut().filter(|s| s.link == link && Some(s.id as u64) == v["id"].as_u64()) else { return };
-    if v["busy"].as_bool() == Some(true) {
-        s.reply = Some("busy");
-    } else if v["rate"].as_bool() == Some(true) {
-        s.reply = Some("rate");
-    } else if v["error"].is_string() {
-        s.reply = Some("invalid-request");
-    } else if let Some(d) = v["done"].as_u64() {
-        if s.done.is_some() { return; }
-        let sz = v["sz"].as_u64().unwrap_or(0);
-        if !bench_done_valid(s.n, s.sz, d, sz, v["n_sent"].as_u64().unwrap_or(0)) { return; }
-        let expected = s.n.div_ceil(sz);
-        if d != expected { return; }
-        let tail = s.n.saturating_sub(d.saturating_sub(1).saturating_mul(sz)).max(BENCH_HDR as u64);
-        let n_sent = d.saturating_sub(1).saturating_mul(sz).saturating_add(tail);
-        if v["n_sent"].as_u64() != Some(n_sent) { return; }
-        let mut uniq = 0u64;
-        let mut bytes = 0u64;
-        for seq in 0..s.acc.sizes.len() {
-            let w = seq / 64;
-            let bit = 1u64 << (seq % 64);
-            let received = s.acc.seen.get(w).is_some_and(|bits| bits & bit != 0);
-            let expected_len = if seq + 1 == d as usize { tail as usize } else { sz as usize };
-            if seq >= d as usize || (received && s.acc.sizes[seq] as usize != expected_len) {
-                if received { s.acc.seen[w] &= !bit; }
-                s.acc.sizes[seq] = 0;
-            } else if s.acc.sizes[seq] != 0 {
-                uniq += 1;
-                bytes += s.acc.sizes[seq] as u64;
-            }
-        }
-        s.acc.uniq = uniq;
-        s.bytes = bytes;
-        s.acc.expected = d as u32;
-        s.negotiated_sz = sz;
-        s.n_sent = Some(n_sent);
-        bench_note_done(&mut s.done, d, Instant::now());
-    }
-}
-
-/// Опрос сессии на тике: закончена - снимаем её и отдаём итог (записывает вызывающий).
-fn bench_finish(slot: &Mutex<Option<BenchSess>>, sh: &Shared, rtt: Option<f64>) -> Option<serde_json::Value> {
-    let mut g = slot.lock().unwrap();
-    let s = g.as_mut()?;
-    let closed = sh.closed.lock().unwrap().contains_key(&hex(s.link.as_bytes()));
-    let now = Instant::now();
-    let verdict = s.poll(now, closed, rtt)?;
-    let j = s.result(now, verdict);
-    sh.note(format!("бенч {}: {verdict}, {} МБ/с", s.to, j["mbps"]));
-    *g = None;
-    Some(j)
-}
-
-/// Имя, полный dest (32 hex) или префикс dest не короче 8 hex. `to` - в нижнем регистре.
-fn bench_match(to: &str, name: &str, dest: &[u8; 16]) -> bool {
-    name.eq_ignore_ascii_case(to) || (to.len() >= 8 && to.chars().all(|c| c.is_ascii_hexdigit()) && hex(dest).starts_with(to))
-}
-
-fn bench_fail(id: u32, to: &str, why: &str) -> serde_json::Value {
-    serde_json::json!({"id": id, "to": to, "verdict": "no-link", "why": why})
-}
-
-fn write_bench_res(dir: &Path, j: &serde_json::Value) {
-    let _ = std::fs::create_dir_all(dir);
-    write_atomic(&dir.join(format!("res-{}.json", j["id"])), j.to_string().as_bytes());
-}
-
-/// Файл запроса телефона: "<N MB>" или "<dest32> <N MB>", необязательно `req=<id>` (вернётся в результате, по нему сверяет запрашивающий).
-fn parse_bench_req(t: &str) -> Option<(Option<[u8; 16]>, u64, Option<String>)> {
-    let (mut dest, mut mb, mut req) = (None, None, None);
-    for w in t.split_whitespace() {
-        if let Some(r) = w.strip_prefix("req=") {
-            if !bench_req_ok(r) {
-                return None;
-            }
-            req = Some(r.to_string());
-        } else if w.len() == 32 && w.chars().all(|c| c.is_ascii_hexdigit()) {
-            dest = <[u8; 16]>::try_from(unhex(&w.to_lowercase()).as_slice()).ok();
-        } else if let Ok(x) = w.trim_end_matches(|c: char| c.is_ascii_alphabetic()).parse::<u64>() {
-            mb = Some(x);
-        }
-    }
-    let mb = mb?;
-    (1..=BENCH_MAX_MB).contains(&mb).then_some((dest, mb, req))
-}
-
-/// Токен запроса бенча: 1..32 символа [A-Za-z0-9_-].
-fn bench_req_ok(r: &str) -> bool {
-    (1..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-fn bench_id(v: &serde_json::Value) -> Option<u32> {
-    let n = v["id"].as_u64()?;
-    u32::try_from(n).ok()
-}
-
-fn bench_done_valid(n: u64, requested_sz: u64, total: u64, sz: u64, n_sent: u64) -> bool {
-    if sz < BENCH_SZ_MIN as u64 || sz > requested_sz || total > BENCH_MAX_PKTS as u64 || total != n.div_ceil(sz) { return false; }
-    let tail = n.saturating_sub(total.saturating_sub(1).saturating_mul(sz)).max(BENCH_HDR as u64);
-    n_sent == total.saturating_sub(1).saturating_mul(sz).saturating_add(tail)
-}
-
-fn bench_note_done(done: &mut Option<(u64, Instant)>, total: u64, now: Instant) {
-    if done.is_none() { *done = Some((total, now)); }
-}
-
-fn bench_timeout_reached(started: Instant, now: Instant, timeout: Duration) -> bool {
-    now.duration_since(started) >= timeout
-}
-
-fn bench_rate_admit(rate: &mut HashMap<[u8; 16], Instant>, peer: [u8; 16], now: Instant) -> bool {
-    rate.retain(|_, at| now.duration_since(*at) < BENCH_RATE);
-    if rate.contains_key(&peer) || rate.len() >= BENCH_RATE_MAX { return false; }
-    rate.insert(peer, now);
-    true
-}
-
-struct BenchServingGuard(Arc<NodeCtx>);
-impl Drop for BenchServingGuard {
-    fn drop(&mut self) { self.0.bench_serving.store(false, Relaxed); }
-}
-
-/// Запрос бенча (с полем "n") на Link с ролью Server или Client. Ответ - rate/busy или пакеты и done.
-fn on_bench_req(ctx: &Arc<NodeCtx>, link: LinkId, v: &serde_json::Value) {
-    let peer = match ctx.links.lock().unwrap().get(&link).map(|l| &l.role) {
-        Some(Role::Server { dest }) => *dest,
-        Some(Role::Client { id, .. }) => *id,
-        _ => return, // неавторизованный Link бенч не обслуживает
-    };
-    let Some(id) = bench_id(v) else { return };
-    let n = v["n"].as_u64();
-    let Some(n) = n.filter(|n| (1..=BENCH_MAX_N).contains(n)) else {
-        spawn_ctl(&ctx.node, link, T_BENCH, serde_json::json!({"id": id, "error": "invalid n"}).to_string().into_bytes());
-        return;
-    };
-    let mdu = ctx.node.engine().link_mdu(&link).unwrap_or(0);
-    if mdu < BENCH_SZ_MIN {
-        spawn_ctl(&ctx.node, link, T_BENCH, serde_json::json!({"id": id, "error": "link MDU below minimum"}).to_string().into_bytes());
-        return;
-    }
-    let requested_sz = v["sz"].as_u64().and_then(|x| usize::try_from(x).ok()).unwrap_or(mdu);
-    if requested_sz < BENCH_SZ_MIN {
-        spawn_ctl(&ctx.node, link, T_BENCH, serde_json::json!({"id": id, "error": "invalid sz"}).to_string().into_bytes());
-        return;
-    }
-    let sz = requested_sz.min(mdu);
-    if ctx.bench_serving.swap(true, Relaxed) {
-        spawn_ctl(&ctx.node, link, T_BENCH, serde_json::json!({"id": id, "busy": true}).to_string().into_bytes());
-        return;
-    }
-    if !bench_rate_admit(&mut ctx.bench_rate.lock().unwrap(), peer, Instant::now()) {
-        ctx.bench_serving.store(false, Relaxed);
-        spawn_ctl(&ctx.node, link, T_BENCH, serde_json::json!({"id": id, "rate": true}).to_string().into_bytes());
-        return;
-    }
-    ctx.sh.note(format!("бенч: отдаю {n} Б пиру {} (датаграмма {sz} Б)", &hex(&peer)[..8]));
-    let c = ctx.clone();
-    let guard = BenchServingGuard(ctx.clone());
-    tokio::spawn(async move { let _guard = guard; bench_send(c, link, id, n, sz).await });
-}
-
-/// Отправка пакетов бенча тем же путём, что IP-пакеты туннеля: `send_datagram` без окна и подтверждений, без своего пейсинга.
-/// Backpressure даёт сам `send_datagram` (ждёт место в очереди отправки). При ошибке ждём, пока Link жив, не дольше BENCH_BLOCK.
-async fn bench_send(ctx: Arc<NodeCtx>, link: LinkId, id: u32, n: u64, sz: usize) {
-    let h = ctx.node.engine().link_handle(&link);
-    let key = hex(link.as_bytes());
-    let total = n.div_ceil(sz as u64);
-    let (mut seq, mut ok_at, mut aborted) = (0u64, Instant::now(), false);
-    let deadline = Instant::now() + Duration::from_secs(900);
-    while seq < total {
-        let now = Instant::now();
-        if h.is_closed() || ctx.sh.closed.lock().unwrap().contains_key(&key) || ok_at.elapsed() >= BENCH_BLOCK || now >= deadline { aborted = true; break; }
-        let remaining = n.saturating_sub(seq.saturating_mul(sz as u64));
-        let packet_len = if seq + 1 == total { remaining.max(BENCH_HDR as u64) as usize } else { sz };
-        let mut pkt = vec![0xa5u8; packet_len];
-        pkt[0] = T_BENCH_DATA;
-        pkt[1..5].copy_from_slice(&id.to_le_bytes());
-        pkt[5..9].copy_from_slice(&(seq as u32).to_le_bytes());
-        pkt[9..17].copy_from_slice(&(now_ms() as u64).to_le_bytes());
-        match tokio::time::timeout(BENCH_BLOCK.min(deadline.saturating_duration_since(now)), h.send_datagram(&pkt)).await {
-            Ok(Ok(())) => {
-                seq += 1;
-                ok_at = Instant::now();
-                if seq % 64 == 0 {
-                    tokio::task::yield_now().await;
-                }
-            }
-            Ok(Err(_)) | Err(_) => {
-                if h.is_closed() || ctx.sh.closed.lock().unwrap().contains_key(&key) || ok_at.elapsed() > BENCH_BLOCK {
-                    aborted = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }
-    }
-    if !aborted {
-        let n_sent = seq.saturating_sub(1).saturating_mul(sz as u64).saturating_add(n.saturating_sub(seq.saturating_sub(1).saturating_mul(sz as u64)).max(BENCH_HDR as u64));
-        send_ctl(&ctx.node, link, T_BENCH, &serde_json::json!({"id": id, "done": seq, "sz": sz, "n_sent": n_sent}).to_string().into_bytes()).await;
-    }
-    ctx.sh.note(format!("бенч: отправлено {seq} из {total} пакетов{}", if aborted { ", прервано" } else { "" }));
-}
-
-/// T_BENCH: с полем "n" - запрос на отдачу, иначе - ответ на наш запрос.
-fn on_bench_ctl(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else { return };
-    if v.get("n").is_some() {
-        on_bench_req(ctx, link, &v);
-    } else {
-        bench_msg(&ctx.bench_sess, link, &v);
-    }
-}
-
-/// RTT до соседа, с которым идёт бенч (из пингов).
-fn node_bench_rtt(ctx: &NodeCtx) -> Option<f64> {
-    let dest = ctx.bench_sess.lock().unwrap().as_ref()?.dest;
-    let neigh = ctx.neigh.lock().unwrap();
-    let n = neigh.get(&dest)?;
-    n.last_heard.elapsed().lt(&Duration::from_secs(5)).then_some(n.rtt_ms).flatten()
-}
-
-/// Запрос от ноды (`bench/req-<id>.json`, кладёт `knothopd bench`): сосед с живым Link с ролью сервера, одна сессия за раз.
-fn bench_node_start(ctx: &Arc<NodeCtx>, id: u32, to: &str, mb: u64, timeout: u64) -> std::result::Result<(), String> {
-    if mb == 0 || mb > BENCH_MAX_MB {
-        return Err(format!("объём: от 1 до {BENCH_MAX_MB} МБ"));
-    }
-    let found: Vec<([u8; 16], String, Option<f64>, LinkId)> = {
-        let links = ctx.links.lock().unwrap();
-        let neigh = ctx.neigh.lock().unwrap();
-        neigh.values()
-            .filter_map(|nb| nb.link.filter(|l| matches!(links.get(l).map(|x| &x.role), Some(Role::Server { .. }))).map(|l| (nb.dest, nb.name.clone(), nb.rtt_ms, l)))
-            .filter(|(d, n, _, _)| bench_match(to, n, d))
-            .collect()
-    };
-    let (dest, name, rtt, link) = match found.len() {
-        0 => return Err("нет живого Link с этим соседом (бенч - по Link соседа с ролью сервера)".into()),
-        1 => found[0].clone(),
-        _ => return Err("неоднозначно: уточните dest".into()),
-    };
-    let mdu = ctx.node.engine().link_mdu(&link).unwrap_or(0);
-    if mdu < BENCH_SZ_MIN { return Err("Link MDU меньше минимального размера бенча".into()); }
-    let mut s = BenchSess::new(id, link, dest, name.clone(), mb, mdu as u64, Duration::from_secs(timeout));
-    s.rtt_idle = rtt;
-    s.path = serde_json::json!({"hops": ctx.node.hops_to(&DestinationHash::new(dest))});
-    *ctx.bench_sess.lock().unwrap() = Some(s);
-    spawn_ctl(&ctx.node, link, T_BENCH, serde_json::json!({"id": id, "n": mb * 1_000_000, "sz": mdu}).to_string().into_bytes());
-    ctx.sh.note(format!("бенч к {name}: {mb} МБ, запрос отправлен"));
-    Ok(())
-}
-
-/// Берём файлы запроса (по одному за тик), пока нет своей сессии; файл удаляем сразу, плохой запрос даёт результат с причиной.
-fn take_bench_req(ctx: &Arc<NodeCtx>) {
-    if ctx.bench_sess.lock().unwrap().is_some() {
-        return;
-    }
-    let dir = ctx.state.join("bench");
-    let Ok(rd) = std::fs::read_dir(&dir) else { return };
-    let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("req-") && n.ends_with(".json")).unwrap_or(false))
-        .collect();
-    files.sort();
-    let Some(p) = files.first().cloned() else { return };
-    let txt = std::fs::read_to_string(&p);
-    let _ = std::fs::remove_file(&p);
-    let Ok(txt) = txt else { return };
-    let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
-    let Some(id) = bench_id(&v) else {
-        write_bench_res(&dir, &bench_fail(0, "", "id must be u32"));
-        return;
-    };
-    let to = v["to"].as_str().unwrap_or("").to_lowercase();
-    let mb = v["mb"].as_u64().unwrap_or(0);
-    let timeout = v["timeout"].as_u64().unwrap_or(120).clamp(10, 900);
-    if let Err(why) = bench_node_start(ctx, id, &to, mb, timeout) {
-        write_bench_res(&dir, &bench_fail(id, &to, &why));
-    }
-}
-
-/// Телефон: запрос из `bench-req` (кладёт приложение или интент стенда). Мерим только текущий выход: Link к другим у телефона нет.
-fn client_bench_start(ctx: &Arc<ClientCtx>, txt: &str) -> std::result::Result<(), String> {
-    let (dest, mb, req) = parse_bench_req(txt).ok_or("bench-req: нужно «<N MB>» или «<dest32> <N MB>», req=<id> необязателен")?;
-    if mb == 0 || mb > BENCH_MAX_MB {
-        return Err(format!("объём: от 1 до {BENCH_MAX_MB} МБ"));
-    }
-    let cur = *ctx.cur.lock().unwrap();
-    let Some((cd, link, _)) = cur else { return Err("выхода нет: бенч мерит только текущий выход".into()) };
-    if dest.is_some_and(|d| d != cd) {
-        return Err("выбранный узел не текущий выход: Link к нему нет".into());
-    }
-    let name = ctx.servers.lock().unwrap().iter().find(|s| s.dest == cd).map(|s| s.name.clone()).unwrap_or_else(|| hex(&cd)[..8].to_string());
-    let mdu = ctx.node.engine().link_mdu(&link).unwrap_or(0);
-    if mdu < BENCH_SZ_MIN { return Err("Link MDU меньше минимального размера бенча".into()); }
-    let id = u32::from_le_bytes(rand16()[..4].try_into().unwrap());
-    // таймаут растёт с объёмом (1000 МБ на медленном пути - минуты), но не больше срока отдачи на сервере (900 с)
-    let mut s = BenchSess::new(id, link, cd, name.clone(), mb, mdu as u64, Duration::from_secs((mb * 2).clamp(120, 900)));
-    s.req = req;
-    s.rtt_idle = *ctx.rtt_ms.lock().unwrap();
-    let vis = ctx.vis.lock().unwrap().get(&cd).map(|x| x.0);
-    s.path = serde_json::json!({"hops": ctx.node.hops_to(&DestinationHash::new(cd)), "vis": vis});
-    *ctx.bench_sess.lock().unwrap() = Some(s);
-    spawn_ctl(&ctx.node, link, T_BENCH, serde_json::json!({"id": id, "n": mb * 1_000_000, "sz": mdu}).to_string().into_bytes());
-    ctx.sh.note(format!("бенч к {name}: {mb} МБ"));
-    Ok(())
-}
-
-fn client_bench_save(ctx: &ClientCtx, j: serde_json::Value) {
-    write_atomic(&ctx.state.join("bench-res.json"), j.to_string().as_bytes());
-    *ctx.bench_last.lock().unwrap() = Some(j);
-}
-
-/// Телефон (0014 R10): запрос из файла `bench-req` (только по нему, сам бенч не запускается); итог - bench-res.json и поле `bench` в status.json.
-async fn client_bench(ctx: Arc<ClientCtx>) {
-    let (req, fin) = (ctx.state.join("bench-req"), ctx.state.join("fin"));
-    while !fin.exists() {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let fresh = now_ms().saturating_sub(ctx.rtt_pong.load(Relaxed) as u128) < 5_000;
-        let rtt = if fresh { *ctx.rtt_ms.lock().unwrap() } else { None };
-        if let Some(j) = bench_finish(&ctx.bench_sess, &ctx.sh, rtt) {
-            client_bench_save(&ctx, j);
-            continue;
-        }
-        if ctx.bench_sess.lock().unwrap().is_some() {
-            continue;
-        }
-        let Ok(txt) = std::fs::read_to_string(&req) else { continue };
-        let _ = std::fs::remove_file(&req);
-        if let Err(why) = client_bench_start(&ctx, &txt) {
-            let mut j = bench_fail(0, "", &why);
-            if let Some(r) = txt.split_whitespace().find_map(|w| w.strip_prefix("req=")).filter(|r| bench_req_ok(r)) {
-                j["req"] = r.into();
-            }
-            client_bench_save(&ctx, j);
-        }
-    }
-}
-
 // ------------------------------------------------------------------------------------------------ сервер
 
 enum Role {
@@ -3843,7 +2934,7 @@ enum Role {
     Unknown,
     /// взаимно проверенный сервер
     Server { dest: [u8; 16] },
-    /// клиент из реестра
+    /// клиент с допущенными правами USE
     Client { id: [u8; 16], ip: u32 },
 }
 
@@ -4023,20 +3114,12 @@ struct NodeCtx {
     tun: Option<Arc<TunState>>,
     started: Instant,
     /// когда (мс unix) выдать внеочередной анонс; 0 - не нужно. Внеочередной анонс не чаще раза в минуту.
-    announce_at: std::sync::atomic::AtomicU64,
-    last_trigger: Mutex<Instant>,
     ours_online: std::sync::atomic::AtomicUsize,
     listen_port: u16,
     /// идентификаторы интерфейсов публичной сети RNS (их выдаёт spawn_interface; по имени узнавать нельзя: интерфейс называется `tcp_client_N`)
     public_ids: Mutex<HashSet<usize>>,
-    /// модель 0013 (права и якоря доверия); None - legacy общий секрет
+    /// модель 0013 (права и якоря доверия)
     t13: Option<T13>,
-    /// R10: бенч, который запросила эта нода (одна сессия за раз)
-    bench_sess: Mutex<Option<BenchSess>>,
-    /// R10: этот узел сейчас отдаёт бенч (один на ноду)
-    bench_serving: AtomicBool,
-    /// R10: когда последний раз отдали бенч пиру (ключ - dest сервера или id клиента), не чаще раза в минуту
-    bench_rate: Mutex<HashMap<[u8; 16], Instant>>,
 }
 
 /// Состояние модели 0013 на узле.
@@ -4045,18 +3128,10 @@ struct T13 {
     trust: Arc<Mutex<trust::Trust>>,
     /// приглашение, по которому нода ещё не зачислена; после зачисления None
     invite: Mutex<Option<trust::Invite>>,
-    /// Link, по которым T_PAIR1 уже отправлен (по одному разу на Link)
-    pair_sent: Mutex<HashSet<LinkId>>,
-    /// пересланные T_PAIRQ (mac -> когда и с какого Link): повтор раньше 8 с не рассылается, петли в mesh гаснут
-    pairq_seen: Mutex<HashMap<[u8; 32], (Instant, LinkId)>>,
-    /// записи, пришедшие раньше якоря админа (посредник шлёт выгрузку до записи о нас): применяются после зачисления
-    early: Mutex<Vec<(LinkId, trust::Record)>>,
     /// H1: записи от пиров есть в памяти, но не на диске; пишет `flush_trust` не чаще раза в 2 с
     trust_dirty: AtomicBool,
     /// когда в последний раз виден анонс админа приглашения (0014 R6а): по нему решаем, просимся ли через посредника
-    admin_seen: Mutex<Option<Instant>>,
     /// попытки зачисления через посредника (dest посредника -> когда): каждому не чаще раза в 60 с
-    relay_try: Mutex<HashMap<[u8; 16], Instant>>,
     /// T_DIR: когда последний раз слали каталог на Link (не чаще раза в 60 с)
     dir_sent: Mutex<HashMap<LinkId, Instant>>,
 }
@@ -4132,30 +3207,6 @@ impl NodeCtx {
         }
     }
 
-    /// Внеочередной анонс (новый участник группы, новая QUIC-связь): через 1-6 с, не чаще раза в минуту.
-    fn trigger_announce(&self) {
-        let mut l = self.last_trigger.lock().unwrap();
-        if l.elapsed() < Duration::from_secs(60) {
-            return;
-        }
-        *l = Instant::now();
-        let jitter = u64::from(rand16()[0]) * 5000 / 255;
-        self.announce_at.store(now_ms() as u64 + 1000 + jitter, Relaxed);
-    }
-
-    /// Теги корней, в чьих сетях мы состоим, плюс сеть админа из ожидающего приглашения (чтобы админ нас нашёл).
-    fn t13_tags(&self) -> Vec<String> {
-        let Some(t) = &self.t13 else { return vec![] };
-        let mut v = t.trust.lock().unwrap().tags();
-        if let Some(inv) = t.invite.lock().unwrap().as_ref() {
-            let Ok(inv_root) = inv.root() else { return v };
-            let tg = trust::root_tag(&inv_root);
-            if !v.contains(&tg) {
-                v.push(tg);
-            }
-        }
-        v
-    }
 
     /// Текущие объявляемые адреса (копия).
     fn adv(&self) -> Vec<String> {
@@ -4165,7 +3216,7 @@ impl NodeCtx {
     fn announce_data(&self) -> Vec<u8> {
         // ADR 0016: как у обычного узла RNS - только теги корней ("r": по пересечению с моими якорями сосед узнаёт знакомую сеть).
         // Адресов, имени и endpoint id нет: они приходят приватным каталогом по LXMF и из приглашения.
-        serde_json::to_vec(&serde_json::json!({"r": self.t13_tags()})).unwrap()
+        Vec::new()
     }
 
     fn self_json(&self) -> serde_json::Value {
@@ -4348,8 +3399,10 @@ impl NodeCtx {
         let removed = remove_link_admission(&self.links, link, || {
             if let Some(t) = &self.tun { t.disallow(link); }
         });
+        if removed.as_ref().is_some_and(|l| matches!(l.role, Role::Client { .. })) {
+            crate::host_acl::notify_nft();
+        }
         if let Some(t) = &self.t13 {
-            t.pair_sent.lock().unwrap().remove(link);
             t.dir_sent.lock().unwrap().remove(link);
         }
         if let Some(l) = removed {
@@ -4438,30 +3491,24 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         let mut inv = None;
         if !invite_raw.trim().is_empty() {
             match trust::Invite::parse(&invite_raw) {
-                Ok(i) => {
-                    if i.root().ok() == Some(my_id) || i.admin == my_pk {
-                        bail!("приглашение не может зачислить эту identity или выдано ею самой");
-                    } else if i.root().map(|root| tr.has_anchor(&root)).unwrap_or(false) {
-                        sh.note("приглашение игнорируется: этот админ уже в якорях".to_string());
-                    } else if !i.fresh(now_ms() as u64 / 1000) {
-                        bail!("приглашение просрочено или датировано будущим: попросите новое у админа");
-                    } else {
-                        inv = Some(i);
-                    }
+                Ok(candidate) => {
+                    let used = tr.enrollment_proofs(&my_pk).iter().any(|p| p.grant.id == crate::enroll::invite_id(&candidate.pin));
+                    if !used { inv = Some(candidate); }
                 }
-                Err(e) if tr.anchors().len() > 1 || tr.record_count() > 0 => {
-                    // нода уже зачислена: приглашение ей больше не нужно (pin погашен), мусорный файл не должен мешать старту
-                    sh.note(format!("приглашение не разобрано ({e:#}), но нода уже зачислена - продолжаю без него"));
-                }
-                Err(e) => {
-                    return Err(e).context("приглашение");
-                }
+                // старый invite_file из node.json (v3): нода уже зачислена, якорь ставится `knothopd trust-anchor`
+                Err(e) if tr.anchors().len() > 1 || tr.record_count() > 0 => { eprintln!("Сохранённое зачисление используется без старого приглашения: {e:#}"); }
+                Err(e) => return Err(e),
             }
         }
-        Some(T13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), pair_sent: Mutex::new(HashSet::new()), pairq_seen: Mutex::new(HashMap::new()),
-            early: Mutex::new(Vec::new()), trust_dirty: AtomicBool::new(false), admin_seen: Mutex::new(None), relay_try: Mutex::new(HashMap::new()), dir_sent: Mutex::new(HashMap::new()) })
+        Some(T13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), 
+            trust_dirty: AtomicBool::new(false),  dir_sent: Mutex::new(HashMap::new()) })
     };
 
+    // Clear stale host-access kernel leases before any ordinary admission.
+    // Без TUN (--no-exit) клиентов нет; --no-host-nft - лаборатория без таблицы: наборы пусты, TCP к хосту закрыт.
+    let host_nft = if a.no_exit || a.no_host_nft { None } else {
+        Some(crate::host_acl::NftHostAccess::new(client_net()).context("HOST_ACCESS nft startup")?)
+    };
     let tun = if a.no_exit {
         None
     } else {
@@ -4498,11 +3545,20 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         identity: node_identity, my_pk, my_id, my_dest, my_key, ep_id: ep.id().to_string(), advertise: Mutex::new(advertise), adv_auto,
         announce_s: a.announce_s, dead: Duration::from_secs(a.dead_s), path_gate: path::PathGate::default(), client_info: Mutex::new(HashMap::new()), peer_clients: Mutex::new(HashMap::new()),
         links: Mutex::new(HashMap::new()), neigh: Mutex::new(HashMap::new()),
-        tun, started: Instant::now(), announce_at: Default::default(), last_trigger: Mutex::new(Instant::now() - Duration::from_secs(3600)),
+        tun, started: Instant::now(),
         ours_online: Default::default(), listen_port: a.port, public_ids: Mutex::new(HashSet::new()),
         t13,
-        bench_sess: Mutex::new(None), bench_serving: AtomicBool::new(false), bench_rate: Mutex::new(HashMap::new()),
     });
+    if let (Some(tun), Some(t), Some(host_nft)) = (&ctx.tun, &ctx.t13, host_nft) {
+        let weak = Arc::downgrade(&ctx);
+        host_nft.start(tun, t.trust.clone(), move || {
+            let ctx = weak.upgrade()?;
+            let links = ctx.links.lock().unwrap();
+            Some(links.iter().filter(|(_, l)| !l.enroll_only && matches!(l.role, Role::Client { .. }))
+                .filter_map(|(link, l)| l.peer_pk.map(|pk| (*link, pk))).collect())
+        })?;
+    }
+    let _enrollment_service = ctx.t13.as_ref().map(|t| enroll_net::register(node.clone(), ctx.identity.clone(), t.trust.clone(), &a.state, None));
     let _sync_guard = admin_lxmf.as_ref().map(|r| lxmf_sync::register(&a.state, r.sync.clone()));
     if let Some(runtime) = admin_lxmf {
         if let Some(t) = &ctx.t13 { runtime.pn.set_source(t.trust.clone()); }
@@ -4513,16 +3569,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         let inv = t.invite.lock().unwrap();
         sh.note(format!("модель 0013: якорей {}, записей {}{}", tr.anchors().len(), tr.record_count(),
             if inv.is_some() { ", жду зачисления по приглашению" } else { "" }));
-        // админ приглашения ещё не знаком: заводим соседа из приглашения, чтобы дозвониться, не дожидаясь его анонса
-        if let Some(i) = inv.as_ref() {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&i.admin[32..64]);
-            let dest = dest_from_pub_tag(&i.admin, &ctx.tag);
-            let ep = EndpointId::from_bytes(&key).map(|e| e.to_string()).unwrap_or_default();
-            ctx.neigh.lock().unwrap().insert(dest, Neighbor { dest, key, pk: i.admin, name: "admin".into(), ep, addrs: Addrs::new(i.addrs.clone()), tags: vec![], accepts_links: true, last_announce: Instant::now(),
-                link: None, last_heard: Instant::now() - Duration::from_secs(3600), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(),
-                last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: LossWin::default(), ping_seq: 0, admitted_at: Instant::now(), seen_gen: 0 });
-        }
+
     }
     ctx.book_load();
     write_atomic(&a.state.join("server.json"), ctx.self_json().to_string().as_bytes());
@@ -4575,12 +3622,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         } else {
             a.announce_s
         };
-        let at = ctx.announce_at.load(Relaxed);
-        let triggered = at != 0 && now_ms() as u64 >= at;
-        if last.elapsed() >= Duration::from_secs(every) || triggered {
-            if triggered {
-                ctx.announce_at.store(0, Relaxed);
-            }
+        if last.elapsed() >= Duration::from_secs(every) {
             let _ = node.announce(&DestinationHash::new(my_dest), Some(&ctx.announce_data())).await;
             last = Instant::now();
             announces += 1;
@@ -4599,6 +3641,7 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
     while let Some(ev) = events.recv().await {
         match ev {
             NodeEvent::AnnounceReceived { announce, .. } => on_announce(&ctx, &announce),
+            NodeEvent::RequestReceived { link_id, request_id, path, data, .. } if path == enroll_net::PATH => { enroll_net::dispatch(&ctx.state, link_id, request_id, data); }
             NodeEvent::LinkEstablished { link_id, is_initiator, destination_hash } => {
                 // LXMF delivery/PN — отдельные назначения. Их identify не
                 // должен продвигать Link в VPN-соседа или вытеснять mesh Link.
@@ -4635,7 +3678,6 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
                 }
             }
             NodeEvent::LinkDataReceived { link_id, .. } if ctx.link_is_cbc(&link_id) => {}
-            NodeEvent::LinkDataReceived { link_id, data, .. } if data.first() == Some(&T_BENCH_DATA) => bench_rx(&ctx.bench_sess, link_id, &data),
             NodeEvent::LinkDataReceived { link_id, data, .. } => {
                 if is_rgp(&data) {
                     on_rgp(&ctx, link_id, &data);
@@ -4652,45 +3694,20 @@ fn on_announce(ctx: &Arc<NodeCtx>, ann: &leviculum_std::ReceivedAnnounce) {
     if std::env::var("KNOTHOP_DEBUG").is_ok() {
         ctx.sh.note(format!("announce from {} path_response={} data={}", hex(&ann.destination_hash().as_bytes()[..4]), ann.is_path_response(), String::from_utf8_lossy(ann.app_data()).chars().take(60).collect::<String>()));
     }
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(ann.app_data()) else { return };
-    if ctx.t13.is_some() {
-        if !v["r"].is_array() {
-            return; // не наш формат (0013: анонс = только теги корней)
-        }
-    } else if v["v"] != 1 || v["t"].as_str() != Some(ctx.tag.as_str()) {
-        return; // чужая группа или не наш формат
-    }
     let dest = *ann.destination_hash().as_bytes();
-    if dest == ctx.my_dest {
-        return;
-    }
     let pk = *ann.public_key();
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&pk[32..64]);
-    // 0013 (ADR 0016): имени и endpoint id в анонсе нет; EndpointId QUIC = ключ подписи identity, имя придёт приватным каталогом по LXMF
-    let name: Option<String> = v["n"].as_str().and_then(|n| norm_peer_name(n, ""));
-    let ep = match v["e"].as_str() {
-        Some(e) => e.to_string(),
-        None => EndpointId::from_bytes(&key).map(|e| e.to_string()).unwrap_or_default(),
-    };
-    let addrs: Vec<String> = v["a"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).take(3).collect()).unwrap_or_default();
-    let tags: Vec<String> = v["r"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.chars().take(16).collect())).take(9).collect()).unwrap_or_default();
-    // Versioned announce field (v=1): advisory planning capability, never authorization. Legacy peers default to true.
+    if dest == ctx.my_dest || dest != dest_from_pub_tag(&pk, T13_TAG) { return; }
+    let Some(t) = &ctx.t13 else { return };
+    let member = t.trust.lock().unwrap().effective(&pk, now_ms() as u64) & trust::TRANSIT != 0;
+    let invited = t.invite.lock().unwrap().as_ref().is_some_and(|i| trust::hash_of(&pk).is_some_and(|h| i.nodes.contains(&h)));
+    if !member && !invited { return; }
+    let v: serde_json::Value = serde_json::from_slice(ann.app_data()).unwrap_or_default();
+    let key: [u8; 32] = pk[32..64].try_into().unwrap();
+    let name: Option<String> = None;
+    let ep = EndpointId::from_bytes(&key).map(|e| e.to_string()).unwrap_or_default();
+    let addrs = Vec::new();
+    let tags = Vec::new();
     let accepts_links = v["lc"].as_bool().unwrap_or(true);
-    // Админ/делегат приглашения распознаётся по ключу до фильтра тегов: анонс остаётся нейтральным.
-    if let Some(t) = &ctx.t13 {
-        if t.invite.lock().unwrap().as_ref().map(|i| i.admin == pk).unwrap_or(false) {
-            *t.admin_seen.lock().unwrap() = Some(Instant::now());
-            ctx.trigger_announce();
-        }
-    }
-    if ctx.t13.is_some() {
-        // 0013: интересны только анонсы из знакомых нам сетей (пересечение тегов корней с моими якорями или с сетью админа моего приглашения)
-        let mine = ctx.t13_tags();
-        if !tags.iter().any(|t| mine.contains(t)) {
-            return;
-        }
-    }
     // S2/S3: новая запись нужна место; защищённых соседей (TRANSIT по записям или Link) публичный анонс не вытесняет
     let is_new = !ctx.neigh.lock().unwrap().contains_key(&dest);
     if is_new {
@@ -4731,7 +3748,6 @@ fn on_announce(ctx: &Arc<NodeCtx>, ann: &leviculum_std::ReceivedAnnounce) {
     // Новый участник группы: ответить анонсом, чтобы он быстро узнал нас (иначе ждать период анонса); дальше им занимается housekeeping (дозвон, Link).
     if is_new {
         ctx.sh.note(format!("новый участник группы {} ({})", name_of(ctx, &dest), &hex(&dest)[..8]));
-        ctx.trigger_announce();
     }
 }
 
@@ -4742,10 +3758,6 @@ fn name_of(ctx: &Arc<NodeCtx>, dest: &[u8; 16]) -> String {
 /// Прямое QUIC-соединение к соседу, если у него есть адрес. Набирает один из двух: тот, у кого хеш меньше, либо тот, у кого нет своих адресов
 /// (его иначе не достать); если за 15 с никто не набрал - набираем в любом случае. Так для пары не создаётся два соединения, а за NAT всё равно работает.
 fn maybe_dial(ctx: &Arc<NodeCtx>, dest: [u8; 16]) {
-    // админ ожидаемого приглашения набирается сразу: иначе зачисление ждало бы лишние 15 с
-    let invite_admin = ctx.t13.as_ref().and_then(|t| t.invite.lock().unwrap().as_ref().map(|i| i.admin));
-    // открытое приглашение без адресов админа: посредник зачисления набирается сразу (R7), не ждёт очереди
-    let open_inv = ctx.t13.as_ref().and_then(|t| t.invite.lock().unwrap().clone()).filter(|i| i.addrs.is_empty());
     let (id, sa, label) = {
         let mut n = ctx.neigh.lock().unwrap();
         let Some(nb) = n.get_mut(&dest) else { return };
@@ -4756,8 +3768,7 @@ fn maybe_dial(ctx: &Arc<NodeCtx>, dest: [u8; 16]) {
         if nb.link.is_some() && ctx.node.hops_to(&DestinationHash::new(dest)) == Some(1) {
             return;
         }
-        let relay = open_inv.as_ref().map(|i| relay_match(i, &nb.pk, &nb.tags)).unwrap_or(false);
-        let may = ctx.my_dest < dest || ctx.adv().is_empty() || nb.first_seen.elapsed() > Duration::from_secs(15) || invite_admin == Some(nb.pk) || relay;
+        let may = ctx.my_dest < dest || ctx.adv().is_empty() || nb.first_seen.elapsed() > Duration::from_secs(15);
         let Ok(id) = nb.ep.parse::<EndpointId>() else { return };
         if !may {
             return;
@@ -4932,7 +3943,7 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
         l.last_heard = Instant::now();
     }
     // Стандартный CBC-Link несёт только зачисление (записи прав, каталог, отказ, просьба через посредника); админ, политика, допуск и данные ему недоступны
-    if ctx.link_is_cbc(&link) && !matches!(ty, T_PAIR_NO | T_PAIRQ) {
+    if ctx.link_is_cbc(&link) && true {
         return;
     }
     match ty {
@@ -4947,14 +3958,6 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
             }
             ctx.send_nbrs(link);
         }
-        T_BENCH => on_bench_ctl(ctx, link, body),
-        T_PAIR1 => {
-            let b = body.to_vec();
-            let c = ctx.clone();
-            tokio::spawn(async move { on_pair1(c, link, b).await });
-        }
-        T_PAIR_NO => on_pair_no(ctx, link, body),
-        T_PAIRQ => on_pairq(ctx, link, body),
         T_USE => {
             if let Some(l) = ctx.links.lock().unwrap().get_mut(&link) {
                 l.want_use = true;
@@ -5159,19 +4162,6 @@ fn live_forward_targets(links: &Mutex<HashMap<LinkId, LinkInfo>>, except: Option
             (Role::Client { .. }, Some(p)) => Some((*k, p, OrdinaryAdmission::Client)),
             _ => None,
         }).collect()
-}
-
-/// Enrollment export for a just-enrolled (or repeat-claimed) holder: its own chain first, then the
-/// rest of the root-scoped `records_visible_to` snapshot. Rights are derived per root from the
-/// CURRENT store, so ADD in root R never exports root S, and a USE-only holder gets only its own
-/// chain plus the EXIT chains of the roots in which it is a member. The record must already have
-/// been offered/issued into `tr`. The enrollment Link has no Client/Server role, so these sends stay
-/// on the plain control sender; the snapshot, not a rights scalar, is what bounds the disclosure.
-fn enrollment_export(tr: &trust::Trust, holder: &trust::Pk) -> (Vec<trust::Record>, Vec<trust::Record>) {
-    let visible = tr.records_visible_to(holder);
-    let chain: Vec<trust::Record> = tr.chain_for(holder).into_iter().filter(|r| visible.contains(r)).collect();
-    let rest = visible.into_iter().filter(|r| !chain.contains(r)).collect();
-    (chain, rest)
 }
 
 fn remove_link_admission(
@@ -6133,6 +5123,19 @@ mod ordinary_admission_tests {
         (node, [r_exit, r_sib, s_exit, s_user])
     }
 
+    /// Enrollment export for a just-enrolled (or repeat-claimed) holder: its own chain first, then the
+    /// rest of the root-scoped `records_visible_to` snapshot. Rights are derived per root from the
+    /// CURRENT store, so ADD in root R never exports root S, and a USE-only holder gets only its own
+    /// chain plus the EXIT chains of the roots in which it is a member. The record must already have
+    /// been offered/issued into `tr`. The enrollment Link has no Client/Server role, so these sends stay
+    /// on the plain control sender; the snapshot, not a rights scalar, is what bounds the disclosure.
+    fn enrollment_export(tr: &trust::Trust, holder: &trust::Pk) -> (Vec<trust::Record>, Vec<trust::Record>) {
+        let visible = tr.records_visible_to(holder);
+        let chain: Vec<trust::Record> = tr.chain_for(holder).into_iter().filter(|r| visible.contains(r)).collect();
+        let rest = visible.into_iter().filter(|r| !chain.contains(r)).collect();
+        (chain, rest)
+    }
+
     #[test]
     fn enrollment_export_is_root_scoped_for_add_and_use_newcomers() {
         let (root_r, root_s) = (leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity());
@@ -6220,51 +5223,12 @@ impl NodeCtx {
     /// (нужен ли сосед, наша ли очередь открывать Link). Нужны: админ приглашения (открываем мы), соседи-транзиты по записям
     /// (открывает меньший dest) и кандидаты на зачисление (только несём носитель QUIC: Link откроет сам приглашённый).
     fn neighbor_policy(&self, d: &[u8; 16]) -> (bool, bool) {
-        let Some(t) = &self.t13 else { return (true, self.my_dest < *d) };
-        // stalled: сосед известен дольше 30 с, Link к нему нет (0014 R1: тупик меньшего dest, который не звонит)
-        let (pk, tags, stalled) = {
-            let n = self.neigh.lock().unwrap();
-            match n.get(d) {
-                Some(nb) => (nb.pk, nb.tags.clone(), nb.link.is_none() && nb.first_seen.elapsed() > Duration::from_secs(30)),
-                None => return (false, false),
-            }
-        };
-        // админ приглашения с адресом - звоним сами; без адреса (телефон) входящих Link он не принимает: только через посредника (R7)
-        if t.invite.lock().unwrap().as_ref().map(|i| i.admin == pk).unwrap_or(false) {
-            let direct = t.invite.lock().unwrap().as_ref().map(|i| !i.addrs.is_empty()).unwrap_or(false);
-            return (direct, direct);
-        }
-        // Do not plan mesh Links to a leaf, even when an anchor grants it TRANSIT.
-        // This announce bit is a scheduling hint only; evaluate() remains the authorization gate.
-        let accepts_links = self.neigh.lock().unwrap().get(d).map(|n| n.accepts_links).unwrap_or(true);
-        if !accepts_links {
-            return (false, false);
-        }
-        // посредник зачисления (R7): носитель QUIC к нему поднимаем (maybe_dial), Link открывает node_relay_tick
-        if t.invite.lock().unwrap().as_ref().map(|i| relay_match(i, &pk, &tags)).unwrap_or(false) {
-            return (true, false);
-        }
-        let (transit, unknown) = {
-            let tr = t.trust.lock().unwrap();
-            (tr.common_with(&pk, trust::TRANSIT, trust::TRANSIT, true, true, now_ms() as u64), tr.rights(&pk) == 0)
-        };
-        if plan_transit_neighbor(accepts_links, transit) {
-            // своя очередь, либо сосед не открыл Link за 30 с: открываем сами (встречный Link снимает admit_neighbor)
-            return (true, self.my_dest < *d || stalled);
-        }
-        let pending_roots = trust::pin_roots_fresh(&self.state);
-        if unknown && pending_roots.iter().any(|root| tags.contains(&trust::root_tag(root))) {
-            return (true, false);
-        }
-        // записей, кроме своей, нет (соседи ещё не обменялись цепочками), сосед с тегом нашего якоря: открываем Link, допуск решит evaluate
-        if stalled {
-            let tr = t.trust.lock().unwrap();
-            let anchor_hit = tr.anchors().iter().any(|(h, _)| tags.contains(&trust::root_tag(h)));
-            if anchor_hit && tr.export_all().iter().all(|r| r.hh == tr.me_hash) {
-                return (true, true);
-            }
-        }
-        (false, false)
+        let Some((pk, accepts)) = self.neigh.lock().unwrap().get(d).map(|n| (n.pk, n.accepts_links)) else { return (false, false) };
+        let Some(t) = &self.t13 else { return (false, false) };
+        let tr = t.trust.lock().unwrap();
+        let transit = tr.common_with(&pk, trust::TRANSIT, trust::TRANSIT, true, true, now_ms() as u64);
+        let wanted = plan_transit_neighbor(accepts, transit);
+        (wanted, wanted && (self.my_dest < *d || self.adv().is_empty()))
     }
 
     fn save_trust(&self) -> bool {
@@ -6335,8 +5299,7 @@ impl NodeCtx {
             let Some(t) = &ctx.t13 else { return Some(false) };
             let tr = match t.trust.try_lock() { Ok(g) => g, Err(WouldBlock) => return None, Err(_) => return Some(false) };
             let links = match ctx.links.try_lock() { Ok(g) => g, Err(WouldBlock) => return None, Err(_) => return Some(false) };
-            let inv = match t.invite.try_lock() { Ok(g) => g, Err(WouldBlock) => return None, Err(_) => return Some(false) };
-            Some(dir_recipient_ok(&links, inv.as_ref().map(|i| i.admin), &tr, &pk, now_ms() as u64))
+            Some(dir_recipient_ok(&links, None, &tr, &pk, now_ms() as u64))
         })
     }
 
@@ -6473,6 +5436,7 @@ impl NodeCtx {
         for l in ids {
             self.evaluate(l);
         }
+        crate::host_acl::notify_nft();
     }
 
     /// Роль Link определяют права пира, а не заявленная роль: сосед-транзит - взаимный TRANSIT в общем корне,
@@ -6675,6 +5639,7 @@ impl NodeCtx {
         for o in admission.replaced {
             self.close_link(o, "новый Link той же identity");
         }
+        crate::host_acl::notify_nft();
         let (idh, ip) = (admission.id, admission.ip);
         let pl = self.client_info.lock().unwrap().get(&link).map(|(_, p)| *p).unwrap_or("?");
         self.sh.note(format!("client {} ({pl}) admitted on {}", &hex(&idh)[..8], &hex(link.as_bytes())[..8]));
@@ -6797,151 +5762,6 @@ fn neighbor_room(entries: &[([u8; 16], bool, Instant)], new_protected: bool) -> 
     oldest.map(NeighborRoom::Evict).unwrap_or(NeighborRoom::Full)
 }
 
-/// H9: запись в буфер `early` с квотой на Link; `false` - квота исчерпана, запись отброшена.
-fn early_push(buf: &mut Vec<(LinkId, trust::Record)>, link: LinkId, rec: trust::Record, root: &trust::Hash) -> bool {
-    if rec.root != *root { return false; }
-    if buf.len() >= EARLY_MAX {
-        // Буфер содержит только неподтверждённые записи. Вытесняем старейшую,
-        // чтобы посторонние записи того же корня не блокировали нужную цепочку.
-        buf.remove(0);
-    }
-    if buf.iter().filter(|(l, _)| *l == link).count() >= EARLY_PER_LINK {
-        if let Some(i) = buf.iter().position(|(l, _)| *l == link) { buf.remove(i); }
-    }
-    buf.push((link, rec));
-    true
-}
-
-const PAIRQ_LEN: usize = 16 + 16 + 64 + 32;
-
-fn pairq_body(root: trust::Hash, inviter: trust::Hash, holder: &[u8; 64], mac: &[u8; 32]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(PAIRQ_LEN);
-    body.extend_from_slice(&root);
-    body.extend_from_slice(&inviter);
-    body.extend_from_slice(holder);
-    body.extend_from_slice(mac);
-    body
-}
-
-fn parse_pairq(body: &[u8]) -> Option<(trust::Hash, trust::Hash, [u8; 64], [u8; 32])> {
-    if body.len() != PAIRQ_LEN { return None; }
-    Some((body[..16].try_into().ok()?, body[16..32].try_into().ok()?,
-        body[32..96].try_into().ok()?, body[96..128].try_into().ok()?))
-}
-
-fn pairq_client_matches(inviter: &trust::Hash, me: &trust::Hash, root: &trust::Hash, pin_root: &trust::Hash) -> bool {
-    inviter == me && root == pin_root
-}
-
-fn enrollment_proof(me: &Identity, inv: &trust::Invite, records: &[trust::Record]) -> Option<Vec<trust::Record>> {
-    let root = inv.root().ok()?;
-    records.iter().filter(|r| inv.enroll_hit(&me.public_key_bytes(), r)).find_map(|cand| {
-        // Передаём только ветки, влияющие на кандидата: его выдачи/отзывы и цепочки издателей.
-        // Сортировка делает результат независимым от порядка прихода T_REC.
-        let mut relevant = vec![cand.clone()];
-        let mut wanted = vec![cand.issuer];
-        let mut issuers = HashSet::from([cand.issuer]);
-        for r in records.iter().filter(|r| r.root == root && r.hh == cand.hh) {
-            if issuers.contains(&r.issuer) {
-                if !relevant.contains(r) { relevant.push(r.clone()); }
-            } else if issuers.len() < trust::MAX_DEPTH {
-                issuers.insert(r.issuer);
-                relevant.push(r.clone());
-            }
-            if r.issuer != root && !wanted.contains(&r.issuer) { wanted.push(r.issuer); }
-        }
-        let mut i = 0;
-        while i < wanted.len() && issuers.len() <= trust::MAX_DEPTH {
-            let who = wanted[i]; i += 1;
-            for r in records.iter().filter(|r| r.root == root && r.hh == who) {
-                if !relevant.contains(r) && (issuers.contains(&r.issuer) || issuers.len() < trust::MAX_DEPTH) {
-                    issuers.insert(r.issuer);
-                    relevant.push(r.clone());
-                    if r.issuer != root && !wanted.contains(&r.issuer) { wanted.push(r.issuer); }
-                }
-            }
-        }
-        relevant.sort_by_key(|r| (r.issuer, r.hh, r.seq, r.rights));
-        let root_pk = inv.root_pk().ok()?;
-        trust::verify_enrollment(me, &root_pk, inv.created, cand, &relevant).ok()
-    })
-}
-
-fn invite_used(inv: &trust::Invite, me: &trust::Pk, records: &[trust::Record]) -> bool {
-    let (Ok(root), Ok(admin)) = (inv.root(), inv.admin_hash()) else { return false };
-    records.iter().any(|r| r.root == root && r.issuer == admin && r.holder == *me
-        && r.seq >= inv.created.saturating_mul(1000))
-}
-
-/// Повтор отдаёт именно свою выдачу только пока участник имеет действующие права в заданном корне.
-fn repeat_record(tr: &trust::Trust, root: &trust::Hash, holder: &trust::Pk, issuer: &trust::Hash) -> Option<trust::Record> {
-    let hh = trust::hash_of(holder)?;
-    if tr.rights_in(root, &hh) == 0 { return None; }
-    tr.chain_for(holder).into_iter().find(|r| r.root == *root && r.hh == hh && r.holder == *holder
-        && r.issuer == *issuer && r.rights != 0)
-}
-
-/// Посредник зачисления (R7): открыто приглашение без адресов админа, пир несёт тег корня админа (и входит в nodes приглашения, если они заданы).
-/// Сам админ посредником не бывает. Адрес посредника проверяет вызывающий.
-fn relay_match(inv: &trust::Invite, pk: &[u8; 64], tags: &[String]) -> bool {
-    let Ok(root) = inv.root() else { return false };
-    if !inv.addrs.is_empty() || *pk == inv.admin || !tags.contains(&trust::root_tag(&root)) {
-        return false;
-    }
-    inv.nodes.is_empty() || trust::hash_of(pk).map(|h| inv.nodes.contains(&h)).unwrap_or(false)
-}
-
-/// R7 (0014): нода с приглашением без адресов админа просится к нему через посредника (сосед с тегом корня админа и адресом).
-/// Попытка: если анонс админа виден за 15 мин - каждому посреднику не чаще раза в 60 с; иначе - не чаще раза в 10 мин (запасной вариант).
-/// Link открывает connect_neighbor (путь через наши узлы); дальше on_peer_ready шлёт T_PAIRQ.
-fn node_relay_tick(ctx: &Arc<NodeCtx>) {
-    let Some(t) = &ctx.t13 else { return };
-    let Some(inv) = t.invite.lock().unwrap().clone() else { return };
-    if !inv.addrs.is_empty() {
-        return; // адрес админа известен: прямой T_PAIR1 (on_peer_ready)
-    }
-    let fresh = t.admin_seen.lock().unwrap().map(|x| x.elapsed() < Duration::from_secs(15 * 60)).unwrap_or(false);
-    let last_any = t.relay_try.lock().unwrap().values().max().copied();
-    if !fresh && last_any.map(|x| x.elapsed() < Duration::from_secs(600)).unwrap_or(false) {
-        return;
-    }
-    // на посредника, с которым Link уже есть (или строится), вторую попытку не открываем
-    let linked: HashSet<[u8; 64]> = ctx.links.lock().unwrap().values().filter_map(|l| l.peer_pk).collect();
-    let cand = {
-        let n = ctx.neigh.lock().unwrap();
-        let tries = t.relay_try.lock().unwrap();
-        n.values()
-            .filter(|nb| relay_match(&inv, &nb.pk, &nb.tags) && !nb.addrs.is_empty() && nb.link.is_none() && !linked.contains(&nb.pk))
-            .filter(|nb| tries.get(&nb.dest).map(|x| x.elapsed() >= Duration::from_secs(60)).unwrap_or(true))
-            .min_by_key(|nb| tries.get(&nb.dest).copied())
-            .map(|nb| (nb.dest, nb.name.clone()))
-    };
-    let Some((dest, name)) = cand else { return };
-    t.relay_try.lock().unwrap().insert(dest, Instant::now());
-    ctx.sh.note(format!("зачисление: прошусь к админу через посредника {name} ({})", &hex(&dest)[..8]));
-    let c = ctx.clone();
-    tokio::spawn(async move { connect_neighbor(c, dest).await });
-}
-
-/// Запрос зачисления через посредника: T_PAIRQ раз в 6 с, до 24 с или до зачисления (Link без прав живёт до 30 с, см. node_housekeeping).
-async fn relay_pairq(ctx: Arc<NodeCtx>, link: LinkId, inv: trust::Invite) {
-    let Some(t) = &ctx.t13 else { return };
-    let (Ok(root), Ok(admin), Ok(mac)) = (inv.root(), inv.admin_hash(), inv.mac(&ctx.my_pk)) else { return };
-    let body = pairq_body(root, admin, &ctx.my_pk, &mac);
-    let t0 = Instant::now();
-    let mut last = Instant::now() - Duration::from_secs(60);
-    while t0.elapsed() < Duration::from_secs(24) {
-        if t.invite.lock().unwrap().is_none() {
-            break;
-        }
-        if last.elapsed() >= Duration::from_secs(6) {
-            last = Instant::now();
-            send_ctl(&ctx.node, link, T_PAIRQ, &body).await;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
 /// Запись каталога: подсказка адреса (недоверенная). Допуск - только по записям о правах.
 struct DirEnt {
     dest: [u8; 16],
@@ -7008,8 +5828,8 @@ fn on_dir_node(ctx: &Arc<NodeCtx>, sender: trust::Pk, dir: &[serde_json::Value])
         // порядок блокировок: Trust -> links; pair_sent и invite - листовые
         let tr = t.trust.lock().unwrap();
         let links = ctx.links.lock().unwrap();
-        let sent = t.pair_sent.lock().unwrap();
-        let admin = t.invite.lock().unwrap().as_ref().map(|i| i.admin);
+        let sent = HashSet::new();
+        let admin = None;
         dir_sender_ok(&links, &sent, admin, &tr, &sender, now_ms() as u64)
     };
     if !allowed {
@@ -7055,33 +5875,9 @@ fn on_dir_node(ctx: &Arc<NodeCtx>, sender: trust::Pk, dir: &[serde_json::Value])
 /// Пир доказал свой ключ (identify): предъявляем свою цепочку прав, при ожидающем приглашении просимся к его админу, оцениваем роль.
 fn on_peer_ready(ctx: &Arc<NodeCtx>, link: LinkId, pk: [u8; 64]) {
     let Some(t) = &ctx.t13 else { return };
-    let inv = t.invite.lock().unwrap().clone();
-    let direct_enrollment = inv.as_ref().map(|i| i.admin == pk).unwrap_or(false);
-    {
-        let mut l = ctx.links.lock().unwrap();
-        let Some(i) = l.get_mut(&link) else { return };
-        i.peer_pk = Some(pk);
-        // Set before sending records or evaluating rights: invite cleanup must not turn this
-        // direct pairing Link into a persistent Server neighbor.
-        i.enroll_only |= direct_enrollment;
-    }
+    if let Some(i) = ctx.links.lock().unwrap().get_mut(&link) { i.peer_pk = Some(pk); }
     lxmf_sync::queue_proof(&ctx.state, t.trust.clone(), ctx.my_pk, pk);
-    if let Some(inv) = inv {
-        if inv.admin == pk && t.pair_sent.lock().unwrap().insert(link) {
-            let mut body = ctx.my_pk.to_vec();
-            let Ok(mac) = inv.mac(&ctx.my_pk) else { return };
-            body.extend_from_slice(&mac);
-            spawn_ctl(&ctx.node, link, T_PAIR1, body);
-            ctx.sh.note("зачисление: запрос отправлен админу приглашения".to_string());
-            // анонс адреса не несёт (ADR 0016): админ узнаёт его здесь, по зашифрованному Link, и сможет сделать ноду выходом
-            ctx.send_dir(link);
-        }
-        // R7: админ без адреса - просимся к нему через посредника (сосед с тегом корня админа)
-        let tags = ctx.neigh.lock().unwrap().values().find(|n| n.pk == pk).map(|n| n.tags.clone()).unwrap_or_default();
-        if relay_match(&inv, &pk, &tags) && t.pair_sent.lock().unwrap().insert(link) {
-            tokio::spawn(relay_pairq(ctx.clone(), link, inv.clone()));
-        }
-    }
+    if let Some(s) = enroll_net::find(&ctx.state) { s.send_proofs(pk); }
     ctx.evaluate(link);
 }
 
@@ -7091,7 +5887,7 @@ fn on_sync_node(ctx: &Arc<NodeCtx>, message: &leviculum_lxmf::Message) {
     let Some(wire) = lxmf_sync::Wire::decode(message) else { return };
     let Some(t) = &ctx.t13 else { return };
     let peers: Vec<_> = ctx.links.lock().unwrap().values().filter_map(|l| l.peer_pk).collect();
-    let invited = t.invite.lock().unwrap().as_ref().map(|i| i.admin);
+    let invited = None;
     let pk = lxmf_sync::source_key(message, &t.trust.lock().unwrap(), peers, invited);
     let Some(pk) = pk.filter(|pk| lxmf_sync::authenticated(message, &ctx.my_id, pk)) else { return };
     lxmf_sync::RX_BYTES.fetch_add(message.pack().len() as u64, Relaxed);
@@ -7123,7 +5919,7 @@ fn on_sync_client(ctx: &Arc<ClientCtx>, message: &leviculum_lxmf::Message) {
     // зачисляемая нода тоже присылает админу каталог (с собственным адресом), поэтому её ключ - допустимый отправитель подписи
     let mut peers: Vec<_> = c.peers.lock().unwrap().values().copied().collect();
     peers.extend(c.enrollees.lock().unwrap().values().copied());
-    let invited = c.invite.lock().unwrap().as_ref().map(|i| i.admin);
+    let invited = None;
     let pk = lxmf_sync::source_key(message, &c.trust.lock().unwrap(), peers, invited);
     let Some(pk) = pk.filter(|pk| lxmf_sync::authenticated(message, ctx.identity.hash(), pk)) else { return };
     lxmf_sync::RX_BYTES.fetch_add(message.pack().len() as u64, Relaxed);
@@ -7162,225 +5958,17 @@ fn on_pol(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
 }
 
 fn on_rec(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
-    let Some(t) = &ctx.t13 else { return };
-    if body.len() != trust::REC_LEN {
-        return;
-    }
     let Some(rec) = trust::Record::parse(body) else { return };
-    let pending_inv = t.invite.lock().unwrap().clone();
-    let mut done = false;
-    if let Some(inv) = pending_inv.as_ref() {
-        if inv.root().ok() == Some(rec.root) {
-            let mut early = t.early.lock().unwrap();
-            let _ = early_push(&mut early, link, rec.clone(), &rec.root);
-            let records: Vec<trust::Record> = early.iter().map(|(_, r)| r.clone()).collect();
-            if let Some(proof) = enrollment_proof(&ctx.identity, inv, &records) {
-                let Ok(root_pk) = inv.root_pk() else { return };
-                let mut tr = t.trust.lock().unwrap();
-                if tr.add_anchor(&root_pk).is_ok() {
-                    for r in proof { let _ = tr.offer(r); }
-                    *t.invite.lock().unwrap() = None;
-                    done = true;
-                }
-            }
-        }
-    }
-    let off = if pending_inv.as_ref().and_then(|i| i.root().ok()) == Some(rec.root) && !done {
-        trust::Offer::Rejected("чужой корень")
-    } else {
-        ctx.accept_rec(rec.clone(), Some(link))
-    };
-    if done {
-        // После проверки цепочки якорь уже добавлен; буферизованные записи того же корня теперь можно принять.
-        let early = std::mem::take(&mut *t.early.lock().unwrap());
-        for (_, r) in early {
-            ctx.accept_rec(r, Some(link));
-        }
-        ctx.save_trust();
-        ctx.sh.note("зачисление подтверждено цепочкой до корня приглашения; приглашение больше не используется".to_string());
-        ctx.trigger_announce();
-        let enroll_only = ctx.links.lock().unwrap().get(&link).map(|i| i.enroll_only).unwrap_or(false);
-        if enroll_only {
-            // Drain the signed record chain before closing this direct pairing Link. Check the
-            // same LinkId and role at expiry so a valid relay/server Link is never torn down.
-            let c = ctx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                let pairing_unknown = c.links.lock().unwrap().get(&link)
-                    .map(|i| i.enroll_only && matches!(i.role, Role::Unknown))
-                    .unwrap_or(false);
-                if pairing_unknown {
-                    c.close_link(link, "прямое зачисление завершено");
-                }
-            });
-        }
-    }
-    if off == trust::Offer::Added {
-        // если это посредник (новичок ждёт на Link без прав) - запись о новичке и каталог ему сразу
-        ctx.to_newcomer(&rec);
-    }
+    if ctx.accept_rec(rec.clone(), Some(link)) == trust::Offer::Added { ctx.to_newcomer(&rec); }
     ctx.evaluate(link);
 }
 
-/// Админ: нода просится по приглашению. pin гасится за её ключом; тот же ключ повторно получает ту же запись, другой - отказ.
-async fn on_pair1(ctx: Arc<NodeCtx>, link: LinkId, body: Vec<u8>) {
-    let Some(t) = &ctx.t13 else { return };
-    if body.len() != 64 + 32 {
-        return;
-    }
-    let Some(peer) = peer_of(&ctx, &link) else { return };
-    let holder: [u8; 64] = body[..64].try_into().unwrap();
-    if holder != peer || ctx.link_is_public(&link) {
-        ctx.close_link(link, "зачисление: ключ не совпал с identify или link через публичную сеть");
-        return;
-    }
-    let now_s = now_ms() as u64 / 1000;
-    let claim = trust::pin_claim(&ctx.state, &ctx.my_pk, &holder, &body[64..], now_s);
-    let my_hash = ctx.my_id;
-    let Some(hh) = id_of_pub(&holder) else { return };
-    let rec = match claim {
-        trust::Claim::New { rights, root } => {
-            let r = t.trust.lock().unwrap().issue(root, holder, rights);
-            match r {
-                Ok(r) => {
-                    if !ctx.save_trust() {
-                        trust::pin_unclaim(&ctx.state, &ctx.my_pk, &holder, &body[64..]);
-                        return;
-                    }
-                    ctx.sh.note(format!("зачисление: {} получила права {}", &hex(&hh)[..8], trust::rights_text(r.rights)));
-                    Some(r)
-                }
-                Err(e) => {
-                    // H8: выдача не удалась - возвращаем pin, приглашение не сгорает
-                    trust::pin_unclaim(&ctx.state, &ctx.my_pk, &holder, &body[64..]);
-                    ctx.sh.note(format!("зачисление: запись не выдана: {e:#}"));
-                    None
-                }
-            }
-        }
-        trust::Claim::Repeat { root } => {
-            let tr = t.trust.lock().unwrap();
-            let found = repeat_record(&tr, &root, &holder, &my_hash);
-            if found.is_none() {
-                drop(tr);
-                trust::pin_unclaim(&ctx.state, &ctx.my_pk, &holder, &body[64..]);
-                ctx.sh.note("зачисление: незавершённое погашение возвращено; повторите запрос".to_string());
-                return;
-            }
-            found
-        }
-        other => {
-            let why = match other {
-                trust::Claim::Spent => "приглашение уже использовано",
-                trust::Claim::Expired => "приглашение просрочено",
-                _ => "приглашение неизвестно этому админу",
-            };
-            ctx.sh.note(format!("зачисление отклонено: {why}"));
-            spawn_ctl(&ctx.node, link, T_PAIR_NO, why.as_bytes().to_vec());
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            ctx.close_link(link, why);
-            return;
-        }
-    };
-    let Some(rec) = rec else {
-        spawn_ctl(&ctx.node, link, T_PAIR_NO, "запись не выдана".as_bytes().to_vec());
-        return;
-    };
-    // Сначала полная цепочка R→…→D→N, затем остальная выгрузка по правам.
-    let (chain, rest) = enrollment_export(&t.trust.lock().unwrap(), &holder);
-    ctx.send_recs(link, chain);
-    ctx.send_recs(link, rest);
-    ctx.forward_rec(&rec, Some(link));
-    ctx.evaluate(link);
-    // Link под зачисление нужен только на это; если новичок не стал соседом-транзитом, закрываем
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    if matches!(ctx.links.lock().unwrap().get(&link).map(|l| &l.role), Some(Role::Unknown)) {
-        ctx.close_link(link, "зачисление завершено");
-    }
-}
-
-/// Нода: админ приглашения отказал. Приглашение одноразовое, повтор не поможет - завершаемся.
-fn on_pair_no(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
-    let Some(t) = &ctx.t13 else { return };
-    let Some(peer) = peer_of(ctx, &link) else { return };
-    if !t.invite.lock().unwrap().as_ref().map(|i| i.admin == peer).unwrap_or(false) {
-        return;
-    }
-    let why: String = String::from_utf8_lossy(body).chars().take(80).collect();
-    ctx.sh.note(format!("зачисление отклонено админом: {why}"));
-    eprintln!("зачисление отклонено админом: {why}");
-    std::process::exit(3);
-}
-
-/// Посредник зачисления пользователя. Админ (телефон) и новичок оба за NAT и друг до друга не дозвонятся, поэтому новичок приходит к любой
-/// ноде, признающей этого админа якорем. Запись о новичке уже есть - отдаём её с выгрузкой выходов; иначе пересылаем запрос клиентскому Link
-/// админа и соседям-серверам. Подлинность проверяет только админ: mac привязан к pin, holder и ключу админа, нода его проверить не может.
-fn on_pairq(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
-    let Some(t) = &ctx.t13 else { return };
-    let Some((root, inviter_h, holder, mac)) = parse_pairq(body) else { return };
-    let (from_user, from_server) = {
-        let l = ctx.links.lock().unwrap();
-        let Some(i) = l.get(&link) else { return };
-        (matches!(i.role, Role::Unknown) && i.peer_pk == Some(holder), matches!(i.role, Role::Server { .. }))
-    };
-    if !from_user && !from_server {
-        return;
-    }
-    let Some(hh) = id_of_pub(&holder) else { return };
-    {
-        let tr = t.trust.lock().unwrap();
-        if !tr.has_anchor(&root) {
-            return;
-        }
-        if from_user {
-            let rights = tr.rights_in(&root, &hh);
-            if rights != 0 {
-                // root-scoped снимок по действующим правам новичка в каждом корне (не скалярная выгрузка по правам одного корня)
-                let mut recs = tr.records_visible_to(&holder);
-                drop(tr);
-                // запись о самом новичке первой: по ней он признаёт админа якорем, остальные записи до этого отклонил бы как чужой корень
-                recs.sort_by_key(|r| !(r.holder == holder && r.root == root));
-                ctx.sh.note(format!("зачисление пользователя {}: запись уже есть, отдаю", &hex(&hh)[..8]));
-                ctx.send_recs(link, recs);
-                ctx.send_dir(link);
-                return;
-            }
-        }
-    }
-    {
-        let mut seen = t.pairq_seen.lock().unwrap();
-        seen.retain(|_, (w, _)| w.elapsed() < Duration::from_secs(60));
-        if seen.get(&mac).map(|(w, _)| w.elapsed() < Duration::from_secs(8)).unwrap_or(false) || seen.len() >= 256 {
-            return;
-        }
-        // H9: новых запросов с одного Link - не больше PAIRQ_PER_LINK за 60 с, чтобы мусор одного пира не вытеснял чужие
-        let from_link = seen.values().filter(|(_, l)| *l == link).count();
-        if !seen.contains_key(&mac) && from_link >= PAIRQ_PER_LINK {
-            return;
-        }
-        seen.insert(mac, (Instant::now(), link));
-    }
-    let targets: Vec<LinkId> = ctx.links.lock().unwrap().iter()
-        .filter(|(k, _)| **k != link)
-        .filter(|(_, i)| match i.role {
-            Role::Server { .. } => true,
-            Role::Client { id, .. } => id == inviter_h,
-            _ => false,
-        }).map(|(k, _)| *k).collect();
-    if from_user {
-        ctx.sh.note(format!("зачисление пользователя {}: пересылаю админу ({} Link)", &hex(&hh)[..8], targets.len()));
-    }
-    for l in targets {
-        spawn_ctl(&ctx.node, l, T_PAIRQ, body.to_vec());
-    }
-}
 
 async fn node_housekeeping(ctx: Arc<NodeCtx>) {
     let mut tick = 0u64;
     let mut lost_listener = 0u32;
     let mut last_ping = Instant::now();
     let mut last_table = Instant::now();
-    let _ = std::fs::create_dir_all(ctx.state.join("bench"));
     let fin = ctx.state.join("fin");
     while !fin.exists() {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -7429,7 +6017,6 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
         }
         // R7: зачисление через посредника (нода с приглашением без адресов админа), проверка раз в 2 с
         if ctx.t13.is_some() && tick % 4 == 0 {
-            node_relay_tick(&ctx);
         }
         // дозвон и повтор подключения к соседям: никакого списка, только то, что узнали из анонсов
         let dests: Vec<[u8; 16]> = ctx.neigh.lock().unwrap().keys().copied().collect();
@@ -7458,7 +6045,6 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
         // появился новый наш интерфейс (QUIC-связь): сообщить о себе
         let n_ours = ctx.our_ifaces().len();
         if n_ours > ctx.ours_online.swap(n_ours, Relaxed) {
-            ctx.trigger_announce();
         }
         // адреса с интерфейсов (нет явного advertise): раз в 60 с перепроверяем, при смене IP объявляем заново (0014 R4)
         if tick % 120 == 0 {
@@ -7475,7 +6061,6 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
                 };
                 if changed {
                     ctx.sh.note(format!("объявляемые адреса изменились: {now_adv:?}"));
-                    ctx.trigger_announce();
                 }
             }
         }
@@ -7483,7 +6068,7 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
         // неавторизованные Link не живут дольше срока (в модели 0013 обмен цепочками и зачисление дольше - окно шире)
         let deadline = if ctx.t13.is_some() { Duration::from_secs(30) } else { UNAUTH_TIMEOUT };
         let stale: Vec<LinkId> = ctx.links.lock().unwrap().iter()
-            .filter(|(_, l)| !matches!(l.role, Role::Server { .. } | Role::Client { .. }) && now.duration_since(l.since) > deadline).map(|(k, _)| *k).collect();
+            .filter(|(id, l)| !matches!(l.role, Role::Server { .. } | Role::Client { .. }) && now.duration_since(l.since) > deadline && !enroll_net::session_live(&ctx.state, id)).map(|(k, _)| *k).collect();
         for l in stale {
             ctx.close_link(l, "авторизация не завершена вовремя");
         }
@@ -7505,14 +6090,6 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
         // H1: записи от пиров на диск не чаще раза в 2 с (тик 500 мс)
         if tick % 4 == 0 {
             ctx.flush_trust();
-        }
-
-        // R10: бенч по файлу-запросу (`knothopd bench`); итог - bench/res-<id>.json
-        if tick % 2 == 0 {
-            take_bench_req(&ctx);
-        }
-        if let Some(j) = bench_finish(&ctx.bench_sess, &ctx.sh, node_bench_rtt(&ctx)) {
-            write_bench_res(&ctx.state.join("bench"), &j);
         }
 
         // пинги соседям и клиентам-проверка живости
@@ -7828,66 +6405,26 @@ fn client_inbox_step(
 }
 
 /// Проверки выдающего при подготовке делегированного приглашения выполняются до создания pin.
-fn validate_invite_rights(tr: &trust::Trust, root: &trust::Hash, rights: u16) -> Result<trust::Pk> {
-    if !tr.has_anchor(root) { bail!("корень отсутствует среди якорей доверия"); }
-    let mine = tr.my_rights_in(root);
-    if mine & trust::ADD == 0 { bail!("в корне нет права ADD"); }
-    if rights == 0 || rights & !trust::ALL != 0 { bail!("права приглашения пусты или содержат неизвестные биты"); }
-    if rights & !mine != 0 { bail!("приглашение шире действующих прав"); }
-    let depth = tr.depth_in(root, &tr.me_hash).ok_or_else(|| anyhow::anyhow!("глубина цепочки не подтверждена"))?;
-    if depth as usize + 1 > trust::MAX_DEPTH { bail!("выдача превысит максимальную глубину цепочки"); }
-    tr.anchors().into_iter().find(|(h, _)| h == root).map(|(_, pk)| pk)
-        .ok_or_else(|| anyhow::anyhow!("публичный ключ корня не найден среди якорей"))
-}
-
 fn admin_invite(a: InviteArgs) -> Result<()> {
-    let id = load_identity_strict(&a.state)?;
+    let nodes = a.nodes.iter().map(|h| unhex(h).try_into().map_err(|_|anyhow::anyhow!("node identity hash"))).collect::<Result<Vec<trust::Hash>>>()?;
     let rights = trust::parse_rights(&a.rights)?;
-    if rights == 0 {
-        bail!("права приглашения не могут быть пустыми");
-    }
-    let mut addrs = a.addrs.clone();
-    if addrs.is_empty() {
-        if let Ok(b) = std::fs::read(a.state.join("server.json")) {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
-                addrs = v["a"].as_array().map(|x| x.iter().filter_map(|y| y.as_str().map(String::from)).collect()).unwrap_or_default();
-            }
-        }
-    }
-    if addrs.is_empty() {
-        eprintln!("ВНИМАНИЕ: в приглашении нет адреса админа (за NAT?): новая нода найдёт вас только по анонсам через публичную RNS, а вы должны сами набрать её адрес.");
-    }
-    let mut nodes: Vec<trust::Hash> = Vec::new();
-    for n in a.nodes.iter().map(|n| n.trim().to_lowercase()).filter(|n| !n.is_empty()) {
-        let h: trust::Hash = unhex(&n).try_into().map_err(|_| anyhow::anyhow!("--nodes: нужен identity-хеш (32 hex), получено {n:?}"))?;
-        if !nodes.contains(&h) {
-            nodes.push(h);
-        }
-    }
-    if nodes.len() > trust::MAX_INVITE_NODES {
-        bail!("--nodes: не более {}", trust::MAX_INVITE_NODES);
-    }
-    let me = *id.hash();
-    let root = match a.root {
-        Some(h) => <[u8; 16]>::try_from(unhex(&h.trim().to_lowercase()))
-            .map_err(|_| anyhow::anyhow!("--root: нужен хеш корня (32 hex)"))?,
-        None => me,
-    };
-    let tr = trust::Trust::load(id.clone(), &a.state).context("trust.json для проверки прав приглашения")?;
-    let root_pk = validate_invite_rights(&tr, &root, rights)?;
-    if addrs.len() > 4 || addrs.iter().any(|x| x.len() > 200) { bail!("--addrs: не более 4 адресов длиной до 200 байт каждый"); }
-    let pin = trust::pin_create(&a.state, &root, rights, &a.label, now_ms() as u64 / 1000)?;
-    let inv = trust::Invite { admin: id.public_key_bytes(), root_pk: (root != me).then_some(root_pk), pin, rights, created: now_ms() as u64 / 1000, addrs, nodes };
-    eprintln!("приглашение действует {} ч, одноразовое; права: {}", trust::INVITE_TTL_S / 3600, trust::rights_text(rights));
-    if let Some(o) = &a.out {
-        write_atomic(o, inv.encode()?.as_bytes());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(o, std::fs::Permissions::from_mode(0o600));
-        }
+    // Сеть держит процесс узла/VPN: в нём (Android, JNI) выпускаем сразу, из отдельного CLI - файловым запросом к демону.
+    let value = if let Some(s) = enroll_net::find(&a.state) {
+        let root = match &a.root { Some(r) => unhex(r).try_into().map_err(|_|anyhow::anyhow!("root hash"))?, None => *s.identity.hash() };
+        // Отдельный поток со своим runtime: вызов идёт из синхронного CLI внутри runtime процесса, блокировать его нельзя.
+        std::thread::spawn(move || -> Result<String> {
+            tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(s.issue_invite(root, nodes, rights))
+        }).join().map_err(|_| anyhow::anyhow!("выпуск приглашения прерван"))??
     } else {
-        println!("{}", inv.encode()?);
+        let root = match &a.root {
+            Some(r) => unhex(r).try_into().map_err(|_|anyhow::anyhow!("root hash"))?,
+            None => *load_identity_strict(&a.state)?.hash(),
+        };
+        enroll_net::issue_via_daemon(&a.state, root, &nodes, rights, Duration::from_secs(120))?
+    };
+    match a.out {
+        Some(out) => crate::enroll::write(&out, value.as_bytes())?,
+        None => println!("{value}"), // явная команда владельца; предпочтителен --out (0600)
     }
     Ok(())
 }
@@ -8083,41 +6620,6 @@ fn policy_step(tr: &mut trust::Trust, state: &Path, defaults: bool, now: u64) ->
     (out, notes)
 }
 
-/// `knothopd bench`: кладёт запрос в `<state>/bench/req-<id>.json` (атомарно), ждёт `res-<id>.json` от работающей ноды и печатает итог.
-fn bench_cli(a: BenchArgs) -> Result<()> {
-    if a.mb == 0 || a.mb > BENCH_MAX_MB {
-        bail!("--mb: от 1 до {BENCH_MAX_MB} МБ");
-    }
-    let to = a.to.trim().to_lowercase();
-    if to.is_empty() {
-        bail!("--to: имя соседа, dest (32 hex) или его префикс не короче 8 hex");
-    }
-    let dir = a.state.join("bench");
-    std::fs::create_dir_all(&dir)?;
-    let timeout = a.timeout.clamp(10, 900);
-    let id = u32::from_le_bytes(rand16()[..4].try_into().unwrap());
-    let req = dir.join(format!("req-{id}.json"));
-    let tmp = dir.join(format!("req-{id}.tmp"));
-    std::fs::write(&tmp, serde_json::json!({"id": id, "to": to, "mb": a.mb, "timeout": timeout}).to_string())?;
-    std::fs::rename(&tmp, &req)?;
-    let res = dir.join(format!("res-{id}.json"));
-    let until = Instant::now() + Duration::from_secs(timeout + 60);
-    while !res.exists() {
-        if Instant::now() > until {
-            bail!("нет результата за {} с: нода с этим --state запущена и работает?", timeout + 60);
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&res)?)?;
-    for k in ["verdict", "to", "path", "mbps", "pps", "bytes_rx", "pkts_rx", "pkts_lost", "dup", "reordered", "secs", "ttfb_ms", "rtt_ms_idle", "rtt_ms_load", "stalls", "stall_s", "why"] {
-        if !v[k].is_null() {
-            let s = v[k].as_str().map(String::from).unwrap_or_else(|| v[k].to_string());
-            println!("{k:<12} {s}");
-        }
-    }
-    Ok(())
-}
-
 fn admin_list(state: &Path) -> Result<()> {
     if state.join("identity.key").exists() {
         let id = load_identity_strict(state)?;
@@ -8135,14 +6637,51 @@ fn admin_list(state: &Path) -> Result<()> {
             println!("  корень {}  держатель {}  выдал {}  {}{}", &hex(&r.root)[..8], &hex(&r.hh)[..8], &hex(&r.issuer)[..8], trust::rights_text(r.rights),
                 if eff != r.rights { format!(" (действует {})", trust::rights_text(eff)) } else { String::new() });
         }
-        let pins = trust::pin_list(state);
-        println!("приглашения ({}):", pins.len());
-        for (p, st, l) in pins {
-            println!("  {p}  {st}  {l}");
-        }
+
     }
     if let Ok(b) = std::fs::read(state.join("neighbors.json")) {
         println!("таблица соседей: {}", String::from_utf8_lossy(&b));
+    }
+    Ok(())
+}
+
+/// R-9: первичный якорь корня на новой ноде. Зачисление по приглашению ставит якорь только клиенту; серверная нода сама не вступает
+/// (`knothopd node --invite-file` лишь допускает анонсы нод приглашения), поэтому оператор привязывает корень вручную:
+/// ключ из файла/stdin, обязательная сверка с отпечатком из другого канала, Trust::load (fail-closed) + атомарная запись.
+/// Узел не должен работать: он владеет trust.json и перезапишет файл из памяти.
+fn trust_anchor_cmd(a: TrustAnchorArgs) -> Result<()> {
+    use std::io::Read;
+    if a.fingerprint.len() != 32 || !a.fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) { bail!("отпечаток: нужно 32 hex"); }
+    let mut raw = String::new();
+    if a.root_key_file == Path::new("-") { std::io::stdin().take(1024).read_to_string(&mut raw)?; }
+    else {
+        let f = std::fs::File::open(&a.root_key_file).with_context(|| format!("файл ключа {}", a.root_key_file.display()))?;
+        f.take(1024).read_to_string(&mut raw)?;
+    }
+    let raw = raw.trim();
+    if raw.len() != 128 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) { bail!("ключ корня: нужно 128 hex (64 байта)"); }
+    let pk: trust::Pk = unhex(raw).try_into().map_err(|_| anyhow::anyhow!("ключ корня"))?;
+    let h = trust::hash_of(&pk).context("ключ корня не разобран")?;
+    if hex(&h) != a.fingerprint.to_lowercase() { bail!("отпечаток не совпал с хешем ключа: якорь не добавлен"); }
+    let me = load_identity_strict(&a.state)?;
+    if std::fs::metadata(a.state.join("status.json")).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < Duration::from_secs(60)) {
+        bail!("узел, похоже, работает (status.json свежий): остановите knothopd и повторите");
+    }
+    let mut tr = trust::Trust::load(me, &a.state)?;
+    if tr.add_anchor(&pk)? { tr.save()?; println!("якорь корня {} добавлен", hex(&h)); } else { println!("якорь корня {} уже был", hex(&h)); }
+    Ok(())
+}
+
+/// R-2: забыть чужие корни и зачисления. Identity и записи собственного корня остаются; временные файлы зачисления удаляются.
+/// Отказывает, если узел работает (status.json свежее 60 с): иначе процесс перезапишет trust.json из памяти.
+fn forget_network_cmd(state: &Path) -> Result<()> {
+    if std::fs::metadata(state.join("status.json")).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < Duration::from_secs(60)) {
+        bail!("узел, похоже, работает (status.json свежий): остановите VPN и повторите");
+    }
+    for f in ["enrollment.json", "enroll-consent.json", "enroll-consented.json"] { let _ = std::fs::remove_file(state.join(f)); }
+    if state.join("identity.key").exists() {
+        let n = trust::Trust::load(load_identity_strict(state)?, state)?.forget_foreign_roots()?;
+        println!("забыто якорей: {n}");
     }
     Ok(())
 }
@@ -8170,17 +6709,18 @@ pub fn run_admin(cmd: VpnCmd) -> Result<()> {
         VpnCmd::Whoami(a) => {
             std::fs::create_dir_all(&a.state)?;
             let id = load_or_create_identity(&a.state)?;
-            let j = serde_json::json!({"hash": hex(id.hash()), "ip": ip_str(client_ip(id.hash())), "prefix": client_net().1});
+            let j = serde_json::json!({"hash": hex(id.hash()), "pk": hex(&id.public_key_bytes()), "ip": ip_str(client_ip(id.hash())), "prefix": client_net().1});
             write_atomic(&a.state.join("whoami.json"), j.to_string().as_bytes());
             println!("{j}");
             Ok(())
         }
+        VpnCmd::TrustAnchor(a) => trust_anchor_cmd(a),
+        VpnCmd::ForgetNetwork(a) => forget_network_cmd(&a.state),
         VpnCmd::RulesList(a) => route::cmd_list(&a.state),
         VpnCmd::RulesCompile(a) => route::cmd_compile(&a.state),
         VpnCmd::Invite(a) => admin_invite(a),
         VpnCmd::Grant(a) => admin_grant(a),
         VpnCmd::Policy(a) => admin_policy(a),
-        VpnCmd::Bench(a) => bench_cli(a),
         VpnCmd::List(a) => admin_list(&a.state),
         _ => bail!("не админ-команда"),
     }
@@ -8405,15 +6945,8 @@ struct C13 {
     hints: Mutex<HashMap<String, Vec<String>>>,
     /// админ-режим: ноды, к которым мы звонили для зачисления (Link -> ожидаемый ключ), и Link, где зачисление завершено
     enrollees: Mutex<HashMap<LinkId, [u8; 64]>>,
-    enrolled: Mutex<HashSet<LinkId>>,
-    /// когда последний раз пробовали зачислить ноду (dest -> момент): не чаще раза в минуту
-    enroll_try: Mutex<HashMap<[u8; 16], Instant>>,
-    /// пользователь по приглашению (админ - телефон за NAT): ноды, чей анонс несёт тег корня админа; через любую из них идёт T_PAIRQ
-    relays: Mutex<HashMap<[u8; 16], CServer>>,
     /// админ-режим: приглашённые пользователи, получившие запись через посредника (hex хеша -> когда); для показа в приложении
     users: Mutex<Vec<(String, u64)>>,
-    /// записи сети, пришедшие раньше записи о нас (до появления якоря админа): применяются сразу после зачисления
-    early: Mutex<Vec<(LinkId, trust::Record)>>,
 }
 
 /// Соседи выхода, которые он сообщил клиенту (T_NBRS): dest выхода -> (когда, [(dest соседа, rtt мс)]). Недоверенная подсказка для рёбер в приложении.
@@ -8432,7 +6965,6 @@ struct ClientCtx {
     sh: Arc<Shared>,
     ep: Endpoint,
     identity: Identity,
-    group: String,
     ip: String,
     servers: Mutex<Vec<CServer>>,
     tun: Arc<TunState>,
@@ -8468,7 +7000,7 @@ struct ClientCtx {
     loss: Mutex<LossWin>,
     fail_ms: u64,
     path_gate: path::PathGate,
-    /// модель 0013; None - легаси (профиль kh2-)
+    /// состояние прав 0013 (создаётся при каждом запуске клиента)
     c13: Option<C13>,
     /// соседи выходов по T_NBRS (0014 R3): недоверенная подсказка, список выходов не меняет
     nbrs: Mutex<NbrsMap>,
@@ -8482,9 +7014,6 @@ struct ClientCtx {
     vis: Mutex<HashMap<[u8; 16], (&'static str, Option<[u8; 16]>, u32)>>,
     /// R9: удачные/неудачные Link к выходу, для `q` в status.json (до 32 выходов)
     qstat: Mutex<HashMap<[u8; 16], QStat>>,
-    /// R10: бенч текущего выхода с телефона (одна сессия) и последний итог (для status.json)
-    bench_sess: Mutex<Option<BenchSess>>,
-    bench_last: Mutex<Option<serde_json::Value>>,
     /// раздельное туннелирование: активные правила и отчёт о загрузке списков,
     /// выходы с идущей попыткой Link и пауза после неудачи
     rcfg: std::sync::RwLock<Arc<route::Cfg>>,
@@ -8577,6 +7106,8 @@ impl ClientCtx {
     /// Запомнить адреса выхода (0013) и сохранить на диск, если они изменились.
     fn remember_addrs(&self, dest: &[u8; 16], addrs: &[String]) {
         let Some(c) = &self.c13 else { return };
+        let addrs: Vec<String> = addrs.iter().filter(|a| sane_hint_addr(a)).take(8).cloned().collect();
+        let addrs = addrs.as_slice();
         if addrs.is_empty() {
             return;
         }
@@ -8647,11 +7178,7 @@ impl ClientCtx {
         let Some(c) = &self.c13 else { return };
         let mut want: Vec<([u8; 64], Vec<String>)> = Vec::new();
         {
-            let inv = c.invite.lock().unwrap();
             let tr = c.trust.lock().unwrap();
-            if let Some(i) = inv.as_ref() {
-                want.push((i.admin, i.addrs.clone()));
-            }
             let mut pks = tr.holders_with(trust::EXIT);
             pks.extend(tr.anchors().into_iter().map(|(_, pk)| pk).filter(|pk| *pk != tr.me_pk));
             for pk in pks {
@@ -8814,13 +7341,12 @@ impl ClientCtx {
             let dest_of = self.carriers.lock().unwrap().iter().find(|(_, x)| *x.label.lock().unwrap() == label).map(|(d, _)| *d)?;
             if dest_of == c.0 { None } else { Some(hex(&dest_of)) }
         });
-        let j = serde_json::json!({"state": state, "group": self.group, "ip": self.ip, "up_s": up_since.elapsed().as_secs(),
+        let j = serde_json::json!({"state": state, "ip": self.ip, "up_s": up_since.elapsed().as_secs(),
             "current": cur.map(|c| serde_json::json!({"d": hex(&c.0), "n": servers.iter().find(|e| e.dest == c.0).map(|e| e.name.clone()), "since_s": c.2.elapsed().as_secs(),
                 "rtt_ms": *self.rtt_ms.lock().unwrap(), "hops": self.node.hops_to(&DestinationHash::new(c.0)),
                 "carrier": self.carriers.lock().unwrap().get(&c.0).map(|x| *x.mode.lock().unwrap()), "via": via})),
             "log_tail": self.sh.log.lock().unwrap().iter().rev().take(25).map(|(t, m)| format!("{} {}", *t as u64, m)).collect::<Vec<_>>(),
             "selected": std::fs::read_to_string(self.state.join("select")).unwrap_or_default().trim().to_string(),
-            "bench": self.bench_last.lock().unwrap().clone(),
             "routing": self.routing_json(&servers),
             "exits": exits, "edges": edges, "tun": self.tun.stats(), "udp": udp_stats(), "failovers": self.failovers.lock().unwrap().clone(), "status": self.status.lock().unwrap().clone(),
             "users": self.c13.as_ref().map(|c| c.users.lock().unwrap().iter().map(|(h, t)| serde_json::json!({"h": &h[..8], "t": t})).collect::<Vec<_>>()).unwrap_or_default(),
@@ -8833,83 +7359,51 @@ impl ClientCtx {
     }
 }
 
-pub async fn run_client(a: ClientArgs) -> Result<()> {
-    // легаси: профиль kh2- (seed клиента внутри); 0013: своя identity в --state, права и выходы - записями
-    let (prof, identity, c13) = match &a.profile_file {
-        Some(f) => {
-            let prof = decode_profile(&std::fs::read_to_string(f).context("profile file")?)?;
-            let id = client_identity(&prof.seed)?;
-            (prof, id, None)
-        }
-        None => {
-            let id = load_or_create_identity(&a.state)?;
-            let my_pk = id.public_key_bytes();
-            let raw = match &a.invite_file {
-                Some(f) => std::fs::read_to_string(f).with_context(|| format!("invite-file {}", f.display()))?,
-                None => a.invite.clone(),
-            };
-            let tr = trust::Trust::load(id.clone(), &a.state).context("trust.json")?;
-            let mut inv = None;
-            if !raw.trim().is_empty() {
-                match trust::Invite::parse(&raw) {
-                    Ok(i) => {
-                        // запись по этому приглашению уже есть (выдана админом после его создания): приглашение использовано.
-                        // Android передаёт сохранённое приглашение при каждом подключении, повторно зачисляться не надо.
-                        let used = invite_used(&i, &my_pk, &tr.chain_for(&my_pk));   // и отзыв по нему: приглашение тоже использовано
-                        if i.root().ok() == Some(*id.hash()) || i.admin == my_pk {
-                            bail!("приглашение не может зачислить эту identity или выдано ею самой");
-                        } else if i.root().map(|root| tr.has_anchor(&root)).unwrap_or(false) {
-                            eprintln!("приглашение игнорируется: этот корень уже в якорях");
-                        } else if used {
-                            eprintln!("приглашение уже использовано: запись админа по нему есть");
-                        } else if !i.fresh(now_ms() as u64 / 1000) {
-                            bail!("приглашение просрочено или датировано будущим: попросите новое у админа");
-                        } else {
-                            inv = Some(i);
-                        }
-                    }
-                    Err(e) if tr.anchors().len() > 1 || tr.record_count() > 0 => {
-                        // клиент уже зачислен: мусорное или устаревшее приглашение не должно мешать работе
-                        eprintln!("приглашение не разобрано ({e:#}), но записи есть - продолжаю без него");
-                    }
-                    Err(e) => {
-                        return Err(e).context("приглашение");
-                    }
-                }
-            }
-            let prof = Profile { group: String::new(), seed: [0u8; 32], ip: client_ip(id.hash()), s: vec![] };
-            let mut hints: HashMap<String, Vec<String>> = std::fs::read(a.state.join("hints.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-            migrate_hints(&mut hints, tr.holders_with(trust::USE | trust::TRANSIT | trust::EXIT).into_iter().chain(tr.anchors().into_iter().map(|(_, pk)| pk)));
-            (prof, id, Some(C13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), rejected: Mutex::new(None), peers: Mutex::new(HashMap::new()), hints: Mutex::new(hints),
-                enrollees: Mutex::new(HashMap::new()), enrolled: Mutex::new(HashSet::new()), enroll_try: Mutex::new(HashMap::new()),
-                relays: Mutex::new(HashMap::new()), users: Mutex::new(Vec::new()), early: Mutex::new(Vec::new()) }))
-        }
+pub async fn run_client13(a: ClientArgs) -> Result<()> {
+    std::fs::create_dir_all(&a.state)?;
+    let id = load_or_create_identity(&a.state)?;
+    let my_pk = id.public_key_bytes();
+    let raw = match &a.invite_file {
+        Some(f) => std::fs::read_to_string(f).with_context(|| format!("invite-file {}", f.display()))?,
+        None => a.invite.clone(),
     };
+    let tr = trust::Trust::load(id.clone(), &a.state).context("trust.json")?;
+    let mut inv = None;
+    if !raw.trim().is_empty() {
+        match trust::Invite::parse(&raw) {
+            Ok(i) => { if !tr.enrollment_proofs(&my_pk).iter().any(|p| p.grant.id == crate::enroll::invite_id(&i.pin)) { inv = Some(i); } }
+            Err(e) if tr.anchors().len() > 1 || tr.record_count() > 0 => { eprintln!("Сохранённое зачисление используется без старого приглашения: {e:#}"); }
+            Err(e) => return Err(e),
+        }
+    }
+    let mut hints: HashMap<String, Vec<String>> = std::fs::read(a.state.join("hints.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    migrate_hints(&mut hints, tr.holders_with(trust::USE | trust::TRANSIT | trust::EXIT).into_iter().chain(tr.anchors().into_iter().map(|(_, pk)| pk)));
+    let c13 = Some(C13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), rejected: Mutex::new(None), peers: Mutex::new(HashMap::new()), hints: Mutex::new(hints),
+        enrollees: Mutex::new(HashMap::new()),
+        users: Mutex::new(Vec::new()) });
+    let identity = id;
     let tun_arg = a.tun_fd.to_string();
     // без дескриптора от VpnService (лаборатория, Linux) TUN создаётся самим процессом и получает адрес, выведенный из identity
-    let tun_ip = format!("{}/{}", ip_str(prof.ip), client_net().1);
+    let tun_ip = format!("{}/{}", ip_str(client_ip(identity.hash())), client_net().1);
     let mut extra: Vec<&str> = vec!["--tun-fd", &tun_arg, "--tun-mtu", "1327", "--path-keepalive-ms", "4000", "--conn-idle-ms", "12000"];
-    if a.tun_fd < 0 && c13.is_some() {
+    if a.tun_fd < 0 {
         extra.extend(["--tun-ip", &tun_ip]);
     }
-    let b = start_base("c", &a.state, false, None, SecretKey::generate(), c13.as_ref().map(|_| identity.clone()), a.quic_cc_mbit, &extra, None).await?;
+    let b = start_base("c", &a.state, false, None, SecretKey::generate(), Some(identity.clone()), a.quic_cc_mbit, &extra, None).await?;
     let (node, sh, ep, cli, events, admin_lxmf) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events, b.admin_lxmf);
     let tun = TunState::open(&cli, false)?;
     let _ = sh.tun.set(tun.clone());
     tokio::spawn(tun_reader(tun.clone(), node.clone(), sh.clone()));
 
-    let servers: Vec<CServer> = prof.s.iter().map(|s| CServer { dest: s.d, key: s.k, name: s.n.clone(), ep: hex(&s.k), addrs: s.a.clone(),
-        hops: None, rtt_ms: None, state: "seen".into(), seen: Instant::now(), pinned: true, pk: None }).collect();
-    if servers.is_empty() && c13.is_none() {
-        bail!("в профиле нет серверов");
-    }
-    let ctx = Arc::new(ClientCtx { node: node.clone(), sh: sh.clone(), ep: ep.clone(), identity, group: prof.group.clone(), ip: ip_str(prof.ip), servers: Mutex::new(servers.clone()), tun,
+    let servers: Vec<CServer> = Vec::new();
+    let client_addr = ip_str(client_ip(identity.hash()));
+    let ctx = Arc::new(ClientCtx { node: node.clone(), sh: sh.clone(), ep: ep.clone(), identity, ip: client_addr, servers: Mutex::new(servers.clone()), tun,
         auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), probe_wait: Mutex::new(HashMap::new()), drain: Mutex::new(DrainState::default()), cur: Mutex::new(None), last_pong: Default::default(), contact_window_ms: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
         state: a.state.clone(), status: Mutex::new("подключаюсь".into()), dialers: Mutex::new(HashMap::new()),
         carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), hints: Mutex::new(HashMap::new()), platforms: Mutex::new(HashMap::new()), books: Mutex::new(HashMap::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
         c13, path_gate: path::PathGate::default(), nbrs: Mutex::new(HashMap::new()), admitted_exits: Mutex::new(HashMap::new()), ctrl: Mutex::new(HashMap::new()), lk_fail: Mutex::new(HashMap::new()), vis: Mutex::new(HashMap::new()), qstat: Mutex::new(HashMap::new()),
-        bench_sess: Mutex::new(None), bench_last: Mutex::new(None),
          rcfg: std::sync::RwLock::new(Arc::new(route::Cfg::default())), rreport: Mutex::new(serde_json::Value::Null), rpending: Mutex::new(HashSet::new()), rback: Mutex::new(HashMap::new()) });
+    let _enrollment_service = ctx.c13.as_ref().map(|c| enroll_net::register(node.clone(), ctx.identity.clone(), c.trust.clone(), &a.state, Some(Arc::downgrade(&ctx))));
     let _admin_client_guard = if let (Some(runtime), Some(c13)) = (admin_lxmf, ctx.c13.as_ref()) {
         let guard = lxmf_admin::register_client_runtime(&a.state, &runtime);
         let trust = c13.trust.clone();
@@ -8922,7 +7416,7 @@ pub async fn run_client(a: ClientArgs) -> Result<()> {
         // (а) админ без приглашения объявляет свой корень: destination только для анонса, Link к нему не принимаем
         let mut dest = new_dest(ctx.identity.clone(), Direction::In, T13_TAG)
             .map_err(|e| anyhow::anyhow!("destination: {e:?}"))?;
-        dest.set_accepts_links(false);
+        dest.set_accepts_links(true);
         let dh = *dest.hash().as_bytes();
         node.register_destination(dest);
         tokio::spawn(client_announce(ctx.clone(), dh));
@@ -8971,7 +7465,6 @@ pub async fn run_client(a: ClientArgs) -> Result<()> {
         }
     }
     tokio::spawn(client_events(ctx.clone(), events));
-    tokio::spawn(client_bench(ctx.clone()));
     // Прямая связь телефона с узлом (наш носитель QUIC/TCP) должна быть и путём RNS. Путь уходит на транзит, когда копия свежего анонса
     // пришла через соседа раньше прямой или носитель переподключился; сам RNS его не вернёт до следующего анонса (600 с).
     // Раз в 60 с на узел спрашиваем путь только по носителю к нему: ответ самого узла (1 хоп, свежий) RNS примет штатно.
@@ -9063,142 +7556,21 @@ pub async fn run_client(a: ClientArgs) -> Result<()> {
     ep.close().await;
     let rejected = ctx.c13.as_ref().and_then(|c| c.rejected.lock().unwrap().clone());
     if let Some(why) = rejected {
-        bail!("зачисление отклонено админом: {why}");
+        bail!("зачисление прекращено: {why}");
     }
     Ok(())
 }
 
-/// Зачисление по приглашению. Админ - нода с адресом: идём к нему напрямую (T_PAIR1). Админ - телефон за NAT (адресов в приглашении нет):
-/// просимся через ноду его сети (T_PAIRQ), а он подтверждает, пока приложение у него включено.
+/// Зачисление по приглашению v4 (ADR 0019): Link к нодам приглашения по RNS, проверка предложения, согласие пользователя, погашение pin.
 async fn pair_client(ctx: &Arc<ClientCtx>) -> Result<()> {
     let Some(c) = &ctx.c13 else { return Ok(()) };
     let Some(inv) = c.invite.lock().unwrap().clone() else { return Ok(()) };
-    let dest = dest_from_pub_tag(&inv.admin, T13_TAG);
-    let direct = ctx.servers.lock().unwrap().iter().any(|s| s.dest == dest && !s.addrs.is_empty());
-    if direct {
-        pair_direct(ctx).await
-    } else {
-        pair_via_relay(ctx).await
-    }
-}
-
-/// A (клиент): таблица попыток зачисления. Записи старше ENROLL_TRY_TTL выкидываем; новый ключ сверх ENROLL_TRY_MAX не вставляем (`false`).
-/// Вытеснять самую старую не стали: чужие анонсы тогда сбивали бы таблицу и тратили попытки; отказ лишь не даёт запомнить попытку.
-fn enroll_try_put(t: &mut HashMap<[u8; 16], Instant>, dest: [u8; 16], now: Instant) -> bool {
-    t.retain(|_, x| now.saturating_duration_since(*x) < ENROLL_TRY_TTL);
-    if !t.contains_key(&dest) && t.len() >= ENROLL_TRY_MAX {
-        return false;
-    }
-    t.insert(dest, now);
-    true
-}
-
-/// Через посредника: Link к ноде сети админа, identify, T_PAIRQ раз в 6 с; ответ - T_REC с записью о нас (on_rec_client).
-async fn pair_via_relay(ctx: &Arc<ClientCtx>) -> Result<()> {
-    let Some(c) = &ctx.c13 else { return Ok(()) };
-    let Some(inv) = c.invite.lock().unwrap().clone() else { return Ok(()) };
-    *ctx.status.lock().unwrap() = "ищу ноды сети админа".into();
-    let t0 = Instant::now();
-    let cand = loop {
-        let pick = {
-            let tried = c.enroll_try.lock().unwrap();
-            let mut relays: Vec<CServer> = c.relays.lock().unwrap().values().cloned().collect();
-            // Повторное приглашение того же админа (смена прав): узлы его сети уже известны по записям, ждать их анонса (600 с) незачем.
-            // Посредник - узел с действующим TRANSIT или EXIT в корне админа (по подписанным записям, не по анонсу).
-            {
-                let tr = c.trust.lock().unwrap();
-                let Ok(root) = inv.root() else { return Ok(()) };
-                for s in ctx.servers.lock().unwrap().iter() {
-                    let member = s.pk.and_then(|pk| trust::hash_of(&pk)).map(|h| tr.rights_in(&root, &h) & (trust::TRANSIT | trust::EXIT) != 0).unwrap_or(false);
-                    if member && relays.len() < 32 && !relays.iter().any(|r| r.dest == s.dest) {
-                        relays.push(s.clone());
-                    }
-                }
-            }
-            let best = relays.iter()
-                .filter(|s| tried.get(&s.dest).map(|t| t.elapsed() > Duration::from_secs(20)).unwrap_or(true))
-                .min_by_key(|s| tried.get(&s.dest).map(|t| std::cmp::Reverse(t.elapsed())))
-                .cloned();
-            best
-        };
-        if let Some(s) = pick {
-            break s;
-        }
-        if t0.elapsed() > Duration::from_secs(60) {
-            bail!("нет нод сети админа в анонсах (публичная RNS пуста или анонсы не доходят)");
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    };
-    // предел таблицы: без места попытка всё равно идёт (это действие владельца приглашения), только не запоминается
-    let _ = enroll_try_put(&mut c.enroll_try.lock().unwrap(), cand.dest, Instant::now());
-    *ctx.status.lock().unwrap() = format!("прошусь к админу через {}", cand.name);
-    // ADR 0016: анонс адреса не несёт; без адреса идём к посреднику по пути RNS (Link сквозь зашифрован, ключ посредника проверен анонсом)
-    let id = if cand.addrs.is_empty() {
-        rns_link(ctx, &cand).await?
-    } else {
-        start_dialer(ctx, &cand);
-        direct_link(ctx, &cand).await?
-    };
-    c.peers.lock().unwrap().insert(id, cand.pk.unwrap_or([0u8; 64]));
-    ctx.node.identify_link(&id, &ctx.identity).await.map_err(|e| anyhow::anyhow!("identify: {e:?}"))?;
-    let my_pk = ctx.identity.public_key_bytes();
-    let (Ok(root), Ok(admin), Ok(mac)) = (inv.root(), inv.admin_hash(), inv.mac(&my_pk)) else { return Ok(()) };
-    let body = pairq_body(root, admin, &my_pk, &mac);
-    ctx.sh.note(format!("зачисление: прошусь к админу через {}", cand.name));
-    *ctx.status.lock().unwrap() = format!("жду подтверждения админа (через {})", cand.name);
-    let t = Instant::now();
-    let mut last = Instant::now() - Duration::from_secs(60);
-    while t.elapsed() < Duration::from_secs(24) {
-        if c.invite.lock().unwrap().is_none() {
-            break;
-        }
-        if last.elapsed() >= Duration::from_secs(6) {
-            last = Instant::now();
-            send_ctl(&ctx.node, id, T_PAIRQ, &body).await;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    if c.invite.lock().unwrap().is_none() {
-        // Посредник допускает нас соседом и шлёт выгрузку сети следом за записью о нас: ждём, пока она дойдёт (иначе нода-новичок знает
-        // лишь свою запись и не поднимает Link с соседями).
-        tokio::time::sleep(Duration::from_millis(4500)).await;
-    }
-    let _ = ctx.node.engine().close_link(&id).await;
-    c.peers.lock().unwrap().remove(&id);
-    if c.invite.lock().unwrap().is_some() {
-        bail!("админ не подтвердил (телефон админа выключен или не подключён к сети?)");
-    }
-    Ok(())
-}
-
-/// Зачисление клиента по приглашению: Link к админу, identify, T_PAIR1; ответ - обычная T_REC с записью о нас (on_rec_client).
-async fn pair_direct(ctx: &Arc<ClientCtx>) -> Result<()> {
-    let Some(c) = &ctx.c13 else { return Ok(()) };
-    let Some(inv) = c.invite.lock().unwrap().clone() else { return Ok(()) };
-    let dest = dest_from_pub_tag(&inv.admin, T13_TAG);
-    let cand = ctx.servers.lock().unwrap().iter().find(|s| s.dest == dest).cloned().ok_or_else(|| anyhow::anyhow!("админ приглашения не в списке выходов"))?;
-    *ctx.status.lock().unwrap() = "зачисляюсь по приглашению".into();
-    let (id, _h) = open_link(ctx, &cand, None).await?;
-    c.peers.lock().unwrap().insert(id, inv.admin);
-    ctx.node.identify_link(&id, &ctx.identity).await.map_err(|e| anyhow::anyhow!("identify: {e:?}"))?;
-    let my_pk = ctx.identity.public_key_bytes();
-    let mut body = my_pk.to_vec();
-    let Ok(mac) = inv.mac(&my_pk) else { return Ok(()) };
-    body.extend_from_slice(&mac);
-    send_ctl(&ctx.node, id, T_PAIR1, &body).await;
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(10) {
-        if c.invite.lock().unwrap().is_none() || c.rejected.lock().unwrap().is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let _ = ctx.node.engine().close_link(&id).await;
-    c.peers.lock().unwrap().remove(&id);
-    if c.invite.lock().unwrap().is_some() && c.rejected.lock().unwrap().is_none() {
-        bail!("админ не ответил на зачисление");
-    }
-    Ok(())
+    let service = enroll_net::find(&ctx.state).context("enrollment runtime")?;
+    *ctx.status.lock().unwrap() = "Связываюсь с нодами приглашения".into();
+    let hints = enroll_net::join(&service, &inv).await?;
+    for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.hint_name(e.dest, &e.name); }
+    *c.invite.lock().unwrap() = None;
+    ctx.refresh_servers13(); start_dialers(ctx); Ok(())
 }
 
 /// Запись от узла по Link клиента: завершение зачисления (запись о нас от админа приглашения) и пополнение списка выходов.
@@ -9254,138 +7626,17 @@ fn on_pol_client(ctx: &Arc<ClientCtx>, _link: LinkId, body: &[u8]) {
     }
 }
 
-fn on_rec_client(ctx: &Arc<ClientCtx>, link: LinkId, body: &[u8]) {
+fn on_rec_client(ctx: &Arc<ClientCtx>, _link: LinkId, body: &[u8]) {
     let Some(c) = &ctx.c13 else { return };
-    if body.len() != trust::REC_LEN {
-        return;
-    }
     let Some(rec) = trust::Record::parse(body) else { return };
-    let pending_inv = c.invite.lock().unwrap().clone();
-    let mut done = false;
-    if let Some(inv) = pending_inv.as_ref() {
-        if inv.root().ok() == Some(rec.root) {
-            let mut early = c.early.lock().unwrap();
-            let _ = early_push(&mut early, link, rec.clone(), &rec.root);
-            let records: Vec<trust::Record> = early.iter().map(|(_, r)| r.clone()).collect();
-            if let Some(proof) = enrollment_proof(&ctx.identity, inv, &records) {
-                let mut tr = c.trust.lock().unwrap();
-                if inv.root_pk().and_then(|pk| tr.add_anchor(&pk).map(|_| ())).is_ok() {
-                    for r in proof { let _ = tr.offer(r); }
-                    *c.invite.lock().unwrap() = None;
-                    done = true;
-                }
-            }
-        }
-    }
-    let mut off = if pending_inv.as_ref().and_then(|i| i.root().ok()) == Some(rec.root) && !done {
-        trust::Offer::Rejected("чужой корень")
-    } else {
-        c.trust.lock().unwrap().offer(rec.clone())
-    };
-    if done {
-        let early: Vec<(LinkId, trust::Record)> = std::mem::take(&mut *c.early.lock().unwrap());
-        let mut tr = c.trust.lock().unwrap();
-        for (_, r) in early {
-            if tr.offer(r) == trust::Offer::Added {
-                off = trust::Offer::Added;
-            }
-        }
-    }
-    if done || off == trust::Offer::Added {
-        if let Err(e) = c.trust.lock().unwrap().save() {
-            ctx.sh.note(format!("trust.json не записан: {e:#}"));
-        }
-        ctx.refresh_servers13();
-        start_dialers(ctx);
-    }
-    if done {
-        ctx.sh.note("зачисление подтверждено цепочкой до корня приглашения; приглашение больше не используется".to_string());
-    }
+    let mut tr = c.trust.lock().unwrap();
+    if tr.offer(rec) == trust::Offer::Added { let _ = tr.save(); }
+    drop(tr); ctx.refresh_servers13(); start_dialers(ctx);
 }
 
-/// Анонс неизвестной ноды с тегом корня, который мы признаём (якорь или админ ожидающего приглашения): запоминаем адрес, чтобы после зачисления
-/// выход нашёлся без нового анонса; если приглашение ещё не принято - нода кандидат в посредники зачисления (T_PAIRQ). Адрес - подсказка, не доверие.
-fn maybe_relay(ctx: &Arc<ClientCtx>, pk: &[u8; 64], v: &serde_json::Value, dest: [u8; 16], name: &str, addrs: &[String]) {
-    let Some(c) = &ctx.c13 else { return };
-    let (mut tags, pending, only) = {
-        let tr = c.trust.lock().unwrap();
-        let inv = c.invite.lock().unwrap();
-        (tr.tags(), inv.as_ref().and_then(|i| i.root().ok()).map(|r| trust::root_tag(&r)), inv.as_ref().map(|i| i.nodes.clone()).unwrap_or_default())
-    };
-    if let Some(p) = &pending {
-        tags.push(p.clone());
-    }
-    let theirs: Vec<&str> = v["r"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
-    if !tags.iter().any(|t| theirs.contains(&t.as_str())) {
-        return;
-    }
-    ctx.remember_addrs(&dest, addrs);
-    let Some(p) = pending else { return };
-    if !theirs.contains(&p.as_str()) {
-        return;
-    }
-    // админ выбрал входные ноды: посредником зачисления может быть только одна из них (identity нода доказывает на Link, анонс - лишь подсказка)
-    if !only.is_empty() && !trust::hash_of(pk).map(|h| only.contains(&h)).unwrap_or(false) {
-        return;
-    }
-    let mut r = c.relays.lock().unwrap();
-    if r.len() >= 16 && !r.contains_key(&dest) {
-        return;
-    }
-    r.insert(dest, CServer { dest, key: pk[32..64].try_into().unwrap(), name: name.to_string(), ep: v["e"].as_str().unwrap_or("").to_string(), addrs: addrs.to_vec(),
-        hops: None, rtt_ms: None, state: "relay".into(), seen: Instant::now(), pinned: false, pk: Some(*pk) });
-}
-
-/// Админ-режим клиента (телефон): анонс ноды, ждущей НАШЕГО приглашения (в `r` тег моего корня, ключ мне не знаком, есть свежий pin).
-/// Нода за NAT или без адреса недостижима для админа, поэтому набираем мы: адрес берём из анонса (подсказка, не доверие).
-fn maybe_enroll(ctx: &Arc<ClientCtx>, pk: &[u8; 64], v: &serde_json::Value, dest: [u8; 16], name: String, addrs: Vec<String>) {
-    let Some(c) = &ctx.c13 else { return };
-    let roots = trust::pin_roots_fresh(&ctx.state);
-    let announced: Vec<&str> = v["r"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
-    let waiting = roots.iter().any(|r| announced.contains(&trust::root_tag(r).as_str()));
-    if !waiting || c.trust.lock().unwrap().rights(pk) != 0 {
-        return;
-    }
-    {
-        let mut t = c.enroll_try.lock().unwrap();
-        if t.get(&dest).map(|x| x.elapsed() < Duration::from_secs(60)).unwrap_or(false) || !enroll_try_put(&mut t, dest, Instant::now()) {
-            return;
-        }
-    }
-    let ep = v["e"].as_str().unwrap_or("").to_string();
-    if !addrs.is_empty() {
-        ctx.remember_addrs(&dest, &addrs); // адрес придёт приватным каталогом по LXMF
-    }
-    let (ctx2, pk2) = (ctx.clone(), *pk);
-    ctx.sh.note(format!("нода {name} ({}) ждёт приглашения: открываю Link по пути RNS", &hex(&dest)[..8]));
-    tokio::spawn(async move {
-        if let Err(e) = enroll_node(&ctx2, dest, pk2, ep, name.clone(), addrs).await {
-            ctx2.sh.note(format!("зачисление ноды {name}: {e:#}"));
-        }
-    });
-}
-
-/// Дозвониться до ожидающей ноды своим носителем (QUIC), открыть Link по нему (не через публичную RNS), identify; дальше нода шлёт T_PAIR1.
-async fn enroll_node(ctx: &Arc<ClientCtx>, dest: [u8; 16], pk: [u8; 64], ep: String, name: String, addrs: Vec<String>) -> Result<()> {
-    let Some(c) = &ctx.c13 else { return Ok(()) };
-    let cand = CServer { dest, key: pk[32..64].try_into().unwrap(), name: name.clone(), ep, addrs, hops: None, rtt_ms: None,
-        state: "enroll".into(), seen: Instant::now(), pinned: false, pk: Some(pk) };
-    if !cand.addrs.is_empty() {
-        start_dialer(ctx, &cand);
-    }
-    let res = enroll_link(ctx, c, &cand).await;
-    if res.is_err() {
-        // неудавшуюся попытку не держим: носитель и дозвон нужны только тем нодам, что стали выходами
-        if let Some(a) = ctx.dialers.lock().unwrap().remove(&dest) {
-            a.store(false, Relaxed);
-        }
-        ctx.carriers.lock().unwrap().remove(&dest);
-    }
-    res
-}
 
 /// Link к ожидающей ноде по любому пути RNS (ADR 0016): адреса нет, путь строит RNS. Link сквозь зашифрован, ключ ноды сверяется
-/// с анонсом (`connect_with_key`) и ещё раз при T_PAIR1; допуск даёт только pin приглашения.
+/// с анонсом (`connect_with_key`); допуск даёт только pin приглашения.
 async fn rns_link(ctx: &Arc<ClientCtx>, cand: &CServer) -> Result<LinkId> {
     let dh = DestinationHash::new(cand.dest);
     // Публичная RNS нужна для координации (анонсы, поиск узла). Когда таблица путей уже есть и у нас живут носители к своим нодам,
@@ -9509,191 +7760,6 @@ async fn direct_link(ctx: &Arc<ClientCtx>, cand: &CServer) -> Result<LinkId> {
     Ok(id)
 }
 
-async fn enroll_link(ctx: &Arc<ClientCtx>, c: &C13, cand: &CServer) -> Result<()> {
-    let id = if cand.addrs.is_empty() { rns_link(ctx, cand).await? } else { direct_link(ctx, cand).await? };
-    c.enrollees.lock().unwrap().insert(id, cand.pk.unwrap());
-    ctx.node.identify_link(&id, &ctx.identity).await.map_err(|e| anyhow::anyhow!("identify: {e:?}"))?;
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(12) && !c.enrolled.lock().unwrap().contains(&id) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let done = c.enrolled.lock().unwrap().contains(&id);
-    if done {
-        tokio::time::sleep(Duration::from_millis(1500)).await; // дать записям уйти
-    }
-    let _ = ctx.node.engine().close_link(&id).await;
-    c.enrollees.lock().unwrap().remove(&id);
-    c.enrolled.lock().unwrap().remove(&id);
-    if !done {
-        bail!("нода не запросила зачисление (приглашение другого админа или уже погашено)");
-    }
-    Ok(())
-}
-
-/// Админ-режим: ожидающая нода просится по нашему приглашению. Зеркало `on_pair1` ноды, но Link открыли мы.
-async fn on_pair1_client(ctx: Arc<ClientCtx>, link: LinkId, body: Vec<u8>) {
-    let Some(c) = &ctx.c13 else { return };
-    if body.len() != 64 + 32 {
-        return;
-    }
-    let Some(expect) = c.enrollees.lock().unwrap().get(&link).copied() else { return };
-    let holder: [u8; 64] = body[..64].try_into().unwrap();
-    if holder != expect {
-        ctx.sh.note("зачисление: ключ ноды не совпал с анонсом, закрываю".to_string());
-        let _ = ctx.node.engine().close_link(&link).await;
-        return;
-    }
-    let my_pk = ctx.identity.public_key_bytes();
-    let my_hash = c.trust.lock().unwrap().me_hash;
-    let rec = match trust::pin_claim(&ctx.state, &my_pk, &holder, &body[64..], now_ms() as u64 / 1000) {
-        trust::Claim::New { rights, root } => {
-            let r = c.trust.lock().unwrap().issue(root, holder, rights);
-            match r {
-                Ok(r) => {
-                    if let Err(e) = c.trust.lock().unwrap().save() {
-                        trust::pin_unclaim(&ctx.state, &my_pk, &holder, &body[64..]);
-                        ctx.sh.note(format!("trust.json не записан: {e:#}"));
-                        return;
-                    }
-                    ctx.sh.note(format!("зачисление: нода {} получила права {}", &hex(&r.hh)[..8], trust::rights_text(r.rights)));
-                    Some(r)
-                }
-                Err(e) => {
-                    // H8: выдача не удалась - возвращаем pin, приглашение не сгорает
-                    trust::pin_unclaim(&ctx.state, &my_pk, &holder, &body[64..]);
-                    ctx.sh.note(format!("зачисление: запись не выдана: {e:#}"));
-                    None
-                }
-            }
-        }
-        trust::Claim::Repeat { root } => {
-            let tr = c.trust.lock().unwrap();
-            let found = repeat_record(&tr, &root, &holder, &my_hash);
-            if found.is_none() {
-                drop(tr);
-                trust::pin_unclaim(&ctx.state, &my_pk, &holder, &body[64..]);
-                ctx.sh.note("зачисление: незавершённое погашение возвращено; повторите запрос".to_string());
-                return;
-            }
-            found
-        }
-        other => {
-            let why = match other {
-                trust::Claim::Spent => "приглашение уже использовано",
-                trust::Claim::Expired => "приглашение просрочено",
-                _ => "приглашение неизвестно этому админу",
-            };
-            ctx.sh.note(format!("зачисление отклонено: {why}"));
-            send_ctl(&ctx.node, link, T_PAIR_NO, why.as_bytes()).await;
-            return;
-        }
-    };
-    let Some(rec) = rec else {
-        send_ctl(&ctx.node, link, T_PAIR_NO, "запись не выдана".as_bytes()).await;
-        return;
-    };
-    let (chain, rest) = enrollment_export(&c.trust.lock().unwrap(), &holder);
-    ctx.sync_to(link, chain.into_iter().chain(rest).collect(), vec![]);
-    // текущий выход узнаёт о новой ноде сразу (иначе - при следующем подключении к нему), дальше он разнесёт запись соседям
-    let cur = ctx.cur.lock().unwrap().map(|x| x.1);
-    if let Some(cur) = cur {
-        ctx.sync_to(cur, vec![rec.clone()], vec![]);
-    }
-    // новая нода не знает адресов остальных (анонс их не несёт): отдаём ей известные нам выходы; это подсказки, допуск по записям
-    send_catalog(&ctx, link, &holder).await;
-    c.enrolled.lock().unwrap().insert(link);
-    ctx.refresh_servers13();
-    start_dialers(&ctx);
-}
-
-/// Админ -> только что зачисленная нода: адреса известных нам нод (до DIR_MAX) приватным каталогом по LXMF.
-/// Подсказки адресов, не права; адресат остаётся допустимым, пока у него есть действующие права в наших записях.
-async fn send_catalog(ctx: &Arc<ClientCtx>, _link: LinkId, except: &[u8; 64]) {
-    let Some(c) = &ctx.c13 else { return };
-    let list: Vec<serde_json::Value> = ctx.servers.lock().unwrap().iter()
-        .filter(|x| x.pk.is_some() && x.pk.as_ref() != Some(except) && !x.addrs.is_empty())
-        .take(DIR_MAX)
-        .map(|x| serde_json::json!({"d": hex(&x.dest), "k": hex(&x.pk.unwrap()), "e": x.ep, "a": x.addrs.iter().take(3).collect::<Vec<_>>(), "n": x.name, "pl": platform()}))
-        .collect();
-    if list.is_empty() {
-        return;
-    }
-    let (holder, authority) = (*except, c.trust.clone());
-    let gate: lxmf_sync::Gate = Arc::new(move || {
-        let tr = match authority.try_lock() {
-            Ok(tr) => tr,
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-            Err(_) => return Some(false),
-        };
-        Some(tr.effective(&holder, now_ms() as u64) != 0)
-    });
-    lxmf_sync::send_dir(&ctx.state, holder, list, gate);
-}
-
-/// Админ-режим: пользователь просится по нашему приглашению через ноду-посредника (Link к ноде - наш, пришёл T_PAIRQ). pin гасится за ключом
-/// новичка, запись о нём подписываем сами и отдаём ноде: она разнесёт её соседям (так нового пользователя узнают все ноды) и ответит новичку.
-async fn on_pairq_client(ctx: Arc<ClientCtx>, link: LinkId, body: Vec<u8>) {
-    let Some(c) = &ctx.c13 else { return };
-    let Some((requested_root, inviter_h, holder, mac)) = parse_pairq(&body) else { return };
-    let (me_hash, my_pk) = (c.trust.lock().unwrap().me_hash, ctx.identity.public_key_bytes());
-    if inviter_h != me_hash {
-        return;
-    }
-    let Some(hh) = id_of_pub(&holder) else { return };
-    let claim = trust::pin_claim(&ctx.state, &my_pk, &holder, &mac, now_ms() as u64 / 1000);
-    if let trust::Claim::New { root, .. } | trust::Claim::Repeat { root } = &claim {
-        if !pairq_client_matches(&inviter_h, &me_hash, &requested_root, root) {
-            if matches!(&claim, trust::Claim::New { .. }) { trust::pin_unclaim(&ctx.state, &my_pk, &holder, &mac); }
-            return;
-        }
-    }
-    let rec = match claim {
-        trust::Claim::New { rights, root } => {
-            let r = c.trust.lock().unwrap().issue(root, holder, rights);
-            match r {
-                Ok(r) => {
-                    if let Err(e) = c.trust.lock().unwrap().save() {
-                        trust::pin_unclaim(&ctx.state, &my_pk, &holder, &mac);
-                        ctx.sh.note(format!("trust.json не записан: {e:#}"));
-                        return;
-                    }
-                    ctx.sh.note(format!("зачисление: пользователь {} получил права {}", &hex(&hh)[..8], trust::rights_text(r.rights)));
-                    if root == me_hash { c.users.lock().unwrap().push((hex(&hh), now_ms() as u64 / 1000)); }
-                    Some(r)
-                }
-                Err(e) => {
-                    // H8: выдача не удалась - возвращаем pin, приглашение не сгорает
-                    trust::pin_unclaim(&ctx.state, &my_pk, &holder, &mac);
-                    ctx.sh.note(format!("зачисление: запись не выдана: {e:#}"));
-                    None
-                }
-            }
-        }
-        trust::Claim::Repeat { root } => {
-            let tr = c.trust.lock().unwrap();
-            let found = repeat_record(&tr, &root, &holder, &me_hash);
-            if found.is_none() {
-                drop(tr);
-                trust::pin_unclaim(&ctx.state, &my_pk, &holder, &mac);
-                ctx.sh.note("зачисление: незавершённое погашение возвращено; повторите запрос".to_string());
-                return;
-            }
-            found
-        }
-        other => {
-            ctx.sh.note(format!("зачисление пользователя {}: {other:?}", &hex(&hh)[..8]));
-            None
-        }
-    };
-    if rec.is_none() { return }
-    let (chain, rest) = enrollment_export(&c.trust.lock().unwrap(), &holder);
-    ctx.sync_to(link, chain.into_iter().chain(rest).collect(), vec![]);
-    let cur = ctx.cur.lock().unwrap().map(|x| x.1);
-    if let Some(cur) = cur.filter(|x| *x != link) {
-        let chain = c.trust.lock().unwrap().chain_for(&holder);
-        ctx.sync_to(cur, chain, vec![]);
-    }
-}
 
 /// (а, 0014 R6) Админ без приглашения (телефон или зачисленный клиент) анонсирует тег своего корня без адресов: нода, ждущая зачисления,
 /// видит, что админ на связи, и просится через посредника. При старте, через 20 с, затем раз в 600 с (инвариант 8).
@@ -9706,16 +7772,8 @@ async fn client_announce(ctx: Arc<ClientCtx>, dest: [u8; 16]) {
         if c.invite.lock().unwrap().is_some() {
             continue; // пока ждём зачисления, своих нод у нас нет
         }
-        // анонсируется только админ: есть выданные им записи или ждущий pin; рядовой пользователь в публичную RNS не анонсируется
-        let (me, admin) = {
-            let tr = c.trust.lock().unwrap();
-            (tr.me_hash, tr.export_all().iter().any(|r| r.issuer == tr.me_hash && r.hh != tr.me_hash))
-        };
-        if !admin && !trust::pin_list(&ctx.state).iter().any(|p| p.1 == "свежий") {
-            continue;
-        }
         // This destination exists only to publish the admin anchor for discovery; it rejects incoming Links.
-        let data = serde_json::json!({"r": [trust::root_tag(&me)], "lc": false});
+        let data = serde_json::json!({"lc": false});
         let _ = ctx.node.announce(&DestinationHash::new(dest), Some(data.to_string().as_bytes())).await;
     }
 }
@@ -9802,10 +7860,7 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
         match ev {
             NodeEvent::AnnounceReceived { announce, .. } if ctx.c13.is_some() => {
                 // анонс лишь подсказка адреса и имени для выхода, которого мы и так знаем по записям о правах
-                let Ok(v) = serde_json::from_slice::<serde_json::Value>(announce.app_data()) else { continue };
-                if !v["r"].is_array() {
-                    continue;
-                }
+                let v: serde_json::Value = serde_json::from_slice(announce.app_data()).unwrap_or_default();
                 let dest = *announce.destination_hash().as_bytes();
                 let addrs: Vec<String> = v["a"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).take(3).collect()).unwrap_or_default();
                 let name: Option<String> = v["n"].as_str().and_then(|n| norm_peer_name(n, ""));
@@ -9836,11 +7891,11 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                     }
                     None => {
                         let name = name.unwrap_or_else(|| "?".into());
-                        maybe_relay(&ctx, announce.public_key(), &v, dest, &name, &addrs);
-                        maybe_enroll(&ctx, announce.public_key(), &v, dest, name, addrs)
+                        let _ = name;
                     }
                 }
             }
+            NodeEvent::RequestReceived { link_id, request_id, path, data, .. } if path == enroll_net::PATH => { enroll_net::dispatch(&ctx.state, link_id, request_id, data); }
             NodeEvent::LinkEstablished { link_id, .. } => {
                 ctx.sh.established.lock().unwrap().insert(hex(link_id.as_bytes()));
             }
@@ -9883,42 +7938,14 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                             let _ = tx.send(reply);
                         }
                     }
-                    T_BENCH => {
-                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
-                            bench_msg(&ctx.bench_sess, link_id, &v);
-                        }
-                    }
                     T_NBRS => {
                         if ctx.c13.is_some() {
                             on_nbrs_client(&ctx, link_id, body);
                         }
                     }
-                    T_PAIR1 => {
-                        let (c2, b) = (ctx.clone(), body.to_vec());
-                        tokio::spawn(async move { on_pair1_client(c2, link_id, b).await });
-                    }
-                    T_PAIRQ => {
-                        let (c2, b) = (ctx.clone(), body.to_vec());
-                        tokio::spawn(async move { on_pairq_client(c2, link_id, b).await });
-                    }
-                    T_PAIR_NO => {
-                        if let Some(c) = &ctx.c13 {
-                            // H7: отказ принимаем только от админа ожидающего приглашения; посредник зачисления срывать его не может
-                            let admin = c.invite.lock().unwrap().as_ref().map(|i| i.admin);
-                            let from_admin = admin.is_some() && c.peers.lock().unwrap().get(&link_id).copied() == admin;
-                            if from_admin {
-                                let why: String = String::from_utf8_lossy(body).chars().take(80).collect();
-                                ctx.sh.note(format!("зачисление отклонено админом: {why}"));
-                                *c.rejected.lock().unwrap() = Some(why);
-                            } else if c.peers.lock().unwrap().contains_key(&link_id) {
-                                ctx.sh.note("T_PAIR_NO не от админа приглашения: проигнорирован".to_string());
-                            }
-                        }
-                    }
                     _ => {}
                 }
             }
-            NodeEvent::LinkDataReceived { link_id, data, .. } if data.first() == Some(&T_BENCH_DATA) => bench_rx(&ctx.bench_sess, link_id, &data),
             NodeEvent::LinkDataReceived { link_id, data, .. } => {
                 // IP-пакеты не берут дополнительный мьютекс таблицы проб.
                 if is_rgp(&data) && data[3] == b'R' {
@@ -10202,7 +8229,10 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     }
     ctx.node.identify_link(&id, &ctx.identity).await.map_err(|e| anyhow::anyhow!("identify: {e:?}"))?;
     if let Some(c) = &ctx.c13 {
-        if let Some(pk) = cand.pk { lxmf_sync::queue_proof(&ctx.state, c.trust.clone(), ctx.identity.public_key_bytes(), pk); }
+        if let Some(pk) = cand.pk {
+            lxmf_sync::queue_proof(&ctx.state, c.trust.clone(), ctx.identity.public_key_bytes(), pk);
+            if let Some(s) = enroll_net::find(&ctx.state) { s.send_proofs(pk); }
+        }
         // повтор T_USE после identify: если первый пакет отстал, узел уже увидит намерение стать клиентом
         send_ctl(&ctx.node, id, T_USE, &client_info_body(&ctx.identity)).await;
     }
@@ -10495,15 +8525,21 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
     let mut ret_recover: Option<RetRecover> = None;
     let mut ret_mv: Option<RetMove> = None;
     let mut ret_recovered: Option<([u8; 16], Instant)> = None;
+    let mut pair_delay = 2u64;
     while !fin.exists() {
         // 0013: сначала зачисление по приглашению (до него права есть только в собственном дереве, выходов нет)
         if ctx.c13.as_ref().map(|c| c.invite.lock().unwrap().is_some()).unwrap_or(false) {
             if let Err(e) = pair_client(&ctx).await {
                 ctx.sh.note(format!("зачисление: {e:#}"));
+                if e.downcast_ref::<enroll_net::Declined>().is_some() || e.downcast_ref::<enroll_net::Refused>().is_some() {
+                    if let Some(c) = &ctx.c13 { *c.rejected.lock().unwrap() = Some(e.to_string()); }
+                }
                 if ctx.c13.as_ref().map(|c| c.rejected.lock().unwrap().is_some()).unwrap_or(false) {
                     return;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                // неверный pin и недоступные ноды не повторяем часто: fail2ban нод растёт с числом неудач
+                tokio::time::sleep(Duration::from_secs(pair_delay)).await;
+                pair_delay = (pair_delay * 2).min(60);
             }
             continue;
         }
@@ -11256,7 +9292,7 @@ mod qreturn_tests {
     // согласование: тела T_PROBEQ/T_PROBER строгие; старый узел (on_control: `_ => {}`) тип 23 просто игнорирует
     #[test]
     fn probe_types_are_unused_by_older_message_types() {
-        let all = [T_AUTH_OK, T_AUTH_FAIL, T_PAIR1, T_PAIR_NO, T_USE, T_PAIRQ, T_NBRS, T_BENCH, T_BENCH_DATA, T_OBSERVE, T_CINFO];
+        let all = [T_AUTH_OK, T_AUTH_FAIL, T_USE, T_NBRS, T_OBSERVE, T_CINFO];
         assert!(!all.contains(&T_PROBEQ) && !all.contains(&T_PROBER) && T_PROBEQ != T_PROBER);
         assert_ne!(T_PROBEQ, 0x45, "не похож на IPv4-датаграмму");
     }

@@ -134,6 +134,42 @@ class HostAclTests(unittest.TestCase):
         self.assertIn("config.version != 1", loader)
 
 
+class HostNftTemplateTests(unittest.TestCase):
+    def test_host_access_input_is_tcp_exact_source_and_destination_only(self):
+        template = (HERE.parent / "deploy-0013/knothop.nft").read_text()
+        input_chain = template.split("chain input {", 1)[1].split("chain forward {", 1)[0]
+        host_rule = next(line for line in input_chain.splitlines() if 'comment "client->host-access-tcp"' in line)
+        for field in ('iifname "khd0"', 'ip saddr @host_access_v4',
+                      'ip daddr @host_access_dest_v4', 'meta l4proto tcp', 'counter accept'):
+            self.assertIn(field, host_rule)
+        self.assertLess(input_chain.index("client->host-access-tcp"), input_chain.index('comment "client->node"'))
+        self.assertIn('iifname "khd0" meta l4proto icmp counter accept', input_chain)
+        self.assertNotIn("ct state", input_chain, "established flows must not bypass revocation")
+        for name in ("host_access_v4", "host_access_dest_v4"):
+            body = template.split(f"set {name} {{", 1)[1].split("}", 1)[0]
+            for text in ("type ipv4_addr", "flags timeout", "timeout 3s", "size 256"):
+                self.assertIn(text, body)
+            self.assertNotIn("elements", body, "no persistent grants")
+        forward = template.split("chain forward {", 1)[1].split("chain output {", 1)[0]
+        self.assertNotIn("host_access", forward)
+        for mark in ("client->own-endpoint-local", "client->own-endpoint-v4", "client->own-endpoint-v6",
+                     "client->internal", "client-ipv6", "carrier-loop-guard", "knothop-user-no-tunnel"):
+            self.assertIn(f'comment "{mark}"', template)
+
+    def test_hostfix_checks_leased_sets_and_preserves_existing_reapply_path(self):
+        helper = (HERE / "node-hostfix.sh").read_text()
+        verified = helper.split("nft_verified() {", 1)[1].split("nft_swap()", 1)[0]
+        for name in ("host_access_v4", "host_access_dest_v4"):
+            self.assertIn(f"nft list set inet knothop {name}", verified)
+        self.assertIn("timeout 3s", verified)
+        self.assertIn('"client->host-access-tcp"', helper)
+        self.assertIn("PartOf=nftables.service", helper)
+        self.assertIn("ReloadPropagatedFrom=nftables.service", helper)
+        self.assertIn("ExecReload=/usr/local/sbin/knothop-hostfix apply", helper)
+        self.assertNotIn("flush set inet knothop host_access", helper,
+                         "hostfix apply must not race the daemon by republishing dynamic grants")
+
+
 class HostPolicyTests(unittest.TestCase):
     ROOT_A = "aabbccddeeff00112233445566778899"
 
