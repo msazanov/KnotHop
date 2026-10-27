@@ -37,7 +37,7 @@ cmd_run() {
   variant_ok "${KH_VARIANT:-}" || { log "KH_VARIANT не задан или неверен"; return 1; }
   [[ -e $OFF ]] && { log "отключено ($OFF)"; return 0; }
   exec 9>"$LOCK"; flock -n 9 || { log "другой проход уже идёт"; return 0; }
-  local sums want have got restarts0 i
+  local sums want have got restarts0
   sums=$(mktemp -p "$DIR" .autoupdate-sums.XXXXXX) || return 1
   SUMS_FILE=$sums   # trap EXIT срабатывает уже после выхода из функции: локальная переменная к тому времени недоступна
   trap 'rm -f "${SUMS_FILE:-}" "$TMP"' EXIT
@@ -57,7 +57,7 @@ cmd_run() {
   restarts0=$(systemctl show "$UNIT" -p NRestarts --value 2>/dev/null || echo 0)
   mv -f "$TMP" "$BIN" || { log "mv не удался"; return 1; }
   systemctl restart "$UNIT" || log "ВНИМАНИЕ: systemctl restart вернул ошибку"
-  for i in $(seq 1 18); do
+  for _ in $(seq 1 18); do
     sleep 5
     if [[ $(systemctl is-active "$UNIT") == active && $(sha "/proc/$(systemctl show "$UNIT" -p MainPID --value)/exe") == "$want" ]]; then
       log "готово: ${want:0:12}, служба active (рестартов с замены: $(( $(systemctl show "$UNIT" -p NRestarts --value) - restarts0 )))"
