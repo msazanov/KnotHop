@@ -36,6 +36,7 @@ mod vpn;
 mod trust;
 mod enroll;
 mod tcpc;
+mod mux;
 mod relay;
 mod health;
 mod bgwrite;
@@ -551,6 +552,8 @@ struct Shared {
     meas_exit: meas::ExitState,
     /// какие носители с какими пирами не работают (по собственным проверкам)
     health: health::Health,
+    /// интерфейсы принимающей стороны: один на ключ iroh пира, к нему подключаются его QUIC- и TCP-носители (`mux.rs`)
+    muxes: mux::Registry,
 }
 
 impl Shared {
@@ -647,6 +650,8 @@ pub(crate) struct Slot {
 impl Slot {
     /// Занять слот, если всего занято меньше `max_live` и с адреса меньше `max_ip`. Без адреса (релей) действует только общий лимит.
     pub(crate) fn take(owner: &SlotsRef, ip: Option<IpAddr>, max_live: usize, max_ip: usize) -> Option<Slot> {
+        // IPv6: счёт по сети /64, иначе один хост с целым префиксом обходит поадресный лимит
+        let ip = ip.map(ip_bucket);
         let mut s = owner.lock().unwrap();
         let c = ip.and_then(|a| s.per_ip.get(&a).copied()).unwrap_or(0);
         if s.live >= max_live || (ip.is_some() && c >= max_ip) {
@@ -657,6 +662,18 @@ impl Slot {
             *s.per_ip.entry(a).or_insert(0) += 1;
         }
         Some(Slot { owner: owner.clone(), ip })
+    }
+}
+
+/// Адрес для поадресного лимита: IPv4 как есть, IPv6 - первые 64 бита.
+pub(crate) fn ip_bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(a) => {
+            let mut o = a.octets();
+            o[8..].fill(0);
+            IpAddr::V6(o.into())
+        }
+        v4 => v4,
     }
 }
 
@@ -999,7 +1016,18 @@ async fn accept_loop(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>) {
             let peer = conn.remote_id().fmt_short().to_string();
             sh.note(format!("quic accepted from {peer}"));
             if carrier().0 {
-                attach_datagrams_until_closed(node, sh, format!("iroh-dg-in-{peer}-{id}"), conn).await;
+                // один интерфейс RNS на ключ iroh пира: смена носителя (QUIC <-> TCP) его не пересоздаёт, Link остаётся
+                let key = *conn.remote_id().as_bytes();
+                let Some(mux) = sh.muxes.get_or_create(&node, &sh, key, tcpc::MAX_MUX) else {
+                    conn.close(0u32.into(), b"too many peers");
+                    return;
+                };
+                if mux.add_quic(conn.clone(), false, mux::owner_key(ip, &key)).is_some() {
+                    let _ = conn.closed().await;
+                } else {
+                    conn.close(0u32.into(), b"too many carriers");
+                }
+                let _ = id;
                 return;
             }
             loop {
@@ -3166,6 +3194,17 @@ mod tests {
         }
         assert_eq!(c.map.len(), LINK_STATE_MAX);
         assert!(c.get(&format!("{:08x}", 0)).is_none());
+    }
+
+    #[test]
+    fn slots_count_ipv6_by_slash_64() {
+        let t: SlotsRef = Default::default();
+        let held: Vec<Slot> = (0..3u16)
+            .map(|i| Slot::take(&t, Some(format!("2001:db8:0:1::{:x}", i + 1).parse().unwrap()), 100, 3).unwrap())
+            .collect();
+        assert!(Slot::take(&t, Some("2001:db8:0:1:dead::1".parse().unwrap()), 100, 3).is_none(), "другой адрес той же /64 обошёл лимит");
+        assert!(Slot::take(&t, Some("2001:db8:0:2::1".parse().unwrap()), 100, 3).is_some(), "соседняя /64 не должна страдать");
+        drop(held);
     }
 
     #[test]

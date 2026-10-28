@@ -584,11 +584,6 @@ const T_OBSERVE: u8 = 21; // admitted client -> exit: UI visible (one byte 0/1),
 /// получатель проверяет права ключа по своим записям, держит не дольше CINFO_TTL; только для отображения
 const T_CINFO: u8 = 22;
 const CINFO_TTL: Duration = Duration::from_secs(60);
-/// Теневой зонд QUIC (этапы A/B make-before-break, qprobe.rs). Допущенный клиент -> выход: ver(1) | ключ iroh соединения зонда (32). Выход выдаёт
-/// этому ключу короткое разрешение на эхо датаграмм и отвечает T_PROBER: ver(1) | статус(1; 0 - разрешено) | ttl(1). Старый узел не знает T_PROBEQ
-/// (`on_control` молча игнорирует неизвестный тип): ответа нет, клиент остаётся на поведении этапа 0.
-const T_PROBEQ: u8 = 23;
-const T_PROBER: u8 = 24;
 const CINFO_MAX: usize = 64;
 /// Каталог нод: не более DIR_MAX записей в одном LXMF-сообщении
 const DIR_MAX: usize = lxmf_sync::DIR_LIMIT;
@@ -1328,261 +1323,15 @@ pub struct CarrierCtl {
     pub silence: Mutex<Option<Instant>>,
     /// когда в последний раз тишина по QUIC совпала со сбоем TCP-дозвона (общий сбой пути, а не блокировка носителя)
     pub joint_fail: Mutex<Option<Instant>>,
-    /// возврат TCP -> QUIC без разрыва Link (этапы A/B): где он сейчас
-    pub ret: Mutex<Ret>,
-    /// номер попытки возврата: растёт при каждом входе в `tcp_return` и при её конце (`ret_end`). Публикация с устаревшим номером отвергается (QAB-M3)
-    pub ret_epoch: std::sync::atomic::AtomicU64,
-    /// когда пир не ответил на T_PROBEQ (старый узел): до `RET_UNSUPPORTED_TTL` возврат идёт по этапу 0
-    pub ret_unsupported: Mutex<Option<Instant>>,
-    /// сколько раз подряд T_PROBER не пришёл (единичная потеря пакета не делает пира устаревшим, QAB-M1); сбрасывается любым T_PROBER
-    pub ret_miss: std::sync::atomic::AtomicU32,
 }
-
-/// Состояние возврата TCP -> QUIC (этапы A/B, docs/reviews/quic-return-make-before-break-2026-10-25.md, раздел 13/14). Номера - интерфейсы RNS:
-/// `tcp` - носитель TCP, `quic` - привязанное рядом QUIC-соединение.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ret {
-    Idle,
-    /// зонд прошёл, QUIC привязан к RNS рядом с TCP; ждём, пока супервизор клиента заметит Link на TCP
-    Standby { tcp: usize, quic: usize },
-    /// супервизор строит Link на QUIC, прежний Link на TCP держится до нового
-    Moving { tcp: usize, quic: usize },
-    /// Link уже на проверенном QUIC; TCP снимается, когда на нём не останется зависимых Link
-    Moved,
-    /// перенос не удался: сторож закрывает QUIC, TCP и прежний Link не тронуты
-    Failed,
-    /// Link ушёл с TCP, но не на проверенный QUIC (его пересобрали сами другим путём): QUIC зонда его не несёт, на него не рассчитываем (QAB-L3)
-    Left,
-}
-
-/// Что делает супервизор клиента на очередном тике при `Standby`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetTick {
-    Nothing,
-    /// Link выхода сидит на TCP: поднять новый на QUIC (старый держим), TCP-интерфейс исключить из выбора пути
-    Move(usize),
-    /// Link уже на проверенном QUIC (без нас): перенос свершился
-    AlreadyOff,
-    /// Link ушёл с TCP на что-то другое: QUIC зонда его не несёт
-    Left,
-}
-
-/// Чистое решение тика: `attached` - интерфейс текущего Link выхода (None - ещё не известен).
-fn ret_tick(state: Ret, attached: Option<usize>) -> (Ret, RetTick) {
-    match (state, attached) {
-        (Ret::Standby { tcp, quic }, Some(a)) if a == tcp => (Ret::Moving { tcp, quic }, RetTick::Move(tcp)),
-        (Ret::Standby { quic, .. }, Some(a)) if a == quic => (Ret::Moved, RetTick::AlreadyOff),
-        (Ret::Standby { .. }, Some(_)) => (Ret::Left, RetTick::Left),
-        (s, _) => (s, RetTick::Nothing),
-    }
-}
-
-/// Публикация владения ресурсом попытки возврата (QAB-M3): слот и состояние меняются под одним порядком замков (слот -> состояние), а
-/// попытка с устаревшим `epoch` ничего не публикует и получает ресурс обратно (вызывающий его закрывает). Так поздний наблюдатель не затирает
-/// `Idle` и не вмешивается в новую попытку.
-fn ret_publish<T>(epoch: &std::sync::atomic::AtomicU64, attempt: u64, slot: &Mutex<Option<T>>, payload: T, ret: &Mutex<Ret>, next: Ret) -> std::result::Result<(), T> {
-    let mut s = slot.lock().unwrap();
-    let mut r = ret.lock().unwrap();
-    if epoch.load(Relaxed) != attempt {
-        return Err(payload);
-    }
-    *s = Some(payload);
-    *r = next;
-    Ok(())
-}
-
-/// Лабораторный отказ B (`KNOTHOP_LAB_RET_B_FAIL`) доступен только в отладочной сборке; в release это константа `false`, и вызывающий код вырезан `cfg`.
-#[cfg(debug_assertions)]
-const fn lab_ret_b_fail_allowed() -> bool {
-    true
-}
-#[cfg(not(debug_assertions))]
-const fn lab_ret_b_fail_allowed() -> bool {
-    false
-}
-// release-конфигурация: проверка при компиляции, что хук недоступен
-#[cfg(not(debug_assertions))]
-const _: () = assert!(!lab_ret_b_fail_allowed());
-
-#[cfg(debug_assertions)]
-fn lab_ret_b_fail(env_set: bool) -> bool {
-    lab_ret_b_fail_allowed() && env_set
-}
-
-/// QAB-M2: после неудачного переноса прежний Link мог быть вытеснен сервером (допуск B идёт раньше AUTH_OK), и обещать, что "прежний Link цел", нельзя.
-/// Пока окно открыто, закрытие/молчание именно этого Link не считается отказом выхода и носителя TCP: Link восстанавливается через тот же TCP.
-const RET_RECOVER_WINDOW: Duration = Duration::from_secs(60);
-
-#[derive(Debug, Clone, Copy)]
-struct RetRecover {
-    dest: [u8; 16],
-    /// прежний Link на TCP
-    link: LinkId,
-    /// интерфейс неудавшегося QUIC: к нему новый Link не привязывается (он закрывается сторожем)
-    quic_if: Option<usize>,
-    /// начало переноса (для измерения разрыва)
-    move_at: Instant,
-    /// когда B не удался
-    armed: Instant,
-}
-
-/// Закрытие `link` выхода `dest` вскоре после неудачи B объясняется вытеснением сервером, а не отказом выхода.
-fn recover_decision(r: Option<&RetRecover>, dest: &[u8; 16], link: &LinkId, now: Instant) -> bool {
-    r.is_some_and(|r| r.dest == *dest && r.link == *link && now.saturating_duration_since(r.armed) <= RET_RECOVER_WINDOW)
-}
-
-/// QAB-R1: неизменяемый контекст начатого B, фиксируется супервизором в момент старта переноса, независимо от изменяемого `Ret`.
-/// Сторож (`tcp_return`) при смерти QUIC или `RET_MOVE_TIMEOUT` ставит `Idle` и стирает номера интерфейсов, но этот контекст не трогает:
-/// решение о восстановлении принимает супервизор по нему, кто бы первым ни заметил отказ.
-#[derive(Debug, Clone, Copy)]
-struct RetMove {
-    dest: [u8; 16],
-    /// прежний Link на TCP
-    link: LinkId,
-    tcp_if: usize,
-    quic_if: usize,
-    /// номер попытки возврата (`ret_epoch`) на момент старта B
-    attempt: u64,
-    started: Instant,
-}
-
-/// Устаревший контекст (B не дал ни Ok, ни Err за это время) не вооружает восстановление.
-const RET_MOVE_CTX_TTL: Duration = Duration::from_secs(100);
-
-/// B не удался (`connect_exit` вернул Err для `dest`): забирает контекст (одно восстановление на попытку), отмечает перенос сорвавшимся
-/// (если сторож ещё не поставил `Idle`) и возвращает вооружённое восстановление по этому контексту. Другой выход, пустой или устаревший контекст - None.
-fn ret_b_error(mv: &mut Option<RetMove>, cc: &CarrierCtl, dest: &[u8; 16], now: Instant) -> Option<RetRecover> {
-    if !mv.as_ref().is_some_and(|m| m.dest == *dest) {
-        return None;
-    }
-    let m = mv.take()?;
-    cc.ret_fail();
-    if now.saturating_duration_since(m.started) > RET_MOVE_CTX_TTL {
-        return None;
-    }
-    Some(RetRecover { dest: m.dest, link: m.link, quic_if: Some(m.quic_if), move_at: m.started, armed: now })
-}
-
-/// B удался или отменён: контекст снят, восстановление не вооружается.
-fn ret_b_done(mv: &mut Option<RetMove>, dest: &[u8; 16]) {
-    if mv.as_ref().is_some_and(|m| m.dest == *dest) {
-        *mv = None;
-    }
-}
-
-/// Конец попытки (или её отмена): в том же порядке замков забирает ресурс, ставит состояние и повышает эпоху - с этого момента любая
-/// публикация старой попытки отвергается. Возвращает забранный ресурс (его закрывает вызывающий вне замков).
-fn ret_finish<T>(epoch: &std::sync::atomic::AtomicU64, slot: &Mutex<Option<T>>, ret: &Mutex<Ret>, next: Ret) -> Option<T> {
-    let mut s = slot.lock().unwrap();
-    let mut r = ret.lock().unwrap();
-    epoch.fetch_add(1, Relaxed);
-    *r = next;
-    s.take()
-}
-
-/// Как долго пир считается не знающим T_PROBEQ после молчания в ответ: старые узлы обновляются редко, а запрос стоит одной попытки возврата.
-const RET_UNSUPPORTED_TTL: Duration = Duration::from_secs(30 * 60);
-/// Сколько ждать, пока супервизор поднимет Link на QUIC (авторизация и проверка датаграммы в connect_exit укладываются в ~25 с).
-const RET_MOVE_TIMEOUT: Duration = Duration::from_secs(40);
-/// Сколько ждать ответ T_PROBER.
-const RET_PROBER_WAIT: Duration = Duration::from_secs(3);
-/// Сколько раз подряд T_PROBER не пришёл, прежде чем пир считается не знающим T_PROBEQ (QAB-M1).
-const RET_MISS_LIMIT: u32 = 2;
 
 impl CarrierCtl {
     fn new() -> Arc<Self> {
-        Arc::new(Self { prefer_tcp: AtomicBool::new(false), mode: Mutex::new("none"), switches: Default::default(), generation: Default::default(), fails: Default::default(), rtt_us: Default::default(), label: Mutex::new(String::new()), peer: Mutex::new(String::new()), silence: Mutex::new(None), joint_fail: Mutex::new(None), ret: Mutex::new(Ret::Idle), ret_epoch: Default::default(), ret_unsupported: Mutex::new(None), ret_miss: Default::default() })
-    }
-    fn ret_get(&self) -> Ret {
-        *self.ret.lock().unwrap()
-    }
-    /// Новая попытка возврата: предыдущие публикации (позднего наблюдателя) станут недействительны. Возвращает её номер.
-    fn ret_begin_attempt(&self) -> u64 {
-        self.ret_epoch.fetch_add(1, Relaxed) + 1
-    }
-    /// Состояние меняется, только пока попытка `attempt` актуальна (иначе новая/завершённая попытка не затирается).
-    fn ret_set_if(&self, attempt: u64, r: Ret) -> bool {
-        let mut cur = self.ret.lock().unwrap();
-        if self.ret_epoch.load(Relaxed) != attempt {
-            return false;
-        }
-        *cur = r;
-        true
-    }
-    /// Тик супервизора: решает по `ret_tick` и записывает следующее состояние.
-    fn ret_poll(&self, attached: Option<usize>) -> RetTick {
-        let act = {
-            let mut r = self.ret.lock().unwrap();
-            let (next, act) = ret_tick(*r, attached);
-            *r = next;
-            act
-        };
-        if act == RetTick::AlreadyOff {
-            // Link пересобран вне TCP без нас, но на проверенный QUIC: носитель этого пира уже не TCP
-            self.set_mode("quic");
-            self.prefer_tcp.store(false, Relaxed);
-        }
-        act
-    }
-    /// Link выхода поднят на проверенном QUIC-интерфейсе: возврат свершился. Носитель считается QUIC с этого момента (`generation` растёт здесь, до чтения
-    /// супервизором `gen_at_connect`: новый Link не принимается за пережившего смену носителя). Link, ушедший на любой другой интерфейс (не TCP и не
-    /// этот QUIC), QUIC не несёт: состояние `Left`, носитель не меняется (QAB-L3). Иначе (TCP-интерфейс, чужое состояние) - false.
-    fn ret_commit(&self, attached: Option<usize>) -> bool {
-        let mut r = self.ret.lock().unwrap();
-        match (*r, attached) {
-            (Ret::Standby { quic, .. } | Ret::Moving { quic, .. }, Some(a)) if a == quic => {
-                *r = Ret::Moved;
-                drop(r);
-                self.set_mode("quic");
-                self.prefer_tcp.store(false, Relaxed);
-                true
-            }
-            (Ret::Standby { tcp, .. } | Ret::Moving { tcp, .. }, Some(a)) if a != tcp => {
-                *r = Ret::Left;
-                false
-            }
-            _ => false,
-        }
-    }
-    /// Попытка переноса Link не удалась: `Moving` -> `Failed` (из других состояний ничего не меняется).
-    fn ret_fail(&self) {
-        let mut r = self.ret.lock().unwrap();
-        if matches!(*r, Ret::Moving { .. } | Ret::Standby { .. }) {
-            *r = Ret::Failed;
-        }
-    }
-    /// QUIC привязан к RNS рядом с TCP, но Link ещё/уже на TCP и QUIC потерян: носитель снова TCP.
-    fn ret_revert(&self) {
-        self.set_mode("tcp");
-        self.prefer_tcp.store(true, Relaxed);
-    }
-    /// TCP снят, QUIC-соединение зонда становится носителем. Если Link не успели перенести, QUIC всё равно носитель (TCP уже мёртв).
-    fn ret_adopt(&self) {
-        if !self.is_quic() {
-            self.set_mode("quic");
-            self.prefer_tcp.store(false, Relaxed);
-        }
-        *self.ret.lock().unwrap() = Ret::Idle;
-    }
-    /// Единственное правило для цепочки "T_PROBER не пришёл": первый раз - ждём ещё (потеря пакета не означает старый узел), второй подряд - узел
-    /// не знает T_PROBEQ. Возвращает true, когда пир признан устаревшим.
-    fn ret_prober_missed(&self, now: Instant) -> bool {
-        if self.ret_miss.fetch_add(1, Relaxed) + 1 >= RET_MISS_LIMIT {
-            self.ret_mark_unsupported(now);
-            true
-        } else {
-            false
-        }
-    }
-    fn ret_unsupported_now(&self, now: Instant) -> bool {
-        self.ret_unsupported.lock().unwrap().is_some_and(|t| now.saturating_duration_since(t) < RET_UNSUPPORTED_TTL)
-    }
-    fn ret_mark_unsupported(&self, now: Instant) {
-        *self.ret_unsupported.lock().unwrap() = Some(now);
+        Arc::new(Self { prefer_tcp: AtomicBool::new(false), mode: Mutex::new("none"), switches: Default::default(), generation: Default::default(), fails: Default::default(), rtt_us: Default::default(), label: Mutex::new(String::new()), peer: Mutex::new(String::new()), silence: Mutex::new(None), joint_fail: Mutex::new(None) })
     }
     fn set_mode(&self, m: &'static str) {
+        // `generation` тут не растёт: смена носителя интерфейс пира (`mux.rs`) не пересоздаёт и Link не рвёт; растёт `Dialer::mux_for`
         *self.mode.lock().unwrap() = m;
-        self.generation.fetch_add(1, Relaxed);
     }
     fn is_quic(&self) -> bool {
         *self.mode.lock().unwrap() == "quic"
@@ -1653,6 +1402,8 @@ fn silence_cause(is_quic: bool, prefer_tcp: bool, flipped: bool) -> SilenceCause
     }
 }
 
+/// Сколько Link живёт без ответа после переключения носителя на TCP: меньше окна «нет приёма» RNS (12 с), TCP успевает соединиться и подтвердить доставку.
+const SILENCE_GRACE: Duration = Duration::from_secs(10);
 /// Сколько после тишины по QUIC TCP-дозвон может подтвердить подозрение: TCP, поднявшийся позже, говорит уже не об этой тишине.
 const SILENCE_CONFIRM: Duration = Duration::from_secs(30);
 /// Второе совпадение тишины по QUIC со сбоем TCP-дозвона за это время считается настоящей блокировкой обоих носителей, а не разовым сбоем сети.
@@ -1744,10 +1495,16 @@ mod carrier_return_tests {
         *cc.peer.lock().unwrap() = "p".into();
         cc.set_mode("tcp");
         let gen_at_connect = cc.generation.load(Relaxed); // Link поднят на TCP
-        cc.set_mode("none"); // сторож дозвона закрыл TCP по паузе возврата
+        cc.set_mode("none"); // носитель закончился
+        cc.generation.fetch_add(1, Relaxed); // интерфейс пира пересоздан (`Dialer::mux_for`): Link на снятом интерфейсе негоден
         cc.set_mode("quic"); // QUIC соединился за миллисекунды
         let flipped = carrier_flipped(&cc, gen_at_connect);
         assert!(flipped);
+        // смена носителя внутри живого интерфейса Link не рвёт и «сменой» не считается
+        let g = cc.generation.load(Relaxed);
+        cc.set_mode("tcp");
+        assert!(!carrier_flipped(&cc, g));
+        cc.set_mode("quic");
         assert_eq!(judge_silence(&cc, flipped, now), SilenceCause::CarrierSwap);
         assert!(confirm_quic_silence(&h, &cc, "p", now).is_none() && !h.is_bad("p", health::Kind::Quic), "QUIC не запоминается");
         assert!(!cc.prefer_tcp.load(Relaxed) && cc.switches.load(Relaxed) == 0, "клиент остаётся на QUIC");
@@ -2074,37 +1831,36 @@ async fn resolve_addrs(addrs: &[String]) -> Vec<SocketAddr> {
     out
 }
 
-/// Держит исходящую связь с узлом и подключает её как интерфейс RNS; переподключается, пока `alive`. Адреса - IP или имена из общего хранилища `book`
-/// (анонс его обновляет): разрешаются заново при каждой попытке, новые адреса подхватываются без перезапуска (0014 R4).
-/// Носитель: QUIC (датаграммы), а если он не соединяется или монитор качества нашёл потери UDP - TCP. Из TCP возвращаемся на QUIC, когда прошла
-/// пауза `back_off` (120 с, удваивается до 30 мин) от момента перехода на TCP, даже если TCP-сессии рвались. Если UDP всё ещё плох, монитор снова переключит за ~30 с.
-async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: String, id: EndpointId, book: Arc<Addrs>, alive: Arc<AtomicBool>, ctl: Arc<CarrierCtl>, hook: Option<ReturnHook>) {
-    let mut n = 0u32;
-    let mut quic_fail = 0u32;
-    let mut tcp_fail = 0u32;
-    // подряд TCP-сессий, закрытых за секунды после подключения
-    let mut short_tcp = 0u32;
-    // первая пауза до попытки вернуться на QUIC; растёт вдвое до 30 минут (KNOTHOP_TCP_BACKOFF_S - для стенда)
-    let first_back: u64 = std::env::var("KNOTHOP_TCP_BACKOFF_S").ok().and_then(|v| v.parse().ok()).unwrap_or(TCP_BACK_OFF_FIRST_S);
-    let mut back_off = first_back;
-    // с какого момента носитель TCP: замечаем по флагу в цикле, в том числе когда флаг выставил монитор извне
-    let mut tcp_since: Option<Instant> = None;
+/// Держит исходящую связь с узлом: один пакетный интерфейс RNS на пира (`mux.rs`), к которому подключаются и от которого отключаются носители.
+/// Адреса - IP или имена из общего хранилища `book` (анонс его обновляет): разрешаются заново при каждой попытке (0014 R4).
+/// Носитель: QUIC (датаграммы), а если он не соединяется или монитор качества нашёл потери UDP - TCP. Link привязан к интерфейсу, а не к носителю,
+/// поэтому смена носителя в обе стороны идёт «сначала подключить новый, потом закрыть старый» и Link не рвёт. Из TCP пытаемся вернуться на QUIC, когда
+/// прошла пауза `back_off` (120 с, удваивается до 30 мин) от перехода на TCP: кандидатный QUIC проходит зонд (`qprobe`) и только потом берёт данные.
+#[allow(clippy::too_many_arguments)]
+async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: String, id: EndpointId, book: Arc<Addrs>, alive: Arc<AtomicBool>, ctl: Arc<CarrierCtl>) {
     // память о неработающих носителях к этому пиру (health.rs): ключ - EndpointId, не имя и не адрес
     let peer = id.to_string();
     *ctl.peer.lock().unwrap() = peer.clone();
-    // QUIC дважды не соединился: если TCP при этом работает (или тоже режется при живом хосте), QUIC запоминается как неработающий
-    let mut quic_suspect = false;
+    let d = Dialer { ep, node, sh, label, id, book, alive, ctl, peer };
+    let first_back: u64 = std::env::var("KNOTHOP_TCP_BACKOFF_S").ok().and_then(|v| v.parse().ok()).unwrap_or(TCP_BACK_OFF_FIRST_S);
+    let mut st = DialState { back_off: first_back, first_back, ..Default::default() };
+    let (sh, ctl, label, peer) = (&d.sh, &d.ctl, d.label.as_str(), d.peer.as_str());
+    let mut quic_fail = 0u32;
+    let mut tcp_fail = 0u32;
     let mut announced_block = false;
-    while alive.load(Relaxed) {
-        let quic_bad = sh.health.is_bad(&peer, health::Kind::Quic);
-        let tcp_bad = sh.health.is_bad(&peer, health::Kind::Tcp);
-        if let Some(rem) = sh.health.blocked_for(&peer) {
+    while d.alive.load(Relaxed) {
+        if st.mux.as_ref().is_some_and(|m| m.is_closed()) {
+            st.mux = None;
+        }
+        let quic_bad = sh.health.is_bad(peer, health::Kind::Quic);
+        let tcp_bad = sh.health.is_bad(peer, health::Kind::Tcp);
+        if let Some(rem) = sh.health.blocked_for(peer) {
             // оба носителя проверены и не работают: прямой интерфейс не поднимаем, путь к пиру найдёт RNS через другие узлы; позже проверим снова
             if !announced_block {
                 announced_block = true;
                 sh.note(format!("{label}: прямой путь заблокирован (QUIC и TCP не проходят), не подключаюсь, повторная проверка через {} мин", rem.as_secs() / 60 + 1));
             }
-            book.pause(rem.min(Duration::from_secs(60))).await;
+            d.book.pause(rem.min(Duration::from_secs(60))).await;
             continue;
         }
         announced_block = false;
@@ -2112,44 +1868,53 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
             ctl.prefer_tcp.store(false, Relaxed);
         }
         if ctl.prefer_tcp.load(Relaxed) {
-            let since = *tcp_since.get_or_insert_with(Instant::now);
-            if tcp_release_due(since.elapsed(), back_off, quic_bad) {
+            let since = *st.tcp_since.get_or_insert_with(Instant::now);
+            if tcp_release_due(since.elapsed(), st.back_off, quic_bad) {
                 // пауза вышла: пробуем QUIC снова; если UDP всё ещё плох, монитор переключит обратно, а пауза вырастет
                 ctl.prefer_tcp.store(false, Relaxed);
-                tcp_since = None;
-                back_off = grown_back_off(back_off);
+                st.tcp_since = None;
+                st.back_off = grown_back_off(st.back_off);
                 sh.note(format!("{label}: пробую вернуться на QUIC"));
             }
         } else {
-            tcp_since = None;
+            st.tcp_since = None;
         }
-        let cur = book.get();
+        let cur = d.book.get();
         let resolved = resolve_addrs(&cur).await;
         // без адресов можно дозвониться только через relay (hole punching по EndpointId); TCP-носителю нужен адрес
         let relay_only = resolved.is_empty() && RELAY_URLS.get().is_some();
         if resolved.is_empty() && !relay_only {
             sh.note(format!("{label}: адрес {cur:?} не разрешился"));
-            book.pause(Duration::from_secs(5)).await;
+            d.book.pause(Duration::from_secs(5)).await;
             continue;
         }
         if relay_only || !(ctl.prefer_tcp.load(Relaxed) || quic_bad) {
-            let mut addr = EndpointAddr::new(id);
+            let mut addr = EndpointAddr::new(d.id);
             for a in &resolved {
                 addr = addr.with_ip_addr(*a);
             }
             let addr = with_relays(addr);
-            match tokio::time::timeout(Duration::from_secs(if resolved.is_empty() { 15 } else { 6 }), ep.connect(addr, ALPN)).await {
+            match tokio::time::timeout(Duration::from_secs(if resolved.is_empty() { 15 } else { 6 }), d.ep.connect(addr, ALPN)).await {
                 Ok(Ok(conn)) => {
-                    n += 1;
                     quic_fail = 0;
-                    quic_suspect = false;
-                    ctl.set_mode("quic");
+                    st.quic_suspect = false;
                     sh.note(format!("quic connected to {label}"));
-                    quic_session(&node, &sh, &ctl, &alive, &label, &peer, conn, QuicSide::Fresh(format!("iroh-dg-out-{label}-{n}")), Instant::now(), &mut back_off, first_back).await;
+                    let Some(m) = d.mux_for(&mut st) else {
+                        conn.close(0u32.into(), b"no interface");
+                        d.book.pause(Duration::from_secs(2)).await;
+                        continue;
+                    };
+                    if m.add_quic(conn.clone(), true, *conn.remote_id().as_bytes()).is_none() {
+                        conn.close(0u32.into(), b"too many carriers");
+                        d.book.pause(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    ctl.set_mode("quic");
+                    d.session(&mut st, Cur::Quic(conn), m).await;
                 }
                 _ if relay_only => {
                     sh.note(format!("{label}: через relay не соединилось, повторю"));
-                    book.pause(Duration::from_secs(10)).await;
+                    d.book.pause(Duration::from_secs(10)).await;
                 }
                 _ => {
                     quic_fail += 1;
@@ -2158,519 +1923,353 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                         if tcp_bad {
                             // TCP уже признан неработающим при живом хосте: если хост отвечает и сейчас, QUIC не проходит тоже
                             if tcpc::reachable(&resolved).await {
-                                let d = sh.health.fail(&peer, health::Kind::Quic);
-                                sh.note(format!("{label}: QUIC не соединяется при живом хосте, запоминаю на {} мин", d.as_secs() / 60));
+                                let dur = sh.health.fail(peer, health::Kind::Quic);
+                                sh.note(format!("{label}: QUIC не соединяется при живом хосте, запоминаю на {} мин", dur.as_secs() / 60));
                             }
                         } else {
                             sh.note(format!("{label}: QUIC не соединяется 2 раза подряд, переключаюсь на TCP"));
                             ctl.prefer_tcp.store(true, Relaxed);
                             ctl.switches.fetch_add(1, Relaxed);
-                            quic_suspect = true;
+                            st.quic_suspect = true;
                         }
                     }
-                    book.pause(Duration::from_secs(2)).await;
+                    d.book.pause(Duration::from_secs(2)).await;
                 }
             }
         } else {
-            match tcpc::connect(&resolved).await {
+            match tcpc::connect(&resolved, d.ep.secret_key(), &d.id).await {
                 tcpc::Dial::Up(stream) => {
-                    n += 1;
                     tcp_fail = 0;
-                    sh.health.ok(&peer, health::Kind::Tcp);
-                    if std::mem::take(&mut quic_suspect) {
-                        let d = sh.health.fail(&peer, health::Kind::Quic);
-                        sh.note(format!("{label}: QUIC не проходит, а TCP работает: запоминаю QUIC как неработающий на {} мин", d.as_secs() / 60));
-                    }
-                    // Link молчал на QUIC, и сразу после этого TCP подтвердил доставку: сеть жива, молчит UDP
-                    if let Some(d) = confirm_quic_silence(&sh.health, &ctl, &peer, Instant::now()) {
-                        sh.note(format!("{label}: Link молчал на QUIC, а TCP работает: запоминаю QUIC как неработающий на {} мин", d.as_secs() / 60));
-                    }
-                    ctl.set_mode("tcp");
-                    let tcp_from = tcp_since.unwrap_or_else(Instant::now);
-                    let wait_s = back_off;
-                    sh.note(format!("tcp connected to {label} (носитель TCP, возврат на QUIC через {back_off} с от перехода)"));
-                    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-                    let (alive2, st2) = (alive.clone(), stop_tx.clone());
-                    let (sh2, peer2) = (sh.clone(), peer.clone());
-                    // возврат на QUIC без разрыва Link (этапы A/B): зонд и перенос идут при живом TCP, `bo` - пауза, выросшая за неудачные попытки
-                    let bo = Arc::new(std::sync::atomic::AtomicU64::new(back_off));
-                    let slot: Arc<Mutex<Option<RetAdopt>>> = Default::default();
-                    let lease: Arc<Mutex<Option<DrainLease>>> = Default::default();
-                    let env = hook.clone().map(|hook| RetEnv {
-                        ep: ep.clone(), node: node.clone(), sh: sh.clone(), label: label.clone(), id, book: book.clone(), ctl: ctl.clone(),
-                        peer: peer.clone(), hook, tcp_name: format!("tcp-out-{label}-{n}"), slot: slot.clone(), lease: lease.clone(), alive: alive.clone(),
-                    });
-                    let bo2 = bo.clone();
-                    let watch = tokio::spawn(async move {
-                        let (mut from, mut wait) = (tcp_from, wait_s);
-                        loop {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            // срок проверяется вместе с памятью о QUIC: помеченный неработающим QUIC не повод рвать рабочий TCP
-                            if !alive2.load(Relaxed) {
-                                let _ = st2.send(true);
-                                break;
-                            }
-                            if !tcp_release_due(from.elapsed(), wait, sh2.health.is_bad(&peer2, health::Kind::Quic)) {
-                                continue;
-                            }
-                            let step = match &env {
-                                Some(env) => tcp_return(env).await,
-                                None => RetStep::Legacy,
-                            };
-                            match step {
-                                // старый пир, нет Link выхода на TCP или узел без клиента: поведение этапа 0 (снять TCP, поднять QUIC заново)
-                                RetStep::Legacy => {
-                                    let _ = st2.send(true);
-                                    break;
-                                }
-                                // QUIC доказан и несёт Link: TCP снимается, QUIC-соединение зонда усыновит дозвон
-                                RetStep::Commit => {
-                                    let _ = st2.send(true);
-                                    break;
-                                }
-                                // зонд не прошёл или пир отложил его: TCP не тронут, пауза растёт, считается заново
-                                RetStep::Stay => {
-                                    wait = grown_back_off(wait);
-                                    bo2.store(wait, Relaxed);
-                                    from = Instant::now();
-                                }
-                            }
-                        }
-                    });
-                    let started = Instant::now();
-                    tcpc::attach(node.clone(), sh.clone(), format!("tcp-out-{label}-{n}"), stream, true, stop_rx).await;
-                    // QAB-M3: сторож останавливается и ДОЖИДАЕТСЯ вне любых замков (его будущее сбрасывается, ConnGuard/слот закрывают QUIC), и только
-                    // потом слот забирается: поздний сторож не может ни опубликовать, ни затереть состояние. Эпоха растёт в `ret_finish`.
-                    watch.abort();
-                    let _ = watch.await;
-                    back_off = bo.load(Relaxed);
-                    let adopted = ret_finish(&ctl.ret_epoch, &slot, &ctl.ret, Ret::Idle);
-                    // QAB-R2: аренда барьера отпускается после того, как интерфейс TCP исчез из движка (offline), но не дольше 3 с и не при остановке клиента.
-                    // `attach` возвращается раньше удаления интерфейса драйвером; пока он online, новый Link мог бы выбрать его.
-                    let held = lease.lock().unwrap().take();
-                    if held.is_some() {
-                        let tcp_name = format!("tcp-out-{label}-{n}");
-                        let t_down = Instant::now();
-                        while iface_by_name(&node, &tcp_name).is_some() && alive.load(Relaxed) {
-                            if t_down.elapsed() > Duration::from_secs(3) {
-                                sh.note(format!("{label}: интерфейс TCP не исчез из движка за 3 с, аренду барьера отпускаю"));
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
-                    drop(held);
-                    if let Some(ad) = adopted {
-                        // QUIC-соединение зонда уже несёт Link (или TCP умер раньше): дальше это обычная QUIC-сессия
-                        ctl.ret_adopt();
-                        sh.note(format!("{label}: возврат на QUIC без разрыва Link, TCP снят"));
-                        let (conn, done, since) = ad.into_parts();
-                        quic_session(&node, &sh, &ctl, &alive, &label, &peer, conn, QuicSide::Adopted(done), since, &mut back_off, first_back).await;
+                    d.tcp_confirmed(&mut st);
+                    let Some(m) = d.mux_for(&mut st) else {
+                        d.book.pause(Duration::from_secs(2)).await;
                         continue;
-                    }
-                    ctl.set_mode("none");
-                    // Сессия умерла сразу после рукопожатия (данные пира не доходят: чёрная дыра на пути): повтор каждые 0,5 с лишь рвёт Link,
-                    // поднятый встречным соединением, при каждой смене носителя. Паузу растим 1,5 -> 3 -> ... -> 60 с, живая сессия её сбрасывает.
-                    if started.elapsed() < Duration::from_secs(15) && alive.load(Relaxed) {
-                        short_tcp = (short_tcp + 1).min(6);
-                        let pause = Duration::from_millis((1500u64 << (short_tcp - 1)).min(60_000));
-                        if short_tcp == 3 {
-                            sh.note(format!("{label}: TCP-сессии рвутся сразу после подключения, пауза между попытками растёт до 60 с"));
-                        }
-                        book.pause(pause).await;
-                    } else {
-                        short_tcp = 0;
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    };
+                    let Some(cur) = d.start_tcp(&m, stream).await else {
+                        d.book.pause(Duration::from_secs(2)).await;
+                        continue;
+                    };
+                    ctl.set_mode("tcp");
+                    st.tcp_since.get_or_insert_with(Instant::now);
+                    sh.note(format!("tcp connected to {label} (носитель TCP, возврат на QUIC через {} с от перехода)", st.back_off));
+                    d.session(&mut st, cur, m).await;
                 }
                 tcpc::Dial::Blackhole => {
-                    // хост отвечает, но данные не доходят: запоминаем; QUIC, не прошедший перед этим, запоминается вместе с ним (пара заблокирована).
-                    // Исключение: Link только что молчал на QUIC и TCP не прошёл в том же окне - общий сбой пути (handover), не блокировка носителей;
-                    // повтор такого совпадения за 10 мин считается настоящей блокировкой обоих.
-                    match record_tcp_blackhole(&sh.health, &ctl, &peer, &mut quic_suspect, Instant::now()) {
-                        Some(d) => sh.note(format!("{label}: TCP соединяется, но данные не доходят (DPI или чёрная дыра), запоминаю на {} мин", d.as_secs() / 60)),
-                        None => sh.note(format!("{label}: QUIC и TCP молчат в одном окне - общий сбой пути, носители не запоминаю")),
-                    }
+                    d.tcp_blackholed(&mut st);
                     ctl.prefer_tcp.store(false, Relaxed);
-                    tcp_since = None;
+                    st.tcp_since = None;
                 }
                 tcpc::Dial::Unreachable => {
                     // хост не отвечает: это не признак блокировки, ничего не запоминаем (в том числе подозрение на тишину по QUIC: сети нет)
-                    let _ = tcp_failed_with_silence(&ctl, false, Instant::now());
-                    quic_suspect = false;
+                    let _ = tcp_failed_with_silence(ctl, false, Instant::now());
+                    st.quic_suspect = false;
                     tcp_fail += 1;
                     if tcp_fail >= 3 {
                         // TCP тоже не идёт: не застреваем, пробуем QUIC
                         ctl.prefer_tcp.store(false, Relaxed);
                         tcp_fail = 0;
                     }
-                    book.pause(Duration::from_secs(2)).await;
+                    d.book.pause(Duration::from_secs(2)).await;
                 }
             }
         }
     }
+    if let Some(m) = st.mux.take() {
+        m.close();
+    }
 }
 
-// ------------------------------------------------------------------------------------------------ QUIC-сессия и возврат TCP -> QUIC без разрыва Link
-
-/// Как QUIC-соединение подключается к RNS в `quic_session`.
-enum QuicSide {
-    /// новое соединение: привязать как интерфейс с этим именем
-    Fresh(String),
-    /// уже привязано возвратом (`tcp_return`): ждём конца задачи привязки
-    Adopted(tokio::task::JoinHandle<()>),
+/// Носитель, который сейчас несёт данные пира.
+enum Cur {
+    Quic(Connection),
+    Tcp { stop: tokio::sync::watch::Sender<bool>, done: tokio::task::JoinHandle<()> },
 }
 
-/// QUIC-сессия (датаграммы): сторож RTT и здоровья, ожидание конца, учёт паузы возврата. Общая для нового соединения и усыновлённого после возврата.
-#[allow(clippy::too_many_arguments)]
-async fn quic_session(node: &Arc<Node>, sh: &Arc<Shared>, ctl: &Arc<CarrierCtl>, alive: &Arc<AtomicBool>, label: &str, peer: &str, conn: Connection, side: QuicSide, q_start: Instant, back_off: &mut u64, first_back: u64) {
-    let c2 = conn.clone();
-    let (ctl2, alive2) = (ctl.clone(), alive.clone());
-    let (sh2, peer2) = (sh.clone(), peer.to_string());
-    let watch = tokio::spawn(async move {
-        let mut proven = false;
-        loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if let Some(p) = c2.paths().iter().find(|p| p.is_selected()) {
-                ctl2.rtt_us.store(p.rtt().as_micros().min(u32::MAX as u128) as u32, Relaxed);
+impl Cur {
+    /// Ждать, пока носитель не закончится сам.
+    async fn ended(&mut self) {
+        match self {
+            Cur::Quic(c) => {
+                let _ = c.closed().await;
             }
-            // запись «QUIC не работает» стирает не рукопожатие, а сессия, прожившая QUIC_PROVEN
-            if !proven {
-                proven = settle_quic_health(&sh2.health, &peer2, q_start.elapsed());
-            }
-            if ctl2.prefer_tcp.load(Relaxed) || !alive2.load(Relaxed) {
-                c2.close(0u32.into(), b"switch carrier");
-                break;
+            Cur::Tcp { done, .. } => {
+                let _ = done.await;
             }
         }
-    });
-    match side {
-        QuicSide::Fresh(name) => attach_datagrams_until_closed(node.clone(), sh.clone(), name, conn).await,
-        QuicSide::Adopted(done) => {
-            let _ = done.await;
-        }
     }
-    watch.abort();
-    ctl.set_mode("none");
-    ctl.rtt_us.store(0, Relaxed);
-    sh.note(format!("quic to {label} ended"));
-    // стабильная сессия: возврат удался, пауза до следующего возврата с TCP начинается заново (потолок 30 мин сохранён)
-    let reset = back_off_after_quic(*back_off, first_back, q_start.elapsed());
-    if reset != *back_off {
-        sh.note(format!("{label}: QUIC держался {} мин, пауза возврата с TCP {back_off} -> {reset} с", q_start.elapsed().as_secs() / 60));
-        *back_off = reset;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
-}
 
-/// Доступ дозвона клиента к его Link (нужен только возврату TCP -> QUIC): у узла (mesh) его нет, там остаётся этап 0.
-#[derive(Clone)]
-struct ReturnHook {
-    ctx: Arc<ClientCtx>,
-    dest: [u8; 16],
-}
-
-/// QUIC-соединение, прошедшее зонд и привязанное к RNS рядом с TCP: ждёт переноса Link, затем усыновляется дозвоном. Владелец ресурса (QAB-M3):
-/// пока оно лежит в слоте, любое снятие слота (в том числе сброс при отмене попытки) закрывает соединение в `Drop`; задача привязки заканчивается сама.
-struct RetAdopt {
-    conn: Option<Connection>,
-    done: Option<tokio::task::JoinHandle<()>>,
-    since: Instant,
-}
-
-impl RetAdopt {
-    fn new(conn: Connection, done: tokio::task::JoinHandle<()>) -> Self {
-        Self { conn: Some(conn), done: Some(done), since: Instant::now() }
-    }
-    /// задача привязки закончилась (QUIC закрыт)
-    fn finished(&self) -> bool {
-        self.done.as_ref().map(|d| d.is_finished()).unwrap_or(true)
-    }
-    /// Передать соединение дозвону (усыновление): `Drop` после этого ничего не закрывает.
-    fn into_parts(mut self) -> (Connection, tokio::task::JoinHandle<()>, Instant) {
-        (self.conn.take().expect("conn"), self.done.take().expect("done"), self.since)
-    }
-}
-
-impl Drop for RetAdopt {
-    fn drop(&mut self) {
-        if let Some(c) = self.conn.take() {
-            c.close(0u32.into(), b"return dropped");
+    fn close(&self) {
+        match self {
+            Cur::Quic(c) => c.close(0u32.into(), b"switch carrier"),
+            Cur::Tcp { stop, .. } => {
+                let _ = stop.send(true);
+            }
         }
     }
 }
 
-/// Соединение между открытием и передачей слоту: отмена задачи (abort сторожа) закрывает его, а не оставляет живым (QAB-M3).
-struct ConnGuard(Option<Connection>);
-
-impl ConnGuard {
-    fn new(c: Connection) -> Self {
-        Self(Some(c))
-    }
-    fn conn(&self) -> &Connection {
-        self.0.as_ref().expect("conn")
-    }
-    fn disarm(&mut self) -> Connection {
-        self.0.take().expect("conn")
-    }
+/// Что дозвон пира помнит между сессиями носителей.
+#[derive(Default)]
+struct DialState {
+    mux: Option<Arc<mux::Mux>>,
+    /// пауза до попытки вернуться на QUIC; растёт вдвое до 30 минут
+    back_off: u64,
+    first_back: u64,
+    /// с какого момента носитель TCP (замечаем и по флагу, выставленному монитором извне)
+    tcp_since: Option<Instant>,
+    /// QUIC дважды не соединился: если TCP при этом работает (или тоже режется при живом хосте), QUIC запоминается как неработающий
+    quic_suspect: bool,
+    /// подряд TCP-сессий, закрытых за секунды после подключения
+    short_tcp: u32,
 }
 
-impl Drop for ConnGuard {
-    fn drop(&mut self) {
-        if let Some(c) = self.0.take() {
-            c.close(0u32.into(), b"probe dropped");
-        }
-    }
-}
-
-struct RetEnv {
+struct Dialer {
     ep: Endpoint,
     node: Arc<Node>,
     sh: Arc<Shared>,
     label: String,
     id: EndpointId,
     book: Arc<Addrs>,
+    alive: Arc<AtomicBool>,
     ctl: Arc<CarrierCtl>,
     peer: String,
-    hook: ReturnHook,
-    /// имя интерфейса TCP-носителя этой сессии
-    tcp_name: String,
-    slot: Arc<Mutex<Option<RetAdopt>>>,
-    /// аренда барьера снятия TCP (QAB-M1): кладётся перед `Legacy`/`Commit`, отпускается дозвоном, когда TCP снят
-    lease: Arc<Mutex<Option<DrainLease>>>,
-    alive: Arc<AtomicBool>,
 }
 
-enum RetStep {
-    /// этап 0: снять TCP и поднять QUIC заново. Для клиента с Link - только через барьер `drain_begin` (аренда уже в `RetEnv::lease`)
-    Legacy,
-    /// QUIC несёт Link, зависимых Link на TCP нет, барьер пройден: TCP можно снять
-    Commit,
-    /// зонд не прошёл, пир отложил его, или снятие запрещено барьером: TCP не тронут, пауза растёт
-    Stay,
-}
-
-static RET_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// Через столько мин ожидания зависимых Link на TCP в заметки идёт предупреждение (принудительного срока нет: Link на TCP не рвём).
-const RET_DRAIN_NOTE: Duration = Duration::from_secs(300);
-/// Запас на задержку доставки T_PROBER: разрешение живёт с момента выдачи сервером, а клиент отсчитывает от получения ответа.
-const RET_GRANT_MARGIN: Duration = Duration::from_millis(500);
-/// Сколько нужно разрешению на сам прогон после рукопожатия (8 запросов с интервалом + ожидание эха, qprobe).
-const RET_PROBE_RUN: Duration = Duration::from_millis(1800);
-
-fn iface_by_name(node: &Arc<Node>, name: &str) -> Option<usize> {
-    node.engine().interface_stats().iter().find(|i| i.online && i.name == name).map(|i| i.interface_id.0)
-}
-
-/// QAB-L2: сколько осталось разрешению после получения T_PROBER.
-fn grant_residual(ttl: Duration, since_reply: Duration) -> Duration {
-    ttl.saturating_sub(RET_GRANT_MARGIN).saturating_sub(since_reply)
-}
-
-/// QAB-L2: сколько ждать рукопожатие при остатке разрешения `residual`. Второе - ограничен ли срок остатком (тогда таймаут не доказывает, что QUIC не работает).
-fn handshake_budget(residual: Duration) -> (Duration, bool) {
-    let cap = Duration::from_secs(6);
-    let room = residual.saturating_sub(RET_PROBE_RUN);
-    if room < cap { (room, true) } else { (cap, false) }
-}
-
-/// QAB-L2: зонд без единого эха после истечения разрешения - причина в сроке, а не в QUIC.
-fn grant_expired(echoed: u8, since_reply: Duration, ttl: Duration) -> bool {
-    echoed == 0 && since_reply >= ttl.saturating_sub(RET_GRANT_MARGIN)
-}
-
-/// Этап 0 для клиента (разрыв до установки: TCP снимается, QUIC поднимается заново) допустим только через барьер (QAB-M1): с живыми
-/// зависимыми Link, неизвестным интерфейсом или недосчитанными Link TCP остаётся. Собственный основной Link выхода при этом рвётся -
-/// так и было на этапе 0 (владельцу описано как явная развилка).
-fn stage0(e: &RetEnv, tcp_if: usize, why: &str) -> RetStep {
-    match e.hook.ctx.drain_begin(tcp_if, &e.hook.dest, true) {
-        Ok(lease) => {
-            *e.lease.lock().unwrap() = Some(lease);
-            e.sh.note(format!("{}: {why}, возвращаюсь как раньше (этап 0, разрыв Link до установки нового)", e.label));
-            RetStep::Legacy
+impl Dialer {
+    /// Интерфейс этого пира: живой или новый. Новый интерфейс - новая «поколение»: Link на прежнем (снятом) интерфейсе больше не годится.
+    fn mux_for(&self, st: &mut DialState) -> Option<Arc<mux::Mux>> {
+        if let Some(m) = st.mux.as_ref().filter(|m| !m.is_closed()) {
+            return Some(m.clone());
         }
-        Err(b) => {
-            e.sh.note(format!("{}: {why}, но TCP не снимаю ({}), остаюсь на TCP", e.label, b.describe()));
-            RetStep::Stay
-        }
-    }
-}
-
-/// Этапы A и B возврата с TCP на QUIC: теневой зонд (A), затем привязка QUIC к RNS и перенос Link супервизором (B). Вызывается сторожем TCP, когда пришёл срок
-/// возврата (вместо прежнего «снять TCP и подключиться заново», то есть без добавочных попыток и пробуждений). TCP и Link не трогаются, пока зонд не прошёл.
-/// Любое снятие TCP (в том числе Legacy) идёт только через барьер `drain_begin`.
-async fn tcp_return(e: &RetEnv) -> RetStep {
-    let (cc, label) = (&e.ctl, e.label.as_str());
-    // TCP-интерфейса уже нет: защищать нечего
-    let Some(tcp_if) = iface_by_name(&e.node, &e.tcp_name) else { return RetStep::Legacy };
-    if cc.ret_unsupported_now(Instant::now()) {
-        return stage0(e, tcp_if, "пир не знает зонд QUIC");
-    }
-    // Нужен Link выхода (ему же этот TCP): по нему просим разрешение на эхо и по нему же потом переносим трафик
-    let Some(link) = e.hook.ctx.main_link_on(&e.hook.dest, tcp_if) else {
-        return stage0(e, tcp_if, "Link выхода не на этом TCP");
-    };
-    let attempt = cc.ret_begin_attempt();
-    // 1. DNS - до запроса разрешения: разрешение живёт 10 с и не должно тратиться на разрешение имён (QAB-L2)
-    let resolved = resolve_addrs(&e.book.get()).await;
-    if resolved.is_empty() {
-        return RetStep::Stay;
-    }
-    // 2. Согласование: старый узел T_PROBEQ не знает и молчит. Первое молчание - возможная потеря пакета, второе подряд - этап 0 и память на RET_UNSUPPORTED_TTL.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    e.hook.ctx.probe_wait.lock().unwrap().insert(link, tx);
-    send_ctl(&e.node, link, T_PROBEQ, &qprobe::probeq_body(e.ep.id().as_bytes())).await;
-    let (ttl, t_rx) = match tokio::time::timeout(RET_PROBER_WAIT, rx).await {
-        Ok(Ok((true, ttl))) => {
-            cc.ret_miss.store(0, Relaxed);
-            (ttl, Instant::now())
-        }
-        Ok(Ok((false, _))) => {
-            cc.ret_miss.store(0, Relaxed);
-            e.sh.note(format!("{label}: зонд QUIC отложен узлом (слишком часто/занят), остаюсь на TCP"));
-            return RetStep::Stay;
-        }
-        _ => {
-            e.hook.ctx.probe_wait.lock().unwrap().remove(&link);
-            if cc.ret_prober_missed(Instant::now()) {
-                return stage0(e, tcp_if, "узел не отвечает на зонд QUIC дважды подряд");
+        match mux::Mux::new(&self.node, &self.sh, mux::next_name("iroh-dg-out", &self.label), false) {
+            Ok(m) => {
+                self.ctl.generation.fetch_add(1, Relaxed);
+                st.mux = Some(m.clone());
+                Some(m)
             }
-            e.sh.note(format!("{label}: ответ на запрос зонда QUIC не пришёл (1 из {RET_MISS_LIMIT}), остаюсь на TCP и повторю позже"));
-            return RetStep::Stay;
-        }
-    };
-    // 3. Отдельное соединение зонда: не привязано к RNS, Link не создаёт. Рукопожатие укладывается в остаток разрешения (QAB-L2).
-    let residual = grant_residual(ttl, t_rx.elapsed());
-    if residual < qprobe::MIN_RESIDUAL {
-        e.sh.note(format!("{label}: разрешение зонда почти истекло ({} мс), не начинаю, остаюсь на TCP", residual.as_millis()));
-        return RetStep::Stay;
-    }
-    let (hs, limited) = handshake_budget(residual);
-    let mut addr = EndpointAddr::new(e.id);
-    for a in &resolved {
-        addr = addr.with_ip_addr(*a);
-    }
-    let mut conn = match tokio::time::timeout(hs, e.ep.connect(addr, ALPN)).await {
-        Ok(Ok(c)) => ConnGuard::new(c),
-        _ => {
-            if limited {
-                e.sh.note(format!("{label}: рукопожатие зонда не уложилось в остаток разрешения ({} мс), QUIC не виню, остаюсь на TCP", hs.as_millis()));
-                return RetStep::Stay;
+            Err(e) => {
+                self.sh.note(format!("{}: интерфейс не создан: {e:#}", self.label));
+                None
             }
-            let d = e.sh.health.fail(&e.peer, health::Kind::Quic);
-            e.sh.note(format!("{label}: зонд QUIC: соединение не открылось, остаюсь на TCP, QUIC запомнен на {} мин", d.as_secs() / 60));
-            return RetStep::Stay;
-        }
-    };
-    // 4. Эхо датаграмм в обе стороны
-    let st = qprobe::run(conn.conn(), rand_core::OsRng.next_u64()).await;
-    if !qprobe::probe_passed(&st) {
-        if grant_expired(st.echoed, t_rx.elapsed(), ttl) {
-            e.sh.note(format!("{label}: разрешение зонда истекло до эха ({}/{}), QUIC не виню, остаюсь на TCP", st.echoed, st.sent));
-            return RetStep::Stay;
-        }
-        let d = e.sh.health.fail(&e.peer, health::Kind::Quic);
-        e.sh.note(format!("{label}: зонд QUIC не прошёл ({}/{} эхо за {} мс), остаюсь на TCP, QUIC запомнен на {} мин", st.echoed, st.sent, st.took_ms, d.as_secs() / 60));
-        return RetStep::Stay;
-    }
-    e.sh.note(format!("{label}: зонд QUIC прошёл ({}/{} эхо за {} мс, вверх {} Б, вниз {} Б)", st.echoed, st.sent, st.took_ms, st.bytes_up, st.bytes_down));
-    // 5. Коммит: привязать QUIC к RNS рядом с TCP; Link переносит супервизор клиента, старый держится до нового.
-    // Слот и состояние публикуются без await между привязкой и публикацией; устаревшая попытка ничего не публикует (QAB-M3).
-    let name = format!("iroh-dg-out-{label}-r{}", RET_SEQ.fetch_add(1, Relaxed));
-    let conn = conn.disarm();
-    let done = tokio::spawn(attach_datagrams_until_closed(e.node.clone(), e.sh.clone(), name.clone(), conn.clone()));
-    if ret_publish(&cc.ret_epoch, attempt, &e.slot, RetAdopt::new(conn, done), &cc.ret, Ret::Idle).is_err() {
-        e.sh.note(format!("{label}: попытка возврата устарела до публикации, QUIC закрыт"));
-        return RetStep::Stay;
-    }
-    let quic_dead = || e.slot.lock().unwrap().as_ref().map(|a| a.finished()).unwrap_or(true);
-    let teardown = |why: &str, fail: bool| {
-        // забираем ресурс и ставим Idle одним шагом; Drop закрывает QUIC вне замков
-        let taken = ret_finish(&cc.ret_epoch, &e.slot, &cc.ret, Ret::Idle);
-        drop(taken);
-        let note = if fail {
-            format!("{label}: возврат на QUIC отменён ({why}), QUIC запомнен на {} мин", e.sh.health.fail(&e.peer, health::Kind::Quic).as_secs() / 60)
-        } else {
-            format!("{label}: возврат на QUIC отменён ({why})")
-        };
-        e.sh.note(note);
-    };
-    // Интерфейс привязанного QUIC: по нему сверяется, что Link действительно ушёл на проверенный QUIC (QAB-L3)
-    let t_if = Instant::now();
-    let quic_if = loop {
-        if let Some(i) = iface_by_name(&e.node, &name) {
-            break Some(i);
-        }
-        if quic_dead() || t_if.elapsed() > Duration::from_secs(3) || !e.alive.load(Relaxed) {
-            break None;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    let Some(quic_if) = quic_if else {
-        teardown("интерфейс QUIC не появился", false);
-        return RetStep::Stay;
-    };
-    if !cc.ret_set_if(attempt, Ret::Standby { tcp: tcp_if, quic: quic_if }) {
-        return RetStep::Stay;
-    }
-    let t0 = Instant::now();
-    loop {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        if !e.alive.load(Relaxed) {
-            teardown("клиент останавливается", false);
-            return RetStep::Stay;
-        }
-        if quic_dead() {
-            teardown("QUIC закрылся до переноса", true);
-            return RetStep::Stay;
-        }
-        match cc.ret_get() {
-            Ret::Moved => break,
-            Ret::Failed => {
-                teardown("Link не поднялся на QUIC", true);
-                return RetStep::Stay;
-            }
-            Ret::Left => {
-                teardown("Link ушёл с TCP другим путём, проверенный QUIC его не несёт", false);
-                e.sh.note(format!("{label}: Link ушёл с TCP по другому пути - это не перенос на QUIC, режим носителя не меняю"));
-                return RetStep::Stay;
-            }
-            _ if t0.elapsed() > RET_MOVE_TIMEOUT => {
-                teardown("Link не перенесён вовремя", true);
-                return RetStep::Stay;
-            }
-            _ => {}
         }
     }
-    // 6. Link уже на проверенном QUIC (mode = quic). TCP снимается только через барьер: пока на нём что-либо живо, неизвестно или недосчитано - остаётся (без срока)
-    let drain0 = Instant::now();
-    let mut noted = false;
-    loop {
-        if !e.alive.load(Relaxed) {
-            return RetStep::Stay;
+
+    /// TCP подтвердил доставку (`Dial::Up`): запись о работающем TCP, а QUIC, не прошедший перед этим или молчавший перед этим, запоминается неработающим.
+    fn tcp_confirmed(&self, st: &mut DialState) {
+        let (sh, label, peer) = (&self.sh, &self.label, &self.peer);
+        sh.health.ok(peer, health::Kind::Tcp);
+        if std::mem::take(&mut st.quic_suspect) {
+            let d = sh.health.fail(peer, health::Kind::Quic);
+            sh.note(format!("{label}: QUIC не проходит, а TCP работает: запоминаю QUIC как неработающий на {} мин", d.as_secs() / 60));
         }
-        if quic_dead() || cc.prefer_tcp.load(Relaxed) {
-            // QUIC потерян или монитор нашёл потери UDP, пока на TCP ещё живы Link: носитель снова TCP, а Link на QUIC пересоберёт супервизор
-            let taken = ret_finish(&cc.ret_epoch, &e.slot, &cc.ret, Ret::Idle);
-            drop(taken);
-            cc.ret_revert();
-            let d = e.sh.health.fail(&e.peer, health::Kind::Quic);
-            e.sh.note(format!("{label}: QUIC потерян до снятия TCP, возвращаюсь на TCP, QUIC запомнен на {} мин", d.as_secs() / 60));
-            return RetStep::Stay;
+        // Link молчал на QUIC, и сразу после этого TCP подтвердил доставку: сеть жива, молчит UDP
+        if let Some(d) = confirm_quic_silence(&sh.health, &self.ctl, peer, Instant::now()) {
+            sh.note(format!("{label}: Link молчал на QUIC, а TCP работает: запоминаю QUIC как неработающий на {} мин", d.as_secs() / 60));
         }
-        match e.hook.ctx.drain_begin(tcp_if, &e.hook.dest, false) {
-            Ok(lease) => {
-                *e.lease.lock().unwrap() = Some(lease);
-                return RetStep::Commit;
+    }
+
+    /// `Dial::Blackhole`: хост отвечает, но данные не доходят: запоминаем; QUIC, не прошедший перед этим, запоминается вместе с ним (пара заблокирована).
+    /// Исключение: Link только что молчал на QUIC и TCP не прошёл в том же окне - общий сбой пути (handover), не блокировка носителей;
+    /// повтор такого совпадения за 10 мин считается настоящей блокировкой обоих.
+    fn tcp_blackholed(&self, st: &mut DialState) {
+        match record_tcp_blackhole(&self.sh.health, &self.ctl, &self.peer, &mut st.quic_suspect, Instant::now()) {
+            Some(d) => self.sh.note(format!("{}: TCP соединяется, но данные не доходят (DPI или чёрная дыра), запоминаю на {} мин", self.label, d.as_secs() / 60)),
+            None => self.sh.note(format!("{}: QUIC и TCP молчат в одном окне - общий сбой пути, носители не запоминаю", self.label)),
+        }
+    }
+
+    /// Подключить TCP-поток носителем и дождаться, пока интерфейс его примет (только после этого прежний носитель можно закрывать).
+    async fn start_tcp(&self, m: &Arc<mux::Mux>, stream: tokio::net::TcpStream) -> Option<Cur> {
+        let _ = stream.set_nodelay(true);
+        let (rd, wr) = stream.into_split();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let done = tokio::spawn(tcpc::run(m.clone(), rd, wr, true, true, Some(ready_tx), stop_rx));
+        match tokio::time::timeout(Duration::from_secs(2), ready_rx).await {
+            Ok(Ok(true)) => Some(Cur::Tcp { stop, done }),
+            _ => {
+                let _ = stop.send(true);
+                None
             }
-            Err(b) => {
-                if !noted && drain0.elapsed() > RET_DRAIN_NOTE {
-                    noted = true;
-                    e.sh.note(format!("{label}: TCP не снимаю: {}", b.describe()));
+        }
+    }
+
+    /// Сессия одного или нескольких носителей: сторож RTT и здоровья, переходы QUIC <-> TCP без разрыва интерфейса, учёт паузы возврата.
+    /// Возвращается, когда носитель закончился (интерфейс остаётся ещё на `mux::GRACE`: следующий носитель подхватит Link).
+    async fn session(&self, st: &mut DialState, mut cur: Cur, m: Arc<mux::Mux>) {
+        let (sh, ctl, label, peer) = (&self.sh, &self.ctl, self.label.as_str(), self.peer.as_str());
+        // с какого момента держится текущий носитель; «доказанный» QUIC стирает запись о неработающем (settle_quic_health)
+        let mut since = Instant::now();
+        let mut proven = false;
+        loop {
+            tokio::select! {
+                _ = cur.ended() => break,
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+            if !self.alive.load(Relaxed) || m.is_closed() {
+                cur.close();
+                break;
+            }
+            match &cur {
+                Cur::Quic(conn) => {
+                    if let Some(p) = conn.paths().iter().find(|p| p.is_selected()) {
+                        ctl.rtt_us.store(p.rtt().as_micros().min(u32::MAX as u128) as u32, Relaxed);
+                    }
+                    // запись «QUIC не работает» стирает не рукопожатие, а сессия, прожившая QUIC_PROVEN
+                    if !proven {
+                        proven = settle_quic_health(&sh.health, peer, since.elapsed());
+                    }
+                    if !ctl.prefer_tcp.load(Relaxed) {
+                        continue;
+                    }
+                    if sh.health.is_bad(peer, health::Kind::Tcp) {
+                        // TCP уже признан неработающим при живом хосте: остаёмся на QUIC
+                        ctl.prefer_tcp.store(false, Relaxed);
+                        continue;
+                    }
+                    // потери UDP или тишина Link: подключаем TCP рядом, переключаем данные и только потом закрываем QUIC
+                    let resolved = resolve_addrs(&self.book.get()).await;
+                    match tcpc::connect(&resolved, self.ep.secret_key(), &self.id).await {
+                        tcpc::Dial::Up(stream) => {
+                            self.tcp_confirmed(st);
+                            match self.start_tcp(&m, stream).await {
+                                Some(next) => {
+                                    self.finish_quic(st, since);
+                                    let old = std::mem::replace(&mut cur, next);
+                                    ctl.set_mode("tcp");
+                                    old.close();
+                                    since = Instant::now();
+                                    proven = false;
+                                    st.tcp_since = Some(since);
+                                    sh.note(format!("{label}: носитель сменён на TCP без разрыва Link (возврат на QUIC через {} с)", st.back_off));
+                                }
+                                None => ctl.prefer_tcp.store(false, Relaxed),
+                            }
+                        }
+                        tcpc::Dial::Blackhole => {
+                            self.tcp_blackholed(st);
+                            ctl.prefer_tcp.store(false, Relaxed);
+                        }
+                        tcpc::Dial::Unreachable => {
+                            let _ = tcp_failed_with_silence(ctl, false, Instant::now());
+                            ctl.prefer_tcp.store(false, Relaxed);
+                        }
+                    }
+                }
+                Cur::Tcp { .. } => {
+                    let quic_bad = sh.health.is_bad(peer, health::Kind::Quic);
+                    let from = *st.tcp_since.get_or_insert(since);
+                    // срок проверяется вместе с памятью о QUIC: помеченный неработающим QUIC не повод пробовать
+                    if !tcp_release_due(from.elapsed(), st.back_off, quic_bad) {
+                        continue;
+                    }
+                    match self.try_return(&m).await {
+                        Ok(conn) => {
+                            let old = std::mem::replace(&mut cur, Cur::Quic(conn));
+                            ctl.set_mode("quic");
+                            ctl.prefer_tcp.store(false, Relaxed);
+                            old.close();
+                            st.tcp_since = None;
+                            since = Instant::now();
+                            proven = false;
+                            sh.note(format!("{label}: возврат на QUIC без разрыва Link"));
+                        }
+                        Err(grow) => {
+                            // отказ из-за занятости узла (общие лимиты разрешений) - не вина пути: пауза не растёт, иначе чужой поток запросов
+                            // удерживает клиентов на TCP до 30 минут
+                            if grow {
+                                st.back_off = grown_back_off(st.back_off);
+                            }
+                            st.tcp_since = Some(Instant::now());
+                        }
+                    }
+                }
+            }
+        }
+        match &cur {
+            Cur::Quic(_) => {
+                ctl.set_mode("none");
+                ctl.rtt_us.store(0, Relaxed);
+                sh.note(format!("quic to {label} ended"));
+                self.finish_quic(st, since);
+            }
+            Cur::Tcp { .. } => {
+                ctl.set_mode("none");
+                st.tcp_since = None;
+                // Сессия умерла сразу после рукопожатия (данные пира не доходят: чёрная дыра на пути): повтор каждые 0,5 с лишь тормозит восстановление,
+                // каждая смена носителя - потери. Паузу растим 1,5 -> 3 -> ... -> 60 с, живая сессия её сбрасывает.
+                if since.elapsed() < Duration::from_secs(15) && self.alive.load(Relaxed) {
+                    st.short_tcp = (st.short_tcp + 1).min(6);
+                    let pause = Duration::from_millis((1500u64 << (st.short_tcp - 1)).min(60_000));
+                    if st.short_tcp == 3 {
+                        sh.note(format!("{label}: TCP-сессии рвутся сразу после подключения, пауза между попытками растёт до 60 с"));
+                    }
+                    self.book.pause(pause).await;
+                } else {
+                    st.short_tcp = 0;
                 }
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    /// QUIC-сессия длиной `since.elapsed()` закончилась: стабильная сессия сбрасывает паузу возврата с TCP к первой (потолок 30 мин сохранён).
+    fn finish_quic(&self, st: &mut DialState, since: Instant) {
+        let reset = back_off_after_quic(st.back_off, st.first_back, since.elapsed());
+        if reset != st.back_off {
+            self.sh.note(format!("{}: QUIC держался {} мин, пауза возврата с TCP {} -> {reset} с", self.label, since.elapsed().as_secs() / 60, st.back_off));
+            st.back_off = reset;
+        }
+    }
+
+    /// Возврат TCP -> QUIC: кандидатное соединение, не привязанное к интерфейсу, получает от узла разрешение, проходит зонд (эхо датаграмм в обе
+    /// стороны) и только после этого принимается интерфейсом носителем данных. Неудача ничего не ломает: TCP и Link не тронуты.
+    async fn try_return(&self, m: &Arc<mux::Mux>) -> Result<Connection, bool> {
+        let (sh, label) = (&self.sh, self.label.as_str());
+        let resolved = resolve_addrs(&self.book.get()).await;
+        if resolved.is_empty() {
+            return Err(true);
+        }
+        let mut addr = EndpointAddr::new(self.id);
+        for a in &resolved {
+            addr = addr.with_ip_addr(*a);
+        }
+        let conn = match tokio::time::timeout(Duration::from_secs(6), self.ep.connect(addr, ALPN)).await {
+            Ok(Ok(c)) => c,
+            _ => {
+                let d = sh.health.fail(&self.peer, health::Kind::Quic);
+                sh.note(format!("{label}: возврат на QUIC: соединение не открылось, остаюсь на TCP, QUIC запомнен на {} мин", d.as_secs() / 60));
+                return Err(true);
+            }
+        };
+        let nonce = rand_core::OsRng.next_u64();
+        match qprobe::request_grant(&conn, nonce).await {
+            Ok(()) => {}
+            Err(why) => {
+                // отказ узла или потеря запроса/ответа не доказывают, что QUIC плох: QUIC не виним, пауза растёт
+                sh.note(format!("{label}: возврат на QUIC отложен: {}", match why {
+                    Some(1) => "узел недавно выдавал разрешение".to_string(),
+                    Some(2) => "узел занят".to_string(),
+                    Some(c) => format!("отказ узла ({c})"),
+                    None => "нет ответа на запрос разрешения".to_string(),
+                }));
+                conn.close(0u32.into(), b"probe deferred");
+                return Err(why != Some(2));
+            }
+        }
+        let st = qprobe::run(&conn, nonce).await;
+        if !qprobe::probe_passed(&st) {
+            let d = sh.health.fail(&self.peer, health::Kind::Quic);
+            sh.note(format!("{label}: зонд QUIC не прошёл ({}/{} эхо за {} мс), остаюсь на TCP, QUIC запомнен на {} мин", st.echoed, st.sent, st.took_ms, d.as_secs() / 60));
+            conn.close(0u32.into(), b"probe failed");
+            return Err(true);
+        }
+        sh.note(format!("{label}: зонд QUIC прошёл ({}/{} эхо за {} мс, вверх {} Б, вниз {} Б)", st.echoed, st.sent, st.took_ms, st.bytes_up, st.bytes_down));
+        if m.add_quic(conn.clone(), true, *conn.remote_id().as_bytes()).is_none() {
+            conn.close(0u32.into(), b"no slot");
+            return Err(true);
+        }
+        Ok(conn)
     }
 }
 
@@ -2688,193 +2287,6 @@ impl ClientCtx {
         lxmf_sync::queue(&self.state, c.trust.clone(), pk, recs, pols)
     }
 
-    /// Link выхода `dest`, который сейчас основной и привязан к интерфейсу `iface`.
-    fn main_link_on(&self, dest: &[u8; 16], iface: usize) -> Option<LinkId> {
-        let (d, id, _) = (*self.cur.lock().unwrap())?;
-        let on = self.node.engine().link_stats(&id).and_then(|s| s.attached_interface()) == Some(iface);
-        (d == *dest && on).then_some(id)
-    }
-
-    /// QAB-M1: единый отказобезопасный барьер снятия TCP-носителя `iface` (все ветки: Commit, Legacy, неподдерживающий пир, потерянный T_PROBER).
-    /// Под замком `drain` (порядок замков: drain -> cur/extra/admitted -> движок; никто не держит cur/extra/admitted, беря drain) собираются все
-    /// зависимые Link по ФАКТИЧЕСКОМУ интерфейсу: основной, дополнительные, допущенные, и Link в процессе подключения (билеты `ConnectTicket`,
-    /// в том числе конечный Link к другому выходу, идущий транзитом через этот носитель). Вердикт - `drain_verdict`; успех помечает интерфейс
-    /// снимаемым: новые привязки к нему запрещены (`carrier_ifaces`, `ConnectTicket::begin`) до конца аренды.
-    /// Ограничение: транзитные Link, которые узел ретранслирует для других (core, API форка их не перечисляет), здесь видны только косвенно -
-    /// через разницу счётчиков движка `uncounted`; клиент (телефон) транзита не ретранслирует. При любой неопределённости - отказ, TCP остаётся.
-    fn drain_begin(self: &Arc<Self>, iface: usize, own: &[u8; 16], allow_own_main: bool) -> std::result::Result<DrainLease, DrainBlock> {
-        let mut d = self.drain.lock().unwrap();
-        let mut known: Vec<(LinkId, Option<[u8; 16]>)> = Vec::new();
-        if let Some((dest, id, _)) = *self.cur.lock().unwrap() {
-            known.push((id, Some(dest)));
-        }
-        known.extend(self.tun.extra.read().unwrap().values().map(|x| (x.id, None)));
-        known.extend(self.admitted_exits.lock().unwrap().keys().map(|id| (*id, None)));
-        let eng = self.node.engine();
-        let counted = eng.active_link_count() + eng.pending_link_count();
-        d.try_drain(iface, own, allow_own_main, &known, |id| eng.link_stats(id).map(|s| s.attached_interface()), counted)?;
-        Ok(DrainLease { ctx: self.clone(), iface })
-    }
-}
-
-// ------------------------------------------------------------------------------------------------ барьер снятия TCP (QAB-M1)
-
-/// Зависимость от носителя: Link (или подключение) и интерфейс, к которому он ФАКТИЧЕСКИ привязан (None - пока неизвестен).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Dep {
-    iface: Option<usize>,
-    /// выход, для которого это основной Link
-    main_of: Option<[u8; 16]>,
-}
-
-/// Почему носитель снять нельзя.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrainBlock {
-    /// на интерфейсе живут Link, которые мы не вправе рвать
-    Live(usize),
-    /// интерфейс Link/подключения ещё неизвестен: "не знаем" не равно "можно отрезать"
-    Unknown(usize),
-    /// движок знает больше Link, чем мы перечислили (транзит, Link между регистрациями)
-    Uncounted(usize),
-}
-
-impl DrainBlock {
-    fn describe(&self) -> String {
-        match self {
-            DrainBlock::Live(n) => format!("на носителе живых зависимых Link: {n}"),
-            DrainBlock::Unknown(n) => format!("неизвестный интерфейс у {n} Link/подключений"),
-            DrainBlock::Uncounted(n) => format!("движок знает на {n} Link больше, чем перечислено"),
-        }
-    }
-}
-
-/// Чистый вердикт барьера. `Ok(n)` - снять можно, при этом оборвутся `n` основных Link собственного выхода `own` (только если `allow_own_main`:
-/// этап 0, разрыв до установки; ветка Commit ничего не рвёт, `allow_own_main = false`). Порядок проверок: неизвестное -> живое чужое -> недосчитанное.
-fn drain_verdict(deps: &[Dep], iface: usize, own: &[u8; 16], allow_own_main: bool, uncounted: usize) -> std::result::Result<usize, DrainBlock> {
-    let unknown = deps.iter().filter(|d| d.iface.is_none()).count();
-    if unknown > 0 {
-        return Err(DrainBlock::Unknown(unknown));
-    }
-    let on: Vec<&Dep> = deps.iter().filter(|d| d.iface == Some(iface)).collect();
-    let own_main = on.iter().filter(|d| allow_own_main && d.main_of == Some(*own)).count();
-    let live = on.len() - own_main;
-    if live > 0 {
-        return Err(DrainBlock::Live(live));
-    }
-    if uncounted > 0 {
-        return Err(DrainBlock::Uncounted(uncounted));
-    }
-    Ok(own_main)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Ticket {
-    /// интерфейс пути, по которому открывается Link (None - ещё ищем путь)
-    iface: Option<usize>,
-    link: Option<LinkId>,
-}
-
-/// Состояние барьера: снимаемые интерфейсы и подключения в процессе. Чистые методы - тестируются без сети.
-#[derive(Default)]
-struct DrainState {
-    draining: HashSet<usize>,
-    tickets: HashMap<u64, Ticket>,
-    next: u64,
-}
-
-impl DrainState {
-    fn open(&mut self) -> u64 {
-        self.next += 1;
-        self.tickets.insert(self.next, Ticket { iface: None, link: None });
-        self.next
-    }
-    /// Подключение выбрало путь по `iface`. Атомарно с `try_drain`: на снимаемый интерфейс новые подключения не привязываются.
-    fn begin_connect(&mut self, t: u64, iface: usize) -> bool {
-        if self.draining.contains(&iface) {
-            return false;
-        }
-        if let Some(x) = self.tickets.get_mut(&t) {
-            x.iface = Some(iface);
-        }
-        true
-    }
-    fn set_link(&mut self, t: u64, link: LinkId) {
-        if let Some(x) = self.tickets.get_mut(&t) {
-            x.link = Some(link);
-        }
-    }
-    fn close(&mut self, t: u64) {
-        self.tickets.remove(&t);
-    }
-    /// `known` - Link, перечисленные владельцами (основной/дополнительные/допущенные), `stats` - фактический интерфейс Link (внешний None - Link мёртв),
-    /// `counted` - сколько Link знает движок (активных + в рукопожатии).
-    fn try_drain(&mut self, iface: usize, own: &[u8; 16], allow_own_main: bool, known: &[(LinkId, Option<[u8; 16]>)],
-        stats: impl Fn(&LinkId) -> Option<Option<usize>>, counted: usize) -> std::result::Result<usize, DrainBlock> {
-        let mut by_id: HashMap<LinkId, Option<[u8; 16]>> = HashMap::new();
-        for (id, main) in known {
-            let e = by_id.entry(*id).or_insert(None);
-            *e = e.or(*main);
-        }
-        for t in self.tickets.values() {
-            if let Some(id) = t.link {
-                by_id.entry(id).or_insert(None);
-            }
-        }
-        let mut deps: Vec<Dep> = Vec::new();
-        let mut alive = 0usize;
-        for (id, main_of) in &by_id {
-            // мёртвый Link (движок его не знает) ничего не держит
-            if let Some(att) = stats(id) {
-                alive += 1;
-                deps.push(Dep { iface: att, main_of: *main_of });
-            }
-        }
-        // подключение без Link: интерфейс пути, если уже выбран, иначе неизвестен
-        for t in self.tickets.values().filter(|t| t.link.is_none()) {
-            deps.push(Dep { iface: t.iface, main_of: None });
-        }
-        let r = drain_verdict(&deps, iface, own, allow_own_main, counted.saturating_sub(alive))?;
-        self.draining.insert(iface);
-        Ok(r)
-    }
-}
-
-/// Аренда: пока жива, интерфейс считается снимаемым. Отпускается, когда носитель снят (или попытка снять отменена).
-struct DrainLease {
-    ctx: Arc<ClientCtx>,
-    iface: usize,
-}
-
-impl Drop for DrainLease {
-    fn drop(&mut self) {
-        self.ctx.drain.lock().unwrap().draining.remove(&self.iface);
-    }
-}
-
-/// Билет подключения Link: пока жив, барьер знает, что идёт подключение (путь ещё не выбран - снятие запрещено).
-struct ConnectTicket {
-    ctx: Arc<ClientCtx>,
-    id: u64,
-}
-
-impl ConnectTicket {
-    fn new(ctx: &Arc<ClientCtx>) -> Self {
-        let id = ctx.drain.lock().unwrap().open();
-        Self { ctx: ctx.clone(), id }
-    }
-    /// false - интерфейс снимается: подключаться по нему нельзя.
-    fn begin(&self, iface: usize) -> bool {
-        self.ctx.drain.lock().unwrap().begin_connect(self.id, iface)
-    }
-    fn set_link(&self, link: LinkId) {
-        self.ctx.drain.lock().unwrap().set_link(self.id, link);
-    }
-}
-
-impl Drop for ConnectTicket {
-    fn drop(&mut self) {
-        self.ctx.drain.lock().unwrap().close(self.id);
-    }
 }
 
 /// Байты подписанных Policy с запуска (без обёртки); sync_* отдельно считает LXMF-конверты, включая ACK/повторы, но не RNS/носитель.
@@ -3696,10 +3108,10 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         }
         _ => None,
     };
-    tokio::spawn(tcpc::listen(node.clone(), sh.clone(), a.port, relay_host));
+    tokio::spawn(tcpc::listen(node.clone(), sh.clone(), a.port, ep.secret_key().clone(), relay_host));
     for s in a.seed.split(',').filter(|s| !s.is_empty()) {
         if let Some((id, addrs)) = parse_peer(s) {
-            tokio::spawn(dial_direct(ep.clone(), node.clone(), sh.clone(), format!("seed-{}", id.fmt_short()), id, Addrs::new(addrs), Arc::new(AtomicBool::new(true)), CarrierCtl::new(), None));
+            tokio::spawn(dial_direct(ep.clone(), node.clone(), sh.clone(), format!("seed-{}", id.fmt_short()), id, Addrs::new(addrs), Arc::new(AtomicBool::new(true)), CarrierCtl::new()));
         } else {
             sh.note(format!("bad --seed entry {s:?} (want id@ip:port)"));
         }
@@ -3898,7 +3310,7 @@ fn maybe_dial(ctx: &Arc<NodeCtx>, dest: [u8; 16]) {
         let sa: Vec<String> = nb.addrs.get();
         tokio::spawn({
             let (ep, node, sh, label, cc, book) = (ctx.ep.clone(), ctx.node.clone(), ctx.sh.clone(), nb.name.clone(), nb.ctl.clone(), nb.addrs.clone());
-            async move { dial_direct(ep, node, sh, label, id, book, alive, cc, None).await }
+            async move { dial_direct(ep, node, sh, label, id, book, alive, cc).await }
         });
         (id, sa, nb.name.clone())
     };
@@ -4029,31 +3441,6 @@ fn on_rgp(ctx: &Arc<NodeCtx>, link: LinkId, d: &[u8]) {
     }
 }
 
-/// T_PROBEQ: допущенный клиент просит разрешить эхо датаграмм своему соединению зонда. Только `Role::Client` без `enroll_only` с доказанным ключом
-/// (CBC-Link отсеян выше); сосед-сервер, неопознанный и зачисляемый пир разрешения не получают. Пределы: `qprobe::Grants`. Ответ всегда по тому же Link.
-fn on_probeq(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
-    let Some(ep) = qprobe::parse_probeq(body) else { return };
-    // узел без модели прав (легаси-профиль) разрешений не выдаёт: нечем проверить EXIT/USE
-    let Some(t) = &ctx.t13 else { return };
-    let Some(pk) = ctx.links.lock().unwrap().get(&link).and_then(|i| i.peer_pk) else { return };
-    // QAB-M4: разрешение выдаётся в одной транзакции с актуальной проверкой прав и живого Link (Trust -> links -> grants, без await под guard).
-    // Link закрывается/заменяется/теряет права через `drop_link_state`, который гасит выданные по нему разрешения под тем же замком `links`.
-    let Some(res) = issue_probe_grant(&t.trust, &ctx.links, qprobe::grants(), link, &pk, ep, Instant::now()) else { return };
-    let code = match res {
-        Ok(()) => 0,
-        Err(d) => d.code(),
-    };
-    spawn_ctl(&ctx.node, link, T_PROBER, qprobe::proberr_body(code));
-}
-
-/// Кому можно выдать разрешение на эхо: допущенному клиенту (`Role::Client`, не `enroll_only`) с доказанным ключом. Возвращает хеш ключа (владельца).
-fn probe_owner(l: &LinkInfo) -> Option<[u8; 32]> {
-    match (&l.role, l.enroll_only, l.peer_pk) {
-        (Role::Client { .. }, false, Some(pk)) => Some(Sha256::digest(pk).into()),
-        _ => None,
-    }
-}
-
 fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
     if data.is_empty() {
         return;
@@ -4068,7 +3455,6 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
     }
     match ty {
         T_CINFO => on_cinfo(ctx, link, body),
-        T_PROBEQ => on_probeq(ctx, link, body),
         T_OBSERVE if matches!(body, [0] | [1]) => {
             {
                 let mut links = ctx.links.lock().unwrap();
@@ -4284,35 +3670,14 @@ fn live_forward_targets(links: &Mutex<HashMap<LinkId, LinkInfo>>, except: Option
         }).collect()
 }
 
+/// Единственный путь снятия допущенного Link (закрытие, отзыв прав через `evaluate`, замена, `LinkClosed` - всё идёт через `drop_link_state`).
 fn remove_link_admission(
     links: &Mutex<HashMap<LinkId, LinkInfo>>, link: &LinkId, disallow: impl FnOnce(),
-) -> Option<LinkInfo> {
-    remove_link_admission_in(links, link, qprobe::grants(), disallow)
-}
-
-/// Единственный путь снятия допущенного Link (закрытие, отзыв прав через `evaluate`, замена, `LinkClosed` - всё идёт через `drop_link_state`).
-/// QAB-M4: разрешение на эхо зонда живёт не дольше Link, по которому выдано. Гасится под замком `links`: выдача (`issue_probe_grant`,
-/// Trust -> links -> grants) либо видит Link и успевает до снятия, либо не видит его и не выдаёт - "живого разрешения после снятия" не бывает.
-fn remove_link_admission_in(
-    links: &Mutex<HashMap<LinkId, LinkInfo>>, link: &LinkId, grants: &qprobe::Grants, disallow: impl FnOnce(),
 ) -> Option<LinkInfo> {
     let mut live = links.lock().unwrap();
     let removed = live.remove(link);
     disallow(); // no promotion/late allow may slip between removal and TUN cleanup
-    grants.revoke_link(link.as_bytes());
     removed
-}
-
-/// Выдать разрешение на эхо зонда `ep` допущенному клиенту по его Link (QAB-M4): одна транзакция с проверкой Role::Client, ключа Link,
-/// не-зачисления и EXIT(мы)/USE(он) в общем корне по текущим записям. None - Link мёртв или права сняты, разрешение не выдано и ответа нет.
-fn issue_probe_grant(
-    authority: &Mutex<trust::Trust>, links: &Mutex<HashMap<LinkId, LinkInfo>>, grants: &qprobe::Grants,
-    link: LinkId, pk: &trust::Pk, ep: [u8; 32], now: Instant,
-) -> Option<std::result::Result<(), qprobe::Deny>> {
-    with_authorized_link(authority, links, link, pk, OrdinaryAdmission::Client, false, |_, live| {
-        let owner = live.get(&link).and_then(probe_owner)?;
-        Some(grants.grant(ep, owner, *link.as_bytes(), now))
-    }).flatten()
 }
 
 struct ClientAdmission {
@@ -4715,80 +4080,6 @@ mod ordinary_admission_tests {
         assert_eq!(b.allow(t0 + DIAG_WINDOW_MS - 1), (false, 0), "окно ещё идёт");
         assert_eq!(b.allow(t0 + DIAG_WINDOW_MS), (true, 6), "новое окно: строка пишется, подавленные сообщены");
         assert_eq!(b.allow(t0 + DIAG_WINDOW_MS + 1), (true, 0));
-    }
-
-    // QAB-M4: разрешение на эхо - только допущенному клиенту с текущими правами и живым Link
-    #[test]
-    fn probe_grant_is_issued_only_to_an_admitted_client_with_current_rights() {
-        let mut f = fixture(true);
-        let tun = TunCore::default();
-        let t0 = Instant::now();
-        let probe = qprobe::build(0, 1, 40);
-        let g = qprobe::Grants::default();
-        // до допуска (Role::Unknown): нет
-        assert!(issue_probe_grant(&f.authority, &f.links, &g, link(), &f.pk, [9; 32], t0).is_none(), "пред-допусковый Link разрешения не получает");
-        promoted(&f, &tun);
-        // чужой ключ на этом Link: нет
-        let other = leviculum_std::api::generate_identity().public_key_bytes();
-        assert!(issue_probe_grant(&f.authority, &f.links, &g, link(), &other, [9; 32], t0).is_none());
-        assert!(g.echo(&[9; 32], &probe, t0).is_none());
-        // допущен: выдано, эхо есть
-        assert_eq!(issue_probe_grant(&f.authority, &f.links, &g, link(), &f.pk, [9; 32], t0), Some(Ok(())));
-        assert!(g.echo(&[9; 32], &probe, t0).is_some());
-        // права сняты (USE пропал) до следующей выдачи: Link в таблице ещё есть, но выдачи нет
-        let g2 = qprobe::Grants::default();
-        let revoke = f.issuer.issue(f.root, f.pk, trust::TRANSIT).unwrap();
-        assert_eq!(f.authority.lock().unwrap().offer(revoke), trust::Offer::Added);
-        assert!(issue_probe_grant(&f.authority, &f.links, &g2, link(), &f.pk, [8; 32], t0).is_none(), "права сняты - разрешения нет");
-        assert!(g2.echo(&[8; 32], &probe, t0).is_none());
-    }
-
-    // QAB-M4: закрытие/замена/отзыв Link гасит уже выданное разрешение сразу, а память интервала остаётся
-    #[test]
-    fn probe_grant_dies_with_its_link_and_closing_does_not_reset_the_interval() {
-        let f = fixture(true);
-        let tun = TunCore::default();
-        let t0 = Instant::now();
-        let probe = qprobe::build(0, 1, 40);
-        let g = qprobe::Grants::default();
-        promoted(&f, &tun);
-        assert_eq!(issue_probe_grant(&f.authority, &f.links, &g, link(), &f.pk, [9; 32], t0), Some(Ok(())));
-        assert!(g.echo(&[9; 32], &probe, t0).is_some());
-        remove_link_admission_in(&f.links, &link(), &g, || tun.close());
-        assert!(g.echo(&[9; 32], &probe, t0).is_none(), "закрытый Link: выданное разрешение мертво");
-        assert!(issue_probe_grant(&f.authority, &f.links, &g, link(), &f.pk, [9; 32], t0).is_none(), "мёртвому Link не выдаём");
-        // интервал выдачи тому же ключу и владельцу не сброшен закрытием
-        let owner: [u8; 32] = Sha256::digest(f.pk).into();
-        assert_eq!(g.grant([9; 32], owner, [5; 16], t0 + Duration::from_secs(1)), Err(qprobe::Deny::TooSoon));
-    }
-
-    // QAB-M4, конкурентно: выдача и снятие Link из разных потоков; после завершения снятия живого разрешения нет ни при каком чередовании
-    #[test]
-    fn probe_grant_vs_close_and_revoke_leave_no_live_grant_after_removal() {
-        for round in 0..64u8 {
-            let mut f = fixture(true);
-            let tun = Arc::new(TunCore::default());
-            promoted(&f, &tun);
-            let g = Arc::new(qprobe::Grants::default());
-            let t0 = Instant::now();
-            let probe = qprobe::build(0, 1, 40);
-            let ep = [round; 32];
-            let revoke = f.issuer.issue(f.root, f.pk, trust::TRANSIT).unwrap();
-            let (authority, links, pk, g1) = (f.authority.clone(), f.links.clone(), f.pk, g.clone());
-            let issuer = std::thread::spawn(move || issue_probe_grant(&authority, &links, &g1, link(), &pk, ep, t0));
-            let (links, g2, tun2) = (f.links.clone(), g.clone(), tun.clone());
-            let closer = std::thread::spawn(move || { remove_link_admission_in(&links, &link(), &g2, || tun2.close()); });
-            if round % 2 == 0 {
-                // отзыв прав параллельно: сам по себе Link не снимает (это делает evaluate -> drop_link_state), но выдача после него невозможна
-                assert_eq!(f.authority.lock().unwrap().offer(revoke), trust::Offer::Added);
-            }
-            let issued = issuer.join().unwrap();
-            closer.join().unwrap();
-            // Link снят: что бы ни выдал параллельный поток, живого разрешения не осталось
-            assert!(g.echo(&ep, &probe, t0).is_none(), "round {round}: после снятия Link эхо невозможно (issued={issued:?})");
-            // и новая выдача по снятому Link невозможна
-            assert!(issue_probe_grant(&f.authority, &f.links, &g, link(), &f.pk, [0xEE; 32], t0 + Duration::from_secs(60)).is_none());
-        }
     }
 
     #[test]
@@ -7099,11 +6390,6 @@ struct ClientCtx {
     auth_wait: Mutex<HashMap<LinkId, tokio::sync::oneshot::Sender<std::result::Result<serde_json::Value, String>>>>,
     /// Пробы датаграмм только после AUTH_OK и проверки EXIT: Link -> случайный seq, метка времени, ответ.
     data_wait: Mutex<HashMap<LinkId, (u32, u64, tokio::sync::oneshot::Sender<()>)>>,
-    /// Ответ выхода на T_PROBEQ (разрешён ли зонд): ждёт возврат на QUIC (`return_probe_link`).
-    /// Ответ: (разрешено ли, срок разрешения от получения ответа).
-    probe_wait: Mutex<HashMap<LinkId, tokio::sync::oneshot::Sender<(bool, Duration)>>>,
-    /// Барьер снятия TCP-носителя и билеты подключений (QAB-M1).
-    drain: Mutex<DrainState>,
     cur: Mutex<Option<([u8; 16], LinkId, Instant)>>,
     last_pong: std::sync::atomic::AtomicU64,
     /// Окно свежести контакта для индикации: `fail_ms` при трафике, keepalive с запасом в простое (выставляет `Pacer`).
@@ -7548,7 +6834,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
     let servers: Vec<CServer> = Vec::new();
     let client_addr = ip_str(client_ip(identity.hash()));
     let ctx = Arc::new(ClientCtx { node: node.clone(), sh: sh.clone(), ep: ep.clone(), identity, ip: client_addr, servers: Mutex::new(servers.clone()), tun,
-        auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), probe_wait: Mutex::new(HashMap::new()), drain: Mutex::new(DrainState::default()), cur: Mutex::new(None), last_pong: Default::default(), contact_window_ms: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
+        auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), cur: Mutex::new(None), last_pong: Default::default(), contact_window_ms: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
         state: a.state.clone(), status: Mutex::new("подключаюсь".into()), dialers: Mutex::new(HashMap::new()),
         carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), hints: Mutex::new(HashMap::new()), platforms: Mutex::new(HashMap::new()), books: Mutex::new(HashMap::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
         c13, path_gate: path::PathGate::default(), nbrs: Mutex::new(HashMap::new()), admitted_exits: Mutex::new(HashMap::new()), ctrl: Mutex::new(HashMap::new()), lk_fail: Mutex::new(HashMap::new()), vis: Mutex::new(HashMap::new()), qstat: Mutex::new(HashMap::new()),
@@ -8064,7 +7350,7 @@ fn start_dialer(ctx: &Arc<ClientCtx>, s: &CServer) {
     let cc = CarrierCtl::new();
     *cc.label.lock().unwrap() = s.name.clone();
     ctx.carriers.lock().unwrap().insert(s.dest, cc.clone());
-    tokio::spawn(dial_direct(ctx.ep.clone(), ctx.node.clone(), ctx.sh.clone(), s.name.clone(), id, book, alive, cc, Some(ReturnHook { ctx: ctx.clone(), dest: s.dest })));
+    tokio::spawn(dial_direct(ctx.ep.clone(), ctx.node.clone(), ctx.sh.clone(), s.name.clone(), id, book, alive, cc));
 }
 
 /// Запустить диалеры выходов, у которых появился адрес: после пересборки списка по записям (новая запись работает без перезапуска клиента).
@@ -8126,7 +7412,6 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                 ctx.admitted_exits.lock().unwrap().remove(&link_id);
                 ctx.ctrl.lock().unwrap().remove(&link_id);
                 ctx.data_wait.lock().unwrap().remove(&link_id);
-                ctx.probe_wait.lock().unwrap().remove(&link_id);
                 ctx.sh.closed.lock().unwrap().insert(hex(link_id.as_bytes()), format!("{reason:?}"));
             }
             NodeEvent::MessageReceived { link_id, data, .. } if !data.is_empty() => {
@@ -8154,11 +7439,6 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                     T_AUTH_FAIL => {
                         if let Some(tx) = ctx.auth_wait.lock().unwrap().remove(&link_id) {
                             let _ = tx.send(Err(String::from_utf8_lossy(body).into()));
-                        }
-                    }
-                    T_PROBER => {
-                        if let (Some(reply), Some(tx)) = (qprobe::parse_prober_ttl(body), ctx.probe_wait.lock().unwrap().remove(&link_id)) {
-                            let _ = tx.send(reply);
                         }
                     }
                     T_NBRS => {
@@ -8210,9 +7490,7 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
 /// Наши интерфейсы носителя (QUIC/TCP, входящие и исходящие), online, кроме `skip`. Публичная RNS сюда не входит:
 /// клиент по ней Link не открывает. Публичные интерфейсы клиент не помнит по id (spawn_interface выдаёт tcp_client_N), поэтому отбор по префиксу.
 fn carrier_ifaces(ctx: &ClientCtx, skip: Option<usize>) -> Vec<usize> {
-    // QAB-M1: интерфейс, который снимается, для новых Link недоступен (выбор пути и `path::acceptable` после подключения)
-    let d = ctx.drain.lock().unwrap();
-    own_carrier_ifaces(&ctx.node).into_iter().filter(|i| Some(*i) != skip && !d.draining.contains(i)).collect()
+    own_carrier_ifaces(&ctx.node).into_iter().filter(|i| Some(*i) != skip).collect()
 }
 
 fn own_carrier_ifaces(node: &Arc<Node>) -> Vec<usize> {
@@ -8345,8 +7623,6 @@ async fn open_link(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usi
 
 async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usize>, est_s: u64, cipher: leviculum_std::api::LinkCipher) -> Result<(LinkId, Arc<leviculum_std::LinkHandle>)> {
     let dest = DestinationHash::new(cand.dest);
-    // QAB-M1: пока идёт подключение (поиск пути, рукопожатие), снимать носитель нельзя; билет закрывается при выходе из функции в любой ветке
-    let ticket = ConnectTicket::new(ctx);
     // CBC enrollment сохраняет публичный fallback. GCM открывается только по нашим носителям.
     let allowed = || if cipher == leviculum_std::api::LinkCipher::Cbc {
         ctx.node.engine().interface_stats().iter().filter(|i| i.online).map(|i| i.interface_id.0).collect()
@@ -8370,12 +7646,6 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
         bail!("нет пути до {}", cand.name);
     }
     let used_iface = ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index);
-    // Атомарно с барьером: интерфейс пути, который уже снимается, не используем; иначе барьер увидит этот выбор и не снимет носитель
-    if let Some(i) = used_iface {
-        if !ticket.begin(i) {
-            bail!("носитель пути до {} снимается, подключаюсь позже", cand.name);
-        }
-    }
     if let Some(p) = ctx.node.engine().get_path_clone(&dest) {
         let iface = ctx.node.engine().interface_stats().iter().find(|i| i.interface_id.0 == p.interface_index).map(|i| i.name.clone()).unwrap_or_default();
         ctx.sh.note(format!("путь к {}: {} хоп, интерфейс {}, транспорт {}", cand.name, p.hops, iface,
@@ -8383,7 +7653,6 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
     }
     let handle = ctx.node.connect_with_key_cipher(&dest, &cand.key, cipher).await?;
     let id = *handle.link_id();
-    ticket.set_link(id);
     let k = hex(id.as_bytes());
     let t = Instant::now();
     while !ctx.sh.established.lock().unwrap().contains(&k) {
@@ -8435,11 +7704,7 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     }
     let dest = DestinationHash::new(cand.dest);
     let t0 = Instant::now();
-    // Внешний билет живёт всю авторизацию и проверку датаграммы: пока Link не готов, он держит TCP (неизвестный интерфейс = отказ снятия, QAB-M1).
-    // Внутренний билет `open_link_wait` закрывается при возврате из `open_link`, поэтому внешний открыт до него и привязывается к Link сразу после.
-    let ticket = ConnectTicket::new(ctx);
     let (id, handle) = open_link(ctx, cand, avoid_iface).await?;
-    ticket.set_link(id);
     let (tx, rx) = tokio::sync::oneshot::channel();
     ctx.auth_wait.lock().unwrap().insert(id, tx);
     if let Some(c) = &ctx.c13 {
@@ -8505,21 +7770,6 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
         if !recs.is_empty() {
             ctx.sync_to(id, recs, vec![]);
         }
-    }
-    // Лабораторная точка отказа B (QAB-M2): сервер уже вытеснил прежний Link (допуск идёт до AUTH_OK), а новый Link не доходит до рабочего состояния.
-    // Существует только в отладочной сборке (`cfg(debug_assertions)`, лабораторные снимки): в release-бинарниках (deploy/build.sh, ci-build.sh, android build.sh)
-    // блока и имени переменной нет. Читается из окружения процесса, как KNOTHOP_LAB_EXIT_NO_ENFORCE. Не меняет протокол и состояние кроме закрытия этого Link.
-    #[cfg(debug_assertions)]
-    if lab_ret_b_fail(std::env::var_os("KNOTHOP_LAB_RET_B_FAIL").is_some()) && ctx.carriers.lock().unwrap().get(&cand.dest).is_some_and(|c| matches!(c.ret_get(), Ret::Moving { .. })) {
-        let _ = ctx.node.engine().close_link(&id).await;
-        // `quicdead` (QAB-R1): Err отдаётся только после того, как сторож убрал Moving (QUIC умер/таймаут), то есть в порядке "сторож первым"
-        if std::env::var("KNOTHOP_LAB_RET_B_FAIL").as_deref() == Ok("quicdead") {
-            let t = Instant::now();
-            while t.elapsed() < Duration::from_secs(50) && ctx.carriers.lock().unwrap().get(&cand.dest).is_some_and(|c| matches!(c.ret_get(), Ret::Moving { .. })) {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }
-        bail!("{}: лабораторный отказ B после AUTH_OK (KNOTHOP_LAB_RET_B_FAIL)", cand.name);
     }
     // Управляющий Channel может отвечать, пока ненадёжные датаграммы по тому же
     // пути не проходят. Такой Link не должен вытеснять рабочий запасной выход.
@@ -8745,9 +7995,6 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
     // переходы текущего выхода с транзита на прямой путь: не чаще раза в 5 мин на выход (если прямой путь не держится - не зацикливаемся)
     let mut direct_retry: HashMap<[u8; 16], Instant> = HashMap::new();
     // QAB-M2: перенос на QUIC не удался, а прежний Link мог быть вытеснен сервером; когда начался перенос; восстановленный выход и время
-    let mut ret_recover: Option<RetRecover> = None;
-    let mut ret_mv: Option<RetMove> = None;
-    let mut ret_recovered: Option<([u8; 16], Instant)> = None;
     let mut pair_delay = 2u64;
     while !fin.exists() {
         // 0013: сначала зачисление по приглашению (до него права есть только в собственном дереве, выходов нет)
@@ -8789,37 +8036,16 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             match result {
                 Ok((id, h)) => {
                     avoid.remove(&c.dest);
-                    if let Some((_, at)) = ret_recovered.take().filter(|(d, _)| *d == c.dest) {
-                        ctx.sh.note(format!("{}: Link восстановлен через TCP после неудачного переноса, разрыв {} мс от начала переноса", c.name, at.elapsed().as_millis()));
-                    }
-                    if ret_recover.as_ref().is_some_and(|r| r.dest == c.dest) {
-                        ret_recover = None;
-                    }
-                    ret_b_done(&mut ret_mv, &c.dest);
                     ctx.lk_fail.lock().unwrap().remove(&c.dest);
                     ctx.note_link(&c.dest, true);
                     if let Some(cc) = ctx.carriers.lock().unwrap().get(&c.dest) {
                         cc.fails.store(0, Relaxed);
-                        // Link выхода поднят вне TCP-интерфейса, пока шёл возврат: коммит. Режим и `generation` меняются ДО чтения gen_at_connect ниже
-                        let attached = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface());
-                        if cc.ret_commit(attached) {
-                            ctx.sh.note(format!("{}: Link поднят на QUIC, возврат с TCP без паузы носителя", c.name));
-                        }
                     }
                     connected = Some((c, id, h));
                     break;
                 }
                 Err(e) => {
                     ctx.sh.note(format!("выход {}: {e:#}", c.name));
-                    // возврат на QUIC не удался: сторож закроет QUIC и вырастит паузу. Прежний Link на TCP не обязательно цел: сервер вытесняет его при
-                    // допуске нового (раньше AUTH_OK, `admit_link_replacing`), поэтому при неудаче B вооружается восстановление через TCP (QAB-M2)
-                    // QAB-R1: решает контекст начатого B (`ret_mv`), а не текущий `Ret`: сторож мог уже поставить `Idle`
-                    let cc = ctx.carriers.lock().unwrap().get(&c.dest).cloned();
-                    if let Some(rec) = cc.and_then(|cc| ret_b_error(&mut ret_mv, &cc, &c.dest, Instant::now())) {
-                        avoid.remove(&c.dest);
-                        ret_recover = Some(rec);
-                        ctx.sh.note(format!("{}: перенос на QUIC не удался; сервер мог вытеснить прежний Link при допуске нового - если он закрыт, восстановлю через TCP", c.name));
-                    }
                     ctx.lk_fail.lock().unwrap().insert(c.dest, (Instant::now(), format!("{e:#}").chars().take(80).collect()));
                     ctx.note_link(&c.dest, false);
                     // Неудачный путь забываем и через транзит: следующий scoped discovery
@@ -8885,8 +8111,8 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         let mut better_since: Option<Instant> = None;
         let mut last_eval = Instant::now();
         let mut direct_since: Option<Instant> = None;
+        let mut sil_grace: Option<Instant> = None;
         let mut last_direct_check = Instant::now();
-        let mut ret_iface: Option<usize> = None;
         let connected_at = ctx.cur.lock().unwrap().map(|c| c.2).unwrap_or_else(Instant::now);
         let reason = loop {
             if fin.exists() {
@@ -8958,27 +8184,20 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             }
             ctx.contact_window_ms.store(step.contact_window_ms, Relaxed);
             if step.silent_ms >= ctx.fail_ms.max(3000) {
-                break format!("нет ответа {} мс", step.silent_ms);
-            }
-            // Возврат TCP -> QUIC (этап B): QUIC уже привязан к RNS рядом с TCP, а Link выхода сидит на TCP - поднимаем новый вне TCP, старый держим
-            let ret_cc = ctx.carriers.lock().unwrap().get(&cand.dest).cloned().filter(|c| matches!(c.ret_get(), Ret::Standby { .. }));
-            if let Some(cc) = ret_cc {
-                let attached = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface());
-                let quic_if = match cc.ret_get() {
-                    Ret::Standby { quic, .. } => quic,
-                    _ => usize::MAX,
-                };
-                match cc.ret_poll(attached) {
-                    RetTick::Move(tcp_if) => {
-                        ret_iface = Some(tcp_if);
-                        // контекст B фиксируется здесь (QAB-R1): дальше сторож может менять `Ret`, но не его
-                        ret_mv = Some(RetMove { dest: cand.dest, link: id, tcp_if, quic_if, attempt: cc.ret_epoch.load(Relaxed), started: Instant::now() });
-                        break format!("возврат на QUIC: {}", cand.name);
+                // Тишина на QUIC: носитель меняется внутри интерфейса пира (`mux.rs`), Link при этом не рвётся. Link держим, пока TCP не подтвердится
+                // или не кончится `SILENCE_GRACE`; тишина без шансов (TCP уже выбран, либо время вышло) - прежний отказ выхода.
+                if sil_grace.is_none() {
+                    let cc = ctx.carriers.lock().unwrap().get(&cand.dest).cloned();
+                    if cc.is_some_and(|cc| judge_silence(&cc, false, Instant::now()) == SilenceCause::Quic) {
+                        ctx.sh.note(format!("{}: тишина по QUIC, переключаю носитель на TCP, Link держу", cand.name));
+                        sil_grace = Some(Instant::now() + SILENCE_GRACE);
                     }
-                    RetTick::AlreadyOff => ctx.sh.note(format!("{}: Link уже на проверенном QUIC, возврат засчитан", cand.name)),
-                    RetTick::Left => ctx.sh.note(format!("{}: Link ушёл с TCP по другому пути - проверенный QUIC его не несёт, возврат не засчитан", cand.name)),
-                    RetTick::Nothing => {}
                 }
+                if !sil_grace.is_some_and(|u| Instant::now() < u) {
+                    break format!("нет ответа {} мс", step.silent_ms);
+                }
+            } else {
+                sil_grace = None;
             }
             if let Some(w) = want {
                 // вернуться к выбранному выходу можно, только если он снова доступен (не забанен и не потерян)
@@ -9017,26 +8236,8 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             direct_retry.insert(cand.dest, Instant::now());
             keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
         }
-        // возврат с TCP на QUIC - тоже смена с удержанием старого Link до нового, без бана; новый Link не должен сесть на TCP
-        let return_move = reason.starts_with("возврат на QUIC");
-        if let (true, Some(i)) = (return_move, ret_iface) {
-            keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
-            avoid.insert(cand.dest, i);
-        }
-        let user = reason == "выбор пользователя" || reason.starts_with("авто:") || direct_move || return_move;
-        // QAB-M2: прежний Link закрыт/замолчал вскоре после неудачного переноса - его вытеснил сервер при допуске B; это не отказ выхода и не вина TCP
-        let recovering = !user && recover_decision(ret_recover.as_ref(), &cand.dest, &id, Instant::now());
-        if recovering {
-            let r = ret_recover.take().expect("recover");
-            ctx.sh.note(format!("{}: прежний Link вытеснен сервером при неудачном переносе ({reason}), восстанавливаю через TCP; прошло {} мс от начала переноса, {} мс от неудачи B", cand.name, r.move_at.elapsed().as_millis(), r.armed.elapsed().as_millis()));
-            ctx.failovers.lock().unwrap().push(serde_json::json!({"at_ms": now_ms() as u64, "from": cand.name, "reason": "перенос на QUIC не удался, Link вытеснен сервером"}));
-            keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
-            if let Some(q) = r.quic_if {
-                avoid.insert(cand.dest, q);
-            }
-            ret_recovered = Some((cand.dest, r.move_at));
-            pending_reason = None;
-        } else if user {
+        let user = reason == "выбор пользователя" || reason.starts_with("авто:") || direct_move;
+        if user {
             ctx.sh.note(format!("проверка выхода: {reason}"));
             pending_reason = Some(reason.clone());
         } else {
@@ -9045,7 +8246,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             pending_reason = None;
         }
         let carrier_flip = ctx.carriers.lock().unwrap().get(&cand.dest).map(|c| carrier_flipped(c, gen_at_connect)).unwrap_or(false);
-        if reason.starts_with("нет ответа") && !recovering {
+        if reason.starts_with("нет ответа") {
             // Тишина после смены носителя (в том числе нашей: дозвон снял TCP по паузе возврата) объяснена сменой: Link привязан к прежнему
             // интерфейсу. QUIC в ней не виноват; если Link, поднятый уже на этом QUIC, замолчит снова, пойдёт обычная ветка.
             // Тишина Link, жившего на текущем QUIC: вероятно, UDP режется; у этого пира пробуем запасной TCP и запоминаем QUIC (health.rs).
@@ -9060,21 +8261,19 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         }
         // Выбранный пользователем выход при смене носителя не бросаем: Link закрыт ради TCP, тот же выход поднимется заново за секунды.
         // Если за это время не поднялся — обычный отступ и переход на лучший из остальных.
-        if carrier_flip && !user && !recovering {
+        if carrier_flip && !user {
             keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
             ctx.sh.note(format!("{}: смена носителя, остаюсь на этом выходе", cand.name));
         }
         if !user {
-            if !recovering {
-                // Отказавший выход отступает независимо от работающего запасного.
-                ctx.lk_fail.lock().unwrap().insert(cand.dest, (Instant::now(), reason.chars().take(80).collect()));
-                banned.failed(cand.dest, Instant::now());
-                if let Some(i) = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface()) {
-                    avoid.insert(cand.dest, i);
-                    let dest = DestinationHash::new(cand.dest);
-                    if ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index) == Some(i) {
-                        ctx.node.engine().remove_path(&dest);
-                    }
+            // Отказавший выход отступает независимо от работающего запасного.
+            ctx.lk_fail.lock().unwrap().insert(cand.dest, (Instant::now(), reason.chars().take(80).collect()));
+            banned.failed(cand.dest, Instant::now());
+            if let Some(i) = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface()) {
+                avoid.insert(cand.dest, i);
+                let dest = DestinationHash::new(cand.dest);
+                if ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index) == Some(i) {
+                    ctx.node.engine().remove_path(&dest);
                 }
             }
             active = None;
@@ -9088,437 +8287,8 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
 
 /// Этапы A/B make-before-break (раздел 13 отчёта): состояние возврата, допуск эха, откат на этап 0. Без сети.
 #[cfg(test)]
-mod qreturn_tests {
+mod carrier_tests {
     use super::*;
-
-    fn tcp_ctl() -> Arc<CarrierCtl> {
-        let cc = CarrierCtl::new();
-        *cc.peer.lock().unwrap() = "p".into();
-        cc.set_mode("tcp");
-        cc.prefer_tcp.store(true, Relaxed);
-        cc
-    }
-
-    fn info(role: Role, enroll_only: bool, pk: Option<[u8; 64]>) -> LinkInfo {
-        LinkInfo { role, since: Instant::now(), last_heard: Instant::now(), peer_pk: pk, want_use: false, enroll_only, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 }
-    }
-
-    // зонд прошёл: Link на TCP -> Move, TCP-интерфейс исключается; пока Link не перенесён, носитель остаётся TCP (данные идут по нему без паузы)
-    #[test]
-    fn standby_moves_link_off_tcp_and_keeps_tcp_mode_until_commit() {
-        let cc = tcp_ctl();
-        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
-        assert_eq!(cc.ret_poll(None), RetTick::Nothing, "интерфейс Link ещё неизвестен");
-        assert_eq!(cc.ret_poll(Some(5)), RetTick::Move(5));
-        assert_eq!(cc.ret_get(), Ret::Moving { tcp: 5, quic: 9 });
-        assert_eq!(cc.ret_poll(Some(5)), RetTick::Nothing, "перенос не запускается дважды");
-        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed), "до коммита носитель TCP: монитор потерь QUIC и тишина по QUIC не срабатывают");
-        let gen_old = cc.generation.load(Relaxed);
-        // новый Link сел на TCP снова (путь ещё не обновился): коммита нет
-        assert!(!cc.ret_commit(Some(5)));
-        assert_eq!(cc.ret_get(), Ret::Moving { tcp: 5, quic: 9 });
-        // новый Link на проверенном QUIC-интерфейсе: коммит; generation растёт ДО чтения gen_at_connect, новый Link не считается пережившим смену
-        assert!(cc.ret_commit(Some(9)));
-        assert_eq!(cc.ret_get(), Ret::Moved);
-        assert!(cc.is_quic() && !cc.prefer_tcp.load(Relaxed));
-        let gen_at_connect = cc.generation.load(Relaxed);
-        assert_ne!(gen_at_connect, gen_old);
-        assert!(!carrier_flipped(&cc, gen_at_connect));
-        assert_eq!(judge_silence(&cc, carrier_flipped(&cc, gen_at_connect), Instant::now()), SilenceCause::Quic, "тишина нового Link - тишина по QUIC");
-        assert!(!cc.ret_commit(Some(9)), "повторный коммит ничего не делает");
-    }
-
-    // Link уже пересобран на проверенный QUIC без нас: перенос засчитан, носитель QUIC
-    #[test]
-    fn standby_with_link_already_on_verified_quic_counts_as_moved() {
-        let cc = tcp_ctl();
-        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
-        assert_eq!(cc.ret_poll(Some(9)), RetTick::AlreadyOff);
-        assert_eq!(cc.ret_get(), Ret::Moved);
-        assert!(cc.is_quic() && !cc.prefer_tcp.load(Relaxed));
-    }
-
-    // QAB-L3: Link ушёл с TCP на ДРУГОЙ интерфейс (не проверенный QUIC): это не возврат, носитель не меняется
-    #[test]
-    fn link_left_tcp_for_another_iface_is_not_a_return() {
-        let cc = tcp_ctl();
-        let gen_old = cc.generation.load(Relaxed);
-        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
-        assert_eq!(cc.ret_poll(Some(7)), RetTick::Left);
-        assert_eq!(cc.ret_get(), Ret::Left);
-        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed) && cc.generation.load(Relaxed) == gen_old, "режим TCP не тронут");
-        // то же при коммите Link, поднятого на постороннем интерфейсе во время Moving
-        let cc = tcp_ctl();
-        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Moving { tcp: 5, quic: 9 });
-        assert!(!cc.ret_commit(Some(7)), "постороннему интерфейсу коммит не положен");
-        assert_eq!(cc.ret_get(), Ret::Left);
-        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed));
-        assert!(!cc.ret_commit(Some(9)), "после Left коммита нет");
-    }
-
-    // перенос не удался: TCP и режим не тронуты, сторож закрывает QUIC
-    #[test]
-    fn failed_move_leaves_tcp_mode_untouched() {
-        let cc = tcp_ctl();
-        let gen_old = cc.generation.load(Relaxed);
-        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Moving { tcp: 5, quic: 9 });
-        cc.ret_fail();
-        assert_eq!(cc.ret_get(), Ret::Failed);
-        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed) && cc.generation.load(Relaxed) == gen_old);
-        let idle = CarrierCtl::new();
-        idle.ret_fail();
-        assert_eq!(idle.ret_get(), Ret::Idle, "из покоя в сбой не переходим");
-    }
-
-    // QUIC потерян после коммита, пока на TCP ещё живы Link: носитель снова TCP, монитор не отключён
-    #[test]
-    fn revert_after_commit_returns_to_tcp() {
-        let cc = tcp_ctl();
-        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
-        assert!(cc.ret_commit(Some(9)));
-        cc.ret_revert();
-        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed));
-    }
-
-    // TCP умер до переноса: усыновление делает QUIC носителем; после коммита режим не трогается (generation остаётся)
-    #[test]
-    fn adopt_makes_quic_the_carrier_without_extra_generation_bump() {
-        let cc = tcp_ctl();
-        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
-        cc.ret_adopt();
-        assert!(cc.is_quic() && !cc.prefer_tcp.load(Relaxed) && cc.ret_get() == Ret::Idle);
-        let cc = tcp_ctl();
-        cc.ret_set_if(cc.ret_begin_attempt(), Ret::Standby { tcp: 5, quic: 9 });
-        assert!(cc.ret_commit(Some(9)));
-        let g = cc.generation.load(Relaxed);
-        cc.ret_adopt();
-        assert_eq!(cc.generation.load(Relaxed), g, "снятие TCP после коммита не меняет носитель второй раз");
-        assert!(cc.is_quic());
-    }
-
-    // QAB-M3: устаревшая попытка не публикует и не затирает состояние, поздний наблюдатель после отмены не воскрешает ресурс
-    #[test]
-    fn stale_attempt_cannot_publish_or_overwrite_after_finish() {
-        let cc = CarrierCtl::new();
-        let slot: Mutex<Option<u32>> = Mutex::new(None);
-        let a1 = cc.ret_begin_attempt();
-        assert!(ret_publish(&cc.ret_epoch, a1, &slot, 7u32, &cc.ret, Ret::Idle).is_ok());
-        assert_eq!(ret_finish(&cc.ret_epoch, &slot, &cc.ret, Ret::Idle), Some(7), "отмена забирает ресурс");
-        assert_eq!(ret_publish(&cc.ret_epoch, a1, &slot, 8u32, &cc.ret, Ret::Moved), Err(8), "поздняя публикация отвергнута, ресурс возвращён");
-        assert!(slot.lock().unwrap().is_none() && cc.ret_get() == Ret::Idle);
-        assert!(!cc.ret_set_if(a1, Ret::Moved), "и состояние старой попытки не пишется");
-        // новая попытка не страдает от хвоста старой
-        let a2 = cc.ret_begin_attempt();
-        assert!(cc.ret_set_if(a2, Ret::Standby { tcp: 5, quic: 9 }));
-        assert!(!cc.ret_set_if(a1, Ret::Idle), "старая попытка не затирает новую");
-        assert_eq!(cc.ret_get(), Ret::Standby { tcp: 5, quic: 9 });
-    }
-
-    // QAB-M3, многопоточно: публикация против отмены - ровно один исход, слот пуст, состояние Idle, ресурс не потерян и не задвоен
-    #[test]
-    fn publish_vs_abort_race_never_leaks_or_overwrites() {
-        for i in 0..400u32 {
-            let cc = CarrierCtl::new();
-            let slot: Arc<Mutex<Option<u32>>> = Arc::default();
-            let a = cc.ret_begin_attempt();
-            let bar = Arc::new(std::sync::Barrier::new(2));
-            let (cc2, slot2, bar2) = (cc.clone(), slot.clone(), bar.clone());
-            let publisher = std::thread::spawn(move || {
-                bar2.wait();
-                ret_publish(&cc2.ret_epoch, a, &slot2, i, &cc2.ret, Ret::Moved)
-            });
-            bar.wait();
-            let taken = ret_finish(&cc.ret_epoch, &slot, &cc.ret, Ret::Idle);
-            let published = publisher.join().unwrap();
-            match (published, taken) {
-                (Ok(()), Some(v)) => assert_eq!(v, i, "публикация успела до отмены: отмена забрала именно её"),
-                (Err(v), None) => assert_eq!(v, i, "отмена раньше: ресурс вернулся издателю"),
-                other => panic!("утечка или дубль ресурса: {other:?}"),
-            }
-            assert!(slot.lock().unwrap().is_none(), "слот пуст");
-            assert_eq!(cc.ret_get(), Ret::Idle, "поздний издатель не затёр Idle");
-        }
-    }
-
-    // M1/L1: два молчания T_PROBER подряд - старый узел; ответ сбрасывает счёт
-    #[test]
-    fn prober_silence_must_repeat_before_peer_is_called_old() {
-        let cc = CarrierCtl::new();
-        let t = Instant::now();
-        assert!(!cc.ret_prober_missed(t), "одна потеря пакета - не старый узел");
-        assert!(!cc.ret_unsupported_now(t));
-        cc.ret_miss.store(0, Relaxed); // пришёл T_PROBER
-        assert!(!cc.ret_prober_missed(t));
-        assert!(cc.ret_prober_missed(t), "второе подряд");
-        assert!(cc.ret_unsupported_now(t));
-    }
-
-    // QAB-M2: окно восстановления привязано к выходу и Link, ограничено по времени
-    #[test]
-    fn recover_decision_is_bound_to_dest_link_and_window() {
-        let (dest, other) = ([1u8; 16], [2u8; 16]);
-        let (l1, l2) = (LinkId::new([11; 16]), LinkId::new([12; 16]));
-        let t0 = Instant::now();
-        let r = RetRecover { dest, link: l1, quic_if: Some(9), move_at: t0, armed: t0 };
-        assert!(recover_decision(Some(&r), &dest, &l1, t0 + Duration::from_secs(5)));
-        assert!(!recover_decision(Some(&r), &other, &l1, t0), "чужой выход");
-        assert!(!recover_decision(Some(&r), &dest, &l2, t0), "другой Link");
-        assert!(!recover_decision(Some(&r), &dest, &l1, t0 + RET_RECOVER_WINDOW + Duration::from_millis(1)), "окно закрыто: это настоящий отказ");
-        assert!(recover_decision(Some(&r), &dest, &l1, t0 + RET_RECOVER_WINDOW));
-        assert!(!recover_decision(None, &dest, &l1, t0));
-    }
-
-    // Отказ B после успешного эха/AUTH: Moving -> Failed (TCP и режим не тронуты), восстановление вооружено только для прежнего Link
-    #[test]
-    fn failure_after_successful_echo_fails_move_and_arms_recovery_only_for_old_link() {
-        let cc = tcp_ctl();
-        let a = cc.ret_begin_attempt();
-        assert!(cc.ret_set_if(a, Ret::Standby { tcp: 5, quic: 9 }));
-        assert_eq!(cc.ret_poll(Some(5)), RetTick::Move(5));
-        cc.ret_fail();
-        assert_eq!(cc.ret_get(), Ret::Failed);
-        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed));
-        let (dest, old, new) = ([3u8; 16], LinkId::new([21; 16]), LinkId::new([22; 16]));
-        let now = Instant::now();
-        let r = RetRecover { dest, link: old, quic_if: Some(9), move_at: now, armed: now };
-        assert!(recover_decision(Some(&r), &dest, &old, now), "вытесненный сервером прежний Link - восстановление");
-        assert!(!recover_decision(Some(&r), &dest, &new, now), "закрытие нового Link - обычный отказ");
-        // сторож разбирает: слот пуст, Idle, эпоха выросла - поздний Failed→Standby невозможен
-        let slot: Mutex<Option<u32>> = Mutex::new(None);
-        let _ = ret_finish(&cc.ret_epoch, &slot, &cc.ret, Ret::Idle);
-        assert!(!cc.ret_set_if(a, Ret::Standby { tcp: 5, quic: 9 }));
-        assert_eq!(cc.ret_get(), Ret::Idle);
-    }
-
-    // QAB-R1: контекст B, как его фиксирует супервизор на тике Move; `Ret` затем меняет сторож
-    fn start_b(cc: &Arc<CarrierCtl>, dest: [u8; 16], old: LinkId, t0: Instant) -> Option<RetMove> {
-        let attempt = cc.ret_begin_attempt();
-        assert!(cc.ret_set_if(attempt, Ret::Standby { tcp: 5, quic: 9 }));
-        assert_eq!(cc.ret_poll(Some(5)), RetTick::Move(5));
-        Some(RetMove { dest, link: old, tcp_if: 5, quic_if: 9, attempt, started: t0 })
-    }
-
-    // (1) сервер вытеснил старый -> QUIC умер -> сторож поставил Idle (ret_finish) -> только потом Err connect_exit: восстановление всё равно вооружается
-    #[test]
-    fn watcher_idle_before_b_error_still_arms_recovery() {
-        let (dest, old) = ([4u8; 16], LinkId::new([31; 16]));
-        let cc = tcp_ctl();
-        let t0 = Instant::now();
-        let mut mv = start_b(&cc, dest, old, t0);
-        let slot: Mutex<Option<u32>> = Mutex::new(Some(1));
-        assert_eq!(ret_finish(&cc.ret_epoch, &slot, &cc.ret, Ret::Idle), Some(1), "сторож закрыл QUIC");
-        assert_eq!(cc.ret_get(), Ret::Idle, "Moving и номера интерфейсов стёрты");
-        let now = t0 + Duration::from_secs(3);
-        let rec = ret_b_error(&mut mv, &cc, &dest, now).expect("контекст пережил сторожа");
-        assert!(recover_decision(Some(&rec), &dest, &old, now + Duration::from_secs(1)), "закрытие прежнего Link - восстановление через TCP");
-        assert_eq!((rec.quic_if, rec.move_at), (Some(9), t0));
-        assert!(!cc.is_quic() && cc.prefer_tcp.load(Relaxed), "режим TCP не тронут");
-    }
-
-    // (2) то же при RET_MOVE_TIMEOUT: сторож по таймауту ставит Idle, Err приходит позже, в пределах срока контекста
-    #[test]
-    fn watcher_move_timeout_idle_before_b_error_still_arms_recovery() {
-        let (dest, old) = ([4u8; 16], LinkId::new([32; 16]));
-        let cc = tcp_ctl();
-        let t0 = Instant::now();
-        let mut mv = start_b(&cc, dest, old, t0);
-        let slot: Mutex<Option<u32>> = Mutex::new(None);
-        let _ = ret_finish(&cc.ret_epoch, &slot, &cc.ret, Ret::Idle);
-        let late = t0 + RET_MOVE_TIMEOUT + Duration::from_secs(2);
-        assert!(ret_b_error(&mut mv, &cc, &dest, late).is_some());
-        // слишком старый контекст не вооружает ничего: решение за обычным отказом
-        let mut mv = start_b(&tcp_ctl(), dest, old, t0);
-        assert!(ret_b_error(&mut mv, &tcp_ctl(), &dest, t0 + RET_MOVE_CTX_TTL + Duration::from_secs(1)).is_none());
-        assert!(mv.is_none(), "и контекст при этом снят");
-    }
-
-    // (3) прежний порядок (супервизор первым, Ret ещё Moving): ret_fail, восстановление ровно одно на попытку
-    #[test]
-    fn supervisor_first_arms_exactly_one_recovery() {
-        let (dest, old) = ([4u8; 16], LinkId::new([33; 16]));
-        let cc = tcp_ctl();
-        let t0 = Instant::now();
-        let mut mv = start_b(&cc, dest, old, t0);
-        assert!(matches!(cc.ret_get(), Ret::Moving { .. }));
-        assert!(ret_b_error(&mut mv, &cc, &[9u8; 16], t0).is_none(), "ошибка другого выхода контекст не трогает");
-        assert!(mv.is_some());
-        let rec = ret_b_error(&mut mv, &cc, &dest, t0 + Duration::from_secs(1));
-        assert!(rec.is_some());
-        assert_eq!(cc.ret_get(), Ret::Failed, "Moving -> Failed, как раньше");
-        assert!(ret_b_error(&mut mv, &cc, &dest, t0 + Duration::from_secs(2)).is_none(), "второй Err той же попытки (или сторож следом) второго восстановления не даёт");
-    }
-
-    // (4) успешный B восстановление не вооружает; позднейшая ошибка другого подключения тоже
-    #[test]
-    fn successful_b_does_not_arm_recovery() {
-        let (dest, old) = ([4u8; 16], LinkId::new([34; 16]));
-        let cc = tcp_ctl();
-        let t0 = Instant::now();
-        let mut mv = start_b(&cc, dest, old, t0);
-        ret_b_done(&mut mv, &[9u8; 16]);
-        assert!(mv.is_some(), "Ok другого выхода контекст не снимает");
-        ret_b_done(&mut mv, &dest);
-        assert!(mv.is_none());
-        assert!(ret_b_error(&mut mv, &cc, &dest, t0 + Duration::from_secs(5)).is_none());
-    }
-
-    // лабораторный отказ B: в отладочной сборке включается только переменной окружения, в release недоступен (там же проверка при компиляции)
-    #[test]
-    fn lab_b_fail_hook_is_debug_only() {
-        assert_eq!(lab_ret_b_fail_allowed(), cfg!(debug_assertions));
-        #[cfg(debug_assertions)]
-        {
-            assert!(lab_ret_b_fail(true) && !lab_ret_b_fail(false));
-        }
-    }
-
-    // QAB-L2: остаток разрешения, бюджет рукопожатия, истечение
-    #[test]
-    fn grant_budget_never_exceeds_the_residual() {
-        let ttl = qprobe::GRANT_TTL;
-        let full = grant_residual(ttl, Duration::ZERO);
-        assert_eq!(full, ttl - RET_GRANT_MARGIN);
-        assert_eq!(grant_residual(ttl, ttl), Duration::ZERO);
-        assert_eq!(grant_residual(Duration::ZERO, Duration::ZERO), Duration::ZERO);
-        let (hs, limited) = handshake_budget(full);
-        assert!(hs + RET_PROBE_RUN <= full, "рукопожатие + прогон укладываются в остаток");
-        assert_eq!(limited, full.saturating_sub(RET_PROBE_RUN) < Duration::from_secs(6));
-        let (hs, limited) = handshake_budget(Duration::from_secs(60));
-        assert_eq!((hs, limited), (Duration::from_secs(6), false), "щедрый остаток: обычный потолок, таймаут значит QUIC");
-        let (hs, limited) = handshake_budget(Duration::from_millis(100));
-        assert_eq!((hs, limited), (Duration::ZERO, true));
-        assert!(grant_expired(0, ttl, ttl) && !grant_expired(0, Duration::from_secs(1), ttl), "истекло только по сроку");
-        assert!(!grant_expired(3, ttl, ttl), "было эхо - причина не срок");
-        assert!(qprobe::MIN_RESIDUAL > RET_PROBE_RUN, "минимальный остаток оставляет время на сам прогон");
-    }
-
-    // ------------------------------------------------------------------------------------------------ барьер снятия TCP (QAB-M1)
-
-    const OWN: [u8; 16] = [0xaa; 16];
-    fn lid(n: u8) -> LinkId { LinkId::new([n; 16]) }
-
-    #[test]
-    fn drain_verdict_blocks_unknown_foreign_and_uncounted() {
-        let main = Dep { iface: Some(5), main_of: Some(OWN) };
-        let other = Dep { iface: Some(5), main_of: None };
-        let away = Dep { iface: Some(9), main_of: Some(OWN) };
-        let unk = Dep { iface: None, main_of: None };
-        assert_eq!(drain_verdict(&[], 5, &OWN, false, 0), Ok(0));
-        assert_eq!(drain_verdict(&[away], 5, &OWN, false, 0), Ok(0), "Link на QUIC TCP не держит");
-        assert_eq!(drain_verdict(&[main], 5, &OWN, false, 0), Err(DrainBlock::Live(1)), "Commit основной Link на TCP не рвёт");
-        assert_eq!(drain_verdict(&[main], 5, &OWN, true, 0), Ok(1), "этап 0: свой основной Link рвётся");
-        assert_eq!(drain_verdict(&[main, other], 5, &OWN, true, 0), Err(DrainBlock::Live(1)), "чужая зависимость блокирует и этап 0");
-        assert_eq!(drain_verdict(&[unk, away], 5, &OWN, true, 0), Err(DrainBlock::Unknown(1)), "неизвестное блокирует всё");
-        assert_eq!(drain_verdict(&[unk, main], 5, &OWN, true, 0), Err(DrainBlock::Unknown(1)), "неизвестное проверяется первым");
-        assert_eq!(drain_verdict(&[], 5, &OWN, true, 2), Err(DrainBlock::Uncounted(2)), "движок знает больше, чем перечислено");
-    }
-
-    fn st(map: &'static [(u8, Option<usize>)]) -> impl Fn(&LinkId) -> Option<Option<usize>> {
-        move |id| map.iter().find(|(n, _)| LinkId::new([*n; 16]) == *id).map(|(_, a)| *a)
-    }
-
-    #[test]
-    fn try_drain_counts_by_actual_iface_and_blocks_transit_exit2_over_exit1() {
-        let mut d = DrainState::default();
-        // основной Link к exit1 уже на QUIC, но допущенный/дополнительный Link к exit2 идёт ТРАНЗИТОМ через TCP к exit1
-        let known = [(lid(1), Some(OWN)), (lid(2), None)];
-        let r = d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9)), (2, Some(5))]), 2);
-        assert_eq!(r, Err(DrainBlock::Live(1)));
-        assert!(!d.draining.contains(&5), "отказ не помечает интерфейс снимаемым");
-        // тот же случай этапа 0: свой основной Link рвётся, но Link к exit2 по-прежнему держит TCP
-        let r = d.try_drain(5, &OWN, true, &known, st(&[(1, Some(5)), (2, Some(5))]), 2);
-        assert_eq!(r, Err(DrainBlock::Live(1)));
-        // когда Link к exit2 переехал, Commit проходит
-        let r = d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9)), (2, Some(9))]), 2);
-        assert_eq!(r, Ok(0));
-        assert!(d.draining.contains(&5));
-    }
-
-    #[test]
-    fn try_drain_ignores_dead_links_but_counts_connecting_tickets() {
-        let mut d = DrainState::default();
-        let known = [(lid(1), Some(OWN)), (lid(2), None)];
-        // Link 2 мёртв (движок его не знает): ничего не держит; counted = 1 (только Link 1)
-        assert_eq!(d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9))]), 1), Ok(0));
-        d.draining.clear();
-        // билет без пути: неизвестный интерфейс блокирует
-        let t = d.open();
-        assert_eq!(d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9))]), 1), Err(DrainBlock::Unknown(1)));
-        // билет выбрал путь по другому интерфейсу: снимать можно
-        assert!(d.begin_connect(t, 9));
-        assert_eq!(d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9))]), 1), Ok(0));
-        d.draining.clear();
-        // билет выбрал путь по TCP: держит
-        let t2 = d.open();
-        assert!(d.begin_connect(t2, 5));
-        assert_eq!(d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9))]), 1), Err(DrainBlock::Live(1)));
-        // билет получил Link: Link учитывается по факту и один раз
-        d.set_link(t2, lid(3));
-        assert_eq!(d.try_drain(5, &OWN, false, &known, st(&[(1, Some(9)), (3, Some(9))]), 2), Ok(0));
-        d.close(t);
-        d.close(t2);
-        assert!(d.tickets.is_empty());
-    }
-
-    #[test]
-    fn draining_iface_forbids_new_bindings_until_lease_ends() {
-        let mut d = DrainState::default();
-        assert_eq!(d.try_drain(5, &OWN, false, &[], |_| None, 0), Ok(0));
-        let t = d.open();
-        assert!(!d.begin_connect(t, 5), "на снимаемый интерфейс не привязываемся");
-        assert!(d.begin_connect(t, 9), "на другой можно");
-        d.draining.remove(&5); // аренда отпущена
-        assert!(d.begin_connect(t, 5));
-    }
-
-    // Гонка: подключение выбирает путь по TCP одновременно со снятием - либо оно привязано и снятие отказано, либо снятие прошло и подключение отказано
-    #[test]
-    fn drain_vs_connect_race_has_exactly_one_winner() {
-        for _ in 0..400 {
-            let d = Arc::new(Mutex::new(DrainState::default()));
-            let t = d.lock().unwrap().open();
-            let bar = Arc::new(std::sync::Barrier::new(2));
-            let (d2, bar2) = (d.clone(), bar.clone());
-            let conn = std::thread::spawn(move || {
-                bar2.wait();
-                d2.lock().unwrap().begin_connect(t, 5)
-            });
-            bar.wait();
-            // снятие может ждать, пока подключение выберет путь (Unknown), поэтому повторяем как в боевом цикле до первого определённого исхода
-            let drained = loop {
-                let r = d.lock().unwrap().try_drain(5, &OWN, false, &[], |_| None, 0);
-                match r {
-                    Err(DrainBlock::Unknown(_)) => std::thread::yield_now(),
-                    other => break other,
-                }
-            };
-            let bound = conn.join().unwrap();
-            match (bound, drained) {
-                (true, Err(DrainBlock::Live(1))) => {}
-                (false, Ok(0)) => {}
-                other => panic!("оба выиграли или оба проиграли: {other:?}"),
-            }
-        }
-    }
-
-    // старый пир: молчание в ответ на T_PROBEQ -> память на RET_UNSUPPORTED_TTL, потом снова пробуем
-    #[test]
-    fn old_peer_is_remembered_as_unsupported_for_a_while() {
-        let cc = CarrierCtl::new();
-        let t0 = Instant::now();
-        assert!(!cc.ret_unsupported_now(t0));
-        cc.ret_mark_unsupported(t0);
-        assert!(cc.ret_unsupported_now(t0 + Duration::from_secs(60)));
-        assert!(!cc.ret_unsupported_now(t0 + RET_UNSUPPORTED_TTL));
-    }
-
-    // согласование: тела T_PROBEQ/T_PROBER строгие; старый узел (on_control: `_ => {}`) тип 23 просто игнорирует
-    #[test]
-    fn probe_types_are_unused_by_older_message_types() {
-        let all = [T_AUTH_OK, T_AUTH_FAIL, T_USE, T_NBRS, T_OBSERVE, T_CINFO];
-        assert!(!all.contains(&T_PROBEQ) && !all.contains(&T_PROBER) && T_PROBEQ != T_PROBER);
-        assert_ne!(T_PROBEQ, 0x45, "не похож на IPv4-датаграмму");
-    }
 
     #[test]
     fn lxmf_and_pn_destinations_never_enter_incoming_vpn_admission() {
@@ -9531,27 +8301,11 @@ mod qreturn_tests {
         assert!(!vpn_incoming_destination(&vpn, pn.hash()));
     }
 
-    // эхо получает только допущенный клиент: сервер, зачисляемый, неопознанный и безымянный пир - нет
+    // расписание возврата с TCP на QUIC не зависит от зонда: пауза удваивается до потолка, разрешение узла реже расписания
     #[test]
-    fn only_admitted_clients_get_a_probe_grant() {
-        let pk = Some([7u8; 64]);
-        assert!(probe_owner(&info(Role::Client { id: [1; 16], ip: 1 }, false, pk)).is_some());
-        assert!(probe_owner(&info(Role::Client { id: [1; 16], ip: 1 }, true, pk)).is_none(), "зачисление");
-        assert!(probe_owner(&info(Role::Client { id: [1; 16], ip: 1 }, false, None)).is_none(), "ключ не доказан");
-        assert!(probe_owner(&info(Role::Unknown, false, pk)).is_none(), "до допуска");
-        assert!(probe_owner(&info(Role::Server { dest: [2; 16] }, false, pk)).is_none(), "сосед-сервер");
-        let a = probe_owner(&info(Role::Client { id: [1; 16], ip: 1 }, false, Some([7; 64]))).unwrap();
-        let b = probe_owner(&info(Role::Client { id: [1; 16], ip: 1 }, false, Some([8; 64]))).unwrap();
-        assert_ne!(a, b, "владелец - хеш ключа");
-    }
-
-    // зонд не создаёт RNS Link и не меняет бюджет: счётчики эха растут только от разрешённых запросов
-    #[test]
-    fn probe_constants_keep_the_wakeup_schedule() {
-        // зонд заменяет прежнюю попытку возврата: расписание back_off то же
+    fn return_schedule_stays_slower_than_grant_interval() {
         assert_eq!(grown_back_off(120), 240);
         assert_eq!(grown_back_off(TCP_BACK_OFF_MAX_S), TCP_BACK_OFF_MAX_S);
         assert!(qprobe::GRANT_INTERVAL < Duration::from_secs(TCP_BACK_OFF_FIRST_S), "разрешение не ограничивает штатное расписание");
-        assert!(RET_MOVE_TIMEOUT < Duration::from_secs(120));
     }
 }

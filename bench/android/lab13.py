@@ -165,7 +165,7 @@ def make_invite(src, rights, label, nodes="", root=""):
     # Приглашение не попадает в stdout/логи/argv: knothopd пишет его в файл с mode 0600.
     path = f"/state/.invite-{os.getpid()}"
     sh("docker", "exec", src, "knothopd", "invite", "--state", "/state", "--rights", rights,
-       "--label", label, "--out", path, *root_arg, *extra)
+       "--out", path, *root_arg, *extra)
     try:
         r = sh("docker", "exec", src, "cat", path)
         return r.stdout.strip()
