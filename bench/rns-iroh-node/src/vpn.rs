@@ -1402,8 +1402,9 @@ fn silence_cause(is_quic: bool, prefer_tcp: bool, flipped: bool) -> SilenceCause
     }
 }
 
-/// Сколько Link живёт без ответа после переключения носителя на TCP: меньше окна «нет приёма» RNS (12 с), TCP успевает соединиться и подтвердить доставку.
-const SILENCE_GRACE: Duration = Duration::from_secs(10);
+/// Окно восстановления живого клиентского Link: не закрываем его через 3 с только из-за задержки/смены носителя.
+/// Фактический LinkClosed/отзыв прав остаётся немедленным; это не изменение ACK/retransmit/rekey.
+const SILENCE_GRACE: Duration = Duration::from_secs(30);
 /// Сколько после тишины по QUIC TCP-дозвон может подтвердить подозрение: TCP, поднявшийся позже, говорит уже не об этой тишине.
 const SILENCE_CONFIRM: Duration = Duration::from_secs(30);
 /// Второе совпадение тишины по QUIC со сбоем TCP-дозвона за это время считается настоящей блокировкой обоих носителей, а не разовым сбоем сети.
@@ -7775,18 +7776,6 @@ async fn wait_scoped_path(node: &Arc<Node>, gate: &path::PathGate, dest: &Destin
     }
 }
 
-/// Путь до выхода ведёт через наш носитель к нему (прямой путь)? Тогда возвращаем его интерфейс.
-fn direct_carrier_iface(ctx: &ClientCtx, dest: &[u8; 16]) -> Option<usize> {
-    let label = ctx.carriers.lock().unwrap().get(dest).map(|x| x.label.lock().unwrap().clone())?;
-    if label.is_empty() {
-        return None;
-    }
-    let (pq, pt) = (format!("iroh-dg-out-{label}-"), format!("tcp-out-{label}-"));
-    let idx = ctx.node.engine().path_table_entries().iter().find(|p| p.hash == *dest)?.interface_index;
-    let name = ctx.node.engine().interface_stats().iter().find(|i| i.interface_id.0 == idx)?.name.clone();
-    (name.starts_with(&pq) || name.starts_with(&pt)).then_some(idx)
-}
-
 /// Путь до узла и установленный Link (без identify).
 async fn open_link(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usize>) -> Result<(LinkId, Arc<leviculum_std::LinkHandle>)> {
     open_link_wait(ctx, cand, avoid_iface, 6, leviculum_std::api::LinkCipher::Gcm).await
@@ -8022,17 +8011,40 @@ impl ClientCtx {
     fn routing_json(&self, servers: &[CServer]) -> serde_json::Value {
         let rc = self.rcfg.read().unwrap().clone();
         let t = &self.tun;
-        let extras: Vec<serde_json::Value> = t.extra.read().unwrap().iter().map(|(d, x)| serde_json::json!({
-            "d": hex(d), "n": servers.iter().find(|e| e.dest == *d).map(|e| self.shown_name(e)),
-            "age_s": (now_ms() as u64).saturating_sub(x.last_rx_ms.load(Relaxed)) / 1000})).collect();
+        let have: Vec<_> = t.extra.read().unwrap().iter().map(|(d,x)|(*d,x.clone())).collect();
+        let interfaces = self.node.engine().interface_stats();
+        let extras: Vec<serde_json::Value> = have.iter().map(|(d, x)| {
+            let attached = self.node.engine().link_stats(&x.id).and_then(|s|s.attached_interface());
+            let label = attached.and_then(|i|interfaces.iter().find(|v|v.interface_id.0==i))
+                .and_then(|i|i.name.strip_prefix("iroh-dg-out-").or_else(||i.name.strip_prefix("tcp-out-")))
+                .and_then(|n|n.rsplit_once('-').map(|v|v.0));
+            let hop = label.and_then(|label|self.carriers.lock().unwrap().iter().find(|(_,c)|*c.label.lock().unwrap()==label).map(|(d,_)|*d));
+            serde_json::json!({"d":hex(d),"n":servers.iter().find(|e|e.dest==*d).map(|e|self.shown_name(e)),
+                "age_s":(now_ms() as u64).saturating_sub(x.last_rx_ms.load(Relaxed))/1000,
+                "sent_pkts":x.sent_pkts.load(Relaxed),"path_known":hop.is_some(),"via":hop.filter(|hop|hop!=d).map(|hop|hex(&hop))})
+        }).collect();
+        let assignments: Vec<_> = rc.exits().into_iter().map(|d| {
+            let lists: Vec<_> = rc.rules.iter().filter(|r| r.action == route::Action::Exit(d)).map(|r| format!("{}:{}",r.kind,r.name)).collect();
+            let manual = rc.manual.iter().filter(|r| r.action == route::Action::Exit(d)).count();
+            serde_json::json!({"d":hex(&d),"lists":lists,"manual":manual})
+        }).collect();
         let pending: Vec<String> = self.rpending.lock().unwrap().iter().map(|d| hex(d)).collect();
         serde_json::json!({"mode": rc.mode, "on": t.routing.load(Relaxed), "extras": extras, "pending": pending, "report": self.rreport.lock().unwrap().clone(),
-            "extra_pkts": t.rt.extra_pkts.load(Relaxed), "fallback_pkts": t.rt.fallback_pkts.load(Relaxed), "direct_fallback_pkts": t.rt.direct_fallback_pkts.load(Relaxed), "dot_dropped": t.rt.dot_dropped.load(Relaxed)})
+            "assignments":assignments,"extra_pkts": t.rt.extra_pkts.load(Relaxed), "waiting_pkts": t.rt.waiting_pkts.load(Relaxed), "direct_fallback_pkts": t.rt.direct_fallback_pkts.load(Relaxed), "dot_dropped": t.rt.dot_dropped.load(Relaxed)})
     }
 }
 
 /// Раздельное туннелирование клиента: перечитывает `routing.json` и файлы списков, собирает правила и держит дополнительные Link к выходам,
 /// на которые правила шлют трафик. Основной выход выбирает `client_supervisor`; здесь только то, что сверх него.
+fn discover_recovery_path(ctx: &Arc<ClientCtx>, dest: [u8;16], link: LinkId) {
+    let avoid = ctx.node.engine().link_stats(&link).and_then(|s|s.attached_interface());
+    let c = ctx.clone();
+    tokio::spawn(async move {
+        // Только наши носители, общий PathGate (20 с); RNS выбирает обход, а не KnotHop.
+        wait_scoped_path(&c.node, &c.path_gate, &DestinationHash::new(dest), || carrier_ifaces(&c, None), avoid, 8).await;
+    });
+}
+
 async fn route_manager(ctx: Arc<ClientCtx>) {
     let fin = ctx.state.join("fin");
     let cfg_path = ctx.state.join("routing.json");
@@ -8042,6 +8054,7 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
     };
     let mut stamp = Vec::new();
     let mut pacers: HashMap<LinkId, Pacer> = HashMap::new();
+    let mut recovering = HashSet::new();
     let mut seq = 0u32;
     while !fin.exists() {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -8078,10 +8091,17 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
             let step = pacers.entry(x.id).or_insert_with(|| Pacer { last_pkts: pkts, ..Default::default() })
                 .step(now, pkts, x.last_rx_ms.load(Relaxed), acked, CLIENT_KEEPALIVE_S * 1000, ctx.fail_ms.max(3000));
             if step.keepalive_ack { x.last_rx_ms.store(now, Relaxed); }
-            let why = if !wanted.contains(d) { Some("не нужен") } else if closed { Some("закрыт") } else if step.silent_ms >= ctx.fail_ms.max(3000) { Some("нет ответа") } else { None };
+            if step.silent_ms >= ctx.fail_ms.max(3000) {
+                if recovering.insert(x.id) { discover_recovery_path(&ctx, *d, x.id); }
+                if let Some(cc) = ctx.carriers.lock().unwrap().get(d) {
+                    if cc.is_quic() { cc.prefer_tcp.store(true, Relaxed); }
+                }
+            } else { recovering.remove(&x.id); }
+            let why = if !wanted.contains(d) { Some("не нужен") } else if closed { Some("закрыт") } else if step.silent_ms >= ctx.fail_ms.max(3000) + SILENCE_GRACE.as_millis() as u64 { Some("нет ответа") } else { None };
             if let Some(why) = why {
                 ctx.tun.extra.write().unwrap().remove(d);
                 pacers.remove(&x.id);
+                recovering.remove(&x.id);
                 let _ = ctx.node.engine().close_link(&x.id).await;
                 if why != "не нужен" {
                     ctx.sh.note(format!("доп. выход {}: {why}", hex(&d[..4])));
@@ -8108,7 +8128,7 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
                 c2.rpending.lock().unwrap().remove(&d);
                 match r {
                     Ok(Ok((id, handle))) => {
-                        c2.tun.extra.write().unwrap().insert(d, ExtraLink { id, handle, last_rx_ms: Arc::new(std::sync::atomic::AtomicU64::new(now_ms() as u64)) });
+                        c2.tun.extra.write().unwrap().insert(d, ExtraLink { id, handle, last_rx_ms: Arc::new(std::sync::atomic::AtomicU64::new(now_ms() as u64)), sent_pkts: Default::default() });
                         c2.sh.note(format!("доп. выход: {}", cand.name));
                     }
                     other => {
@@ -8160,11 +8180,10 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
     // Рабочий запасной Link живёт и во время проверки выбранного выхода.
     // Неудачная проба не создаёт новый Link к прежнему выходу и не считается сменой.
     let mut active: Option<(CServer, LinkId, Arc<leviculum_std::LinkHandle>)> = None;
+    let mut primary: Option<[u8;16]> = None;
     let mut pending_reason: Option<String> = None;
     let mut seq = 0u32;
     let mut keep_trying: HashMap<[u8; 16], Instant> = HashMap::new();
-    // переходы текущего выхода с транзита на прямой путь: не чаще раза в 5 мин на выход (если прямой путь не держится - не зацикливаемся)
-    let mut direct_retry: HashMap<[u8; 16], Instant> = HashMap::new();
     // QAB-M2: перенос на QUIC не удался, а прежний Link мог быть вытеснен сервером; когда начался перенос; восстановленный выход и время
     let mut pair_delay = 2u64;
     while !fin.exists() {
@@ -8188,12 +8207,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         let want: Option<[u8; 16]> = std::fs::read_to_string(&sel_file).ok().and_then(|t| dest32(t.trim()));
         // выход, на котором только что сменили носитель, идёт первым
         let keep_first: Option<[u8; 16]> = keep_trying.iter().find(|(_, t)| **t > Instant::now()).map(|(d, _)| *d);
-        let mut cands = candidates(&ctx, &banned, want.or(keep_first));
-        if cands.is_empty() && want.is_some() {
-            // выбранный вручную выход недоступен: пока он не вернётся, работаем через лучший из остальных
-            ctx.sh.note(format!("выбранный выход {} недоступен, работаю через лучший из остальных", want.map(|w| hex(&w[..4])).unwrap_or_default()));
-            cands = candidates(&ctx, &banned, None);
-        }
+        let cands = candidates(&ctx, &banned, path::primary_target(want, primary).or(keep_first));
         let mut connected = None;
         for c in cands {
             if let Some(old) = active.as_ref().filter(|a| a.0.dest == c.dest && !keep_trying.get(&c.dest).map(|t| *t > Instant::now()).unwrap_or(false)) {
@@ -8247,18 +8261,23 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             }
         }
         if connected.is_none() {
-            connected = active.clone();
+            connected = active.as_ref().filter(|old| want.or(primary).map_or(true, |d| old.0.dest == d)).cloned();
         }
         let Some((cand, id, handle)) = connected else {
-            *ctx.status.lock().unwrap() = "нет доступных выходов, повторяю".into();
+            *ctx.tun.client_link.write().unwrap() = None;
+            *ctx.cur.lock().unwrap() = None;
+            ctx.publish_service();
+            *ctx.status.lock().unwrap() = "восстанавливаю путь к выбранной ноде; другой выход не подставляется".into();
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         };
         keep_trying.remove(&cand.dest);
         let gen_at_connect = ctx.carriers.lock().unwrap().get(&cand.dest).map(|c| c.generation.load(Relaxed)).unwrap_or(0);
-        let reused = active.as_ref().map(|a| a.1 == id).unwrap_or(false);
+        let old_link = active.as_ref().map(|a| a.1);
+        let reused = old_link == Some(id) && ctx.cur.lock().unwrap().map(|c| c.1) == Some(id);
         let previous_name = active.as_ref().map(|a| a.0.name.clone()).unwrap_or_default();
         active = Some((cand.clone(), id, handle.clone()));
+        primary = Some(cand.dest);
         if !reused {
             *ctx.tun.client_link.write().unwrap() = Some(handle);
             *ctx.tun.main_dest.write().unwrap() = cand.dest;
@@ -8273,17 +8292,15 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                     ctx.failovers.lock().unwrap().push(serde_json::json!({"at_ms": now_ms() as u64, "from": previous_name, "reason": reason}));
                 }
                 let _ = ctx.node.engine().close_link(&old).await;
+            } else if let Some(old) = old_link.filter(|old| *old != id) {
+                let _ = ctx.node.engine().close_link(&old).await;
             }
             ctx.sh.note(format!("текущий выход: {} ({})", cand.name, &hex(&cand.dest)[..8]));
         }
 
         // обслуживание: пинг раз в секунду, смена по просьбе пользователя, отказ -> следующий выход
         let mut pacer = Pacer { last_pkts: ctx.tun.traffic_pkts(), ..Default::default() };
-        let mut better_since: Option<Instant> = None;
-        let mut last_eval = Instant::now();
-        let mut direct_since: Option<Instant> = None;
         let mut sil_grace: Option<Instant> = None;
-        let mut last_direct_check = Instant::now();
         let connected_at = ctx.cur.lock().unwrap().map(|c| c.2).unwrap_or_else(Instant::now);
         let reason = loop {
             if fin.exists() {
@@ -8298,42 +8315,8 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                 Some(format!("выбранный выход {name} недоступен: {why}; повтор через {retry} с; работаю через {}", ctx.shown_name(&cand)))
             });
             *ctx.status.lock().unwrap() = unavailable.unwrap_or_else(|| format!("выход: {}", ctx.shown_name(&cand)));
-            // Auto failover remains RTT/backoff based. Manual selection and rule-based routing
-            // are unchanged; legacy user ranking never reorders candidate exits.
-            if want.is_none() && last_eval.elapsed() >= Duration::from_secs(3) {
-                last_eval = Instant::now();
-                let rtt_of = |d: &[u8; 16]| ctx.rns_rtt(d);
-                let cur_rtt = rtt_of(&cand.dest);
-                let best = candidates(&ctx, &banned, None).into_iter().find(|c| c.dest != cand.dest && rtt_of(&c.dest).is_some());
-                let better = match (cur_rtt, best.as_ref().and_then(|b| rtt_of(&b.dest))) {
-                    (Some(cr), Some(br)) => cr > br * 1.4 && cr - br > 15.0,
-                    _ => false,
-                };
-                if better {
-                    let t0 = *better_since.get_or_insert(Instant::now());
-                    if t0.elapsed() >= Duration::from_secs(15) {
-                        break format!("авто: {} быстрее ({:.0} мс против {:.0} мс)", best.as_ref().map(|b| b.name.clone()).unwrap_or_default(), best.as_ref().and_then(|b| rtt_of(&b.dest)).unwrap_or(0.0), cur_rtt.unwrap_or(0.0));
-                    }
-                } else {
-                    better_since = None;
-                }
-            }
-            // Link к выходу открылся, пока путь шёл через транзит, и так на нём и остаётся (Link не переезжает при смене пути):
-            // пинг складывается из двух плеч. Если прямой путь через наш носитель к этому выходу держится 10 с - переподключаемся к нему же.
-            if last_direct_check.elapsed() >= Duration::from_secs(3) {
-                last_direct_check = Instant::now();
-                let attached = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface());
-                let direct = direct_carrier_iface(&ctx, &cand.dest).filter(|_| ctx.node.hops_to(&DestinationHash::new(cand.dest)) == Some(1));
-                let may = direct_retry.get(&cand.dest).map(|t| t.elapsed() > Duration::from_secs(300)).unwrap_or(true);
-                match (attached, direct) {
-                    (Some(a), Some(dv)) if a != dv && may => {
-                        if direct_since.get_or_insert(Instant::now()).elapsed() >= Duration::from_secs(10) {
-                            break format!("прямой путь к {}: Link шёл через транзит", cand.name);
-                        }
-                    }
-                    _ => direct_since = None,
-                }
-            }
+            // Рабочий Link не меняется из-за рейтинга RTT или появления более короткого пути.
+            // RNS строит путь; новая сессия к ТОЙ ЖЕ конечной ноде нужна только после фактического отказа.
             tokio::time::sleep(Duration::from_millis(250)).await;
             let k = hex(id.as_bytes());
             if let Some(r) = ctx.sh.closed.lock().unwrap().get(&k) {
@@ -8359,10 +8342,12 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                 // или не кончится `SILENCE_GRACE`; тишина без шансов (TCP уже выбран, либо время вышло) - прежний отказ выхода.
                 if sil_grace.is_none() {
                     let cc = ctx.carriers.lock().unwrap().get(&cand.dest).cloned();
-                    if cc.is_some_and(|cc| judge_silence(&cc, false, Instant::now()) == SilenceCause::Quic) {
-                        ctx.sh.note(format!("{}: тишина по QUIC, переключаю носитель на TCP, Link держу", cand.name));
-                        sil_grace = Some(Instant::now() + SILENCE_GRACE);
+                    if let Some(cc) = cc {
+                        let _ = judge_silence(&cc, false, Instant::now());
                     }
+                    ctx.sh.note(format!("{}: восстанавливаю связь, сохраняю Link до {} с", cand.name, SILENCE_GRACE.as_secs()));
+                    discover_recovery_path(&ctx, cand.dest, id);
+                    sil_grace = Some(Instant::now() + SILENCE_GRACE);
                 }
                 if !sil_grace.is_some_and(|u| Instant::now() < u) {
                     break format!("нет ответа {} мс", step.silent_ms);
@@ -8371,10 +8356,8 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                 sil_grace = None;
             }
             if let Some(w) = want {
-                // вернуться к выбранному выходу можно, только если он снова доступен (не забанен и не потерян)
-                let usable = banned.ready(&w, Instant::now())
-                    && ctx.servers.lock().unwrap().iter().any(|e| e.dest == w && e.state != "lost" && (ctx.c13.is_none() || exit_eligible(&ctx, e)));
-                if w != cand.dest && usable {
+                // Явный выбор не разрешает продолжать отправку через старый выход, даже если новый пока недоступен.
+                if w != cand.dest {
                     break "выбор пользователя".to_string();
                 }
             }
@@ -8400,14 +8383,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         if reason == "fin" {
             break;
         }
-        // прямой путь к тому же выходу - как смена по выбору: старый Link держим до нового, без бана
-        let direct_move = reason.starts_with("прямой путь");
-        if direct_move {
-            direct_retry.retain(|_, t| t.elapsed() < Duration::from_secs(300));
-            direct_retry.insert(cand.dest, Instant::now());
-            keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
-        }
-        let user = reason == "выбор пользователя" || reason.starts_with("авто:") || direct_move;
+        let user = reason == "выбор пользователя";
         if user {
             ctx.sh.note(format!("проверка выхода: {reason}"));
             pending_reason = Some(reason.clone());
@@ -8460,6 +8436,14 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
 #[cfg(test)]
 mod carrier_tests {
     use super::*;
+
+    #[test]
+    fn established_exit_is_sticky_and_only_manual_choice_overrides_it() {
+        assert_eq!(path::primary_target(None, Some([0xaa;16])), Some([0xaa;16]));
+        assert_eq!(path::primary_target(Some([0xbb;16]), Some([0xaa;16])), Some([0xbb;16]));
+        assert_eq!(path::primary_target(None,None), None);
+        assert!(SILENCE_GRACE >= Duration::from_secs(25), "TCP handshake and discovery must get time to recover");
+    }
 
     #[test]
     fn lxmf_and_pn_destinations_never_enter_incoming_vpn_admission() {

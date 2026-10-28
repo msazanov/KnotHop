@@ -103,6 +103,11 @@ public final class MyNodeActivity extends Activity {
         box.addView(rename);
         text("Узлы сети узнают новое имя при следующем подключении телефона к выходу.", 12, false, GREY);
         fingerprint(me);
+        Button policy = new Button(this);
+        policy.setAllCaps(false);
+        policy.setText("Мои права в сетях");
+        policy.setOnClickListener(v -> { Ui.tick(v); startActivity(new android.content.Intent(this, PolicyActivity.class)); });
+        box.addView(policy);
         int mine = view.optInt("my_rights", 0);
         boolean canAdd = view.optBoolean("can_add", false), canRemove = view.optBoolean("can_remove", false);
         text("\nМои права в моей сети", 16, true, 0);

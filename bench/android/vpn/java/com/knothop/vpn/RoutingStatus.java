@@ -42,7 +42,7 @@ final class RoutingStatus {
     final Map<String, Long> extraAge = new HashMap<>();
     final List<String> pending = new ArrayList<>();
     final boolean rulesOn;
-    final long extraPkts, fallbackPkts;
+    final long extraPkts, fallbackPkts, waitingPkts;
 
     private RoutingStatus(boolean active, boolean error, JSONObject j, String selected) {
         this.active = active;
@@ -50,7 +50,7 @@ final class RoutingStatus {
         this.haveData = j != null;
         String cd = "", cn = "";
         boolean on = false;
-        long ex = 0, fb = 0;
+        long ex = 0, fb = 0, waiting = 0;
         JSONArray raw = null;
         if (j != null) {
             JSONObject cur = j.optJSONObject("current");
@@ -77,6 +77,7 @@ final class RoutingStatus {
                 on = r.optBoolean("on");
                 ex = r.optLong("extra_pkts");
                 fb = r.optLong("fallback_pkts") + r.optLong("direct_fallback_pkts");
+                waiting = r.optLong("waiting_pkts");
                 JSONArray xs = r.optJSONArray("extras");
                 for (int i = 0; xs != null && i < xs.length(); i++) {
                     JSONObject x = xs.optJSONObject(i);
@@ -95,6 +96,7 @@ final class RoutingStatus {
         rulesOn = on;
         extraPkts = ex;
         fallbackPkts = fb;
+        waitingPkts = waiting;
         selectedDest = selected;
     }
 

@@ -68,9 +68,9 @@ final class RoutingIssues {
             String d = e.getKey().toLowerCase(Locale.ROOT);
             String who = lb.nameOf(d);
             if (!lb.known(d)) {
-                out.add(new Issue(true, "Выход " + who + " не найден среди известных (правил: " + e.getValue() + "). Пока он не появится, такой трафик идёт через выход по умолчанию."));
+                out.add(new Issue(true, "Выход " + who + " не найден среди известных (правил: " + e.getValue() + "). До его появления трафик этих правил не отправляется через другие ноды."));
             } else if (st.unavailable(d)) {
-                out.add(new Issue(true, "Выход " + who + " сейчас недоступен (правил: " + e.getValue() + "): такой трафик временно идёт через выход по умолчанию."));
+                out.add(new Issue(true, "Выход " + who + " сейчас недоступен (правил: " + e.getValue() + "). Восстанавливаем путь к нему; подмена другим выходом запрещена."));
             } else if (st.active && st.haveData && !d.equals(st.currentDest) && !st.extraAge.containsKey(d) && !st.pending.contains(d)) {
                 out.add(new Issue(false, "Дополнительное соединение с выходом " + who + " ещё не поднято (правил: " + e.getValue() + ")."));
             }

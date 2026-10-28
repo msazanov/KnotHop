@@ -49,6 +49,7 @@ import java.util.Locale;
  * «мимо VPN»: они задают исключённые маршруты туннеля и применяются при следующем подключении.
  */
 public class RoutingActivity extends Activity {
+    static final String EXTRA_TARGET = "routing_target", EXTRA_NAME = "routing_name";
     private static final int GREEN = 0xFF1F7A3A, GREY = 0xFF555555, TEXT = 0xFF222222, WARN = 0xFF8A4B00;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private File files, state, rstate;
@@ -66,12 +67,18 @@ public class RoutingActivity extends Activity {
     private long importTried = -1;
     private boolean resumed, showDetails;
     private String downloadResult, renderSig = "";
+    private String target = "", targetName = "";
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         files = getFilesDir();
         state = new File(files, "state");
+        String chosen = getIntent().getStringExtra(EXTRA_TARGET);
+        if (chosen != null && chosen.matches("[0-9a-fA-F]{32}")) {
+            target = chosen.toLowerCase(Locale.ROOT);
+            targetName = RightsEditor.clip(getIntent().getStringExtra(EXTRA_NAME));
+        }
         rstate = new File(files, "rstate");
         rstate.mkdirs();
         sv = new ScrollView(this);
@@ -82,6 +89,7 @@ public class RoutingActivity extends Activity {
         sv.addView(root);
         setContentView(sv);
         RoutingCfg.migrateLegacy(state);
+        RoutingCfg.ensureDefaults(state);
         load();
         render();
         labIntent();
@@ -220,17 +228,22 @@ public class RoutingActivity extends Activity {
         issues = collectIssues();
         root.removeAllViews();
         detailsView = null;
-        root.addView(NodeTabs.bar(this, NodeTabs.ROUTING));
-        TextView title = text("Маршрутизация", 22, true, 0xFF000000);
+        if (target.isEmpty()) root.addView(NodeTabs.bar(this, NodeTabs.ROUTING));
+        TextView title = text(target.isEmpty() ? "Маршрутизация" : "Маршруты через " + (targetName.isEmpty() ? lb.nameOf(target) : targetName), 22, true, 0xFF000000);
         if (Build.VERSION.SDK_INT >= 28) title.setAccessibilityHeading(true);
         root.addView(title);
         root.addView(note("Изменения сохраняются сразу."));
         renderLegacyBanner();
-        renderMode();
+        if (target.isEmpty()) renderMode();
+        else {
+            root.addView(note("Здесь только правила с выходом через эту ноду. Другие правила телефона сохраняются."));
+            if (!cfg.mode.equals(RoutingCfg.MODE_RULES)) root.addView(button("Включить маршрутизацию по правилам", v -> { cfg.mode = RoutingCfg.MODE_RULES; saveAndRender(); }));
+            root.addView(button("Все правила телефона", v -> startActivity(new android.content.Intent(this, RoutingActivity.class))));
+        }
         renderTemplates();
-        renderDefaultExit();
+        if (target.isEmpty()) renderDefaultExit();
         renderIssues();
-        if (cfg.mode.equals(RoutingCfg.MODE_RULES)) {
+        if (!target.isEmpty() || cfg.mode.equals(RoutingCfg.MODE_RULES)) {
             root.addView(note(RoutingLabels.ORDER_NOTE));
             renderManual();
             renderLists();
@@ -244,13 +257,17 @@ public class RoutingActivity extends Activity {
         sv.post(() -> sv.scrollTo(0, scroll));
     }
 
-    // ---------------------------------------------------------------- шаблоны и импорт v2rayN
+    // ---------------------------------------------------------------- шаблоны и совместимый импорт JSON
 
     private void renderTemplates() {
         root.addView(section("Шаблоны и импорт"));
-        root.addView(note("Готовые наборы правил и импорт правил v2rayN (JSON). Добавляются к имеющимся и включают режим «По правилам»."));
-        root.addView(button("Шаблоны правил…", v -> pickTemplate()));
-        root.addView(button("Импорт из v2rayN…", v -> importDialog("")));
+        root.addView(note("Готовые наборы и совместимый JSON-импорт. Неподдерживаемые условия перечисляются до сохранения."));
+        if (target.isEmpty()) root.addView(button("Локальные сети и РФ напрямую", v -> {
+            try { confirmImport(RoutingImport.parse(RoutingImport.TEMPLATES[2].json), RoutingImport.TEMPLATES[2].title, RoutingImport.TEMPLATES[2].note); }
+            catch (Exception e) { Toast.makeText(this, "Шаблон не разобран", Toast.LENGTH_LONG).show(); }
+        }));
+        if (target.isEmpty()) root.addView(button("Шаблоны правил…", v -> pickTemplate()));
+        root.addView(button("Импорт правил JSON…", v -> importDialog("")));
     }
 
     private void pickTemplate() {
@@ -274,7 +291,7 @@ public class RoutingActivity extends Activity {
         e.setTextSize(12);
         e.setHint("[{\"outboundTag\":\"direct\",\"domain\":[\"geosite:category-ru\"]}, …]");
         e.setText(prefill);
-        AlertDialog dlg = new AlertDialog.Builder(this).setTitle("Импорт правил v2rayN").setView(e)
+        AlertDialog dlg = new AlertDialog.Builder(this).setTitle("Импорт правил JSON").setView(e)
                 .setNeutralButton("Вставить", null)
                 .setNegativeButton("Отмена", null)
                 .setPositiveButton("Далее", null).create();
@@ -288,7 +305,7 @@ public class RoutingActivity extends Activity {
                 try {
                     RoutingImport.Result r = RoutingImport.parse(e.getText().toString());
                     dlg.dismiss();
-                    confirmImport(r, "Импорт v2rayN", "");
+                    confirmImport(r, "Импорт правил", "");
                 } catch (Exception ex) {
                     e.setError("Не JSON-массив правил: " + ex.getMessage());
                 }
@@ -298,10 +315,15 @@ public class RoutingActivity extends Activity {
     }
 
     private void confirmImport(RoutingImport.Result r, String title, String intro) {
+        final RoutingImport.Result imported = target.isEmpty() ? r : RoutingImport.forTarget(r, target);
+        r = imported;
         StringBuilder m = new StringBuilder();
         if (!intro.isEmpty()) m.append(intro).append("\n\n");
         m.append("Будет перенесено записей: ").append(r.count()).append(" (списки: ").append(r.rules.size()).append(", свои адреса и домены: ").append(r.manual.size()).append(")\n");
-        m.append("\nПорядок KnotHop: свои записи перед списками; подсети «напрямую» исключаются из VPN системно. Порядок исходного v2rayN может отличаться.\n");
+        m.append("\nПорядок KnotHop: свои записи перед списками; подсети «напрямую» исключаются из VPN системно. Порядок исходного JSON может отличаться.\n");
+        if (!target.isEmpty()) m.append("\nВыход для добавляемых правил: ").append(targetName.isEmpty() ? lb.nameOf(target) : targetName).append(". Правила direct относятся ко всему телефону и здесь не импортируются.\n");
+        int conflicts = RoutingImport.conflicts(cfg, r);
+        if (conflicts > 0) m.append("\nБудет переназначено существующих правил: ").append(conflicts).append(". Их прежние действия заменятся.\n");
         if (r.siteDirect > 0) m.append("\nПравил для сайтов «мимо VPN»: ").append(r.siteDirect).append(". Мимо туннеля работают только подсети, трафик сайтов пойдёт через выход по умолчанию.\n");
         if (!r.skipped.isEmpty()) {
             m.append("\nПропущено: ").append(r.skipped.size()).append('\n');
@@ -309,10 +331,10 @@ public class RoutingActivity extends Activity {
         }
         AlertDialog.Builder b = new AlertDialog.Builder(this).setTitle(title).setMessage(m.toString().trim()).setNegativeButton("Отмена", null);
         if (r.count() > 0) {
-            b.setPositiveButton("Добавить", (d, w) -> {
-                int n = RoutingImport.apply(cfg, r);
+            b.setPositiveButton(conflicts > 0 ? "Переназначить и добавить" : "Добавить", (d, w) -> {
+                int n = RoutingImport.apply(cfg, imported);
                 saveAndRender();
-                String extra = RulesFiles.present(files) || !needsLists(r) ? "" : ". Для списков загрузите файлы (раздел «Файлы списков»)";
+                String extra = RulesFiles.present(files) || !needsLists(imported) ? "" : ". Потяните главный экран вниз, чтобы загрузить геоданные";
                 Toast.makeText(this, "Добавлено записей: " + n + extra, Toast.LENGTH_LONG).show();
             });
         }
@@ -401,7 +423,7 @@ public class RoutingActivity extends Activity {
         } else {
             root.addView(note(st.active && !st.selectedDest.isEmpty() ? RoutingLabels.DEFAULT_EXIT_PICKED : RoutingLabels.DEFAULT_EXIT_AUTO));
         }
-        root.addView(button("Выбрать выход на главном экране", v -> finish()));
+        root.addView(button("Выбрать ноду на главном экране", v -> finish()));
     }
 
     // ---------------------------------------------------------------- предупреждения
@@ -421,6 +443,7 @@ public class RoutingActivity extends Activity {
     private interface Pick { void on(String action); }
 
     private void pickAction(boolean allowDirect, Pick cb) {
+        if (!target.isEmpty()) { cfg.mode = RoutingCfg.MODE_RULES; cb.on("exit:" + target); return; }
         List<String> acts = new ArrayList<>(), labels = new ArrayList<>();
         acts.add("default");
         labels.add("Выход по умолчанию");
@@ -488,8 +511,8 @@ public class RoutingActivity extends Activity {
         List<String> labels = new ArrayList<>();
         List<Integer> ids = new ArrayList<>();
         labels.add("Изменить, куда отправлять…"); ids.add(0);
-        if (index > 0) { labels.add("Проверять раньше (выше)"); ids.add(1); }
-        if (index < size - 1) { labels.add("Проверять позже (ниже)"); ids.add(2); }
+        if (target.isEmpty() && index > 0) { labels.add("Проверять раньше (выше)"); ids.add(1); }
+        if (target.isEmpty() && index < size - 1) { labels.add("Проверять позже (ниже)"); ids.add(2); }
         labels.add(enabled ? "Выключить" : "Включить"); ids.add(3);
         labels.add("Удалить…"); ids.add(4);
         new AlertDialog.Builder(this).setTitle(title)
@@ -518,6 +541,7 @@ public class RoutingActivity extends Activity {
         for (int i = 0; i < cfg.manual.size(); i++) {
             final int k = i;
             final RoutingCfg.Manual m = cfg.manual.get(i);
+            if (!target.isEmpty() && !m.action.equals("exit:" + target)) continue;
             String title = m.value.length() > 60 ? m.value.substring(0, 60) + "…" : m.value;
             String sub = (m.ip() ? "подсеть/IP" : "домен") + " → " + lb.action(m.action);
             root.addView(ruleRow(title, sub, m.enabled, m.valid() && RoutingCfg.cleanManual(m.value) != null, on -> { m.enabled = on; saveAndRender(); }, () ->
@@ -580,6 +604,13 @@ public class RoutingActivity extends Activity {
                 final boolean ips = allIp;
                 dlg.dismiss();
                 pickAction(ips, a -> {
+                    RoutingImport.Result incoming = new RoutingImport.Result();
+                    for (String line : lines) incoming.manual.add(new RoutingCfg.Manual(line, a));
+                    int conflicts = RoutingImport.conflicts(cfg, incoming);
+                    if (conflicts > 0) {
+                        confirmImport(incoming, "Переназначить адреса?", "Эти условия уже используются в других правилах: " + conflicts);
+                        return;
+                    }
                     int skipped = 0;
                     for (String s : lines) {
                         boolean dup = false;
@@ -605,6 +636,7 @@ public class RoutingActivity extends Activity {
         for (int i = 0; i < cfg.rules.size(); i++) {
             final int k = i;
             final RoutingCfg.Rule r = cfg.rules.get(i);
+            if (!target.isEmpty() && !r.action.equals("exit:" + target)) continue;
             String title = RoutingLabels.ruleTitle(r);
             root.addView(ruleRow(title, "→ " + lb.action(r.action), r.enabled, r.valid(), on -> { r.enabled = on; saveAndRender(); }, () ->
                     itemMenu(title, k, cfg.rules.size(), r.enabled, item -> {
@@ -620,12 +652,20 @@ public class RoutingActivity extends Activity {
         LinearLayout acts = new LinearLayout(this);
         acts.setOrientation(LinearLayout.HORIZONTAL);
         acts.addView(button("Добавить список", v -> addRuleDialog()), weight());
-        acts.addView(button("Шаблоны", v -> presets()), weight());
+        if (target.isEmpty()) acts.addView(button("Шаблоны", v -> presets()), weight());
         root.addView(acts);
     }
 
     private void putRule(String type, String name, String action) {
-        for (RoutingCfg.Rule r : cfg.rules) if (r.type.equals(type) && r.name.equalsIgnoreCase(name)) { r.action = action; r.enabled = true; return; }
+        for (RoutingCfg.Rule r : cfg.rules) if (r.type.equals(type) && r.name.equalsIgnoreCase(name)) {
+            if (!target.isEmpty() && !r.action.equals(action)) {
+                new AlertDialog.Builder(this).setTitle("Переназначить правило?")
+                        .setMessage(type + ":" + name + " сейчас: " + lb.action(r.action) + ". Перенести на эту ноду?")
+                        .setPositiveButton("Переназначить", (d, w) -> { r.action = action; r.enabled = true; saveAndRender(); })
+                        .setNegativeButton("Отмена", null).show();
+            } else { r.action = action; r.enabled = true; }
+            return;
+        }
         if (cfg.rules.size() < RoutingCfg.MAX_RULES) cfg.rules.add(new RoutingCfg.Rule(type, name, action));
         else Toast.makeText(this, "Не больше " + RoutingCfg.MAX_RULES + " правил по спискам", Toast.LENGTH_SHORT).show();
     }
@@ -813,6 +853,7 @@ public class RoutingActivity extends Activity {
             }
             if (!st.pending.isEmpty()) s.append("Поднимаю доп. выходов: ").append(st.pending.size()).append('\n');
             s.append("Пакетов по правилам: ").append(st.extraPkts).append(", ушли через выход по умолчанию вместо правила: ").append(st.fallbackPkts).append('\n');
+            s.append("Не отправлено до восстановления целевой ноды: ").append(st.waitingPkts).append('\n');
         }
         return s.toString().trim();
     }

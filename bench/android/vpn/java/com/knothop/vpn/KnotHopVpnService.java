@@ -133,6 +133,7 @@ public class KnotHopVpnService extends VpnService {
         Util.lab("service run() start");
         try {
             migrateLegacyRoutingBeforeNative();
+            RoutingCfg.ensureDefaults(state);
             Profile prof = Profile.parse(getSharedPreferences("p", MODE_PRIVATE).getString("profile", ""));
             File pf = new File(state, "profile.txt");
             Files.write(pf.toPath(), prof.raw.getBytes(StandardCharsets.UTF_8));

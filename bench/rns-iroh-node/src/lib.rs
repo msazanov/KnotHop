@@ -1870,14 +1870,15 @@ struct ExtraLink {
     handle: Arc<leviculum_std::LinkHandle>,
     /// время (мс unix) последнего пакета с этого Link
     last_rx_ms: Arc<std::sync::atomic::AtomicU64>,
+    sent_pkts: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Default)]
 struct RouteCounters {
     /// пакеты, ушедшие по дополнительному Link
     extra_pkts: std::sync::atomic::AtomicU64,
-    /// правило велело идти через выход, к которому Link ещё не поднят: пакет ушёл через основной
-    fallback_pkts: std::sync::atomic::AtomicU64,
+    /// Целевая нода правила недоступна: пакет НЕ отправлен через чужой выход.
+    waiting_pkts: std::sync::atomic::AtomicU64,
     /// правило велело идти мимо туннеля, но адрес известен только по домену: пакет ушёл через основной
     direct_fallback_pkts: std::sync::atomic::AtomicU64,
     /// отброшенные пакеты на порт 853 (DoT скрывает DNS-ответы от доменных правил)
@@ -2380,10 +2381,12 @@ async fn tun_reader(tun: Arc<TunState>, _node: Arc<Node>, sh: Arc<Shared>) {
                                 l = Some(x.handle.clone());
                                 on_main = false;
                                 tun.rt.extra_pkts.fetch_add(1, Relaxed);
+                                x.sent_pkts.fetch_add(1, Relaxed);
                             }
                             None => {
-                                if *tun.main_dest.read().unwrap() != d {
-                                    tun.rt.fallback_pkts.fetch_add(1, Relaxed);
+                                if !route::main_allowed(act, *tun.main_dest.read().unwrap()) {
+                                    tun.rt.waiting_pkts.fetch_add(1, Relaxed);
+                                    continue;
                                 }
                             }
                         },

@@ -32,22 +32,35 @@ final class RulesFiles {
     }
 
     /** Скачать оба файла; возвращает пустую строку при успехе, иначе причину. Вызывать не из главного потока. */
-    static String download(File filesDir, Progress p) {
+    static synchronized String download(File filesDir, Progress p) {
+        return download(filesDir, p, BASES);
+    }
+
+    /** Раздельный аргумент источников нужен локальному HTTP-тесту; UI всегда использует закреплённые HTTPS-источники. */
+    static synchronized String download(File filesDir, Progress p, String[] bases) {
         File d = dir(filesDir);
         d.mkdirs();
         for (String name : NAMES) {
             String want = null;
-            for (String b : BASES) {
+            for (String b : bases) {
                 want = fetchSum(b + name + ".sha256sum");
                 if (want != null) break;
             }
+            if (want == null) return name + ": не удалось получить контрольную сумму; прежний файл сохранён";
+            File current = new File(d, name);
+            try {
+                if (current.isFile() && current.length() > 0 && want.equals(hash(current))) {
+                    p.on(name + ": уже актуален");
+                    continue;
+                }
+            } catch (Exception ignored) { }
             String err = "";
             boolean ok = false;
-            for (String b : BASES) {
+            for (String b : bases) {
                 File part = new File(d, name + ".part");
                 try {
                     String got = get(b + name, part, name, p);
-                    if (want != null && !want.equals(got)) throw new Exception("не сошлась контрольная сумма");
+                    if (part.length() == 0 || !want.equals(got)) throw new Exception("не сошлась контрольная сумма");
                     Files.move(part.toPath(), new File(d, name).toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
                     ok = true;
                     break;
@@ -59,6 +72,18 @@ final class RulesFiles {
             if (!ok) return err;
         }
         return "";
+    }
+
+    private static String hash(File file) throws Exception {
+        if (file.length() > MAX_BYTES) return "";
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        try (InputStream in = Files.newInputStream(file.toPath())) {
+            byte[] b = new byte[1 << 16]; int n;
+            while ((n = in.read(b)) > 0) md.update(b, 0, n);
+        }
+        StringBuilder out = new StringBuilder();
+        for (byte b : md.digest()) out.append(String.format("%02x", b));
+        return out.toString();
     }
 
     private static String fetchSum(String url) {

@@ -1,6 +1,6 @@
 package com.knothop.vpn;
 
-/** JVM-only: тот же пример v2rayN, что в шаблоне, и ограничения импорта. */
+/** JVM-only: совместимый JSON, шаблоны и ограничения импорта. */
 public final class RoutingImportCheck {
     private static void require(boolean ok, String why) { if (!ok) throw new AssertionError(why); }
 
@@ -8,7 +8,7 @@ public final class RoutingImportCheck {
         RoutingImport.Result lan = RoutingImport.parse(RoutingImport.TEMPLATES[0].json);
         require(lan.manual.size() == 4 && lan.rules.isEmpty() && lan.skipped.isEmpty(), "LAN without lists");
         RoutingImport.Result ru = RoutingImport.parse(RoutingImport.TEMPLATES[2].json);
-        require(ru.count() == 4 && ru.skipped.size() == 2 && ru.siteDirect == 2, "v2rayN example: 4 imported, protocol/block skipped");
+        require(ru.count() == 4 && ru.skipped.size() == 2 && ru.siteDirect == 2, "compatible example: 4 imported, protocol/block skipped");
         RoutingCfg cfg = new RoutingCfg();
         require(RoutingImport.apply(cfg, ru) == 4 && cfg.mode.equals("rules"), "apply enables rules");
         RoutingImport.apply(cfg, ru);

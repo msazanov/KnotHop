@@ -48,6 +48,11 @@ impl Action {
     }
 }
 
+/// Явное назначение ноды нельзя подменять текущим выходом, пока её Link недоступен.
+pub fn main_allowed(action: Action, main: [u8; 16]) -> bool {
+    match action { Action::Exit(wanted) => wanted == main, _ => true }
+}
+
 // ---------- формат .dat (protobuf) ----------
 
 enum Val<'a> {
@@ -240,14 +245,13 @@ pub struct ManualCfg {
 pub struct Cfg {
     /// "auto" | "rules"; legacy "priority" configs normalize to "auto".
     pub mode: String,
-    pub priority: Vec<[u8; 16]>,
     pub rules: Vec<RuleCfg>,
     pub manual: Vec<ManualCfg>,
 }
 
 impl Default for Cfg {
     fn default() -> Cfg {
-        Cfg { mode: "auto".into(), priority: Vec::new(), rules: Vec::new(), manual: Vec::new() }
+        Cfg { mode: "auto".into(), rules: Vec::new(), manual: Vec::new() }
     }
 }
 
@@ -255,9 +259,7 @@ impl Cfg {
     pub fn parse(s: &str) -> Cfg {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else { return Cfg::default() };
         let mode = if v["mode"].as_str() == Some("rules") { "rules".to_string() } else { "auto".to_string() };
-        // Retain the legacy field in the in-memory type for source compatibility, but do not parse
-        // or export user exit rankings. Rules remain independent and keep their own precedence.
-        let priority = Vec::new();
+        // Поле старого рейтинга не разбирается и в рабочей модели отсутствует.
         let rules = v["rules"].as_array().map(|a| a.iter().filter_map(|x| {
             let kind = x["t"].as_str().filter(|t| *t == "geosite" || *t == "geoip")?.to_string();
             let name = x["n"].as_str().filter(|n| !n.is_empty() && n.len() <= 80)?.to_string();
@@ -267,7 +269,7 @@ impl Cfg {
             let value = x["v"].as_str().map(str::trim).filter(|n| !n.is_empty() && n.len() <= 253)?.to_string();
             Some(ManualCfg { value, action: Action::parse(x["a"].as_str()?)? })
         }).take(MAX_MANUAL).collect()).unwrap_or_default();
-        Cfg { mode, priority, rules, manual }
+        Cfg { mode, rules, manual }
     }
 
     pub fn load(state: &Path) -> Cfg {
@@ -793,6 +795,14 @@ mod tests {
         Action::Exit([0xaa; 16])
     }
 
+    #[test]
+    fn explicit_exit_never_falls_back_to_another_main() {
+        assert!(main_allowed(exit_a(), [0xaa;16]));
+        assert!(!main_allowed(exit_a(), [0xbb;16]));
+        assert!(!main_allowed(exit_a(), [0;16]));
+        assert!(main_allowed(Action::Default, [0xbb;16]));
+    }
+
     fn dns_reply(q: &str, ips: &[[u8; 4]]) -> Vec<u8> {
         let mut m = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, ips.len() as u8, 0, 0, 0, 0];
         for l in q.split('.') {
@@ -842,7 +852,6 @@ mod tests {
         std::fs::write(d.join("geoip.dat"), geoip(&[("RU", vec![([10, 0, 0, 0], 8)]), ("BIG", vec![([10, 1, 0, 0], 16)])])).unwrap();
         let cfg = Cfg {
             mode: "rules".into(),
-            priority: vec![],
             rules: vec![
                 RuleCfg { kind: "geoip".into(), name: "ru".into(), action: Action::Direct },
                 RuleCfg { kind: "geoip".into(), name: "BIG".into(), action: exit_a() },
@@ -866,7 +875,6 @@ mod tests {
         std::fs::write(d.join("geosite.dat"), geosite(&[("YOUTUBE", vec![(2, "youtube.com"), (3, "yt.be")])])).unwrap();
         let cfg = Cfg {
             mode: "rules".into(),
-            priority: vec![],
             rules: vec![RuleCfg { kind: "geosite".into(), name: "youtube".into(), action: exit_a() }],
             manual: vec![ManualCfg { value: "domain:example.org".into(), action: Action::Direct }],
         };
@@ -960,10 +968,8 @@ mod tests {
         assert_eq!(c.manual[0].value, "a.com");
         assert_eq!(c.exits(), vec![[0xaa; 16]]);
         assert_eq!(Cfg::parse("{not json").mode, "auto");
-        assert!(c.priority.is_empty(), "legacy rankings are ignored");
         let legacy = Cfg::parse(r#"{"mode":"priority","priority":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}"#);
         assert_eq!(legacy.mode, "auto");
-        assert!(legacy.priority.is_empty());
     }
 
     #[test]
@@ -982,7 +988,6 @@ mod tests {
         }"#;
         let cfg = Cfg::parse(JAVA_JSON);
         assert_eq!(cfg.mode, "rules");
-        assert!(cfg.priority.is_empty());
         assert_eq!(cfg.rules.len(), 2, "off_rules must never become active native rules");
         assert_eq!(cfg.rules[0].name, "FIRST");
         assert_eq!(cfg.rules[1].name, "SECOND");
@@ -1003,7 +1008,6 @@ mod tests {
 
         let old = Cfg::parse(r#"{"mode":"priority","priority":["11111111111111111111111111111111"],"rules":[{"t":"geoip","n":"FIRST","a":"direct"}]}"#);
         assert_eq!(old.mode, "auto");
-        assert!(old.priority.is_empty(), "old exit ranking never affects selection");
         assert_eq!(old.rules.len(), 1, "legacy mode does not delete the rule data");
     }
 
@@ -1024,7 +1028,6 @@ mod tests {
         }
         let cfg = Cfg {
             mode: "rules".into(),
-            priority: vec![],
             rules: vec![
                 RuleCfg { kind: "geoip".into(), name: "RU".into(), action: Action::Direct },
                 RuleCfg { kind: "geosite".into(), name: "YOUTUBE".into(), action: exit_a() },

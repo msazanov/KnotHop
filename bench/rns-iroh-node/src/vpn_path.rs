@@ -65,6 +65,11 @@ pub(super) fn link_timed_out(now: Instant, authenticated_rx: Option<Instant>, ti
     authenticated_rx.map(|t| now.saturating_duration_since(t) > timeout).unwrap_or(true)
 }
 
+/// После первого допуска сохраняем конечную ноду. Отказ пути не разрешает подставлять другой выход.
+pub(super) fn primary_target(manual: Option<[u8;16]>, established: Option<[u8;16]>) -> Option<[u8;16]> {
+    manual.or(established)
+}
+
 /// Отступ относится к выходу, а не к текущему запасному Link. Истечение паузы
 /// разрешает пробу, но само по себе не доказывает восстановление выхода.
 #[derive(Default)]

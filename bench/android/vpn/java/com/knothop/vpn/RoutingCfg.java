@@ -82,6 +82,19 @@ final class RoutingCfg {
 
     static File file(File state) { return new File(state, "routing.json"); }
 
+    /** Начальные настройки только для ещё не настроенного телефона. Никогда не заменяем существующий (даже повреждённый) файл пользователя. */
+    static synchronized boolean ensureDefaults(File state) {
+        if (file(state).exists()) return false;
+        RoutingCfg c = new RoutingCfg();
+        c.mode = MODE_RULES;
+        for (String cidr : new String[]{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"}) c.manual.add(new Manual(cidr, "direct"));
+        c.rules.add(new Rule("geoip", "private", "direct"));
+        c.rules.add(new Rule("geosite", "private", "direct"));
+        c.rules.add(new Rule("geosite", "category-ru", "direct"));
+        c.rules.add(new Rule("geoip", "ru", "direct"));
+        return c.save(state).isEmpty();
+    }
+
     // ---------------------------------------------------------------- чтение
 
     static RoutingCfg load(File state) {

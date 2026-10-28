@@ -140,20 +140,10 @@ public class MainActivity extends Activity {
         header = new TextView(this);
         header.setTextSize(13);
         mainBox.addView(header);
-        Button rightsBtn = new Button(this);
-        rightsBtn.setText("Мои права");
-        rightsBtn.setAllCaps(false);
-        rightsBtn.setOnClickListener(v -> { Ui.tick(v); startActivity(new Intent(this, PolicyActivity.class)); });
-        mainBox.addView(rightsBtn);
         nodesMsg = new TextView(this);
         nodesMsg.setTextSize(12);
         nodesMsg.setText("Потяните страницу вниз, чтобы обновить ноды и права");
         mainBox.addView(nodesMsg);
-        Button updBtn = new Button(this);
-        updBtn.setText("Проверить обновление");
-        updBtn.setAllCaps(false);
-        updBtn.setOnClickListener(v -> { Ui.tick(v); checkUpdate(true); });
-        mainBox.addView(updBtn);
         updMsg = new TextView(this);
         updMsg.setTextSize(12);
         updMsg.setText("Версия " + installedName() + " (" + installedCode() + ")");
@@ -186,7 +176,7 @@ public class MainActivity extends Activity {
         status.setTypeface(Typeface.MONOSPACE);
         mainBox.addView(status);
         topo = new TopologyView(this);
-        topo.setOnPick((dest, name) -> { select(dest); Util.lab("PICK " + name + " " + dest); android.widget.Toast.makeText(this, "Выход: " + name, android.widget.Toast.LENGTH_SHORT).show(); });
+        topo.setOnPick((dest, name) -> openNodeAdmin(dest, name, ""));
         topo.setOnLongPick((dest, name) -> openNodeAdmin(dest, name, ""));
         topo.setOnPhonePick(() -> startActivity(new Intent(this, MyNodeActivity.class)));
         mainBox.addView(topo, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 600));
@@ -585,26 +575,45 @@ public class MainActivity extends Activity {
      * Потяни-чтобы-обновить: права и список нод (расписки), внеочередной анонс, проверка связи со всеми нодами, обновление скачанных
      * списков маршрутов, если они старше суток. Нужен включённый режим «Сеть» или «VPN»: узел работает только в них.
      */
+    private TextView geoMsg;
+    private volatile boolean geoBusy;
+
     private void pullRefresh() {
+        checkUpdate(true);
+        refreshGeo();
         if (!active()) {
-            android.widget.Toast.makeText(this, "Сначала включите режим «Сеть» или «VPN»", android.widget.Toast.LENGTH_SHORT).show();
+            android.widget.Toast.makeText(this, "Геоданные и версия проверяются. Для опроса нод включите «Сеть» или «VPN»", android.widget.Toast.LENGTH_SHORT).show();
             return;
         }
         refreshNodes();
         Native.kick(0);
         Native.kick(1);
-        final File files = getFilesDir();
-        final File rstate = new File(files, "state");
-        File g = new File(RulesFiles.dir(files), "geoip.dat");
-        if (RulesFiles.present(files) && System.currentTimeMillis() - g.lastModified() > 24L * 3600 * 1000) {
-            new Thread(() -> {
-                String err = RulesFiles.download(files, t -> { });
-                if (err.isEmpty()) {
-                    try { Native.runVpn("rules-list --state " + rstate.getAbsolutePath(), rstate.getAbsolutePath()); } catch (Throwable ignored) { }
-                }
-                Util.lab("pull: списки маршрутов " + (err.isEmpty() ? "обновлены" : "не обновлены: " + err));
-            }, "knothop-rules-refresh").start();
+    }
+
+    private void refreshGeo() {
+        if (geoBusy) return;
+        geoBusy = true;
+        if (geoMsg == null) {
+            geoMsg = new TextView(this); geoMsg.setTextSize(12);
+            mainBox.addView(geoMsg, Math.min(2, mainBox.getChildCount()));
         }
+        geoMsg.setText("Проверяю геоданные…");
+        final File files = getFilesDir();
+        final File rstate = new File(files, "rstate");
+        new Thread(() -> {
+            String err = RulesFiles.download(files, t -> ui.post(() -> { if (!isFinishing() && !isDestroyed()) geoMsg.setText(t); }));
+            if (err.isEmpty()) {
+                rstate.mkdirs();
+                try {
+                    if (Native.runVpn("rules-list --state " + rstate.getAbsolutePath(), rstate.getAbsolutePath()) != 0) err = "не удалось разобрать геоданные";
+                } catch (Throwable t) { err = "не удалось разобрать геоданные"; }
+            }
+            final String result = err;
+            ui.post(() -> {
+                geoBusy = false;
+                if (!isFinishing() && !isDestroyed()) geoMsg.setText(result.isEmpty() ? "Геоданные актуальны. Исключения из VPN применяются при следующем подключении" : "Геоданные: " + result);
+            });
+        }, "knothop-rules-refresh").start();
     }
 
     @Override
@@ -916,14 +925,12 @@ public class MainActivity extends Activity {
                 tv.setPadding(12, 22, 12, 22);
                 tv.setClickable(true);
                 tv.setOnClickListener(v -> {
-                    select(dest);
-                    Util.lab("PICK(list) " + name + " " + dest);
-                    android.widget.Toast.makeText(this, "Выход: " + name, android.widget.Toast.LENGTH_SHORT).show();
+                    openNodeAdmin(dest, name, e.optString("id", ""));
                 });
                 Button more = new Button(this);
                 more.setText("⋯");
                 more.setAllCaps(false);
-                more.setContentDescription("Управление нодой " + name);
+                more.setContentDescription("Настройки ноды " + name);
                 more.setMinWidth((int) (48 * getResources().getDisplayMetrics().density));
                 more.setOnClickListener(v -> openNodeAdmin(dest, name, e.optString("id", "")));
                 rows.put(dest, tv);
@@ -1057,7 +1064,7 @@ public class MainActivity extends Activity {
                 if (e != null && dest.equals(e.optString("d"))) { fp = e.optString("id", ""); break; }
             }
         }
-        Intent in = new Intent(this, NodeAdminActivity.class)
+        Intent in = new Intent(this, NodeSettingsActivity.class)
                 .putExtra(NodeAdminActivity.EXTRA_TARGET, dest)
                 .putExtra(NodeAdminActivity.EXTRA_NAME, name == null ? "Нода" : name)
                 .putExtra(NodeAdminActivity.EXTRA_FINGERPRINT, fp);

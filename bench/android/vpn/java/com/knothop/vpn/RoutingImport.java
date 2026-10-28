@@ -8,7 +8,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Импорт правил в формате v2rayN / Xray: массив объектов {enabled, outboundTag, domain[], ip[], remarks, ...} (или объект с "rules",
+ * Совместимый JSON-импорт: массив объектов {enabled, outboundTag, domain[], ip[], remarks, ...} (или объект с "rules",
  * или целый конфиг с "routing":{"rules":[...]}). Те же имена категорий geoip:/geosite:, что в файлах списков проекта.
  *
  * <p>Переносится только то, что умеет маршрутизация клиента: outboundTag direct и proxy (proxy = выход по умолчанию) и условия
@@ -27,6 +27,31 @@ final class RoutingImport {
     }
 
     private RoutingImport() { }
+
+    /** В настройках конкретной ноды импортируем только proxy-условия, привязывая их к этой цели. Direct не должен менять весь телефон скрытно. */
+    static Result forTarget(Result source, String destination) {
+        if (!destination.matches("[0-9a-f]{32}")) throw new IllegalArgumentException("invalid destination");
+        Result out = new Result();
+        out.skipped.addAll(source.skipped);
+        for (RoutingCfg.Rule r : source.rules) {
+            if (!r.action.equals("default") && !r.action.equals("exit:" + destination)) { out.skipped.add(r.type + ":" + r.name + ": общее правило direct — настраивается в своей ноде"); continue; }
+            RoutingCfg.Rule copy = new RoutingCfg.Rule(r.type, r.name, "exit:" + destination); copy.enabled = r.enabled; out.rules.add(copy);
+        }
+        for (RoutingCfg.Manual m : source.manual) {
+            if (!m.action.equals("default") && !m.action.equals("exit:" + destination)) { out.skipped.add(m.value + ": общее правило direct — настраивается в своей ноде"); continue; }
+            RoutingCfg.Manual copy = new RoutingCfg.Manual(m.value, "exit:" + destination); copy.enabled = m.enabled; out.manual.add(copy);
+        }
+        return out;
+    }
+
+    static int conflicts(RoutingCfg cfg, Result incoming) {
+        int count = 0;
+        for (RoutingCfg.Rule r : incoming.rules) for (RoutingCfg.Rule old : cfg.rules)
+            if (old.type.equals(r.type) && old.name.equalsIgnoreCase(r.name) && !old.action.equals(r.action)) { count++; break; }
+        for (RoutingCfg.Manual m : incoming.manual) for (RoutingCfg.Manual old : cfg.manual)
+            if (old.value.equalsIgnoreCase(m.value) && !old.action.equals(m.action)) { count++; break; }
+        return count;
+    }
 
     /** Исключение с понятным текстом, если это не JSON-массив правил. */
     static Result parse(String text) throws Exception {
@@ -175,8 +200,8 @@ final class RoutingImport {
                 "Сайты и адреса из списков geosite:category-ru и geoip:ru идут мимо VPN, остальное через выход. Нужны файлы списков. Мимо VPN работают только адреса (geoip), сайты пойдут через выход по умолчанию.",
                 "[{\"enabled\":true,\"outboundTag\":\"direct\",\"remarks\":\"Bypass Russia domains\",\"domain\":[\"geosite:category-ru\"]},"
                         + "{\"enabled\":true,\"outboundTag\":\"direct\",\"remarks\":\"Bypass Russia IP\",\"ip\":[\"geoip:ru\"]}]"),
-        new Template("Набор v2rayN (РФ)",
-                "Стандартный набор правил v2rayN для России: локальные сети (geoip:private, geosite:private) и российские сайты и адреса напрямую. Правила bittorrent и block UDP 443 не поддерживаются и будут пропущены.",
+        new Template("Локальные сети и РФ напрямую",
+                "Локальные сети и российские адреса идут напрямую, остальное через выбранный выход. Доменные direct-условия сохраняются, но их обход VPN пока не реализован. Неподдерживаемые условия протокола и блокировки перечислены отдельно.",
                 "[{\"enabled\":true,\"locked\":false,\"outboundTag\":\"direct\",\"protocol\":[\"bittorrent\"],\"remarks\":\"Bypass bittorrent\"},"
                         + "{\"enabled\":true,\"locked\":false,\"network\":\"udp\",\"outboundTag\":\"block\",\"port\":\"443\",\"remarks\":\"Block udp443\"},"
                         + "{\"enabled\":true,\"ip\":[\"geoip:private\"],\"locked\":false,\"outboundTag\":\"direct\",\"remarks\":\"Direct LAN IP\"},"
