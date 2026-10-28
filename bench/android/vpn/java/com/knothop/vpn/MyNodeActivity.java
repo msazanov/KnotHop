@@ -1,7 +1,6 @@
 package com.knothop.vpn;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -10,7 +9,6 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -32,10 +30,7 @@ import java.util.Map;
  * HOST_ACCESS здесь не меняется: он выдаётся на экране конкретной ноды.
  */
 public final class MyNodeActivity extends Activity {
-    private static final int USE = 1, TRANSIT = 2, EXIT = 4, ADD = 8, REMOVE = 16, CONFIG = 32, ALL = 63;
-    private static final int[] BITS = {USE, TRANSIT, EXIT, ADD, REMOVE, CONFIG};
-    private static final String[] NAMES = {"USE", "TRANSIT", "EXIT", "ADD", "REMOVE", "CONFIG"};
-    private static final String[] HINTS = {"использовать выходы сети", "быть транзитом", "быть выходом в интернет", "добавлять участников", "отзывать права", "настраивать сеть"};
+    private static final int ALL = RightsEditor.ALL;
     private static final int GREY = 0xFF777777;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private File state;
@@ -189,71 +184,8 @@ public final class MyNodeActivity extends Activity {
         box.addView(edit);
     }
 
-    /** Чекбоксы USE..CONFIG; те, что у меня самого нет (grantable), недоступны. */
     private void editDialog(String holder, String name, int current) {
-        int grantable = view == null ? 0 : view.optInt("grantable", 0) & ALL;
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(48, 16, 48, 0);
-        CheckBox[] boxes = new CheckBox[BITS.length];
-        for (int i = 0; i < BITS.length; i++) {
-            CheckBox c = new CheckBox(this);
-            c.setText(NAMES[i] + " — " + HINTS[i]);
-            c.setChecked((current & BITS[i]) != 0);
-            c.setEnabled((grantable & BITS[i]) != 0);
-            boxes[i] = c;
-            col.addView(c);
-        }
-        new AlertDialog.Builder(this).setTitle("Права: " + (name == null ? NodeAdminActivity.brief(holder) : name))
-                .setView(col).setNegativeButton("Отмена", null)
-                .setPositiveButton("Далее", (d, w) -> {
-                    int next = 0;
-                    for (int i = 0; i < BITS.length; i++) if (boxes[i].isChecked()) next |= BITS[i];
-                    if (next == current) { Toast.makeText(this, "Права не изменились", Toast.LENGTH_SHORT).show(); return; }
-                    confirm(holder, name, current, next);
-                }).show();
-    }
-
-    private void confirm(String holder, String name, int current, int next) {
-        int grantable = view == null ? 0 : view.optInt("grantable", 0) & ALL;
-        boolean revokeAll = next == 0, widens = (next & ~current) != 0;
-        // как в Trust::issue: пустые права (отзыв) требуют REMOVE, любые другие - ADD и подмножество своих прав
-        if (revokeAll && !view.optBoolean("can_remove", false)) { notice("Нет права REMOVE: снять все права нельзя."); return; }
-        if (!revokeAll && !view.optBoolean("can_add", false)) { notice("Нет права ADD: менять права нельзя."); return; }
-        if ((next & ~grantable) != 0) { notice("Нельзя выдать права, которых нет у вас."); return; }
-        StringBuilder m = new StringBuilder();
-        m.append("Участник: ").append(name == null ? "" : name + " ").append(NodeAdminActivity.brief(holder));
-        m.append("\nБыло: ").append(rightsText(current)).append("\nСтанет: ").append(revokeAll ? "ничего (все права снимаются)" : rightsText(next));
-        if ((next & USE) == 0 && !revokeAll) m.append("\n\nБез USE участник пропадёт из сети.");
-        if ((next & ~current & (ADD | REMOVE | CONFIG)) != 0) m.append("\n\nВы выдаёте административные права: участник сможет сам менять права других.");
-        m.append("\n\nЗапись подписывается этим телефоном и уходит в очередь; применение на других нодах не подтверждается.");
-        new AlertDialog.Builder(this).setTitle(revokeAll ? "Снять все права?" : "Изменить права?").setMessage(m.toString())
-                .setNegativeButton("Назад", null)
-                .setPositiveButton("Подтвердить", (d, w) -> submit(holder, next)).show();
-    }
-
-    private void submit(String holder, int rights) {
-        if (busy || !holder.matches("[0-9a-f]{32}") || (rights & ~ALL) != 0) return;
-        busy = true;
-        new Thread(() -> {
-            String msg;
-            try {
-                String raw = Native.runCLI("rights-set --state " + state.getAbsolutePath() + " --holder " + holder + " --rights " + rights, state.getAbsolutePath());
-                if (raw == null || raw.length() > 8192) throw new Exception("bad response");
-                JSONObject r = new JSONObject(raw);
-                msg = r.optBoolean("accepted", false)
-                        ? "Запись подписана и поставлена в очередь; удалённое применение не подтверждено."
-                        : "Не принято: " + clip(r.optString("detail", r.optString("rejected", "ошибка backend")));
-            } catch (Throwable e) { msg = "Backend не подтвердил запрос (" + e.getClass().getSimpleName() + "). Не считайте его отправленным."; }
-            final String shown = msg;
-            runOnUiThread(() -> {
-                busy = false;
-                if (isFinishing() || isDestroyed()) return;
-                notice(shown);
-                lastKey = "";
-                refresh();
-            });
-        }, "knothop-mynode-set").start();
+        RightsEditor.edit(this, view, state, holder, name, current, this::notice, () -> { lastKey = ""; refresh(); });
     }
 
     private void notice(String s) { notice = s; lastKey = ""; render(); }
@@ -272,16 +204,9 @@ public final class MyNodeActivity extends Activity {
         return m;
     }
 
-    private static String rightsText(int mask) {
-        StringBuilder b = new StringBuilder();
-        for (int i = 0; i < BITS.length; i++) if ((mask & BITS[i]) != 0) b.append(b.length() == 0 ? "" : ", ").append(NAMES[i]);
-        return b.length() == 0 ? "нет" : b.toString();
-    }
+    private static String rightsText(int mask) { return RightsEditor.rightsText(mask); }
 
-    private static String clip(String s) {
-        String v = s == null ? "" : s.replaceAll("[\\p{Cntrl}]", " ");
-        return v.length() > 120 ? v.substring(0, 120) + "…" : v;
-    }
+    private static String clip(String s) { return RightsEditor.clip(s); }
 
     private void text(String value, int size, boolean bold, int color) {
         TextView t = new TextView(this);

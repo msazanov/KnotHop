@@ -42,7 +42,8 @@ public class MainActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SharedPreferences sp;
 
-    private LinearLayout pairBox, mainBox, listBox, adminBox;
+    private LinearLayout pairBox, mainBox, listBox, adminBox, usersBox;
+    private TextView usersTitle;
     private EditText profileField;
     private TextView pairMsg, header, status, usersView, nodesMsg, updMsg;
     private Button benchBtn;
@@ -177,6 +178,13 @@ public class MainActivity extends Activity {
         usersView = new TextView(this);
         usersView.setTextSize(12);
         adminBox.addView(usersView);
+        usersTitle = new TextView(this);
+        usersTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        usersTitle.setPadding(0, 16, 0, 4);
+        adminBox.addView(usersTitle);
+        usersBox = new LinearLayout(this);
+        usersBox.setOrientation(LinearLayout.VERTICAL);
+        adminBox.addView(usersBox);
         mainBox.addView(adminBox);
         status = new TextView(this);
         status.setTextSize(13);
@@ -728,6 +736,7 @@ public class MainActivity extends Activity {
         try {
             Profile pr = Profile.parse(saved);
             adminBox.setVisibility(pr.own() ? View.VISIBLE : View.GONE);   // приглашать может только администратор своей сети
+            if (pr.own()) refreshUsers();
             if (pr.own()) header.setText("Вы администратор своей сети. Для первой настройки привяжите корень телефона к своей серверной ноде командой knothopd trust-anchor на сервере. "
                     + "Для выпуска приглашения включите «Сеть» и выберите ноды в «Пригласить»; VPN не обязателен. QR готов сразу, разрешения доставляются в фоне. Приглашение одноразовое, действует 48 часов. Оставьте «Сеть» включённой для доставки");
             else header.setText(enrolled()
@@ -943,6 +952,89 @@ public class MainActivity extends Activity {
             tv.setTextColor("current".equals(st) ? Ui.green(this) : Ui.fg(this));
         }
         listBox.setVisibility(View.VISIBLE);
+    }
+
+    // --- админ: пользователи своей сети. Список - из локального Trust (trust-view), а не из анонсов: телефоны с одним USE не анонсируются.
+    private JSONObject usersView0;
+    private String usersSig = "";
+    private long usersAt;
+    private boolean usersBusy;
+
+    private void refreshUsers() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (usersBusy || now - usersAt < 4000) return;
+        usersBusy = true;
+        usersAt = now;
+        final File st = new File(getFilesDir(), "state");
+        new Thread(() -> {
+            JSONObject got = null;
+            try {
+                String raw = Native.runCLI("trust-view --state " + st.getAbsolutePath(), st.getAbsolutePath());
+                if (raw != null && raw.length() <= 65536) {
+                    JSONObject v = new JSONObject(raw);
+                    if (!v.has("error")) got = v;
+                }
+            } catch (Throwable ignored) { }
+            final JSONObject result = got;
+            runOnUiThread(() -> {
+                usersBusy = false;
+                if (isFinishing() || isDestroyed()) return;
+                renderUsers(result, st);
+            });
+        }, "knothop-users-view").start();
+    }
+
+    private java.util.Map<String, String> knownNames() {
+        java.util.Map<String, String> m = new java.util.HashMap<>();
+        JSONObject j = currentStatus();
+        JSONArray ex = j == null ? null : j.optJSONArray("exits");
+        for (int i = 0; ex != null && i < ex.length(); i++) {
+            JSONObject e = ex.optJSONObject(i);
+            String id = e == null ? "" : e.optString("id", "").toLowerCase(java.util.Locale.ROOT);
+            if (id.matches("[0-9a-f]{32}")) m.put(id, RightsEditor.clip(TopologyView.shortName(e.optString("n", "?"))));
+        }
+        return m;
+    }
+
+    private void renderUsers(JSONObject view, File st) {
+        JSONArray ps = view == null ? null : view.optJSONArray("participants");
+        java.util.Map<String, String> names = knownNames();
+        String sig = String.valueOf(view) + names;
+        if (sig.equals(usersSig)) return;
+        usersSig = sig;
+        usersView0 = view;
+        usersBox.removeAllViews();
+        int n = ps == null ? 0 : ps.length();
+        boolean manage = view != null && (view.optBoolean("can_add", false) || view.optBoolean("can_remove", false));
+        usersTitle.setText(view == null ? "Пользователи: состояние доверия недоступно" : "Пользователи (" + n + ")" + (manage ? " — удерживайте строку, чтобы изменить права" : ""));
+        for (int i = 0; ps != null && i < ps.length(); i++) {
+            JSONObject p = ps.optJSONObject(i);
+            String holder = p == null ? "" : p.optString("holder", "");
+            if (!holder.matches("[0-9a-f]{32}")) continue;
+            final String name = names.get(holder);
+            final int rights = p.optInt("rights", 0) & RightsEditor.ALL, eff = p.optInt("eff", rights) & RightsEditor.ALL;
+            TextView tv = new TextView(this);
+            tv.setTextSize(14);
+            tv.setPadding(12, 18, 12, 18);
+            tv.setText((name == null ? "Пользователь" : name) + "  ·  " + NodeAdminActivity.brief(holder) + "\n" + RightsEditor.rightsText(rights)
+                    + (eff != rights ? " (действует: " + RightsEditor.rightsText(eff) + ")" : "") + (p.has("queued") ? "\nв очереди: " + RightsEditor.rightsText(p.optInt("queued", 0) & RightsEditor.ALL) : ""));
+            tv.setClickable(true);
+            tv.setOnClickListener(v -> android.widget.Toast.makeText(this, manage ? "Удерживайте, чтобы изменить права" : "Права только для просмотра", android.widget.Toast.LENGTH_SHORT).show());
+            if (manage) tv.setOnLongClickListener(v -> {
+                Ui.tick(v);
+                RightsEditor.edit(this, usersView0, st, holder, name, rights,
+                        msg -> android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show(),
+                        () -> { usersSig = ""; usersAt = 0; refreshUsers(); });
+                return true;
+            });
+            usersBox.addView(tv);
+        }
+        if (n == 0 && view != null) {
+            TextView tv = new TextView(this);
+            tv.setTextSize(12);
+            tv.setText("Пока никого: выпустите приглашение кнопкой «Пригласить».");
+            usersBox.addView(tv);
+        }
     }
 
     private void openNodeAdmin(String dest, String name, String fingerprint) {
