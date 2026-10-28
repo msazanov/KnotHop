@@ -176,8 +176,8 @@ public class MainActivity extends Activity {
         status.setTypeface(Typeface.MONOSPACE);
         mainBox.addView(status);
         topo = new TopologyView(this);
-        topo.setOnPick((dest, name) -> openNodeAdmin(dest, name, ""));
-        topo.setOnLongPick((dest, name) -> openNodeAdmin(dest, name, ""));
+        topo.setOnPick((dest, name) -> toggleDefaultExit(dest, name));   // короткий тап: нода по умолчанию
+        topo.setOnLongPick((dest, name) -> openNodeAdmin(dest, name, ""));   // удержание: настройки ноды
         topo.setOnPhonePick(() -> startActivity(new Intent(this, MyNodeActivity.class)));
         mainBox.addView(topo, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 600));
         android.widget.CheckBox pingBox = new android.widget.CheckBox(this);
@@ -640,6 +640,22 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) { }
     }
 
+    /** Короткий тап по ноде: сделать её выходом по умолчанию; повторный тап по выбранной возвращает автоматический выбор. */
+    private void toggleDefaultExit(String dest, String name) {
+        if (dest == null || !dest.matches("[0-9a-fA-F]{32}")) return;
+        String d = dest.toLowerCase(java.util.Locale.ROOT);
+        File st = new File(getFilesDir(), "state");
+        boolean same = d.equals(Util.read(new File(st, "select")).trim().toLowerCase(java.util.Locale.ROOT));
+        try {
+            st.mkdirs();
+            File tmp = new File(st, "select.tmp");
+            java.nio.file.Files.write(tmp.toPath(), (same ? "auto" : d).getBytes("UTF-8"));
+            java.nio.file.Files.move(tmp.toPath(), new File(st, "select").toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            android.widget.Toast.makeText(this, same ? "Выход выбирается автоматически" : "Выход по умолчанию: " + TopologyView.shortName(name == null ? "" : name)
+                    + " (подключение зависит от прав и доступности)", android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Exception e) { android.widget.Toast.makeText(this, "Не удалось сохранить выбор", android.widget.Toast.LENGTH_LONG).show(); }
+    }
+
     private long nodesRefreshSerial;
 
     /** Каталог запрашивается отдельно от расписок приглашения. Работает и в режиме «Сеть», после полной выдачи и истечения билета. */
@@ -924,9 +940,8 @@ public class MainActivity extends Activity {
                 tv.setTextSize(14);
                 tv.setPadding(12, 22, 12, 22);
                 tv.setClickable(true);
-                tv.setOnClickListener(v -> {
-                    openNodeAdmin(dest, name, e.optString("id", ""));
-                });
+                tv.setOnClickListener(v -> toggleDefaultExit(dest, name));
+                tv.setOnLongClickListener(v -> { Ui.click(v); openNodeAdmin(dest, name, e.optString("id", "")); return true; });
                 Button more = new Button(this);
                 more.setText("⋯");
                 more.setAllCaps(false);
@@ -961,6 +976,7 @@ public class MainActivity extends Activity {
                     + (e.isNull("h") || fail ? "" : ", путь RNS " + e.optInt("h") + " хоп")
                     + (e.isNull("r") || e.optDouble("r", 0) <= 0 || "current".equals(st) ? "" : ", +" + Math.round(e.optDouble("r")) + " мс")
                     + ("current".equals(st) ? "   ТЕКУЩИЙ" : "")
+                    + (e.optString("d").equalsIgnoreCase(j.optString("selected")) ? "   ★ по умолчанию" : "")
                     + (qs.isEmpty() ? "" : "\n" + qs);
             if (!label.contentEquals(tv.getText())) Util.lab("ROW " + label.replace("\n", " | "));
             tv.setText(label);
