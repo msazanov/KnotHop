@@ -312,6 +312,10 @@ public class KnotHopVpnService extends VpnService {
         if (Build.VERSION.SDK_INT >= 29) b.setMetered(false);
         // IPv6 туннелем не переносится: маршрут по умолчанию загоняет его в туннель, где пакеты отбрасываются (нет утечки мимо VPN).
         b.addAddress("fd99:99::2", 128).addRoute("::", 0);
+        // Приложения мимо VPN (выбор пользователя): исключение исполняет система, не зависит от версии Android.
+        for (String pkg : AppRules.load(new java.io.File(getFilesDir(), "state")).directPackages()) {
+            try { b.addDisallowedApplication(pkg); } catch (Throwable ignored) { }   // пакет удалён - пропускаем
+        }
         return b;
     }
 

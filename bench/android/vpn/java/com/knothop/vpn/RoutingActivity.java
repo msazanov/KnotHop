@@ -267,6 +267,7 @@ public class RoutingActivity extends Activity {
             catch (Exception e) { Toast.makeText(this, "Шаблон не разобран", Toast.LENGTH_LONG).show(); }
         }));
         if (target.isEmpty()) root.addView(button("Шаблоны правил…", v -> pickTemplate()));
+        if (target.isEmpty()) root.addView(button("Приложения мимо VPN…", v -> startActivity(new android.content.Intent(this, AppsActivity.class))));
         root.addView(button("Импорт правил JSON…", v -> importDialog("")));
     }
 

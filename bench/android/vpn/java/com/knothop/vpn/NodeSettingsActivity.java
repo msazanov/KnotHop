@@ -39,6 +39,7 @@ public final class NodeSettingsActivity extends Activity {
         button("Выбирать выход автоматически", () -> select("auto"));
         button("Сайты и адреса через эту ноду", () -> startActivity(new Intent(this, RoutingActivity.class)
                 .putExtra(RoutingActivity.EXTRA_TARGET, target).putExtra(RoutingActivity.EXTRA_NAME, name)));
+        button("Приложения мимо VPN", () -> startActivity(new Intent(this, AppsActivity.class)));
         button("Все правила телефона", () -> startActivity(new Intent(this, RoutingActivity.class)));
         text("Администрирование сервера — отдельные права. Наличие USE не позволяет менять чужую ноду.", 13);
         button("Управление сервером и права", () -> startActivity(new Intent(this, NodeAdminActivity.class)
