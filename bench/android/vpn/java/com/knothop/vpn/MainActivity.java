@@ -42,7 +42,7 @@ public class MainActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SharedPreferences sp;
 
-    private LinearLayout pairBox, mainBox, listBox, adminBox, usersBox;
+    private LinearLayout pairBox, mainBox, adminBox, usersBox;
     private TextView usersTitle;
     private EditText profileField;
     private TextView pairMsg, header, status, usersView, nodesMsg, updMsg;
@@ -85,12 +85,6 @@ public class MainActivity extends Activity {
             @Override public void onRefresh() { pullRefresh(); }
             @Override public void onPullUp() { logConsole.setOpen(true); }
         });
-
-        TextView title = new TextView(this);
-        title.setText("KnotHop");
-        title.setTextSize(20);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        root.addView(title);
 
         // --- спаривание
         pairBox = new LinearLayout(this);
@@ -188,16 +182,13 @@ public class MainActivity extends Activity {
         pingBox.setOnCheckedChangeListener((v, on) -> { sp.edit().putBoolean("ping_layout", on).apply(); topo.setPingMode(on); });
         mainBox.addView(pingBox);
         benchBtn = new Button(this);
-        benchBtn.setText("Тест связи");
-        benchBtn.setOnClickListener(v -> { Ui.tick(v); confirmBench(); });
+        benchBtn.setText("Обновить и проверить");
+        benchBtn.setOnClickListener(v -> { Ui.tick(v); refreshAndTest(); });
         mainBox.addView(benchBtn);
         benchView = new TextView(this);
         benchView.setTextSize(12);
         benchView.setTypeface(Typeface.MONOSPACE);
         mainBox.addView(benchView);
-        listBox = new LinearLayout(this);
-        listBox.setOrientation(LinearLayout.VERTICAL);
-        mainBox.addView(listBox);
         root.addView(mainBox);
 
         LinearLayout outer = new LinearLayout(this);
@@ -590,6 +581,32 @@ public class MainActivity extends Activity {
         Native.kick(1);
     }
 
+    private long lastManualAnnounce;
+
+    /**
+     * Единая кнопка: проверка версии и геоданных, опрос нод и прав, ручной анонс себя, проверка связи с нодами и замер скорости.
+     * Анонс не чаще раза в минуту (штатный период 600 с остаётся; это просьба пользователя, а не частый цикл). Первый замер скорости
+     * спрашивает подтверждение (HTTP не шифруется), дальше берутся сохранённые адреса.
+     */
+    private void refreshAndTest() {
+        checkUpdate(true);
+        refreshGeo();
+        if (!active()) {
+            android.widget.Toast.makeText(this, "Геоданные и версия проверяются. Для опроса нод и замера скорости включите «Сеть» или «VPN»", android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+        refreshNodes();
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (lastManualAnnounce == 0 || now - lastManualAnnounce >= 60_000) {
+            lastManualAnnounce = now;
+            Native.kick(0);
+        }
+        Native.kick(1);
+        if (!"up".equals(KnotHopVpnService.phase)) return;   // замер идёт только через включённый VPN
+        if (sp.getBoolean("speed_ack", false) && KnotHopVpnService.speedPath() != null) requestBench(25);
+        else confirmBench();
+    }
+
     private void refreshGeo() {
         if (geoBusy) return;
         geoBusy = true;
@@ -791,7 +808,10 @@ public class MainActivity extends Activity {
         if (j != null) {
             try {
                 JSONObject cur = j.optJSONObject("current");
-                s.append("выход: ").append(cur == null ? "— (ищу)" : TopologyView.shortName(cur.optString("n")) + " (" + cur.optString("d").substring(0, 8) + ")").append('\n');
+                String pinned = j.optString("selected");
+                s.append("выход: ").append(cur == null ? "— (ищу)" : TopologyView.shortName(cur.optString("n")) + " (" + cur.optString("d").substring(0, 8) + ")")
+                        .append(cur != null && pinned.equalsIgnoreCase(cur.optString("d")) ? "  ★ по умолчанию" : "").append('\n');
+                if (pinned.matches("[0-9a-fA-F]{32}") && (cur == null || !pinned.equalsIgnoreCase(cur.optString("d")))) s.append("выбран вами: ").append(pinned, 0, 8).append(" (подключаюсь)\n");
                 if (cur != null && !cur.isNull("via")) {
                     String vd = cur.optString("via"); String vn = vd;
                     JSONArray exs = j.optJSONArray("exits");
@@ -810,8 +830,6 @@ public class MainActivity extends Activity {
                 }
                 if (sts != prevTs) { prevUp = up; prevDown = down; prevTs = sts; }
                 s.append(String.format("вверх %s  %.1f Мбит/с\nвниз  %s  %.1f Мбит/с\n", mb(up), rUp, mb(down), rDown));
-                JSONArray fo = j.optJSONArray("failovers");
-                s.append("смен выхода: ").append(fo == null ? 0 : fo.length());
                 JSONArray us = j.optJSONArray("users");
                 StringBuilder ut = new StringBuilder();
                 for (int q = 0; us != null && q < us.length(); q++) ut.append(q == 0 ? "" : ", ").append(us.optJSONObject(q).optString("h"));
@@ -827,8 +845,6 @@ public class MainActivity extends Activity {
             prevTs = 0;
             rUp = rDown = 0;
             try { topo.update(new JSONObject("{\"state\":\"idle\",\"ip\":\"\"}")); } catch (Exception ignored) { }
-            listBox.removeAllViews();
-            listSig = "";
             updateBenchUi(state, null, null);
         }
         status.setText(s);
@@ -860,6 +876,7 @@ public class MainActivity extends Activity {
                     String dl = down.getText().toString().trim(), ul = up.getText().toString().trim();
                     SpeedTransfer.endpoint(dl, SpeedTransfer.MAX_BYTES); SpeedTransfer.endpoint(ul, SpeedTransfer.MAX_BYTES);
                     sp.edit().putString("speed_down", dl).putString("speed_up", ul).apply();
+                    sp.edit().putBoolean("speed_ack", true).apply();
                     requestBench(25);
                 } catch (Exception e) { benchView.setText(e.getMessage()); }
             }).setNegativeButton("Отмена", null).show();
@@ -881,7 +898,7 @@ public class MainActivity extends Activity {
 
     private void updateBenchUi(File state, JSONObject status, JSONObject cur) {
         if (benchBtn == null) return;
-        benchBtn.setEnabled("up".equals(KnotHopVpnService.phase) && !SpeedTest.running());
+        benchBtn.setEnabled(!SpeedTest.running());
         benchView.setText(SpeedTest.text);
     }
 
@@ -916,74 +933,11 @@ public class MainActivity extends Activity {
     }
 
     private final java.util.Set<String> logSeen = new java.util.HashSet<>();
-    private String listSig = "";
-    private final java.util.Map<String, TextView> rows = new java.util.HashMap<>();
 
-    /** Список выходов: строки создаются один раз на набор узлов и только обновляются (иначе нажатие терялось: вид заменялся между DOWN и UP). */
+    /** Узлы выходов нужны правилам маршрутизации (имена, назначения); сам список на экране убран: ноды выбираются тапом по графу. */
     private void buildList(JSONObject j) {
         JSONArray ex = j.optJSONArray("exits");
-        if (ex == null) return;
-        RoutingCfg.cacheNodes(getFilesDir(), ex);
-        StringBuilder sig = new StringBuilder();
-        for (int i = 0; i < ex.length(); i++) sig.append(ex.optJSONObject(i).optString("d")).append(',');
-        if (!sig.toString().equals(listSig)) {
-            listSig = sig.toString();
-            listBox.removeAllViews();
-            rows.clear();
-            for (int i = 0; i < ex.length(); i++) {
-                final JSONObject e = ex.optJSONObject(i);
-                final String dest = e.optString("d");
-                final String name = e.optString("n");
-                LinearLayout row = new LinearLayout(this);
-                row.setOrientation(LinearLayout.HORIZONTAL);
-                TextView tv = new TextView(this);
-                tv.setTextSize(14);
-                tv.setPadding(12, 22, 12, 22);
-                tv.setClickable(true);
-                tv.setOnClickListener(v -> toggleDefaultExit(dest, name));
-                tv.setOnLongClickListener(v -> { Ui.click(v); openNodeAdmin(dest, name, e.optString("id", "")); return true; });
-                Button more = new Button(this);
-                more.setText("⋯");
-                more.setAllCaps(false);
-                more.setContentDescription("Настройки ноды " + name);
-                more.setMinWidth((int) (48 * getResources().getDisplayMetrics().density));
-                more.setOnClickListener(v -> openNodeAdmin(dest, name, e.optString("id", "")));
-                rows.put(dest, tv);
-                row.addView(tv, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
-                row.addView(more, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT));
-                listBox.addView(row);
-            }
-        }
-        for (int i = 0; i < ex.length(); i++) {
-            JSONObject e = ex.optJSONObject(i);
-            String st = e.optString("s");
-            TextView tv = rows.get(e.optString("d"));
-            if (tv == null) continue;
-            // A failed local Link is not a dead node; reports cover only observed neighbours.
-            boolean v = e.optBoolean("v"), fail = "fail".equals(e.optString("lk"));
-            int reporters = e.optInt("ra", 0);
-            String vis = e.isNull("vis") ? "" : e.optString("vis");   // R8: direct | via | none; пусто - старая нативная часть
-            String car = "носитель " + TopologyView.carrierName(e.optString("c"));
-            String why = TopologyView.whyText(e.isNull("why") ? "" : e.optString("why"));
-            String how = fail ? (v ? car + " · " : "") + "мой Link недоступен" + (why.isEmpty() ? "" : ": " + why)
-                    : "none".equals(vis) ? (reporters > 0 ? "видят другие узлы" : v ? "носитель есть, пути нет" : "нет свежих данных") : "via".equals(vis) ? "через транзит"
-                    : v ? car + (e.isNull("pr") ? "" : " " + Math.round(e.optDouble("pr")) + " мс") : (reporters > 0 ? "видят другие узлы" : "нет свежих данных");
-            // R9: качество Link - удачные/неудачные попытки, смен пути, секунд с последнего удачного контакта
-            JSONObject q = e.optJSONObject("q");
-            String qs = q == null ? "" : "Link " + q.optInt("ok") + "/" + q.optInt("fail") + ", смен пути " + q.optInt("pc")
-                    + (q.isNull("age") ? "" : ", был " + q.optLong("age") + " с назад");
-            String label = ("current".equals(st) ? "● " : "○ ") + TopologyView.shortName(e.optString("n")) + (e.isNull("pl") ? "" : " " + TopologyView.kindIcon(e.optString("pl"))) + "   " + how
-                    + (e.isNull("h") || fail ? "" : ", путь RNS " + e.optInt("h") + " хоп")
-                    + (e.isNull("r") || e.optDouble("r", 0) <= 0 || "current".equals(st) ? "" : ", +" + Math.round(e.optDouble("r")) + " мс")
-                    + ("current".equals(st) ? "   ТЕКУЩИЙ" : "")
-                    + (e.optString("d").equalsIgnoreCase(j.optString("selected")) ? "   ★ по умолчанию" : "")
-                    + (qs.isEmpty() ? "" : "\n" + qs);
-            if (!label.contentEquals(tv.getText())) Util.lab("ROW " + label.replace("\n", " | "));
-            tv.setText(label);
-            tv.setTypeface("current".equals(st) ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
-            tv.setTextColor("current".equals(st) ? Ui.green(this) : Ui.fg(this));
-        }
-        listBox.setVisibility(View.VISIBLE);
+        if (ex != null) RoutingCfg.cacheNodes(getFilesDir(), ex);
     }
 
     // --- админ: пользователи своей сети. Список - из локального Trust (trust-view), а не из анонсов: телефоны с одним USE не анонсируются.
