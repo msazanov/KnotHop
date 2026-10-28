@@ -8207,7 +8207,15 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         let want: Option<[u8; 16]> = std::fs::read_to_string(&sel_file).ok().and_then(|t| dest32(t.trim()));
         // выход, на котором только что сменили носитель, идёт первым
         let keep_first: Option<[u8; 16]> = keep_trying.iter().find(|(_, t)| **t > Instant::now()).map(|(d, _)| *d);
-        let cands = candidates(&ctx, &banned, path::primary_target(want, primary).or(keep_first));
+        let mut cands = candidates(&ctx, &banned, want.or(keep_first));
+        // Закрепление только явного выбора. В авто-режиме действующий выход лишь идёт первым среди живых,
+        // отказавший выход отступает и подключается следующий (старый Link закрывается после нового).
+        if want.is_none() {
+            if let Some(i) = primary.and_then(|p| cands.iter().position(|c| c.dest == p)) {
+                let c = cands.remove(i);
+                cands.insert(0, c);
+            }
+        }
         let mut connected = None;
         for c in cands {
             if let Some(old) = active.as_ref().filter(|a| a.0.dest == c.dest && !keep_trying.get(&c.dest).map(|t| *t > Instant::now()).unwrap_or(false)) {
@@ -8261,7 +8269,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             }
         }
         if connected.is_none() {
-            connected = active.as_ref().filter(|old| want.or(primary).map_or(true, |d| old.0.dest == d)).cloned();
+            connected = active.as_ref().filter(|old| want.map_or(true, |d| old.0.dest == d)).cloned();
         }
         let Some((cand, id, handle)) = connected else {
             *ctx.tun.client_link.write().unwrap() = None;
@@ -8301,6 +8309,8 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         // обслуживание: пинг раз в секунду, смена по просьбе пользователя, отказ -> следующий выход
         let mut pacer = Pacer { last_pkts: ctx.tun.traffic_pkts(), ..Default::default() };
         let mut sil_grace: Option<Instant> = None;
+        let mut better_since: Option<Instant> = None;
+        let mut last_eval = Instant::now();
         let connected_at = ctx.cur.lock().unwrap().map(|c| c.2).unwrap_or_else(Instant::now);
         let reason = loop {
             if fin.exists() {
@@ -8315,8 +8325,24 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                 Some(format!("выбранный выход {name} недоступен: {why}; повтор через {retry} с; работаю через {}", ctx.shown_name(&cand)))
             });
             *ctx.status.lock().unwrap() = unavailable.unwrap_or_else(|| format!("выход: {}", ctx.shown_name(&cand)));
-            // Рабочий Link не меняется из-за рейтинга RTT или появления более короткого пути.
-            // RNS строит путь; новая сессия к ТОЙ ЖЕ конечной ноде нужна только после фактического отказа.
+            // Авто-режим: уходим с выхода только при кратно худшем RTT (в 2 раза и на 100 мс) дольше 20 с; новый Link поднимается до закрытия старого.
+            // Явно выбранный выход и работающий Link при этом не трогаются.
+            if want.is_none() && last_eval.elapsed() >= Duration::from_secs(3) {
+                last_eval = Instant::now();
+                let cur_rtt = ctx.rns_rtt(&cand.dest);
+                let best = candidates(&ctx, &banned, None).into_iter().find(|c| c.dest != cand.dest && ctx.rns_rtt(&c.dest).is_some());
+                let better = match (cur_rtt, best.as_ref().and_then(|b| ctx.rns_rtt(&b.dest))) {
+                    (Some(cr), Some(br)) => cr > br * 2.0 && cr - br > 100.0,
+                    _ => false,
+                };
+                if better {
+                    if better_since.get_or_insert(Instant::now()).elapsed() >= Duration::from_secs(20) {
+                        break format!("авто: {} быстрее", best.as_ref().map(|b| b.name.clone()).unwrap_or_default());
+                    }
+                } else {
+                    better_since = None;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
             let k = hex(id.as_bytes());
             if let Some(r) = ctx.sh.closed.lock().unwrap().get(&k) {
@@ -8383,7 +8409,8 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         if reason == "fin" {
             break;
         }
-        let user = reason == "выбор пользователя";
+        let user = reason == "выбор пользователя" || reason.starts_with("авто:");
+        if reason.starts_with("авто:") { primary = None; }
         if user {
             ctx.sh.note(format!("проверка выхода: {reason}"));
             pending_reason = Some(reason.clone());
@@ -8423,11 +8450,16 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                     ctx.node.engine().remove_path(&dest);
                 }
             }
-            active = None;
-            *ctx.tun.client_link.write().unwrap() = None;
-            *ctx.cur.lock().unwrap() = None;
-            ctx.publish_service();
-            let _ = ctx.node.engine().close_link(&id).await;
+            if want.is_some() {
+                active = None;
+                *ctx.tun.client_link.write().unwrap() = None;
+                *ctx.cur.lock().unwrap() = None;
+                ctx.publish_service();
+                let _ = ctx.node.engine().close_link(&id).await;
+            } else {
+                // Авто: прежний Link остаётся до подключения следующего выхода (или до возврата этого после бана).
+                pending_reason = Some(reason.clone());
+            }
         }
     }
 }
@@ -8438,10 +8470,7 @@ mod carrier_tests {
     use super::*;
 
     #[test]
-    fn established_exit_is_sticky_and_only_manual_choice_overrides_it() {
-        assert_eq!(path::primary_target(None, Some([0xaa;16])), Some([0xaa;16]));
-        assert_eq!(path::primary_target(Some([0xbb;16]), Some([0xaa;16])), Some([0xbb;16]));
-        assert_eq!(path::primary_target(None,None), None);
+    fn silence_grace_covers_carrier_switch_and_path_discovery() {
         assert!(SILENCE_GRACE >= Duration::from_secs(25), "TCP handshake and discovery must get time to recover");
     }
 
