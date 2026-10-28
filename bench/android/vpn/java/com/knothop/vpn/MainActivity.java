@@ -145,14 +145,9 @@ public class MainActivity extends Activity {
         rightsBtn.setAllCaps(false);
         rightsBtn.setOnClickListener(v -> { Ui.tick(v); startActivity(new Intent(this, PolicyActivity.class)); });
         mainBox.addView(rightsBtn);
-        Button nodesBtn = new Button(this);
-        nodesBtn.setText("Обновить список нод");
-        nodesBtn.setAllCaps(false);
-        nodesBtn.setOnClickListener(v -> { Ui.tick(v); refreshNodes(); });
-        mainBox.addView(nodesBtn);
         nodesMsg = new TextView(this);
         nodesMsg.setTextSize(12);
-        nodesMsg.setVisibility(View.GONE);
+        nodesMsg.setText("Потяните страницу вниз, чтобы обновить ноды и права");
         mainBox.addView(nodesMsg);
         Button updBtn = new Button(this);
         updBtn.setText("Проверить обновление");
@@ -636,7 +631,9 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) { }
     }
 
-    /** Дожим расписок зачисления: файл refresh-nodes читает нативная часть (раз в 5 с); сама она делает это и раз в 2 мин. Нужен подключённый VPN. */
+    private long nodesRefreshSerial;
+
+    /** Каталог запрашивается отдельно от расписок приглашения. Работает и в режиме «Сеть», после полной выдачи и истечения билета. */
     private void refreshNodes() {
         if (!(active() || KnotHopVpnService.tunHeld)) {
             android.widget.Toast.makeText(this, "Сначала включите режим «Сеть» или «VPN»", android.widget.Toast.LENGTH_SHORT).show();
@@ -646,21 +643,33 @@ public class MainActivity extends Activity {
             File st = new File(getFilesDir(), "state");
             st.mkdirs();
             final File result = new File(st, "refresh-result.txt");
+            final File directory = new File(st, "directory-result.json");
+            final long started = System.currentTimeMillis();
+            final long serial = ++nodesRefreshSerial;
             result.delete();
             new File(st, "refresh-nodes").createNewFile();
             nodesMsg.setVisibility(View.VISIBLE);
-            nodesMsg.setText("Опрашиваю ноды… (до двух минут)");
-            final long until = System.currentTimeMillis() + 180_000;
+            nodesMsg.setText("Запрашиваю каталог нод и проверяю права…");
+            final long until = android.os.SystemClock.elapsedRealtime() + 180_000;
             ui.postDelayed(new Runnable() {
                 public void run() {
-                    if (isFinishing() || isDestroyed()) return;
+                    if (isFinishing() || isDestroyed() || serial != nodesRefreshSerial) return;
                     String r = result.exists() ? Util.read(result).trim() : "";
-                    if (!r.isEmpty()) nodesMsg.setText(r);
-                    else if (System.currentTimeMillis() > until) nodesMsg.setText("Нет ответа от нативной части за 3 мин; повторите позже");
-                    else ui.postDelayed(this, 1000);
+                    String catalog = "";
+                    try {
+                        JSONObject d = new JSONObject(Util.read(directory));
+                        JSONObject current = currentStatus();
+                        JSONArray exits = current == null ? null : current.optJSONArray("exits");
+                        if (d.optLong("at_ms", 0) >= started) catalog = "Каталог обновлён: " + d.optInt("entries", 0)
+                                + " нод; выходов с подтверждёнными правами: " + (exits == null ? d.optInt("known", 0) : exits.length());
+                    } catch (Exception ignored) { }
+                    if (!catalog.isEmpty()) nodesMsg.setText(catalog + (r.isEmpty() ? "" : "\n" + r));
+                    else if (!r.isEmpty()) nodesMsg.setText(r);
+                    if (android.os.SystemClock.elapsedRealtime() <= until) ui.postDelayed(this, 1000);
+                    else if (catalog.isEmpty()) nodesMsg.setText((r.isEmpty() ? "" : r + "\n") + "Свежий каталог пока не получен. Повторите жест позже");
                 }
             }, 1000);
-        } catch (Exception ignored) { }
+        } catch (Exception e) { nodesMsg.setText("Не удалось запустить обновление нод (" + e.getClass().getSimpleName() + ")"); }
     }
 
     private long installedCode() {

@@ -28,7 +28,12 @@ pub struct Wire {
     /// Взаимоисключимо с записями и политиками; разбор и фильтр адресов — `parse_dir` на приёме.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dir: Vec<serde_json::Value>,
+    /// Запрос свежего каталога, независимый от срока/полноты приглашения. Не выдаёт прав.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub get_dir: bool,
 }
+
+fn is_false(value: &bool) -> bool { !value }
 
 impl Wire {
     pub fn decode(message: &Message) -> Option<Self> {
@@ -36,6 +41,9 @@ impl Wire {
             || !matches!(message.method, DeliveryMethod::Direct | DeliveryMethod::Propagated) || message.content.len() > super::lxmf_admin::MAX_ADMIN_CONTENT { return None; }
         let wire: Self = serde_json::from_slice(&message.content).ok()?;
         if wire.v != 1 || wire.records.len() + wire.policies.len() > 16 || wire.dir.len() > DIR_LIMIT { return None; }
+        if wire.get_dir {
+            return (wire.records.is_empty() && wire.policies.is_empty() && wire.dir.is_empty() && wire.ack.is_none()).then_some(wire);
+        }
         if !wire.dir.is_empty() && (!wire.records.is_empty() || !wire.policies.is_empty() || wire.ack.is_some() || !wire.dir.iter().all(|e| e.is_object())) { return None; }
         if let Some(ack) = &wire.ack {
             if ack.len() != 64 || !ack.bytes().all(|b| b.is_ascii_hexdigit()) || !wire.records.is_empty() || !wire.policies.is_empty() { return None; }
@@ -79,7 +87,7 @@ pub fn digest(content: &[u8]) -> String { super::hex(&Sha256::digest(content)) }
 pub fn send(state: &Path, pk: Pk, records: &[Record], policies: &[Policy], gate: Gate) -> bool {
     if records.len() + policies.len() > 16 || (records.is_empty() && policies.is_empty()) { return false; }
     let wire = Wire { v:1, records:records.iter().map(|r| super::hex(&r.wire())).collect(),
-        policies:policies.iter().map(|p| super::hex(&p.wire())).collect(), ack:None, dir:vec![] };
+        policies:policies.iter().map(|p| super::hex(&p.wire())).collect(), ack:None, dir:vec![], get_dir:false };
     let Ok(content) = serde_json::to_vec(&wire) else { return false };
     if content.len() > super::lxmf_admin::MAX_ADMIN_CONTENT { return false; }
     submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
@@ -91,10 +99,17 @@ pub fn send_dir(state: &Path, pk: Pk, mut dir: Vec<serde_json::Value>, gate: Gat
     // хвост каталога отбрасываем, пока сообщение не уложится в лимит администрирования
     let content = loop {
         if dir.is_empty() { return false; }
-        let Ok(content) = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:None, dir:dir.clone() }) else { return false };
+        let Ok(content) = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:None, dir:dir.clone(), get_dir:false }) else { return false };
         if content.len() <= super::lxmf_admin::MAX_ADMIN_CONTENT { break content; }
         dir.pop();
     };
+    submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
+}
+
+/// Подписанный LXMF-запрос каталога у уже авторизованной ноды. Получатель повторно проверяет членство и ограничивает частоту.
+pub fn request_dir(state: &Path, pk: Pk, gate: Gate) -> bool {
+    let wire = Wire { v:1, records:vec![], policies:vec![], ack:None, dir:vec![], get_dir:true };
+    let Ok(content) = serde_json::to_vec(&wire) else { return false };
     submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
 }
 
@@ -137,7 +152,7 @@ pub fn authenticated(message: &Message, me: &[u8;16], pk: &Pk) -> bool {
 }
 
 pub fn acknowledge(state: &Path, message: &Message, pk: Pk) {
-    let content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some(digest(&message.content)), dir:vec![] }).unwrap();
+    let content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some(digest(&message.content)), dir:vec![], get_dir:false }).unwrap();
     submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate:Arc::new(|| Some(true)), exp:super::now_ms() as u64/1000+TTL, ack:true }));
 }
 pub fn received_ack(state: &Path, source: [u8;16], digest: String) {
@@ -498,7 +513,7 @@ mod tests {
     #[test]
     fn sync_codec_signature_and_scope_are_not_authority() {
         let (actor, target, attacker) = (generate_identity(), generate_identity(), generate_identity());
-        let wire = Wire { v:1, records:vec![], policies:vec![], ack:Some("11".repeat(32)), dir:vec![] };
+        let wire = Wire { v:1, records:vec![], policies:vec![], ack:Some("11".repeat(32)), dir:vec![], get_dir:false };
         let make = |identity:&Identity| Message::create(super::super::lxmf_admin::lxmf_destination(target.hash()),
             super::super::lxmf_admin::lxmf_destination(actor.hash()), identity, 1.0,
             TITLE.to_vec(), serde_json::to_vec(&wire).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
@@ -518,7 +533,7 @@ mod tests {
             super::super::lxmf_admin::lxmf_destination(actor.hash()), &actor, 1.0,
             TITLE.to_vec(), serde_json::to_vec(wire).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
         let entry = serde_json::json!({"d": "00", "k": "00", "a": ["203.0.113.7:47001"], "n": "x"});
-        let base = Wire { v:1, records:vec![], policies:vec![], ack:None, dir:vec![entry.clone()] };
+        let base = Wire { v:1, records:vec![], policies:vec![], ack:None, dir:vec![entry.clone()], get_dir:false };
         let decoded = Wire::decode(&make(&base)).expect("каталог из объектов");
         assert_eq!(decoded.dir, vec![entry.clone()]);
         // каталог не смешивается с записями, политиками и ACK
@@ -531,6 +546,33 @@ mod tests {
         assert!(Wire::decode(&make(&Wire { dir:vec![serde_json::json!("203.0.113.7:47001")], ..base.clone() })).is_none());
         // пустое сообщение по-прежнему не принимается
         assert!(Wire::decode(&make(&Wire { dir:vec![], ..base })).is_none());
+    }
+
+    #[test]
+    fn directory_request_is_exclusive_and_small() {
+        let (actor, target) = (generate_identity(), generate_identity());
+        let make = |wire: &Wire| Message::create(super::super::lxmf_admin::lxmf_destination(target.hash()),
+            super::super::lxmf_admin::lxmf_destination(actor.hash()), &actor, 1.0,
+            TITLE.to_vec(), serde_json::to_vec(wire).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
+        let wire = Wire { v:1, records:vec![], policies:vec![], ack:None, dir:vec![], get_dir:true };
+        let msg = make(&wire);
+        assert!(Wire::decode(&msg).unwrap().get_dir);
+        assert!(msg.content.len() < 100, "request is control traffic, not an enrollment payload");
+        assert!(Wire::decode(&make(&Wire { dir:vec![serde_json::json!({})], ..wire.clone() })).is_none());
+        assert!(Wire::decode(&make(&Wire { records:vec!["00".into()], ..wire.clone() })).is_none());
+        assert!(Wire::decode(&make(&Wire { policies:vec!["00".into()], ..wire.clone() })).is_none());
+        assert!(Wire::decode(&make(&Wire { ack:Some("11".repeat(32)), ..wire })).is_none());
+    }
+
+    #[test]
+    fn directory_control_payload_budget_for_eight_nodes() {
+        let entries = (0..8).map(|i| serde_json::json!({"d":format!("{i:032x}"),"k":"11".repeat(64),"e":"22".repeat(32),
+            "a":[format!("203.0.113.{}:47001",i+1)],"n":format!("node-{i}")})).collect::<Vec<_>>();
+        let request = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:None, dir:vec![], get_dir:true }).unwrap();
+        let reply = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:None, dir:entries, get_dir:false }).unwrap();
+        assert!(request.len() < 100 && reply.len() < 4096);
+        eprintln!("directory serialized control payload: request={} B, eight-node reply={} B, two peers / 120s={} B/s (no transport/ACK/records)",
+            request.len(), reply.len(), 2 * (request.len() + reply.len()) / 120);
     }
 
     #[test]
@@ -582,7 +624,7 @@ mod tests {
         let mut tr = trust::Trust::new(sender.clone(), None);
         let rec = tr.issue(*sender.hash(), target.public_key_bytes(), trust::TRANSIT).unwrap();
         for n in [1, 16] {
-            let content = serde_json::to_vec(&Wire { v:1, records:vec![super::super::hex(&rec.wire());n], policies:vec![], ack:None, dir:vec![] }).unwrap();
+            let content = serde_json::to_vec(&Wire { v:1, records:vec![super::super::hex(&rec.wire());n], policies:vec![], ack:None, dir:vec![], get_dir:false }).unwrap();
             let message = Message::create(super::super::lxmf_admin::lxmf_destination(target.hash()),
                 super::super::lxmf_admin::lxmf_destination(sender.hash()), &sender, 1.0,
                 TITLE.to_vec(), content, vec![], DeliveryMethod::Direct).unwrap();
@@ -590,7 +632,7 @@ mod tests {
                 n*(trust::REC_LEN+1), message.pack().len(), message.content.len());
             assert!(message.pack().len() <= super::super::lxmf_admin::MAX_ADMIN_CONTENT);
         }
-        let ack_content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some("00".repeat(32)), dir:vec![] }).unwrap();
+        let ack_content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some("00".repeat(32)), dir:vec![], get_dir:false }).unwrap();
         let ack = Message::create(super::super::lxmf_admin::lxmf_destination(sender.hash()),
             super::super::lxmf_admin::lxmf_destination(target.hash()), &target, 1.0,
             TITLE.to_vec(), ack_content, vec![], DeliveryMethod::Direct).unwrap();
@@ -689,6 +731,28 @@ mod tests {
         };
         assert!(authenticated(&ack, sender.hash(), &recipient.public_key_bytes()));
         assert_eq!(Wire::decode(&ack).unwrap().ack, Some(digest(&message.content)));
+        // Каталог запрашивается тем же LXMF router, независимо от наличия enrollment/приглашения.
+        assert!(request_dir(&base, recipient.public_key_bytes(), Arc::new(|| Some(true))));
+        let request = loop {
+            if let Ok(message) = r2.inbound.try_recv() {
+                if Wire::decode(&message).is_some_and(|w| w.get_dir) { break message; }
+            }
+            assert!(Instant::now()<until, "directory request not delivered");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(authenticated(&request, recipient.hash(), &sender.public_key_bytes()));
+        let entries = (0..8).map(|i| serde_json::json!({"n":format!("node-{i}"),"a":[format!("203.0.113.{}:47001",i+1)]})).collect::<Vec<_>>();
+        assert!(send_dir(&base.join("server"), sender.public_key_bytes(), entries.clone(), Arc::new(|| Some(true))));
+        let reply = loop {
+            if let Ok(message) = r1.inbound.try_recv() {
+                if Wire::decode(&message).is_some_and(|w| !w.dir.is_empty()) { break message; }
+            }
+            assert!(Instant::now()<until, "directory reply not delivered");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(authenticated(&reply, sender.hash(), &recipient.public_key_bytes()));
+        assert_eq!(Wire::decode(&reply).unwrap().dir, entries);
+        assert!(parsed(&Wire::decode(&reply).unwrap()).unwrap().0.is_empty(), "каталог не создаёт записей о правах");
         assert!(base.join("server/lxmf/propagation").is_dir());
         client.stop().await.unwrap();
         server.stop().await.unwrap();

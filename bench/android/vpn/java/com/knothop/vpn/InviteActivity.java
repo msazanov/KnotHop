@@ -126,7 +126,7 @@ public final class InviteActivity extends Activity {
                     try {
                         startForegroundService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_MODE)
                                 .putExtra(KnotHopVpnService.EXTRA_MODE, 1));
-                        android.widget.Toast.makeText(this, "Запускаю узел. Затем обновите список нод", android.widget.Toast.LENGTH_LONG).show();
+                        android.widget.Toast.makeText(this, "Запускаю узел. Затем потяните страницу вниз для обновления нод", android.widget.Toast.LENGTH_LONG).show();
                     } catch (RuntimeException e) {
                         android.widget.Toast.makeText(this, "Не удалось запустить узел: " + e.getMessage(), android.widget.Toast.LENGTH_LONG).show();
                     }

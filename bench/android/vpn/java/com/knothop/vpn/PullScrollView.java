@@ -63,11 +63,17 @@ class PullScrollView extends ScrollView {
 
     @Override
     public boolean onTouchEvent(MotionEvent e) {
-        if (e.getActionMasked() == MotionEvent.ACTION_DOWN) downY = e.getY();
+        if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+            downY = e.getY();
+            pulling = pullingUp = ready = false;
+        }
         // Когда ScrollView уже перехватил прокрутку, Android больше не зовёт onInterceptTouchEvent для MOVE.
         // Поэтому достижение нижнего края проверяем и в собственном обработчике жеста.
         if (!pulling && !pullingUp && listener != null && e.getActionMasked() == MotionEvent.ACTION_MOVE
                 && atBottom() && downY - e.getY() > slop * 2) pullingUp = true;
+        // Аналогично у верхнего края: пустая область/уже перехваченная прокрутка тоже должна запускать pull-to-refresh.
+        if (!pulling && !pullingUp && listener != null && e.getActionMasked() == MotionEvent.ACTION_MOVE
+                && getScrollY() == 0 && e.getY() - downY > slop) pulling = true;
         if (pullingUp) {
             int a = e.getActionMasked();
             if (a == MotionEvent.ACTION_UP) {

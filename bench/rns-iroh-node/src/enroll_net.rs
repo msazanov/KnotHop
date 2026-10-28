@@ -18,9 +18,10 @@ pub struct Service {
     io:Mutex<()>,rate:Mutex<(VecDeque<Instant>,HashMap<Hash,VecDeque<Instant>>)>,
     inflight:Arc<tokio::sync::Semaphore>, delays:Arc<tokio::sync::Semaphore>,
     issue_cursor:std::sync::atomic::AtomicUsize,
+    receipt_cursor:std::sync::atomic::AtomicUsize,
 }
 pub fn register(node:Arc<Node>,identity:Identity,trust:Arc<Mutex<Trust>>,state:&Path,client:Option<Weak<ClientCtx>>)->Arc<Service>{
-    let s=Arc::new(Service{node,identity,trust,state:state.into(),client,sessions:Mutex::new(HashMap::new()),ban:Mutex::new(Fail2Ban::default()),io:Mutex::new(()),rate:Mutex::new((VecDeque::new(),HashMap::new())),inflight:Arc::new(tokio::sync::Semaphore::new(8)),delays:Arc::new(tokio::sync::Semaphore::new(4)),issue_cursor:std::sync::atomic::AtomicUsize::new(0)});
+    let s=Arc::new(Service{node,identity,trust,state:state.into(),client,sessions:Mutex::new(HashMap::new()),ban:Mutex::new(Fail2Ban::default()),io:Mutex::new(()),rate:Mutex::new((VecDeque::new(),HashMap::new())),inflight:Arc::new(tokio::sync::Semaphore::new(8)),delays:Arc::new(tokio::sync::Semaphore::new(4)),issue_cursor:std::sync::atomic::AtomicUsize::new(0),receipt_cursor:std::sync::atomic::AtomicUsize::new(0)});
     s.node.register_request_handler(DestinationHash::new(dest_from_pub_tag(&s.identity.public_key_bytes(),T13_TAG)),PATH,leviculum_std::api::RequestPolicy::AllowAll);
     SERVICES.get_or_init(Default::default).lock().unwrap().insert(state_key(state),Arc::downgrade(&s));
     let poller=Arc::downgrade(&s);
@@ -519,37 +520,23 @@ pub fn receipt_progress(s:&Service)->(usize,usize,bool){
 /// Resume missing-node redemption with previously signed consent, then collect receipts from known peers.
 /// `None` means no actionable fresh enrollment, not necessarily a complete node list.
 pub async fn refresh(s:&Arc<Service>)->Result<Option<Vec<serde_json::Value>>>{
-    let mut pending_hints=vec![];let mut pending_work=false;
-    if let Some(mut pending)=read_join(&s.state)?{
-        let inv=Invite::parse(&pending.ticket)?;let id=enroll::invite_id(&inv.pin);
-        let proofs=s.trust.lock().unwrap().enrollment_proofs(&s.identity.public_key_bytes());
-        let missing=inv.nodes.iter().copied().filter(|h|!proofs.iter().any(|p|p.grant.id==id&&p.rec.scope==*h)).collect::<Vec<_>>();
-        if missing.is_empty(){std::fs::remove_file(pending_join(&s.state))?;}
-        else{
-            // Two destinations per round, rotating; the client's 2 -> 30 min backoff bounds absent-node retries.
-            // Never re-open the consent dialog if no proof of a previously accepted Grant is stored.
-            if proofs.iter().any(|p|p.grant.id==id){
-                pending_work=true;
-                let targets=(0..missing.len().min(2)).map(|i|missing[(pending.cursor+i)%missing.len()]).collect::<Vec<_>>();
-                pending.cursor=pending.cursor.wrapping_add(targets.len());
-                enroll::write(&pending_join(&s.state),&serde_json::to_vec(&pending)?)?;
-                for h in targets{if s.state.join("fin").exists(){break}if let Ok(v)=join_one(s,&inv,h,false).await{pending_hints.extend(v);}}
-            }
-        }
-    }
     let proofs=s.trust.lock().unwrap().enrollment_proofs(&s.identity.public_key_bytes());
     let mut ids:Vec<Hash>=vec![];for p in &proofs{if !ids.contains(&p.grant.id){ids.push(p.grant.id)}}
-    let (mut hints,mut worked,mut last,mut answered)=(pending_hints,pending_work,None,pending_work);
+    let (mut hints,mut worked,mut last,mut answered)=(vec![],false,None,false);
     for id in ids{
-        let have:Vec<&Proof>=proofs.iter().filter(|p|p.grant.id==id).collect();let grant=&have[0].grant;
+        let mut have:Vec<&Proof>=proofs.iter().filter(|p|p.grant.id==id).collect();let grant=have[0].grant.clone();
         if !grant.fresh(now_ms()as u64/1000)||grant.nodes.iter().all(|n|have.iter().any(|p|p.rec.scope==*n)){continue}
         worked=true;
-        for p in &have{
+        let cursor=s.receipt_cursor.fetch_add(1,std::sync::atomic::Ordering::Relaxed)%have.len();have.rotate_left(cursor);
+        // A live authenticated exit already has a working private route; do not open another CBC/public Link just to collect receipts.
+        have.sort_by_key(|p|receipt_link(s,p.rec.scope).is_none());
+        for p in have.into_iter().take(2){
             let h=p.rec.scope;
             let r:Result<Vec<serde_json::Value>>=async{
-                let link=s.open(h,false).await?;let mut req=vec![3];req.extend(id);
+                let (link,owned)=match receipt_link(s,h){Some(l)=>(l,false),None=>(tokio::time::timeout(Duration::from_secs(20),s.open(h,false)).await.context("Нода не ответила на поиск пути за 20 с")??,true)};
+                let mut req=vec![3];req.extend(id);
                 // Ответ несёт все расписки ноды (десятки КиБ уходят ресурсом); 10 с ему не хватало (RequestTimedOut на телефоне), как у `join` - 70 с.
-                let reply=rpc(&s.node,link,&req,60_000).await;let _=s.node.engine().close_link(&link).await;
+                let reply=rpc(&s.node,link,&req,60_000).await;if owned{let _=s.node.engine().close_link(&link).await;}
                 apply_to(&s.trust,&s.identity,&s.state,id,h,&reply?,Some(&hex(&grant.digest())),false)
             }.await;
             match r{Ok(v)=>{hints.extend(v);answered=true;}Err(e)=>last=Some(e)}
@@ -560,7 +547,30 @@ pub async fn refresh(s:&Arc<Service>)->Result<Option<Vec<serde_json::Value>>>{
             if s.state.join("fin").exists(){break}
         }
     }
+    // First collect already issued evidence. Missing-node discovery must not delay the useful reply from a working commissioner.
+    if let Some(mut pending)=read_join(&s.state)?{
+        let inv=Invite::parse(&pending.ticket)?;let id=enroll::invite_id(&inv.pin);
+        let proofs=s.trust.lock().unwrap().enrollment_proofs(&s.identity.public_key_bytes());
+        let missing=inv.nodes.iter().copied().filter(|h|!proofs.iter().any(|p|p.grant.id==id&&p.rec.scope==*h)).collect::<Vec<_>>();
+        if missing.is_empty(){std::fs::remove_file(pending_join(&s.state))?;}
+        else if proofs.iter().any(|p|p.grant.id==id){
+            worked=true;
+            let targets=(0..missing.len().min(2)).map(|i|missing[(pending.cursor+i)%missing.len()]).collect::<Vec<_>>();
+            pending.cursor=pending.cursor.wrapping_add(targets.len());
+            enroll::write(&pending_join(&s.state),&serde_json::to_vec(&pending)?)?;
+            for h in targets{
+                if s.state.join("fin").exists(){break}
+                match join_one(s,&inv,h,false).await{Ok(v)=>{hints.extend(v);answered=true},Err(e)=>last=Some(e)}
+            }
+        }
+    }
     match last{Some(e)if !answered=>Err(e),_=>Ok(worked.then_some(hints))}
+}
+
+fn receipt_link(s:&Service,scope:Hash)->Option<LinkId>{
+    let ctx=s.client.as_ref()?.upgrade()?;let c=ctx.c13.as_ref()?;
+    let links=c.peers.lock().unwrap().iter().filter(|(_,pk)|trust::hash_of(pk)==Some(scope)).map(|(link,_)|*link).collect::<Vec<_>>();
+    links.into_iter().find(|link|s.node.engine().link_stats(link).is_some())
 }
 /// Маркер принятого предложения: пишется перед REDEEM (id приглашения и digest grant, без pin) и живёт до применения ответа.
 /// Нужен, если ответ на REDEEM потерян после погашения: повтор приглашения тогда приходит как `nodes`, а доказательства ещё нет.

@@ -2642,6 +2642,8 @@ struct T13 {
     /// попытки зачисления через посредника (dest посредника -> когда): каждому не чаще раза в 60 с
     /// T_DIR: когда последний раз слали каталог на Link (не чаще раза в 60 с)
     dir_sent: Mutex<HashMap<LinkId, Instant>>,
+    /// Каталог для обычных клиентов и LXMF-запросов: один снимок в минуту на identity, не на новый Link.
+    dir_requested: Mutex<HashMap<trust::Pk, Instant>>,
 }
 
 impl NodeCtx {
@@ -3020,7 +3022,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
             }
         }
         Some(T13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), 
-            trust_dirty: AtomicBool::new(false),  dir_sent: Mutex::new(HashMap::new()) })
+            trust_dirty: AtomicBool::new(false),  dir_sent: Mutex::new(HashMap::new()), dir_requested: Mutex::new(HashMap::new()) })
     };
     if let Some(t) = &t13 { let _ = RELAY_TRUST.set(t.trust.clone()); }
 
@@ -3853,6 +3855,54 @@ mod ordinary_admission_tests {
         // сосед-сервер: обе стороны
         links.insert(l, link_info(Role::Server { dest: [2; 16] }, false, Some(stranger)));
         assert!(dir_sender_ok(&links, &none, None, &tr, &stranger, now) && dir_recipient_ok(&links, None, &tr, &stranger, now));
+    }
+
+    #[test]
+    fn member_directory_is_root_scoped_and_revocation_closes_it() {
+        let mut f = fixture(true);
+        let foreign = leviculum_std::api::generate_identity();
+        let other = leviculum_std::api::generate_identity();
+        let stranger = leviculum_std::api::generate_identity();
+        let mut ft = trust::Trust::new(foreign.clone(), None);
+        let mine = ft.issue(*foreign.hash(), f.node_pk, trust::EXIT | trust::TRANSIT).unwrap();
+        let sibling = ft.issue(*foreign.hash(), other.public_key_bytes(), trust::EXIT).unwrap();
+        let mut tr = f.authority.lock().unwrap();
+        tr.add_anchor(&foreign.public_key_bytes()).unwrap();
+        tr.offer(mine); tr.offer(sibling);
+        let roots = directory_roots(&tr, &f.pk, now_ms() as u64);
+        assert_eq!(roots, vec![f.root]);
+        assert!(directory_node_visible(&tr, &roots, &f.node_pk));
+        assert!(!directory_node_visible(&tr, &roots, &other.public_key_bytes()), "каталог не раскрывает чужую сеть");
+        assert!(directory_roots(&tr, &stranger.public_key_bytes(), now_ms() as u64).is_empty(), "собственный корень не даёт членства");
+        let revoke = f.issuer.issue(f.root, f.pk, 0).unwrap();
+        assert_eq!(tr.offer(revoke), trust::Offer::Added);
+        assert!(directory_roots(&tr, &f.pk, now_ms() as u64).is_empty());
+    }
+
+    #[test]
+    fn scoped_enrollment_gets_sibling_routes_but_not_sibling_use() {
+        let root = leviculum_std::api::generate_identity();
+        let node = leviculum_std::api::generate_identity();
+        let sibling = leviculum_std::api::generate_identity();
+        let user = leviculum_std::api::generate_identity();
+        let rh = *root.hash();
+        let mut issuer = trust::Trust::new(root.clone(), None);
+        issuer.issue(rh, node.public_key_bytes(), trust::TRANSIT | trust::EXIT).unwrap();
+        issuer.issue(rh, sibling.public_key_bytes(), trust::TRANSIT | trust::EXIT).unwrap();
+        let inv = crate::enroll::Invite::new(vec![*node.hash()]).unwrap();
+        let g = crate::enroll::Grant::create(&root, rh, &inv, trust::USE, now_ms() as u64 / 1000).unwrap();
+        let consent = crate::enroll::EnRec::consent(&user, &g, trust::USE).unwrap();
+        let proof = crate::enroll::Proof { root:root.public_key_bytes(), admin:root.public_key_bytes(), chain:issuer.chain_for(&node.public_key_bytes()),
+            rec:crate::enroll::EnRec::create(&node, &g, user.public_key_bytes(), trust::USE, consent, now_ms() as u64).unwrap(), grant:g };
+        let mut tr = trust::Trust::new(node.clone(), None);
+        tr.add_anchor(&root.public_key_bytes()).unwrap();
+        for rec in issuer.export_all() { tr.offer(rec); }
+        tr.offer_enrollment(proof).unwrap();
+        let roots = directory_roots(&tr, &user.public_key_bytes(), now_ms() as u64);
+        assert_eq!(roots, vec![rh]);
+        assert!(directory_node_visible(&tr, &roots, &sibling.public_key_bytes()), "путь к соседу виден независимо от его расписки");
+        assert_eq!(tr.rights_at(&rh, user.hash(), sibling.hash()), 0, "каталог не выдаёт USE на другой scope");
+        assert!(tr.records_visible_to(&user.public_key_bytes()).iter().any(|r| r.holder == sibling.public_key_bytes()), "цепочка EXIT отправляется вместе с каталогом");
     }
 
     #[test]
@@ -4700,6 +4750,52 @@ impl NodeCtx {
         self.send_dir_checked(link, server);
     }
 
+    /// Полный каталог доступной сети и проверяемые цепочки её выходов. Работает и без enrollment/живого Link: LXMF доставит ответ.
+    /// Подсказки не дают USE на другие scope. Корни, в которых адресат не участник, в ответ не попадают.
+    fn send_member_directory(self: &Arc<Self>, pk: trust::Pk) -> bool {
+        let Some(t) = &self.t13 else { return false };
+        let (list, records, snapshot_roots) = {
+            let tr = t.trust.lock().unwrap();
+            let roots = directory_roots(&tr, &pk, now_ms() as u64);
+            if roots.is_empty() { return false; }
+            {
+                let mut sent = t.dir_requested.lock().unwrap();
+                sent.retain(|_, at| at.elapsed() < Duration::from_secs(60));
+                // Не подтверждаем запрос без ответа: LXMF повторит его после окна лимита, иначе ручное обновление сразу после admission теряется.
+                if sent.contains_key(&pk) { return false; }
+                if sent.len() >= 256 { return false; }
+                sent.insert(pk, Instant::now());
+            }
+            let mut list = vec![];
+            let mine = self.adv();
+            if !mine.is_empty() {
+                list.push(serde_json::json!({"d":hex(&self.my_dest),"k":hex(&self.my_pk),"e":self.ep_id,"a":mine,"n":self.name,"pl":platform()}));
+            }
+            let n = self.neigh.lock().unwrap();
+            list.extend(n.values().filter(|nb| !nb.addrs.is_empty() && directory_node_visible(&tr, &roots, &nb.pk))
+                .take(DIR_MAX - list.len()).map(|nb| serde_json::json!({"d":hex(&nb.dest),"k":hex(&nb.pk),"e":nb.ep,
+                    "a":nb.addrs.get().into_iter().take(3).collect::<Vec<_>>(),"n":nb.name})));
+            (list, tr.records_visible_to(&pk), roots)
+        };
+        let me = Arc::downgrade(self);
+        let gate: lxmf_sync::Gate = Arc::new(move || {
+            let ctx = me.upgrade()?;
+            let t = ctx.t13.as_ref()?;
+            let tr = match t.trust.try_lock() {
+                Ok(tr) => tr,
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+                Err(_) => return Some(false),
+            };
+            let roots = directory_roots(&tr, &pk, now_ms() as u64);
+            // Не отправляем старый снимок утраченного root, даже если адресат остался участником другого root.
+            Some(snapshot_roots.iter().all(|r| roots.contains(r)))
+        });
+        let sent = !list.is_empty() && lxmf_sync::send_dir(&self.state, pk, list, gate);
+        let recs_sent = records.is_empty() || lxmf_sync::queue(&self.state, t.trust.clone(), pk, records, vec![]);
+        if !sent || !recs_sent { t.dir_requested.lock().unwrap().remove(&pk); }
+        sent && recs_sent
+    }
+
     /// Адресат каталога допустим, пока он: живой Link (новичок или сосед-сервер), админ ожидающего приглашения или ключ с эффективным TRANSIT.
     /// Без ожидания mutex (None - повторить позже); слабая ссылка не удерживает узел.
     fn dir_gate(self: &Arc<Self>, pk: trust::Pk) -> lxmf_sync::Gate {
@@ -5004,6 +5100,9 @@ impl NodeCtx {
         for (l, pk) in ids {
             self.send_dir_checked(l, Some(pk));
         }
+        let clients: Vec<_> = self.links.lock().unwrap().values()
+            .filter(|l| matches!(l.role, Role::Client { .. })).filter_map(|l| l.peer_pk).collect();
+        for pk in clients { self.send_member_directory(pk); }
     }
 
     fn admit_client13(self: &Arc<Self>, link: LinkId, pk: [u8; 64]) {
@@ -5062,6 +5161,7 @@ impl NodeCtx {
             // новому клиенту соседей шлём всегда (0014 R3)
             c.send_nbrs(link);
             c.send_admitted_records(link, pk, OrdinaryAdmission::Client);
+            c.send_member_directory(pk);
         });
     }
 
@@ -5230,6 +5330,19 @@ fn dir_recipient_ok(links: &HashMap<LinkId, LinkInfo>, admin: Option<trust::Pk>,
         || tr.effective(pk, now) & trust::TRANSIT != 0
 }
 
+/// Root-local membership, including an EnRec valid on THIS node. Identity ownership, foreign-root rights and an address hint are not membership.
+fn directory_roots(tr: &trust::Trust, peer: &trust::Pk, now: u64) -> Vec<trust::Hash> {
+    let Some(h) = trust::hash_of(peer) else { return vec![] };
+    tr.anchors().into_iter().filter_map(|(root, _)| {
+        let mine = tr.effective_in(&root, &tr.me_hash, now);
+        (mine & (trust::EXIT | trust::TRANSIT) != 0 && tr.rights_at(&root, &h, &tr.me_hash) != 0).then_some(root)
+    }).collect()
+}
+
+fn directory_node_visible(tr: &trust::Trust, roots: &[trust::Hash], pk: &trust::Pk) -> bool {
+    trust::hash_of(pk).is_some_and(|h| roots.iter().any(|root| tr.rights_in(root, &h) & (trust::EXIT | trust::TRANSIT) != 0))
+}
+
 /// Каталог от посредника зачисления (R6), админа приглашения или соседа: адреса нод - подсказки для диалера.
 /// Отправитель опознан по ключу LXMF-подписи (`source_key`); подпись не право, поэтому нужно ещё одно из: роль Server (взаимный TRANSIT),
 /// Link, через который сами просимся, админ ожидающего приглашения или эффективный TRANSIT в записях. Истина - `true`, если адресата можно подтвердить.
@@ -5304,6 +5417,10 @@ fn on_sync_node(ctx: &Arc<NodeCtx>, message: &leviculum_lxmf::Message) {
     lxmf_sync::RX_BYTES.fetch_add(message.pack().len() as u64, Relaxed);
     lxmf_sync::RX_MESSAGES.fetch_add(1, Relaxed);
     if let Some(digest) = wire.ack { lxmf_sync::received_ack(&ctx.state, message.source_hash, digest); return; }
+    if wire.get_dir {
+        if ctx.send_member_directory(pk) { lxmf_sync::acknowledge(&ctx.state, message, pk); }
+        return;
+    }
     if !wire.dir.is_empty() {
         if message.content.len() <= lxmf_admin::MAX_ADMIN_CONTENT && on_dir_node(ctx, pk, &wire.dir) { lxmf_sync::acknowledge(&ctx.state, message, pk); }
         return;
@@ -5336,6 +5453,7 @@ fn on_sync_client(ctx: &Arc<ClientCtx>, message: &leviculum_lxmf::Message) {
     lxmf_sync::RX_BYTES.fetch_add(message.pack().len() as u64, Relaxed);
     lxmf_sync::RX_MESSAGES.fetch_add(1, Relaxed);
     if let Some(digest) = wire.ack { lxmf_sync::received_ack(&ctx.state, message.source_hash, digest); return; }
+    if wire.get_dir { return; } // телефон не выдаёт сетевой каталог и не является транзитным сервером
     if !wire.dir.is_empty() {
         if message.content.len() <= lxmf_admin::MAX_ADMIN_CONTENT && on_dir_client(ctx, pk, &wire.dir) { lxmf_sync::acknowledge(&ctx.state, message, pk); }
         return;
@@ -6872,6 +6990,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
         ctx.refresh_servers13();
         tokio::spawn(client_policy_loop(ctx.clone()));
         tokio::spawn(client_enroll_refresh(ctx.clone()));
+        tokio::spawn(client_directory_refresh(ctx.clone()));
         let note = {
             let c = ctx.c13.as_ref().unwrap();
             let tr = c.trust.lock().unwrap();
@@ -7024,11 +7143,54 @@ async fn pair_client(ctx: &Arc<ClientCtx>) -> Result<()> {
     ctx.refresh_servers13(); start_dialers(ctx); Ok(())
 }
 
-/// Дожим расписок зачисления (см. `enroll_net::refresh`): раз в 2 мин и сразу по файлу `refresh-nodes` (кнопка приложения).
+/// Отдельный быстрый путь каталога: не ждёт долгих запросов отсутствующих нод приглашения.
+/// По жесту и раз в 2 минуты спрашиваем максимум два известных выхода через штатный LXMF.
+async fn client_directory_refresh(ctx: Arc<ClientCtx>) {
+    let Some(c) = &ctx.c13 else { return };
+    let (fin, trigger) = (ctx.state.join("fin"), ctx.state.join("refresh-nodes"));
+    let mut last = Instant::now() - Duration::from_secs(120);
+    while !fin.exists() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let manual = trigger.exists();
+        if !manual && last.elapsed() < Duration::from_secs(120) { continue; }
+        if c.invite.lock().unwrap().is_some() { continue; }
+        if manual {
+            let _ = std::fs::remove_file(&trigger);
+            let _ = crate::enroll::write(&ctx.state.join("refresh-enrollment"), b"");
+        }
+        last = Instant::now();
+        let current = ctx.cur.lock().unwrap().map(|v| v.0);
+        let mut servers = ctx.servers.lock().unwrap().clone();
+        servers.sort_by_key(|s| (Some(s.dest) != current, s.dest));
+        let targets: Vec<_> = servers.into_iter().filter(|s| exit_eligible(&ctx, s)).filter_map(|s| s.pk).take(2).collect();
+        let mut queued = 0;
+        for pk in targets {
+            let weak = Arc::downgrade(&ctx);
+            let gate: lxmf_sync::Gate = Arc::new(move || {
+                let ctx = weak.upgrade()?;
+                let c = ctx.c13.as_ref()?;
+                let tr = match c.trust.try_lock() {
+                    Ok(tr) => tr,
+                    Err(std::sync::TryLockError::WouldBlock) => return None,
+                    Err(_) => return Some(false),
+                };
+                Some(authorized_exit(&tr, Some(&pk), now_ms() as u64))
+            });
+            if lxmf_sync::request_dir(&ctx.state, pk, gate) { queued += 1; }
+        }
+        if manual {
+            let text = if queued == 0 { "Не удалось запросить каталог: нет доступного авторизованного выхода".into() }
+                else { format!("Запрос каталога отправлен нодам: {queued}. Ожидаю ответ; подтверждения приглашения обновляются отдельно") };
+            let _ = crate::enroll::write(&ctx.state.join("refresh-result.txt"), text.as_bytes());
+        }
+    }
+}
+
+/// Дожим расписок зачисления (см. `enroll_net::refresh`): раз в 2 мин и по файлу `refresh-enrollment`.
 /// Найденные адреса - подсказки; права ноды получают только из подписанных записей.
 async fn client_enroll_refresh(ctx: Arc<ClientCtx>) {
     let Some(c) = &ctx.c13 else { return };
-    let (fin, trigger) = (ctx.state.join("fin"), ctx.state.join("refresh-nodes"));
+    let (fin, trigger) = (ctx.state.join("fin"), ctx.state.join("refresh-enrollment"));
     // Грант может включать ноду, которая так и не зачислена (расписок всегда меньше): пауза растёт 2 -> 30 мин, пока новых записей нет.
     let (mut last, mut wait) = (Instant::now(), 120u64);
     let count = || c.trust.lock().unwrap().enrollment_proofs(&ctx.identity.public_key_bytes()).len();
@@ -7052,7 +7214,11 @@ async fn client_enroll_refresh(ctx: Arc<ClientCtx>) {
             continue;
         };
         let before = count();
-        let res = enroll_net::refresh(&service).await;
+        // Один недоступный scope не блокирует жест/диагностику навсегда; сохранённый курсор продолжит следующий проход.
+        let res = match tokio::time::timeout(Duration::from_secs(120), enroll_net::refresh(&service)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!("Не все ноды ответили за 2 минуты; опрос продолжится в фоне")),
+        };
         wait = if manual || count() > before { 120 } else { (wait * 2).min(1800) };
         let after = count();
         let (received, expected, refreshable) = enroll_net::receipt_progress(&service);
@@ -7299,10 +7465,12 @@ fn on_dir_client(ctx: &Arc<ClientCtx>, sender: trust::Pk, dir: &[serde_json::Val
         return false;
     }
     let own_only = !(peer || rights);
+    let mut accepted = 0;
     for e in parse_dir_values(dir, T13_TAG, DIR_MAX) {
         if own_only && sender != e.pk {
             continue;
         }
+        accepted += 1;
         ctx.remember_addrs(&e.dest, &e.addrs);
         ctx.hint_name(e.dest, &e.name);
         if let Some(pl) = e.pl.as_deref() {
@@ -7333,6 +7501,9 @@ fn on_dir_client(ctx: &Arc<ClientCtx>, sender: trust::Pk, dir: &[serde_json::Val
     }
     ctx.refresh_servers13();
     start_dialers(ctx);
+    let known = ctx.servers.lock().unwrap().len();
+    let summary = serde_json::json!({"at_ms":now_ms(),"entries":accepted,"known":known});
+    let _ = crate::enroll::write(&ctx.state.join("directory-result.json"), &serde_json::to_vec(&summary).unwrap());
     true
 }
 
