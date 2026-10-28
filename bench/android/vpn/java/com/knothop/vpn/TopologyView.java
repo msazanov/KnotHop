@@ -89,9 +89,11 @@ final class TopologyView extends View {
     private final Runnable longPress = () -> {
         if (!dragged && dragNode != null && onLongPick != null) {
             longPicked = true;
+            Ui.click(this);
             onLongPick.pick(dragNode.dest, dragNode.name);
         } else if (!dragged && dragPhone && onPhonePick != null) {
             longPicked = true;
+            Ui.click(this);
             onPhonePick.run();
         }
     };
@@ -506,7 +508,7 @@ final class TopologyView extends View {
             c.drawText(s, cx, cy - (m.ascent + m.descent) / 2f, b);
         }
         if (dim) {
-            p.setColor(0x99FFFFFF);
+            p.setColor(Ui.dark(getContext()) ? 0x99000000 : 0x99FFFFFF);
             c.drawCircle(cx, cy, r, p);
         }
     }
@@ -585,7 +587,7 @@ final class TopologyView extends View {
             p.setPathEffect(null);
             p.setColor(0x663478C6);
             t.setTextSize(8 * d);
-            t.setColor(0xFF3478C6);
+            t.setColor(Ui.ink(getContext(), 0xFF3478C6));
             for (Edge e : edges) {
                 Node na = byDest.get(e.a), nb = byDest.get(e.b);
                 if (na == null || nb == null) continue;
@@ -607,7 +609,7 @@ final class TopologyView extends View {
                 p.setColor(0x883478C6);
                 c.drawPath(curve(cur.x, cur.y, n.x, n.y, 0.22f), p);
                 if (n.rtt > 0) {
-                    t.setColor(0xFF3478C6);
+                    t.setColor(Ui.ink(getContext(), 0xFF3478C6));
                     c.drawText("+" + Math.round(n.rtt) + " мс", (cur.x + n.x) / 2 + (n.y - cur.y) * 0.11f, (cur.y + n.y) / 2 - (n.x - cur.x) * 0.11f, t);
                 }
             }
@@ -615,7 +617,7 @@ final class TopologyView extends View {
         // узлы с путём RNS через транзит (vis via): подвешены тонкой пунктирной линией к своей nh, от телефона линии нет
         p.setStrokeWidth(1.2f * d);
         p.setPathEffect(new DashPathEffect(new float[]{5 * d, 5 * d}, 0));
-        p.setColor(0xFF6A6A70);
+        p.setColor(Ui.ink(getContext(), 0xFF6A6A70));
         for (Node n : ns) {
             if (!"via".equals(n.vis) || "current".equals(n.state) || n.nh.isEmpty() || n.nh.equals(n.dest)) continue;
             Node hop = byDest.get(n.nh);
@@ -634,24 +636,24 @@ final class TopologyView extends View {
                 if (hop != null) {
                     c.drawLine(px, py, hop.x, hop.y, p);
                     c.drawLine(hop.x, hop.y, n.x, n.y, p);
-                    t.setColor(0xFF2E9E4F);
+                    t.setColor(Ui.green(getContext()));
                     c.drawText("через " + shortName(hop.name), (hop.x + n.x) / 2, (hop.y + n.y) / 2 - 8 * d, t);
                     String s = ("tcp".equals(n.carrier) ? "TCP " : "") + (phoneRtt >= 0 ? Math.round(phoneRtt) + " мс" : "");
                     c.drawText(s, (px + hop.x) / 2, (py + hop.y) / 2 - 8 * d, t);
                 } else if (!"via".equals(n.vis)) {
                     c.drawLine(px, py, n.x, n.y, p);
-                    t.setColor(0xFF2E9E4F);
+                    t.setColor(Ui.green(getContext()));
                     String s = ("tcp".equals(n.carrier) ? "TCP " : "") + (phoneRtt >= 0 ? Math.round(phoneRtt) + " мс" : "");
                     c.drawText(s, (px + n.x) / 2, (py + n.y) / 2 - 8 * d, t);
                 }
             } else if ((n.vis.isEmpty() ? n.visible : "direct".equals(n.vis)) && !n.isVia && !"fail".equals(n.lk)) {   // пунктир только к узлам с прямым путём и возможным Link
                 p.setStrokeWidth(2f * d);
                 p.setPathEffect(new DashPathEffect(new float[]{9 * d, 7 * d}, 0));
-                p.setColor(pingMode ? pingColor(n.rtt, 0xFF) : 0xFF6A6A70);
+                p.setColor(pingMode ? pingColor(n.rtt, 0xFF) : Ui.ink(getContext(), 0xFF6A6A70));
                 if (pingMode) p.setStrokeWidth((1f + 2.5f * (1 - pingNorm(n.rtt))) * d);
                 c.drawLine(px, py, n.x, n.y, p);
                 if (pingMode && n.rtt > 0) {
-                    t.setColor(0xFF444444);
+                    t.setColor(Ui.ink(getContext(), 0xFF444444));
                     t.setTextSize(8.5f * d);
                     c.drawText(Math.round(n.rtt) + " мс", (px + n.x) / 2, (py + n.y) / 2 - 4 * d, t);
                     t.setTextSize(10 * d);
@@ -674,7 +676,7 @@ final class TopologyView extends View {
         ph.setTextSize(40 * d);
         Paint.FontMetrics fm = ph.getFontMetrics();
         c.drawText("\uD83D\uDCF1", px, py - (fm.ascent + fm.descent) / 2f, ph);
-        t.setColor(0xFF444444);
+        t.setColor(Ui.ink(getContext(), 0xFF444444));
         t.setTextSize(10 * d);
         c.drawText(phoneLabel, px, py + 44 * d, t);
 
@@ -696,14 +698,14 @@ final class TopologyView extends View {
             drawBadge(c, n, n.x, n.y, r, false);
             p.setStyle(Paint.Style.STROKE);
             p.setStrokeWidth((isCur ? 3 : 1.5f) * d);
-            p.setColor(isCur || n.isVia ? 0xFF2E9E4F : 0xFF444444);
+            p.setColor(isCur || n.isVia ? Ui.green(getContext()) : Ui.ink(getContext(), 0xFF444444));
             c.drawCircle(n.x, n.y, r, p);
         }
-        // подписи отдельным слоем поверх всех кружков и линий, с белой подложкой: ничто не закрывает текст
+        // Подписи поверх кружков и линий с подложкой под текущую тему.
         Paint h = new Paint(t);
         h.setStyle(Paint.Style.STROKE);
         h.setStrokeWidth(3.2f * d);
-        h.setColor(0xDDFFFFFF);
+        h.setColor(Ui.dark(getContext()) ? 0xDD000000 : 0xDDFFFFFF);
         for (Node n : ns) {
             boolean isCur = "current".equals(n.state);
             int same = 0;
@@ -720,11 +722,11 @@ final class TopologyView extends View {
             t.setTextSize(11 * d); h.setTextSize(11 * d);
             h.setTextAlign(Paint.Align.CENTER);
             c.drawText(l1, n.x, n.y + r + 14 * d, h);
-            t.setColor(isCur ? 0xFF1E7A3A : 0xFF222222);
+            t.setColor(isCur ? Ui.green(getContext()) : Ui.fg(getContext()));
             c.drawText(l1, n.x, n.y + r + 14 * d, t);
             t.setTextSize(9.5f * d); h.setTextSize(9.5f * d);
             c.drawText(l2, n.x, n.y + r + 26 * d, h);
-            t.setColor("fail".equals(n.lk) ? 0xFF999999 : 0xFF666666);
+            t.setColor(Ui.ink(getContext(), "fail".equals(n.lk) ? 0xFF999999 : 0xFF666666));
             c.drawText(l2, n.x, n.y + r + 26 * d, t);
             if (l3 != null && !l3.isEmpty()) {
                 c.drawText(l3, n.x, n.y + r + 38 * d, h);
@@ -743,7 +745,7 @@ final class TopologyView extends View {
             Util.lab("EDGES " + (hasEdges ? edges.size() : -1) + " lk " + lk);
         }
         if (ns.isEmpty()) {
-            t.setColor(0xFF888888);
+            t.setColor(Ui.ink(getContext(), 0xFF888888));
             t.setTextSize(13 * d);
             c.drawText("ждём таблицу выходов…", px, py + 70 * d, t);
         }
@@ -812,9 +814,10 @@ final class TopologyView extends View {
                     Node n;
                     synchronized (nodes) { n = hit(x, y); }
                     if (n != null && onPick != null) {
+                        Ui.tick(this);
                         onPick.pick(n.dest, n.name);
                     } else if (n == null && hitPhone(x, y)) {
-                        if (onPhonePick != null) onPhonePick.run();
+                        if (onPhonePick != null) { Ui.tick(this); onPhonePick.run(); }
                     } else if (n == null) {
                         long now = System.currentTimeMillis();
                         if (now - lastTapMs < 350) {   // двойное касание: встряхнуть, всё возвращается на кольцо

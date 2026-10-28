@@ -119,6 +119,18 @@ pub extern "system" fn Java_com_knothop_vpn_Native_setUiVisible(_env: JNIEnv, _c
     rns_iroh_node::mobile::set_ui_visible(visible != 0);
 }
 
+/// Подключить (fd >= 0) или снять (fd < 0) TUN у работающего узла без перезапуска. Узел берёт свой дубликат дескриптора.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_knothop_vpn_Native_setTun(_env: JNIEnv, _c: JClass, fd: jint) -> jboolean {
+    rns_iroh_node::mobile::set_tun_fd(fd) as jboolean
+}
+
+/// Просьба пользователя: 0 - внеочередной анонс, 1 - проверка связи со всеми нодами.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_knothop_vpn_Native_kick(_env: JNIEnv, _c: JClass, kind: jint) -> jboolean {
+    rns_iroh_node::mobile::kick(kind) as jboolean
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_knothop_vpn_Native_networkChanged(_env: JNIEnv, _c: JClass) {
     rns_iroh_node::mobile::network_changed();

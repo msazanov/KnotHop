@@ -37,6 +37,8 @@ public class PolicyActivity extends Activity {
     private LinearLayout box;
     private String lastShown = "";
     private boolean binding;
+    private boolean fallbackLoading, fallbackTried;
+    private JSONArray fallbackPolicy;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -53,6 +55,8 @@ public class PolicyActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        fallbackTried = false;
+        lastShown = "";
         ui.post(tick);
     }
 
@@ -82,11 +86,25 @@ public class PolicyActivity extends Activity {
 
     private void render() throws Exception {
         String js = Util.read(new File(state, "status.json"));
-        if (js.isEmpty()) { show(null); return; }
-        JSONArray pol = new JSONObject(js).optJSONArray("policy");
+        boolean offline = "idle".equals(KnotHopVpnService.phase) || "error".equals(KnotHopVpnService.phase);
+        JSONArray pol = js.isEmpty() ? null : new JSONObject(js).optJSONArray("policy");
+        if (offline || pol == null) {
+            if (!fallbackTried && !fallbackLoading) {
+                fallbackTried = true;
+                fallbackLoading = true;
+                new Thread(() -> {
+                    JSONArray got = null;
+                    try { got = new JSONObject(Native.runCLI("trust-view --state " + state.getAbsolutePath(), state.getAbsolutePath())).optJSONArray("policy"); }
+                    catch (Exception ignored) { }
+                    final JSONArray result = got;
+                    ui.post(() -> { fallbackLoading = false; fallbackPolicy = result; lastShown = ""; });
+                }, "knothop-rights-view").start();
+            }
+            pol = fallbackPolicy;
+        }
         String own = "";
         try { own = new JSONObject(Util.read(new File(state, "whoami.json"))).optString("hash", ""); } catch (Throwable ignored) { }
-        String key = String.valueOf(pol) + own;
+        String key = String.valueOf(pol) + own + offline + fallbackLoading;
         if (key.equals(lastShown)) return;
         lastShown = key;
         show(pol);
@@ -100,9 +118,10 @@ public class PolicyActivity extends Activity {
         title.setTypeface(Typeface.DEFAULT_BOLD);
         box.addView(title);
         TextView hint = new TextView(this);
-        hint.setText("Права выдаёт администратор сети. Здесь видно, на что вы согласны: это только сужает выданное и расширить не может. Нода без действующих прав скрывается из списков.");
+        hint.setText("Права выдаёт администратор сети. Здесь видно, на что вы согласны: это только сужает выданное и расширить не может. Нода без действующих прав скрывается из списков."
+                + (("idle".equals(KnotHopVpnService.phase) || "error".equals(KnotHopVpnService.phase)) ? " Показаны сохранённые данные; узел сейчас не подключён." : ""));
         hint.setTextSize(12);
-        hint.setTextColor(GREY);
+        hint.setTextColor(Ui.ink(this, GREY));
         box.addView(hint);
         String own = "";
         try { own = new JSONObject(Util.read(new File(state, "whoami.json"))).optString("hash", ""); } catch (Throwable ignored) { }
@@ -117,7 +136,7 @@ public class PolicyActivity extends Activity {
         }
         if (shown == 0) {
             TextView none = new TextView(this);
-            none.setText("\nВы пока не вступили ни в одну чужую сеть, либо приложение не запущено.");
+            none.setText(pol == null ? (fallbackLoading ? "\nЗагружаю сохранённые права…" : "\nДанные о правах пока недоступны. Включите режим «Сеть» и дождитесь зачисления.") : "\nНет сохранённых прав в чужих сетях.");
             box.addView(none);
         }
     }
@@ -130,7 +149,7 @@ public class PolicyActivity extends Activity {
         boolean valid = own != null && own.matches("[0-9a-fA-F]{32}");
         if (!valid) {
             t.setText("Мой fingerprint появится после создания identity (запустите приложение).");
-            t.setTextColor(GREY);
+            t.setTextColor(Ui.ink(this, GREY));
             box.addView(t);
             return;
         }
@@ -161,9 +180,25 @@ public class PolicyActivity extends Activity {
         box.addView(t);
         TextView st = new TextView(this);
         st.setTextSize(12);
-        st.setTextColor(eff == 0 ? 0xFFB33A3A : GREEN);
+        st.setTextColor(Ui.ink(this, eff == 0 ? 0xFFB33A3A : GREEN));
         st.setText(eff == 0 ? "Вы скрыты: действующих прав нет." : "Действует: " + names(eff));
         box.addView(st);
+        JSONArray scopes = p.optJSONArray("scopes");
+        if (scopes != null && scopes.length() > 0) {
+            TextView note = new TextView(this);
+            note.setText("Права по приглашению действуют только на подтвердивших нодах, не на всю сеть:");
+            note.setTextSize(12);
+            box.addView(note);
+            for (int i = 0; i < scopes.length(); i++) {
+                JSONObject node = scopes.optJSONObject(i);
+                if (node == null) continue;
+                String hash = node.optString("node", "?");
+                TextView row = new TextView(this);
+                row.setText("• " + hash.substring(0, Math.min(8, hash.length())) + ": " + names(node.optInt("eff")));
+                row.setTextSize(12);
+                box.addView(row);
+            }
+        }
         addRow(root, "Использовать выходы сети", USE, grant, offer, true);
         addRow(root, "Быть транзитом для других", TRANSIT, grant, offer, false);
         addRow(root, "Быть выходом в интернет", EXIT, grant, offer, false);
@@ -171,7 +206,7 @@ public class PolicyActivity extends Activity {
         if (admin != 0) {
             TextView a = new TextView(this);
             a.setTextSize(12);
-            a.setTextColor(GREY);
+            a.setTextColor(Ui.ink(this, GREY));
             a.setText("Административные права (выдано): " + names(admin));
             box.addView(a);
         }
@@ -190,7 +225,7 @@ public class PolicyActivity extends Activity {
         if (!note.isEmpty()) {
             TextView n = new TextView(this);
             n.setTextSize(11);
-            n.setTextColor(GREY);
+            n.setTextColor(Ui.ink(this, GREY));
             n.setPadding(96, 0, 0, 8);
             n.setText(note);
             box.addView(n);

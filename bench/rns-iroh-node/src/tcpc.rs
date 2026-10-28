@@ -27,6 +27,11 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Слоты соединений TCP-носителя (общие для `listen`).
 static SLOTS: LazyLock<SlotsRef> = LazyLock::new(Default::default);
+/// relay iroh: отдельный пул, равный лимиту клиентов `relay::MAX_CLIENTS`
+static RELAY_SLOTS: LazyLock<SlotsRef> = LazyLock::new(Default::default);
+const MAX_RELAY_CONNS: usize = 64;
+/// сколько ждём первый байт, чтобы отличить носитель от relay (как и ожидание маркера в `hello_accept`)
+const MARKER_WAIT: Duration = Duration::from_secs(5);
 
 /// Срок чтения: до первого полного кадра принимающей стороны - общий `auth_until`, потом обычная тишина `IDLE`.
 fn read_until(authed: bool, auth_until: tokio::time::Instant) -> tokio::time::Instant {
@@ -144,8 +149,9 @@ pub async fn attach(node: Arc<Node>, sh: Arc<Shared>, name: String, stream: TcpS
     writer.abort();
 }
 
-/// Слушать TCP на том же порту, что и QUIC (порты TCP и UDP независимы).
-pub async fn listen(node: Arc<Node>, sh: Arc<Shared>, port: u16) {
+/// Слушать TCP на том же порту, что и QUIC (порты TCP и UDP независимы). С `relay` тот же порт обслуживает и TLS-relay iroh:
+/// соединение различается по первому байту (`R` - маркер носителя, `0x16` - TLS), без relay поведение прежнее.
+pub async fn listen(node: Arc<Node>, sh: Arc<Shared>, port: u16, relay: Option<Arc<relay::Host>>) {
     let l = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -169,10 +175,26 @@ pub async fn listen(node: Arc<Node>, sh: Arc<Shared>, port: u16) {
         n += 1;
         let (node, sh) = (node.clone(), sh.clone());
         let name = format!("tcp-in-{}-{n}", peer.ip());
+        let relay = relay.clone();
         tokio::spawn(async move {
-            let _slot = slot;
-            let (_keep, rx) = tokio::sync::watch::channel(false);
-            attach(node, sh, name, s, false, rx).await;
+            let kind = match &relay {
+                Some(_) => relay::classify(&s, MARKER_WAIT).await,
+                None => relay::Kind::Carrier,
+            };
+            match (kind, relay) {
+                (relay::Kind::Carrier, _) => {
+                    let _slot = slot;
+                    let (_keep, rx) = tokio::sync::watch::channel(false);
+                    attach(node, sh, name, s, false, rx).await;
+                }
+                (relay::Kind::Relay, Some(host)) => {
+                    // слот носителя нужен был только до опознания; relay считается отдельно, чтобы не вытеснять носитель
+                    drop(slot);
+                    let Some(_relay_slot) = Slot::take(&RELAY_SLOTS, Some(peer.ip()), MAX_RELAY_CONNS, MAX_PER_IP) else { return };
+                    host.serve(s).await;
+                }
+                _ => {}
+            }
         });
     }
 }

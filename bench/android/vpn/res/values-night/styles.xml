@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.KnotHop" parent="@android:style/Theme.DeviceDefault">
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:textColorPrimary">#EDEDED</item>
+        <item name="android:textColorSecondary">#B5B5BF</item>
+        <item name="android:textColorHint">#AAAAAA</item>
+        <item name="android:textViewStyle">@style/Widget.KnotHop.Text</item>
+        <item name="android:statusBarColor">#000000</item>
+        <item name="android:navigationBarColor">#000000</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:colorAccent">#8AB8FF</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+    <style name="Widget.KnotHop.Text" parent="@android:style/Widget.TextView">
+        <item name="android:textColor">#EDEDED</item>
+    </style>
+</resources>

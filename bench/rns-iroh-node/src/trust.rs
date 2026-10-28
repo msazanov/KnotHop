@@ -1336,12 +1336,23 @@ impl Trust {
             .anchors
             .keys()
             .filter_map(|root| {
-                let g = self.rights_in(root, &self.me_hash);
-                (g != 0).then(|| (*root, g, self.my_offer.get(root).copied(), self.effective_in(root, &self.me_hash, now)))
+                // Display only: never feed this union into delegation or root-wide admission.
+                let scopes = self.policy_scope_view(root, now);
+                let g = scopes.iter().fold(self.rights_in(root, &self.me_hash), |a, (_, g, _)| a | g);
+                (g != 0 || !scopes.is_empty()).then(|| (*root, g, self.my_offer.get(root).copied(), g & self.offer_in(root, &self.me_hash, now)))
             })
             .collect();
         v.sort_by_key(|x| x.0);
         v
+    }
+
+    /// UI detail for node-scoped v4 grants. Does not alter rights_in/my_rights_in or delegation.
+    pub fn policy_scope_view(&self, root: &Hash, now: u64) -> Vec<(Hash, u16, u16)> {
+        self.enroll_recs.values().filter(|p| p.grant.root == *root && p.rec.holder == self.me_pk)
+            .map(|p| {
+                let g = self.rights_at(root, &self.me_hash, &p.rec.scope);
+                (p.rec.scope, g, g & self.offer_in(root, &self.me_hash, now))
+            }).collect()
     }
 
     /// Моя настройка в корне, если задана.

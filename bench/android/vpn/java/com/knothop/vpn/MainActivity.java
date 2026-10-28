@@ -21,7 +21,7 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 
 import org.json.JSONArray;
@@ -44,8 +44,15 @@ public class MainActivity extends Activity {
 
     private LinearLayout pairBox, mainBox, listBox, adminBox;
     private EditText profileField;
-    private TextView pairMsg, header, status, logView, usersView, nodesMsg, updMsg;
-    private Button button, benchBtn;
+    private TextView pairMsg, header, status, usersView, nodesMsg, updMsg;
+    private Button benchBtn;
+    private TextView pullHint, modeText;
+    private LogConsole logConsole;
+    private SeekBar modeSeek;
+    private boolean modeDragging;
+    /** Выбранный пользователем режим, пока служба его не подтвердила (через ~5 с ползунок снова показывает фактический). */
+    private int pendingMode = -1;
+    private long pendingUntil;
     private TextView benchView;
     /** Предел длины вставляемого или открытого по ссылке приглашения (H4/O6). */
     private static final int MAX_PASTE = 4096;
@@ -59,11 +66,24 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         sp = getSharedPreferences("p", MODE_PRIVATE);
-        ScrollView sv = new ScrollView(this);
+        PullScrollView sv = new PullScrollView(this);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(24, 48, 24, 24);
         sv.addView(root);
+        pullHint = new TextView(this);
+        pullHint.setGravity(Gravity.CENTER);
+        pullHint.setTextSize(13);
+        pullHint.setVisibility(View.GONE);
+        root.addView(pullHint);
+        sv.setListener(new PullScrollView.Listener() {
+            @Override public void onPull(float f) {
+                pullHint.setVisibility(f > 0 ? View.VISIBLE : View.GONE);
+                pullHint.setText(f >= 1f ? "Отпустите, чтобы обновить" : "Потяните вниз, чтобы обновить");
+            }
+            @Override public void onRefresh() { pullRefresh(); }
+            @Override public void onPullUp() { logConsole.setOpen(true); }
+        });
 
         TextView title = new TextView(this);
         title.setText("KnotHop");
@@ -89,6 +109,7 @@ public class MainActivity extends Activity {
         Button paste = new Button(this);
         paste.setText("Вставить");
         paste.setOnClickListener(v -> {
+            Ui.tick(v);
             ClipboardManager cb = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
             ClipData d = cb.getPrimaryClip();
             if (d != null && d.getItemCount() > 0 && d.getItemAt(0).getText() != null) profileField.setText(d.getItemAt(0).getText());
@@ -96,17 +117,17 @@ public class MainActivity extends Activity {
         Button pair = new Button(this);
         pair.setText("Спарить");
         pair.setFilterTouchesWhenObscured(true);   // F8
-        pair.setOnClickListener(v -> doPair(profileField.getText().toString()));
+        pair.setOnClickListener(v -> { Ui.tick(v); doPair(profileField.getText().toString()); });
         row.addView(paste);
         row.addView(pair);
         pairBox.addView(row);
         Button scan = new Button(this);
         scan.setText("Сканировать QR");
-        scan.setOnClickListener(v -> startActivityForResult(new Intent(this, ScanActivity.class), REQ_SCAN));
+        scan.setOnClickListener(v -> { Ui.tick(v); startActivityForResult(new Intent(this, ScanActivity.class), REQ_SCAN); });
         pairBox.addView(scan);
         Button own = new Button(this);
-        own.setText("Запустить без приглашения (своя сеть)");
-        own.setOnClickListener(v -> doPair(""));
+        own.setText("Своя сеть (нужна собственная серверная нода)");
+        own.setOnClickListener(v -> { Ui.tick(v); doPair(""); });
         pairBox.addView(own);
         pairMsg = new TextView(this);
         pairBox.addView(pairMsg);
@@ -118,34 +139,15 @@ public class MainActivity extends Activity {
         header = new TextView(this);
         header.setTextSize(13);
         mainBox.addView(header);
-        LinearLayout r2 = new LinearLayout(this);
-        r2.setOrientation(LinearLayout.HORIZONTAL);
-        button = new Button(this);
-        button.setOnClickListener(v -> onButton());
-        r2.addView(button);
-        Button forget = new Button(this);
-        forget.setText("Забыть профиль");
-        forget.setOnClickListener(v -> {
-            if (active() || KnotHopVpnService.tunHeld) startService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_STOP));
-            forgetProfile();
-            refresh();
-        });
-        r2.addView(forget);
-        mainBox.addView(r2);
-        Button routeBtn = new Button(this);
-        routeBtn.setText("Маршрутизация");
-        routeBtn.setAllCaps(false);
-        routeBtn.setOnClickListener(v -> startActivity(new Intent(this, RoutingActivity.class)));
-        mainBox.addView(routeBtn);
         Button rightsBtn = new Button(this);
         rightsBtn.setText("Мои права");
         rightsBtn.setAllCaps(false);
-        rightsBtn.setOnClickListener(v -> startActivity(new Intent(this, PolicyActivity.class)));
+        rightsBtn.setOnClickListener(v -> { Ui.tick(v); startActivity(new Intent(this, PolicyActivity.class)); });
         mainBox.addView(rightsBtn);
         Button nodesBtn = new Button(this);
         nodesBtn.setText("Обновить список нод");
         nodesBtn.setAllCaps(false);
-        nodesBtn.setOnClickListener(v -> refreshNodes());
+        nodesBtn.setOnClickListener(v -> { Ui.tick(v); refreshNodes(); });
         mainBox.addView(nodesBtn);
         nodesMsg = new TextView(this);
         nodesMsg.setTextSize(12);
@@ -154,7 +156,7 @@ public class MainActivity extends Activity {
         Button updBtn = new Button(this);
         updBtn.setText("Проверить обновление");
         updBtn.setAllCaps(false);
-        updBtn.setOnClickListener(v -> checkUpdate(true));
+        updBtn.setOnClickListener(v -> { Ui.tick(v); checkUpdate(true); });
         mainBox.addView(updBtn);
         updMsg = new TextView(this);
         updMsg.setTextSize(12);
@@ -170,7 +172,7 @@ public class MainActivity extends Activity {
         Button inviteBtn = new Button(this);
         inviteBtn.setText("Пригласить");
         inviteBtn.setFilterTouchesWhenObscured(true);   // F8
-        inviteBtn.setOnClickListener(v -> startActivity(new Intent(this, InviteActivity.class)));
+        inviteBtn.setOnClickListener(v -> { Ui.tick(v); startActivity(new Intent(this, InviteActivity.class)); });
         adminBox.addView(inviteBtn);
         usersView = new TextView(this);
         usersView.setTextSize(12);
@@ -194,7 +196,7 @@ public class MainActivity extends Activity {
         mainBox.addView(pingBox);
         benchBtn = new Button(this);
         benchBtn.setText("Тест связи");
-        benchBtn.setOnClickListener(v -> confirmBench());
+        benchBtn.setOnClickListener(v -> { Ui.tick(v); confirmBench(); });
         mainBox.addView(benchBtn);
         benchView = new TextView(this);
         benchView.setTextSize(12);
@@ -203,13 +205,30 @@ public class MainActivity extends Activity {
         listBox = new LinearLayout(this);
         listBox.setOrientation(LinearLayout.VERTICAL);
         mainBox.addView(listBox);
-        logView = new TextView(this);
-        logView.setTextSize(10);
-        logView.setTypeface(Typeface.MONOSPACE);
-        mainBox.addView(logView);
         root.addView(mainBox);
 
-        setContentView(sv);
+        LinearLayout outer = new LinearLayout(this);
+        outer.setOrientation(LinearLayout.VERTICAL);
+        outer.addView(sv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        logConsole = new LogConsole(this);
+        outer.addView(logConsole, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        LinearLayout modePanel = buildModePanel();
+        outer.addView(modePanel, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        setContentView(outer);
+        // клавиатура (поле фильтра журнала): журнал занимает всё место от верха экрана до клавиатуры, остальное прячется
+        final View decor = getWindow().getDecorView();
+        decor.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
+            android.graphics.Rect r = new android.graphics.Rect();
+            decor.getWindowVisibleDisplayFrame(r);
+            int full = decor.getRootView().getHeight();
+            boolean kb = full > 0 && full - r.bottom > full * 0.15f;
+            logConsole.setMaxBody((int) (full * 0.6f));
+            boolean grow = kb && logConsole.isOpen();
+            logConsole.setExpanded(grow);
+            sv.setVisibility(grow ? View.GONE : View.VISIBLE);
+            modePanel.setVisibility(grow ? View.GONE : View.VISIBLE);
+        });
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != 0) {
             requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 2);
         }
@@ -248,6 +267,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (!sp.contains("profile")) offerShown = "";   // профиль мог быть забыт на экране своей ноды
         topo.setActive(true);
         ui.post(tick);
     }
@@ -316,26 +336,6 @@ public class MainActivity extends Activity {
         pairMsg.setText("");
         profileField.setText("");
         refresh();
-    }
-
-    /**
-     * «Забыть профиль» (R-2, R-3): профиль, приглашение, зачисление и чужие корни доверия. Идентичность телефона и записи его
-     * собственной сети остаются. Чужие якоря стирает нативная часть (`forget-network`) после остановки службы.
-     */
-    private void forgetProfile() {
-        File st = new File(getFilesDir(), "state");
-        sp.edit().remove("profile").apply();
-        for (int i = 0; i < 30 && (active() || KnotHopVpnService.tunHeld); i++) {   // служба останавливается асинхронно, до 3 с
-            try { Thread.sleep(100); } catch (InterruptedException e) { break; }
-        }
-        for (String n : new String[]{"profile.txt", "enrollment.json", "enroll-consent.json", "enroll-consented.json", "status.json"}) new File(st, n).delete();
-        offerShown = "";
-        if (new File(st, "identity.key").exists()) {
-            String sd = st.getAbsolutePath();
-            if (Native.runVpn("forget-network --state " + sd, sd) != 0) {
-                android.widget.Toast.makeText(this, "Не удалось забыть чужие сети: " + Util.read(new File(st, "error.txt")), android.widget.Toast.LENGTH_LONG).show();
-            }
-        }
     }
 
     /**
@@ -468,19 +468,148 @@ public class MainActivity extends Activity {
         return !"idle".equals(p) && !"error".equals(p);
     }
 
-    private void onButton() {
-        if (active() || KnotHopVpnService.tunHeld) {
+    private AlertDialog nameDialog;
+
+    /**
+     * Имя телефона для сети (state/node-name.txt, его нативная часть сообщает выходам в T_USE). Спрашиваем один раз, пока имя - автоимя
+     * «телефон-XXXXXX» (по хешу ключа) или не задано; позже имя меняется в настройках своей ноды.
+     */
+    private void maybeAskName() {
+        if (sp.getBoolean("name_asked", false) || (nameDialog != null && nameDialog.isShowing())) return;
+        if (offerDialog != null && offerDialog.isShowing()) return;
+        if (!NodeName.isAuto(getFilesDir())) { sp.edit().putBoolean("name_asked", true).apply(); return; }
+        nameDialog = NodeName.dialog(this, getFilesDir(), () -> sp.edit().putBoolean("name_asked", true).apply());
+    }
+
+    private static final String[] MODE_TITLE = {"Отключено", "В сети нод, без VPN", "VPN включён"};
+
+    /** Закреплённая внизу панель: ползунок с тремя точками притяжения (слева - отключено, середина - сеть нод без VPN, справа - VPN). */
+    private LinearLayout buildModePanel() {
+        LinearLayout p = new LinearLayout(this);
+        p.setOrientation(LinearLayout.VERTICAL);
+        p.setBackgroundColor(Ui.panel(this));
+        p.setPadding(32, 16, 32, 24);
+        modeText = new TextView(this);
+        modeText.setTextSize(14);
+        modeText.setTypeface(Typeface.DEFAULT_BOLD);
+        modeText.setGravity(Gravity.CENTER);
+        p.addView(modeText);
+        modeSeek = new SeekBar(this);
+        modeSeek.setMax(100);
+        modeSeek.setFilterTouchesWhenObscured(true);   // F8
+        modeSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            private int lastStep;
+            @Override public void onProgressChanged(SeekBar s, int v, boolean fromUser) {
+                if (!fromUser) return;
+                int step = (v + 25) / 50;
+                modeText.setText(MODE_TITLE[step]);
+                if (step != lastStep) { Ui.tick(s); lastStep = step; }
+            }
+            @Override public void onStartTrackingTouch(SeekBar s) { modeDragging = true; lastStep = (s.getProgress() + 25) / 50; }
+            @Override public void onStopTrackingTouch(SeekBar s) {
+                modeDragging = false;
+                int m = (s.getProgress() + 25) / 50;
+                s.setProgress(m * 50, true);   // точка притяжения
+                applyMode(m);
+            }
+        });
+        p.addView(modeSeek);
+        LinearLayout labels = new LinearLayout(this);
+        labels.setOrientation(LinearLayout.HORIZONTAL);
+        String[] t = {"Откл.", "Сеть", "VPN"};
+        int[] g = {Gravity.START, Gravity.CENTER_HORIZONTAL, Gravity.END};
+        for (int i = 0; i < 3; i++) {
+            TextView l = new TextView(this);
+            l.setText(t[i]);
+            l.setTextSize(12);
+            l.setGravity(g[i]);
+            labels.addView(l, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        }
+        p.addView(labels);
+        return p;
+    }
+
+    /** Фактический режим: 0 - служба не работает, 1 - узел в сети без TUN, 2 - VPN (сбой с удержанием TUN тоже считается режимом 2). */
+    private int curMode() {
+        if (pendingMode >= 0 && System.currentTimeMillis() < pendingUntil) return pendingMode;
+        pendingMode = -1;
+        if (KnotHopVpnService.tunHeld) return 2;
+        if (!active()) return 0;
+        return KnotHopVpnService.mode == 2 ? 2 : 1;
+    }
+
+    private void updateModePanel() {
+        if (modeSeek == null || modeDragging) return;
+        int m = curMode();
+        if (modeSeek.getProgress() != m * 50) modeSeek.setProgress(m * 50);
+        String t = MODE_TITLE[m];
+        if (KnotHopVpnService.tunHeld) t = "VPN не работает, трафик заблокирован: сдвиньте влево до конца";
+        else if (!KnotHopVpnService.lastError.isEmpty() && m != 0) t += " (" + KnotHopVpnService.lastError + ")";
+        modeText.setText(t);
+    }
+
+    private void applyMode(int m) {
+        int cur = curMode();
+        if (m == cur) return;
+        Ui.click(modeSeek);
+        if (KnotHopVpnService.tunHeld && m != 0) {
+            android.widget.Toast.makeText(this, "Сначала сдвиньте ползунок влево до конца, затем включите заново", android.widget.Toast.LENGTH_LONG).show();
+            updateModePanel();
+            return;
+        }
+        pendingMode = m;
+        pendingUntil = System.currentTimeMillis() + 5000;
+        if (m == 0) {
             startService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_STOP));
             return;
         }
-        Intent consent = VpnService.prepare(this);
-        if (consent != null) startActivityForResult(consent, REQ_VPN);
-        else startVpn();
+        if (m == 2) {
+            Intent consent = VpnService.prepare(this);
+            if (consent != null) {
+                pendingUntil = System.currentTimeMillis() + 60_000;   // пока открыт системный диалог
+                startActivityForResult(consent, REQ_VPN);
+                return;
+            }
+        }
+        sendMode(m);
+    }
+
+    private void sendMode(int m) {
+        startForegroundService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_MODE).putExtra(KnotHopVpnService.EXTRA_MODE, m));
+    }
+
+    /**
+     * Потяни-чтобы-обновить: права и список нод (расписки), внеочередной анонс, проверка связи со всеми нодами, обновление скачанных
+     * списков маршрутов, если они старше суток. Нужен включённый режим «Сеть» или «VPN»: узел работает только в них.
+     */
+    private void pullRefresh() {
+        if (!active()) {
+            android.widget.Toast.makeText(this, "Сначала включите режим «Сеть» или «VPN»", android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+        refreshNodes();
+        Native.kick(0);
+        Native.kick(1);
+        final File files = getFilesDir();
+        final File rstate = new File(files, "state");
+        File g = new File(RulesFiles.dir(files), "geoip.dat");
+        if (RulesFiles.present(files) && System.currentTimeMillis() - g.lastModified() > 24L * 3600 * 1000) {
+            new Thread(() -> {
+                String err = RulesFiles.download(files, t -> { });
+                if (err.isEmpty()) {
+                    try { Native.runVpn("rules-list --state " + rstate.getAbsolutePath(), rstate.getAbsolutePath()); } catch (Throwable ignored) { }
+                }
+                Util.lab("pull: списки маршрутов " + (err.isEmpty() ? "обновлены" : "не обновлены: " + err));
+            }, "knothop-rules-refresh").start();
+        }
     }
 
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
-        if (req == REQ_VPN && res == RESULT_OK) startVpn();
+        if (req == REQ_VPN) {
+            if (res == RESULT_OK) sendMode(2);
+            else { pendingMode = -1; updateModePanel(); }
+        }
         if (req == REQ_SCAN && res == RESULT_OK && data != null) {
             String t = data.getStringExtra(ScanActivity.EXTRA_TEXT);
             if (t != null) {
@@ -488,10 +617,6 @@ public class MainActivity extends Activity {
                 pairMsg.setText("QR считан. Проверьте и нажмите «Спарить»");
             }
         }
-    }
-
-    private void startVpn() {
-        startForegroundService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_START));
     }
 
     /** Выбор выхода: файл select в каталоге состояния читает нативная часть. Без выбора (или пока выбранный выход недоступен) нативная часть сама берёт лучший. */
@@ -506,7 +631,7 @@ public class MainActivity extends Activity {
     /** Дожим расписок зачисления: файл refresh-nodes читает нативная часть (раз в 5 с); сама она делает это и раз в 2 мин. Нужен подключённый VPN. */
     private void refreshNodes() {
         if (!(active() || KnotHopVpnService.tunHeld)) {
-            android.widget.Toast.makeText(this, "Сначала подключитесь", android.widget.Toast.LENGTH_SHORT).show();
+            android.widget.Toast.makeText(this, "Сначала включите режим «Сеть» или «VPN»", android.widget.Toast.LENGTH_SHORT).show();
             return;
         }
         try {
@@ -581,6 +706,7 @@ public class MainActivity extends Activity {
         public void run() {
             refresh();
             pollOffer();
+            if (sp.contains("profile") && !Util.LAB_BUILD) maybeAskName();
             ui.postDelayed(this, 1000);
         }
     };
@@ -602,14 +728,15 @@ public class MainActivity extends Activity {
         try {
             Profile pr = Profile.parse(saved);
             adminBox.setVisibility(pr.own() ? View.VISIBLE : View.GONE);   // приглашать может только администратор своей сети
-            if (pr.own()) header.setText("Вы администратор своей сети. Кнопка «Пригласить»: выбор нод и прав; приглашение показывается как QR и строка и нигде не сохраняется. Приглашение действует 48 часов; выбранные ноды сами выдадут права, держать приложение включённым после выпуска не нужно (но при выпуске телефон должен быть подключён)");
+            if (pr.own()) header.setText("Вы администратор своей сети. Для первой настройки привяжите корень телефона к своей серверной ноде командой knothopd trust-anchor на сервере. "
+                    + "Для выпуска приглашения включите «Сеть» и выберите ноды в «Пригласить»; VPN не обязателен. QR готов сразу, разрешения доставляются в фоне. Приглашение одноразовое, действует 48 часов. Оставьте «Сеть» включённой для доставки");
             else header.setText(enrolled()
                     ? grantedHeader()
-                    : "Приглашение принято, зачисление ещё не завершено. Нажмите «Подключить»: телефон свяжется с нодами приглашения и покажет, какие права вам предлагают; согласитесь в диалоге");
+                    : "Приглашение принято, зачисление ещё не завершено. Передвиньте ползунок внизу в «Сеть» или «VPN»: телефон свяжется с нодами приглашения и покажет, какие права вам предлагают; согласитесь в диалоге");
         } catch (Throwable e) {
             header.setText("профиль повреждён: " + e.getMessage());
         }
-        button.setText(active() || KnotHopVpnService.tunHeld ? "Отключить" : "Подключить");
+        updateModePanel();
         StringBuilder s = new StringBuilder("состояние: ").append(KnotHopVpnService.phase).append('\n');
         if (!KnotHopVpnService.lastError.isEmpty()) s.append("ОШИБКА: ").append(KnotHopVpnService.lastError).append('\n');
         File state = new File(getFilesDir(), "state");
@@ -665,9 +792,7 @@ public class MainActivity extends Activity {
         Util.lab("STATUS " + s.toString().replace("\n", " | "));
         String log = Util.read(new File(state, "log.txt"));
         String[] lines = log.split("\n");
-        StringBuilder l = new StringBuilder();
-        for (int i = Math.max(0, lines.length - 8); i < lines.length; i++) { String ln = TopologyView.prettify(lines[i]); l.append(ln.length() > 110 ? ln.substring(0, 110) : ln).append('\n'); }
-        logView.setText(l);
+        logConsole.setLines(lines);
         if (lines.length > 0) Util.lab("LOG " + lines[lines.length - 1]);
     }
 
@@ -815,7 +940,7 @@ public class MainActivity extends Activity {
             if (!label.contentEquals(tv.getText())) Util.lab("ROW " + label.replace("\n", " | "));
             tv.setText(label);
             tv.setTypeface("current".equals(st) ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
-            tv.setTextColor("current".equals(st) ? 0xFF2E9E4F : 0xFF222222);
+            tv.setTextColor("current".equals(st) ? Ui.green(this) : Ui.fg(this));
         }
         listBox.setVisibility(View.VISIBLE);
     }

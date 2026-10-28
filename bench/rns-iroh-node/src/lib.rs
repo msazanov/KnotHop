@@ -36,6 +36,7 @@ mod vpn;
 mod trust;
 mod enroll;
 mod tcpc;
+mod relay;
 mod health;
 mod bgwrite;
 pub mod mobile;
@@ -59,6 +60,9 @@ pub async fn run_vpn(cli: VpnCli) -> Result<()> {
         other => vpn::run_admin(other),
     }
 }
+
+/// `--tun-fd`: узел без устройства TUN (Android, режим «в сети без VPN»); устройство подключается позже.
+pub const TUN_DETACHED: i32 = -2;
 
 /// ALPN QUIC виден в первом пакете: нейтральное значение без имени проекта (ADR 0016).
 const ALPN: &[u8] = b"rns/0";
@@ -1795,7 +1799,10 @@ struct TunCounters {
 }
 
 pub struct TunState {
-    afd: tokio::io::unix::AsyncFd<TunFd>,
+    /// Устройство TUN. На Android клиент может работать без него (режим «в сети без VPN»); устройство подключается и снимается на лету
+    /// (`set_device`), читатель следит за `dev_gen`.
+    dev: std::sync::RwLock<Option<Arc<tokio::io::unix::AsyncFd<TunFd>>>>,
+    dev_gen: tokio::sync::watch::Sender<u64>,
     is_exit: bool,
     /// клиент: текущий Link к выходу (None, пока идёт смена маршрута)
     client_link: std::sync::RwLock<Option<Arc<leviculum_std::LinkHandle>>>,
@@ -2066,59 +2073,10 @@ impl TunState {
         true
     }
 
-    fn open(cli: &Cli, is_exit: bool) -> Result<Arc<Self>> {
-        if cli.tun_fd >= 0 {
-            // Дескриптор принадлежит VpnService (Java держит свою копию и закроет её при остановке): берём собственную через dup.
-            use std::os::fd::FromRawFd;
-            let fd = unsafe { libc::fcntl(cli.tun_fd, libc::F_DUPFD_CLOEXEC, 3) };
-            if fd < 0 {
-                bail!("dup tun fd {}: {}", cli.tun_fd, std::io::Error::last_os_error());
-            }
-            unsafe {
-                let fl = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-            }
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-            return Ok(Arc::new(TunState {
-                afd: tokio::io::unix::AsyncFd::new(TunFd(owned))?,
-                is_exit,
-                client_link: std::sync::RwLock::new(None),
-                last_rx_ms: Default::default(),
-                last_tx_ms: Default::default(),
-                unanswered_since_ms: Default::default(),
-                failovers: std::sync::Mutex::new(Vec::new()),
-                routes: std::sync::RwLock::new(HashMap::new()),
-                enforce: Default::default(),
-                allowed: std::sync::RwLock::new(HashMap::new()),
-                host_access: std::sync::RwLock::new(HashSet::new()),
-                host_inventory: Arc::new(std::sync::RwLock::new(None)),
-                host_acl_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                host_acl_started: Default::default(),
-                health_echo_last: std::sync::Mutex::new(HashMap::new()),
-                c: TunCounters::default(),
-                routing: Default::default(),
-                router: std::sync::RwLock::new(Arc::new(route::Router::empty())),
-                extra: std::sync::RwLock::new(HashMap::new()),
-                rt: RouteCounters::default(),
-                main_dest: std::sync::RwLock::new([0; 16]),
-            }));
-        }
-        let fd = open_tun(&cli.tun_name)?;
-        ip_cmd(&["addr", "add", &cli.tun_ip, "dev", &cli.tun_name])?;
-        ip_cmd(&["link", "set", "dev", &cli.tun_name, "mtu", &cli.tun_mtu.to_string(), "txqueuelen", &cli.tun_txqlen.to_string(), "up"])?;
-        if !cli.tun_qdisc.is_empty() {
-            // tc: `fq_codel` держит очередь короткой по времени ожидания и не рубит хвост пачки целиком,
-            // чем лечит и потери в пачках TCP, и раздутые буферы одной мерой.
-            let st = std::process::Command::new("tc")
-                .args(["qdisc", "replace", "dev", &cli.tun_name, "root", &cli.tun_qdisc, "limit", &cli.tun_txqlen.to_string()])
-                .status()
-                .context("run tc")?;
-            if !st.success() {
-                bail!("tc qdisc {} failed: {st}", cli.tun_qdisc);
-            }
-        }
-        Ok(Arc::new(TunState {
-            afd: tokio::io::unix::AsyncFd::new(fd)?,
+    fn build(is_exit: bool, dev: Option<tokio::io::unix::AsyncFd<TunFd>>) -> Arc<Self> {
+        Arc::new(TunState {
+            dev: std::sync::RwLock::new(dev.map(Arc::new)),
+            dev_gen: tokio::sync::watch::channel(0).0,
             is_exit,
             client_link: std::sync::RwLock::new(None),
             last_rx_ms: Default::default(),
@@ -2139,12 +2097,75 @@ impl TunState {
             extra: std::sync::RwLock::new(HashMap::new()),
             rt: RouteCounters::default(),
             main_dest: std::sync::RwLock::new([0; 16]),
-        }))
+        })
+    }
+
+    fn open(cli: &Cli, is_exit: bool) -> Result<Arc<Self>> {
+        if cli.tun_fd == TUN_DETACHED {
+            // Android, режим «в сети без VPN»: устройство подключит `set_device`, пока пакеты некуда класть и неоткуда читать.
+            return Ok(Self::build(is_exit, None));
+        }
+        if cli.tun_fd >= 0 {
+            // Дескриптор принадлежит VpnService (Java держит свою копию и закроет её при остановке): берём собственную через dup.
+            use std::os::fd::FromRawFd;
+            let fd = unsafe { libc::fcntl(cli.tun_fd, libc::F_DUPFD_CLOEXEC, 3) };
+            if fd < 0 {
+                bail!("dup tun fd {}: {}", cli.tun_fd, std::io::Error::last_os_error());
+            }
+            unsafe {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            return Ok(Self::build(is_exit, Some(tokio::io::unix::AsyncFd::new(TunFd(owned))?)));
+        }
+        let fd = open_tun(&cli.tun_name)?;
+        ip_cmd(&["addr", "add", &cli.tun_ip, "dev", &cli.tun_name])?;
+        ip_cmd(&["link", "set", "dev", &cli.tun_name, "mtu", &cli.tun_mtu.to_string(), "txqueuelen", &cli.tun_txqlen.to_string(), "up"])?;
+        if !cli.tun_qdisc.is_empty() {
+            // tc: `fq_codel` держит очередь короткой по времени ожидания и не рубит хвост пачки целиком,
+            // чем лечит и потери в пачках TCP, и раздутые буферы одной мерой.
+            let st = std::process::Command::new("tc")
+                .args(["qdisc", "replace", "dev", &cli.tun_name, "root", &cli.tun_qdisc, "limit", &cli.tun_txqlen.to_string()])
+                .status()
+                .context("run tc")?;
+            if !st.success() {
+                bail!("tc qdisc {} failed: {st}", cli.tun_qdisc);
+            }
+        }
+        Ok(Self::build(is_exit, Some(tokio::io::unix::AsyncFd::new(fd)?)))
+    }
+
+    fn device(&self) -> Option<Arc<tokio::io::unix::AsyncFd<TunFd>>> {
+        self.dev.read().unwrap().clone()
+    }
+
+    /// Подключить (`Some`) или снять (`None`) устройство TUN на лету. Дескриптор переходит во владение узла: после снятия старое
+    /// устройство закрывается, когда его отпустит читатель.
+    pub(crate) fn set_device(&self, fd: Option<std::os::fd::OwnedFd>) -> Result<()> {
+        let dev = match fd {
+            Some(owned) => {
+                use std::os::fd::AsRawFd;
+                unsafe {
+                    let fl = libc::fcntl(owned.as_raw_fd(), libc::F_GETFL);
+                    libc::fcntl(owned.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+                }
+                Some(Arc::new(tokio::io::unix::AsyncFd::new(TunFd(owned))?))
+            }
+            None => None,
+        };
+        *self.dev.write().unwrap() = dev;
+        self.dev_gen.send_modify(|g| *g = g.wrapping_add(1));
+        Ok(())
     }
 
     fn write_tun(&self, pkt: &[u8]) {
         use std::sync::atomic::Ordering::Relaxed;
-        let n = unsafe { libc::write(self.afd.get_ref().as_raw_fd(), pkt.as_ptr() as *const _, pkt.len()) };
+        let Some(dev) = self.device() else {
+            self.c.tun_write_drops.fetch_add(1, Relaxed);
+            return;
+        };
+        let n = unsafe { libc::write(dev.get_ref().as_raw_fd(), pkt.as_ptr() as *const _, pkt.len()) };
         if n == pkt.len() as isize {
             self.c.to_tun_pkts.fetch_add(1, Relaxed);
             self.c.to_tun_bytes.fetch_add(pkt.len() as u64, Relaxed);
@@ -2270,17 +2291,27 @@ impl TunState {
 async fn tun_reader(tun: Arc<TunState>, _node: Arc<Node>, sh: Arc<Shared>) {
     use std::sync::atomic::Ordering::Relaxed;
     let mut buf = vec![0u8; 65536];
+    let mut generation = tun.dev_gen.subscribe();
     loop {
-        let mut guard = match tun.afd.readable().await {
-            Ok(g) => g,
-            Err(e) => {
-                sh.note(format!("tun reader stopped: {e}"));
-                return;
-            }
+        // Сначала отметить поколение как виденное, потом брать устройство: смена между этими шагами не потеряется.
+        generation.borrow_and_update();
+        let Some(dev) = tun.device() else {
+            if generation.changed().await.is_err() { return; }
+            continue;
+        };
+        let mut guard = tokio::select! {
+            r = dev.readable() => match r {
+                Ok(g) => g,
+                Err(e) => {
+                    sh.note(format!("tun reader stopped: {e}"));
+                    return;
+                }
+            },
+            _ = generation.changed() => continue,
         };
         // Вычерпываем всё готовое за одно пробуждение: меньше переключений на пакет.
         loop {
-            let n = unsafe { libc::read(tun.afd.get_ref().as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(dev.get_ref().as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
             if n < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::WouldBlock {

@@ -128,7 +128,7 @@ DEXIN=$(find "$W/classes" -name '*.class'); [ "$APP" = vpn ] && DEXIN="$DEXIN $Q
 echo "== APK"
 if [ "$APP" = vpn ]; then
   "$BT/aapt2" compile --dir "$SRC/res" -o "$W/resources.zip"
-  "$BT/aapt2" link -o "$W/base.apk" -I "$PLATFORM" -R "$W/resources.zip" --manifest "$SRC/AndroidManifest.xml" --min-sdk-version $API --target-sdk-version 34
+  "$BT/aapt2" link -o "$W/base.apk" -I "$PLATFORM" "$W/resources.zip" --manifest "$SRC/AndroidManifest.xml" --min-sdk-version $API --target-sdk-version 34
 else
   "$BT/aapt2" link -o "$W/base.apk" -I "$PLATFORM" --manifest "$SRC/AndroidManifest.xml" --min-sdk-version $API --target-sdk-version 34
 fi

@@ -34,9 +34,9 @@ import java.util.Map;
 /**
  * Приглашение v4 (ADR 0019) в три страницы: 1) ноды, которые выдадут права (1-8; где у вас права администратора; по умолчанию ничего не выбрано, одна галочка «все»),
  * 2) права (USE, TRANSIT, EXIT; по умолчанию пресет «Пользователь»), 3) готовое приглашение: QR и строка. Приглашение действует 48 часов.
- * Подтверждение выпуска — обычное подтверждение в интерфейсе; системная биометрия не используется. Приглашение живёт только в памяти этого экрана: при выходе (назад, смена приложения)
- * строка и картинка стираются, экран закрыт от снимков (FLAG_SECURE), в буфер обмена само ничего не кладётся, в журнал не пишется.
- * Каждая выбранная нода сама хранит одноразовое разрешение (хеш pin): держать телефон подключённым после выпуска не нужно.
+ * Подтверждение выпуска — обычное подтверждение в интерфейсе; системная биометрия не используется. При выходе (назад, смена приложения)
+ * строка и картинка стираются с экрана; приватная очередь хранит pin до подтверждений нод или TTL. Экран закрыт FLAG_SECURE, pin в журнал не пишется.
+ * QR создаётся после локального сохранения разрешения. Закрытая очередь LXMF доставляет его нодам асинхронно.
  */
 public final class InviteActivity extends Activity {
     private static final String[] R_NAME = {"use", "transit", "exit"};
@@ -105,7 +105,7 @@ public final class InviteActivity extends Activity {
     private Button button(String s, View.OnClickListener l) {
         Button x = new Button(this);
         x.setText(s);
-        x.setOnClickListener(l);
+        x.setOnClickListener(v -> { Ui.tick(v); l.onClick(v); });
         x.setFilterTouchesWhenObscured(true);   // F8: нажатие не проходит через перекрывающее окно
         return x;
     }
@@ -118,8 +118,21 @@ public final class InviteActivity extends Activity {
         nodeBoxes.clear();
         box.addView(text("Пригласить: шаг 1 из 2", 20, true));
         if (nodes.isEmpty()) {
-            box.addView(text("Нод с правами администратора пока не видно. Нажмите «Подключить» на главном экране и подождите, пока появятся ноды: "
-                    + "приглашение выдают сами ноды, выбрать нужно хотя бы одну.", 14, false));
+            box.addView(text("Пока нет доступных нод с правом выпуска приглашений. Для выпуска достаточно режима «Сеть» — включать VPN не требуется.", 14, false));
+            box.addView(text("Если это новая собственная сеть, сначала привяжите корень этого телефона к своей серверной ноде (команда knothopd trust-anchor на сервере). "
+                    + "Название телефона не зачисляет серверы в сеть и не даёт прав в чужой сети. Публичные RNS-узлы не заменяют ваш VPN-выход.", 14, false));
+            if ("idle".equals(KnotHopVpnService.phase) || ("error".equals(KnotHopVpnService.phase) && !KnotHopVpnService.tunHeld)) {
+                box.addView(button("Включить сеть без VPN", v -> {
+                    try {
+                        startForegroundService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_MODE)
+                                .putExtra(KnotHopVpnService.EXTRA_MODE, 1));
+                        android.widget.Toast.makeText(this, "Запускаю узел. Затем обновите список нод", android.widget.Toast.LENGTH_LONG).show();
+                    } catch (RuntimeException e) {
+                        android.widget.Toast.makeText(this, "Не удалось запустить узел: " + e.getMessage(), android.widget.Toast.LENGTH_LONG).show();
+                    }
+                }));
+            }
+            box.addView(button("Обновить список", v -> { loadNodes(); show1(); }));
             box.addView(button("Назад", v -> finish()));
             return;
         } else {
@@ -269,10 +282,11 @@ public final class InviteActivity extends Activity {
         page = 3;
         invite = inv;
         box.removeAllViews();
-        box.addView(text("Приглашение готово", 20, true));
+        box.addView(text("Приглашение готово · разрешения в очереди доставки", 20, true));
         box.addView(text("Отсканируйте QR камерой второго телефона (кнопка «Сканировать QR» в приложении) или отправьте строку. "
                 + "Приглашение одноразовое, действует 48 часов; новичок увидит права и срок и должен согласиться. "
-                + "При выходе с этого экрана приглашение исчезнет и больше нигде не хранится.", 13, false));
+                + "Ноды могут ещё ожидать разрешение: новичок повторит попытку автоматически. Оставьте режим «Сеть» включённым для отправки; после перезапуска очередь продолжит доставку. "
+                + "При выходе QR исчезнет с экрана. Секрет временно хранится только в закрытой очереди доставки; срок действия приглашения — 48 часов.", 13, false));
         qrView = new ImageView(this);
         qrView.setAdjustViewBounds(true);
         try {

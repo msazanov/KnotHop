@@ -391,8 +391,8 @@ public final class NodeAdminActivity extends Activity {
         if (bold) t.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         box.addView(t);
     }
-    private void disabled(String reason) { TextView t = new TextView(this); t.setText("Недоступно: " + safe(reason, "нет authority", 200)); t.setTextSize(12); t.setTextColor(0xFF777777); t.setPadding(0, 2, 0, 8); box.addView(t); }
-    private Button button(String label, View.OnClickListener listener) { Button b = new Button(this); b.setText(label); b.setAllCaps(false); b.setOnClickListener(listener); b.setFilterTouchesWhenObscured(true); return b; }
+    private void disabled(String reason) { TextView t = new TextView(this); t.setText("Недоступно: " + safe(reason, "нет authority", 200)); t.setTextSize(12); t.setTextColor(Ui.ink(this, 0xFF777777)); t.setPadding(0, 2, 0, 8); box.addView(t); }
+    private Button button(String label, View.OnClickListener listener) { Button b = new Button(this); b.setText(label); b.setAllCaps(false); b.setOnClickListener(v -> { Ui.tick(v); listener.onClick(v); }); b.setFilterTouchesWhenObscured(true); return b; }
 
     static String brief(String hash) { return hash == null || hash.isEmpty() ? "неизвестен" : hash.length() <= 12 ? hash : hash.substring(0, 8) + "…" + hash.substring(hash.length() - 4); }
     private static boolean validDest(String s) { return s != null && s.matches("[0-9a-fA-F]{32}"); }

@@ -183,7 +183,7 @@ public class RoutingActivity extends Activity {
         TextView t = new TextView(this);
         t.setText(s);
         t.setTextSize(sp);
-        t.setTextColor(color);
+        t.setTextColor(Ui.ink(this, color));
         if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
         return t;
     }
@@ -206,7 +206,7 @@ public class RoutingActivity extends Activity {
         b.setAllCaps(false);
         b.setText(s);
         b.setMinHeight(dp(48));
-        b.setOnClickListener(l);
+        b.setOnClickListener(v -> { Ui.tick(v); l.onClick(v); });
         return b;
     }
 
@@ -220,12 +220,14 @@ public class RoutingActivity extends Activity {
         issues = collectIssues();
         root.removeAllViews();
         detailsView = null;
+        root.addView(NodeTabs.bar(this, NodeTabs.ROUTING));
         TextView title = text("Маршрутизация", 22, true, 0xFF000000);
         if (Build.VERSION.SDK_INT >= 28) title.setAccessibilityHeading(true);
         root.addView(title);
         root.addView(note("Изменения сохраняются сразу."));
         renderLegacyBanner();
         renderMode();
+        renderTemplates();
         renderDefaultExit();
         renderIssues();
         if (cfg.mode.equals(RoutingCfg.MODE_RULES)) {
@@ -242,6 +244,83 @@ public class RoutingActivity extends Activity {
         sv.post(() -> sv.scrollTo(0, scroll));
     }
 
+    // ---------------------------------------------------------------- шаблоны и импорт v2rayN
+
+    private void renderTemplates() {
+        root.addView(section("Шаблоны и импорт"));
+        root.addView(note("Готовые наборы правил и импорт правил v2rayN (JSON). Добавляются к имеющимся и включают режим «По правилам»."));
+        root.addView(button("Шаблоны правил…", v -> pickTemplate()));
+        root.addView(button("Импорт из v2rayN…", v -> importDialog("")));
+    }
+
+    private void pickTemplate() {
+        String[] titles = new String[RoutingImport.TEMPLATES.length];
+        for (int i = 0; i < titles.length; i++) titles[i] = RoutingImport.TEMPLATES[i].title;
+        new AlertDialog.Builder(this).setTitle("Шаблон правил").setItems(titles, (d, i) -> {
+            RoutingImport.Template t = RoutingImport.TEMPLATES[i];
+            try {
+                confirmImport(RoutingImport.parse(t.json), t.title, t.note);
+            } catch (Exception e) {
+                Toast.makeText(this, "Шаблон не разобран: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            }
+        }).setNegativeButton("Отмена", null).show();
+    }
+
+    private void importDialog(String prefill) {
+        EditText e = new EditText(this);
+        e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        e.setMinLines(6);
+        e.setGravity(Gravity.TOP);
+        e.setTextSize(12);
+        e.setHint("[{\"outboundTag\":\"direct\",\"domain\":[\"geosite:category-ru\"]}, …]");
+        e.setText(prefill);
+        AlertDialog dlg = new AlertDialog.Builder(this).setTitle("Импорт правил v2rayN").setView(e)
+                .setNeutralButton("Вставить", null)
+                .setNegativeButton("Отмена", null)
+                .setPositiveButton("Далее", null).create();
+        dlg.setOnShowListener(x -> {
+            dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
+                android.content.ClipboardManager cb = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                android.content.ClipData d = cb.getPrimaryClip();
+                if (d != null && d.getItemCount() > 0 && d.getItemAt(0).getText() != null) e.setText(d.getItemAt(0).getText());
+            });
+            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                try {
+                    RoutingImport.Result r = RoutingImport.parse(e.getText().toString());
+                    dlg.dismiss();
+                    confirmImport(r, "Импорт v2rayN", "");
+                } catch (Exception ex) {
+                    e.setError("Не JSON-массив правил: " + ex.getMessage());
+                }
+            });
+        });
+        dlg.show();
+    }
+
+    private void confirmImport(RoutingImport.Result r, String title, String intro) {
+        StringBuilder m = new StringBuilder();
+        if (!intro.isEmpty()) m.append(intro).append("\n\n");
+        m.append("Будет перенесено записей: ").append(r.count()).append(" (списки: ").append(r.rules.size()).append(", свои адреса и домены: ").append(r.manual.size()).append(")\n");
+        m.append("\nПорядок KnotHop: свои записи перед списками; подсети «напрямую» исключаются из VPN системно. Порядок исходного v2rayN может отличаться.\n");
+        if (r.siteDirect > 0) m.append("\nПравил для сайтов «мимо VPN»: ").append(r.siteDirect).append(". Мимо туннеля работают только подсети, трафик сайтов пойдёт через выход по умолчанию.\n");
+        if (!r.skipped.isEmpty()) {
+            m.append("\nПропущено: ").append(r.skipped.size()).append('\n');
+            for (int i = 0; i < Math.min(8, r.skipped.size()); i++) m.append("• ").append(r.skipped.get(i)).append('\n');
+        }
+        AlertDialog.Builder b = new AlertDialog.Builder(this).setTitle(title).setMessage(m.toString().trim()).setNegativeButton("Отмена", null);
+        if (r.count() > 0) {
+            b.setPositiveButton("Добавить", (d, w) -> {
+                int n = RoutingImport.apply(cfg, r);
+                saveAndRender();
+                String extra = RulesFiles.present(files) || !needsLists(r) ? "" : ". Для списков загрузите файлы (раздел «Файлы списков»)";
+                Toast.makeText(this, "Добавлено записей: " + n + extra, Toast.LENGTH_LONG).show();
+            });
+        }
+        b.show();
+    }
+
+    private static boolean needsLists(RoutingImport.Result r) { return !r.rules.isEmpty(); }
+
     private boolean hasDirect() {
         for (RoutingCfg.Rule r : cfg.rules) if (r.enabled && r.action.equals("direct")) return true;
         for (RoutingCfg.Manual m : cfg.manual) if (m.enabled && m.action.equals("direct")) return true;
@@ -257,7 +336,7 @@ public class RoutingActivity extends Activity {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(12), dp(8), dp(12), dp(8));
-        box.setBackgroundColor(0xFFFFF3D6);
+        box.setBackgroundColor(Ui.warnBg(this));
         box.addView(text("Приоритеты выходов отключены", 15, true, WARN));
         box.addView(text("Раньше порядок " + n + " выходов в списке влиял на выбор. Теперь выход по умолчанию выбирается на главном экране или автоматически, "
                 + "а правила и их порядок настраиваются отдельно ниже. Прежний список сохранён в резервной копии в настройках на этом телефоне.", 13, false, TEXT));
@@ -290,7 +369,7 @@ public class RoutingActivity extends Activity {
             rb.setId(View.generateViewId());
             rb.setText(titled(m[1], m[2]));
             rb.setTextSize(15);
-            rb.setTextColor(TEXT);
+            rb.setTextColor(Ui.ink(this, TEXT));
             rb.setMinHeight(dp(56));
             rb.setPadding(dp(8), dp(8), dp(8), dp(8));
             rb.setChecked(cfg.mode.equals(m[0]));

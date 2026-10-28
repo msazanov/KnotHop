@@ -43,7 +43,7 @@ EXACT_EXCLUDES = {
 }
 EXCLUDED_DIRS = {
     ".git", ".codegraph", ".beads", "target", "__pycache__", ".pytest_cache",
-    "results", "results-raw", "dist", "state", "reviews", "archive", "decisions",
+    "results", "results-raw", "dist", "state", "enroll-outbox", "reviews", "archive", "decisions",
 }
 EXCLUDED_SUFFIXES = {".apk", ".aab", ".whl", ".pyc", ".keystore", ".jks", ".p12", ".pem", ".key", ".log"}
 
@@ -81,7 +81,7 @@ def should_exclude(rel: Path) -> bool:
         return True
     if any(part in EXCLUDED_DIRS for part in rel.parts) or rel.suffix.lower() in EXCLUDED_SUFFIXES:
         return True
-    if rel.name in {"identity.key", "group.key", "trust.json", "node.json", "known_hosts"}:
+    if rel.name in {"identity.key", "group.key", "trust.json", "node.json", "known_hosts", "enroll-join.json"}:
         return True
     if rel.name.startswith("invite") or rel.name.endswith(".profile"):
         return True

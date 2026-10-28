@@ -22,16 +22,16 @@ final class SpeedTest {
                 };
                 String download;
                 try { download = SpeedTransfer.run(factory, path::valid, down, false, bytes, SpeedTransfer.MAX_MS).text(); }
-                catch (Exception e) { download = "Не измерено: " + e.getMessage(); }
+                catch (Throwable e) { download = "Не измерено: " + e.getMessage(); }
                 text = "↓ " + download + "\nОтправка…";
                 try {
                     String upload = SpeedTransfer.run(factory, path::valid, up, true, bytes, SpeedTransfer.MAX_MS).text();
                     text = "↓ " + download + "\n↑ " + upload;
-                } catch (Exception e) {
+                } catch (Throwable e) {
                     text = "↓ " + download + "\n↑ Не измерено: " + e.getMessage();
                 }
-            } catch (Exception e) {
-                text = "Не измерено: " + e.getMessage();
+            } catch (Throwable e) {   // Error в фоновом потоке иначе роняет весь процесс
+                text = "Не измерено: " + e;
             } finally { running.set(false); }
         }, "knothop-http-speed").start();
         return true;

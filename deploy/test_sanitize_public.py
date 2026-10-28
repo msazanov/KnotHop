@@ -41,6 +41,11 @@ def make_fork(root: Path) -> str:
 
 
 class SanitizeTests(unittest.TestCase):
+    def test_async_invite_secrets_are_excluded_even_outside_named_state_dir(self):
+        self.assertTrue(sp.should_exclude(Path("bench/custom-node/enroll-outbox/0123.json")))
+        self.assertTrue(sp.should_exclude(Path("bench/custom-node/enroll-join.json")))
+        self.assertFalse(sp.should_exclude(Path("bench/rns-iroh-node/src/enroll_net.rs")))
+
     def test_sanitize_replaces_tokens_and_excludes_private_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             src, dst = Path(tmp) / "src", Path(tmp) / "dst"

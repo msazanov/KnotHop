@@ -92,13 +92,21 @@ public final class MyNodeActivity extends Activity {
 
     private void render() {
         box.removeAllViews();
+        box.addView(NodeTabs.bar(this, NodeTabs.RIGHTS));
         text("Моя нода", 22, true, 0);
         if (view == null) {
             text("Локальное состояние доверия недоступно: приложение ещё не создало identity или не запускалось.", 14, false, GREY);
             return;
         }
         String me = view.optString("me", "");
-        text("Имя: телефон-" + (me.length() >= 6 ? me.substring(0, 6) : me), 15, true, 0);
+        String own = NodeName.get(getFilesDir());
+        text("Имя: " + (own.isEmpty() ? "телефон-" + (me.length() >= 6 ? me.substring(0, 6) : me) : own), 15, true, 0);
+        Button rename = new Button(this);
+        rename.setAllCaps(false);
+        rename.setText("Изменить имя");
+        rename.setOnClickListener(v -> NodeName.dialog(this, getFilesDir(), () -> { lastKey = ""; refresh(); }));
+        box.addView(rename);
+        text("Узлы сети узнают новое имя при следующем подключении телефона к выходу.", 12, false, GREY);
         fingerprint(me);
         int mine = view.optInt("my_rights", 0);
         boolean canAdd = view.optBoolean("can_add", false), canRemove = view.optBoolean("can_remove", false);
@@ -132,6 +140,12 @@ public final class MyNodeActivity extends Activity {
                 if (o != null) text("Сеть " + o.optString("tag", "?") + ": " + rightsText(o.optInt("rights", 0)), 13, false, 0);
             }
         }
+        text("\nПрофиль", 16, true, 0);
+        Button forget = new Button(this);
+        forget.setAllCaps(false);
+        forget.setText("Забыть профиль");
+        forget.setOnClickListener(v -> ProfileReset.confirm(this));
+        box.addView(forget);
     }
 
     private void fingerprint(String me) {
@@ -275,7 +289,7 @@ public final class MyNodeActivity extends Activity {
         t.setTextSize(size);
         t.setPadding(0, 4, 0, 4);
         if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
-        if (color != 0) t.setTextColor(color);
+        if (color != 0) t.setTextColor(Ui.ink(this, color));
         box.addView(t);
     }
 }

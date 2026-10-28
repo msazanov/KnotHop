@@ -17,23 +17,21 @@ pub struct Service {
     client:Option<Weak<ClientCtx>>,sessions:Mutex<HashMap<LinkId,Session>>,ban:Mutex<Fail2Ban>,
     io:Mutex<()>,rate:Mutex<(VecDeque<Instant>,HashMap<Hash,VecDeque<Instant>>)>,
     inflight:Arc<tokio::sync::Semaphore>, delays:Arc<tokio::sync::Semaphore>,
+    issue_cursor:std::sync::atomic::AtomicUsize,
 }
 pub fn register(node:Arc<Node>,identity:Identity,trust:Arc<Mutex<Trust>>,state:&Path,client:Option<Weak<ClientCtx>>)->Arc<Service>{
-    let s=Arc::new(Service{node,identity,trust,state:state.into(),client,sessions:Mutex::new(HashMap::new()),ban:Mutex::new(Fail2Ban::default()),io:Mutex::new(()),rate:Mutex::new((VecDeque::new(),HashMap::new())),inflight:Arc::new(tokio::sync::Semaphore::new(8)),delays:Arc::new(tokio::sync::Semaphore::new(4))});
+    let s=Arc::new(Service{node,identity,trust,state:state.into(),client,sessions:Mutex::new(HashMap::new()),ban:Mutex::new(Fail2Ban::default()),io:Mutex::new(()),rate:Mutex::new((VecDeque::new(),HashMap::new())),inflight:Arc::new(tokio::sync::Semaphore::new(8)),delays:Arc::new(tokio::sync::Semaphore::new(4)),issue_cursor:std::sync::atomic::AtomicUsize::new(0)});
     s.node.register_request_handler(DestinationHash::new(dest_from_pub_tag(&s.identity.public_key_bytes(),T13_TAG)),PATH,leviculum_std::api::RequestPolicy::AllowAll);
     SERVICES.get_or_init(Default::default).lock().unwrap().insert(state_key(state),Arc::downgrade(&s));
-    let recovery=s.clone();
-    tokio::spawn(async move {
-        // Registration happens before the LXMF registry. Wait once, then reconstruct from durable spent evidence.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let recovered=Store::new(&recovery.state).and_then(|s|s.recover()).unwrap_or_default();
-        for proof in recovered { if proof.rec.node==recovery.identity.public_key_bytes(){ let _=recovery.announce_close(&proof); } }
-    });
     let poller=Arc::downgrade(&s);
     tokio::spawn(async move{
+        // The LXMF pending queue is in memory. Reconstruct missing deliveries from durable spent/receipts,
+        // not just once on restart. At most four grants (28 peers) per pass, rotating for fairness.
+        let mut recovered=Instant::now()-Duration::from_secs(118);let mut cursor=0usize;
         loop{
             tokio::time::sleep(Duration::from_secs(1)).await;
             let Some(s)=poller.upgrade()else{return};
+            if recovered.elapsed()>=Duration::from_secs(120){s.recover_closes(&mut cursor);recovered=Instant::now();}
             s.serve_requests().await;
         }
     });
@@ -41,6 +39,33 @@ pub fn register(node:Arc<Node>,identity:Identity,trust:Arc<Mutex<Trust>>,state:&
 }
 #[derive(Deserialize)]
 struct IssueReq{root:String,nodes:Vec<String>,cap:u16}
+/// Admin's private durable delivery queue. It contains the pin: directory 0700, files 0600, never logged.
+#[derive(Clone,Serialize,Deserialize)]
+struct IssueDelivery{grant:String,pin:String}
+#[derive(Serialize,Deserialize)]
+struct IssueOutbox{delivery:IssueDelivery,acked:Vec<Hash>}
+#[derive(Serialize,Deserialize)]
+struct PendingJoin{ticket:String,until:u64,cursor:usize}
+fn pending_join(state:&Path)->PathBuf{state.join("enroll-join.json")}
+fn read_join(state:&Path)->Result<Option<PendingJoin>>{
+    let path=pending_join(state);
+    let bytes=match std::fs::read(&path){Ok(v)=>v,Err(e)if e.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(e)=>return Err(e.into())};
+    if bytes.len()>4096{bail!("pending enrollment size")};let p:PendingJoin=serde_json::from_slice(&bytes)?;
+    if p.until<=now_ms()as u64/1000{std::fs::remove_file(path)?;return Ok(None)}Ok(Some(p))
+}
+fn remember_join(state:&Path,invite:&Invite,until:Option<u64>)->Result<()> {
+    let mut p=read_join(state)?.filter(|p|Invite::parse(&p.ticket).ok().is_some_and(|i|i==*invite))
+        .unwrap_or(PendingJoin{ticket:invite.encode()?,until:now_ms()as u64/1000+enroll::TTL,cursor:0});
+    if let Some(until)=until{p.until=p.until.min(until)}
+    enroll::write(&pending_join(state),&serde_json::to_vec(&p)?)
+}
+fn issue_outbox(state:&Path)->Result<PathBuf>{
+    use std::os::unix::fs::PermissionsExt;
+    let p=state.join("enroll-outbox");std::fs::create_dir_all(&p)?;std::fs::set_permissions(&p,std::fs::Permissions::from_mode(0o700))?;Ok(p)
+}
+fn read_issue(path:&Path)->Result<IssueOutbox>{
+    let bytes=std::fs::read(path)?;if bytes.len()>4096{bail!("issue outbox size")};Ok(serde_json::from_slice(&bytes)?)
+}
 /// Каталог запросов выпуска от CLI другого процесса: `<state>/enroll-req/<32 hex>.req` -> `.out` (приглашение) или `.err`.
 pub fn req_dir(state:&Path)->PathBuf{state.join("enroll-req")}
 /// Положить запрос демону и дождаться приглашения (для CLI, когда сеть держит другой процесс).
@@ -56,7 +81,7 @@ pub fn issue_via_daemon(state:&Path,root:Hash,nodes:&[Hash],cap:u16,wait:Duratio
     let result=loop{
         if let Ok(v)=std::fs::read_to_string(&out){break Ok(v.trim().to_string())}
         if let Ok(e)=std::fs::read_to_string(&err){break Err(anyhow::anyhow!("{}",e.trim()))}
-        if start.elapsed()>wait{let _=std::fs::remove_file(&req);break Err(anyhow::anyhow!("Демон не ответил: запустите узел или VPN и повторите"))}
+        if start.elapsed()>wait{let _=std::fs::remove_file(&req);break Err(anyhow::anyhow!("Демон не ответил: включите режим «Сеть» или запустите узел и повторите"))}
         std::thread::sleep(Duration::from_millis(300));
     };
     for p in [&req,&out,&err]{let _=std::fs::remove_file(p);}
@@ -124,20 +149,65 @@ impl Service {
         let mut tr=self.trust.lock().unwrap();tr.offer_enrollment(proof.clone())?;tr.save()?;drop(tr);
         let receipt=self.base(proof)?;Store::new(&self.state)?.receipt(&proof.grant.id,receipt.clone())?;Ok(receipt)
     }
-    fn send(&self,pk:Pk,op:&str,proof:&Proof,receipt:Option<Receipt>)->bool {
-        let exp=proof.grant.expires;
-        let env=Envelope{v:4,op:op.into(),sender:hex(&self.identity.public_key_bytes()),exp,body:enroll::hex(&proof.wire()),receipt};
+    fn transmit(&self,pk:Pk,env:Envelope,grant:Grant,admin:Pk)->bool {
+        let exp=env.exp;
         let Ok(content)=serde_json::to_vec(&env)else{return false};if content.len()>lxmf_admin::MAX_ADMIN_CONTENT{return false}
-        let tr=self.trust.clone();let grant=proof.grant.clone();let admin=proof.admin;
+        let tr=self.trust.clone();
         let gate:lxmf_sync::Gate=Arc::new(move||{
             let t=match tr.try_lock(){Ok(t)=>t,Err(std::sync::TryLockError::WouldBlock)=>return None,Err(_)=>return Some(false)};
             Some(grant.fresh(now_ms()as u64/1000)&&grant.verify(&t,&admin).is_ok())
         });
-        lxmf_sync::submit(&self.state,lxmf_sync::Command::Send(lxmf_sync::Outbound{title:TITLE.to_vec(),pk,content,gate,exp,ack:false}))
+        // Durable jobs reconstruct delivery later. Do not occupy one of the shared 32 in-memory slots
+        // for all 48 hours while a recipient is offline; keep the existing sync queue TTL/budget.
+        let queue_exp=exp.min(now_ms()as u64/1000+lxmf_sync::TTL);
+        lxmf_sync::submit(&self.state,lxmf_sync::Command::Send(lxmf_sync::Outbound{title:TITLE.to_vec(),pk,content,gate,exp:queue_exp,ack:false}))
+    }
+    fn send(&self,pk:Pk,op:&str,proof:&Proof,receipt:Option<Receipt>)->bool {
+        let exp=proof.grant.expires;
+        let env=Envelope{v:4,op:op.into(),sender:hex(&self.identity.public_key_bytes()),exp,body:enroll::hex(&proof.wire()),receipt};
+        self.transmit(pk,env,proof.grant.clone(),proof.admin)
     }
     fn announce_close(&self,p:&Proof)->Result<()> {
-        let tr=self.trust.lock().unwrap();let peers=p.grant.nodes.iter().filter(|h|**h!=*self.identity.hash()).filter_map(|h|tr.public_key_in(&p.grant.root,h)).collect::<Vec<_>>();drop(tr);
+        let receipts=Store::new(&self.state)?.receipts(&p.grant.id)?;
+        let have=receipts.iter().filter_map(|r|Proof::parse(&enroll::raw(&r.proof).ok()?).ok().map(|p|p.rec.scope)).collect::<HashSet<_>>();
+        let tr=self.trust.lock().unwrap();let peers=p.grant.nodes.iter().filter(|h|**h!=*self.identity.hash()&&!have.contains(*h)).filter_map(|h|tr.public_key_in(&p.grant.root,h)).collect::<Vec<_>>();drop(tr);
         for pk in peers{if !self.send(pk,"close",p,None){bail!("LXMF enrollment queue busy")}}Ok(())
+    }
+    fn recover_closes(&self,cursor:&mut usize){
+        self.deliver_issues();
+        let proofs=match Store::new(&self.state).and_then(|s|s.recover()){
+            Ok(v)=>v.into_iter().filter(|p|p.rec.node==self.identity.public_key_bytes()).collect::<Vec<_>>(),
+            Err(_)=>return,
+        };
+        if proofs.is_empty(){return}
+        let count=proofs.len().min(4);
+        for i in 0..count{let _=self.announce_close(&proofs[(*cursor+i)%proofs.len()]);}
+        *cursor=(*cursor+count)%proofs.len();
+    }
+    fn deliver_issues(&self){
+        let Ok(dir)=issue_outbox(&self.state)else{return};
+        let Ok(entries)=std::fs::read_dir(dir)else{return};
+        let mut paths=entries.flatten().take(64).map(|e|e.path()).collect::<Vec<_>>();paths.sort();
+        let mut deliveries=vec![];
+        for path in paths{
+            if path.extension().is_none_or(|e|e!="json"){continue}
+            let Ok(item)=read_issue(&path)else{continue};let Ok(bytes)=enroll::raw(&item.delivery.grant)else{continue};let Ok(g)=Grant::parse(&bytes)else{continue};
+            if !g.fresh(now_ms()as u64/1000)||g.nodes.iter().all(|n|item.acked.contains(n)){let _=std::fs::remove_file(path);continue}
+            for target in &g.nodes{
+                if item.acked.contains(target){continue}
+                let pk=self.trust.lock().unwrap().public_key_in(&g.root,target);
+                let Some(pk)=pk else{continue};
+                let Ok(body)=serde_json::to_vec(&item.delivery)else{continue};
+                deliveries.push((pk,g.clone(),body));
+            }
+        }
+        if deliveries.is_empty(){return}
+        let count=deliveries.len().min(8);let start=self.issue_cursor.fetch_add(count,std::sync::atomic::Ordering::Relaxed);
+        for i in 0..count{
+            let(pk,g,body)=&deliveries[start.wrapping_add(i)%deliveries.len()];
+            let env=Envelope{v:4,op:"issue".into(),sender:hex(&self.identity.public_key_bytes()),exp:g.expires,body:enroll::hex(body),receipt:None};
+            self.transmit(*pk,env,g.clone(),self.identity.public_key_bytes());
+        }
     }
     async fn unknown(&self,link:LinkId,peer:Pk)->serde_json::Value{
         let member=self.trust.lock().unwrap().rights(&peer)!=0;
@@ -263,20 +333,20 @@ impl Service {
     pub async fn issue_invite(self:&Arc<Self>,root:Hash,nodes:Vec<Hash>,cap:u16)->Result<String>{
         let invite=Invite::new(nodes)?;let grant=Grant::create(&self.identity,root,&invite,cap,now_ms()as u64/1000)?;
         grant.verify(&self.trust.lock().unwrap(),&self.identity.public_key_bytes())?;
-        let mut accepted=vec![];
-        for h in &invite.nodes {
-            let result=if *h==*self.identity.hash(){
-                let tr=self.trust.lock().unwrap();let mut chain=tr.chain_for(&tr.me_pk);chain.retain(|r|r.root==root);
-                Store::new(&self.state)?.issue(&tr,&grant,&invite.pin,&self.identity.public_key_bytes(),&chain,now_ms()as u64/1000).map(|_|())
-            }else{async{
-                let link=self.open(*h,true).await?;let bytes=grant.wire();let mut body=vec![4];body.extend((bytes.len()as u16).to_le_bytes());body.extend(bytes);body.extend(invite.pin);
-                let reply=rpc(&self.node,link,&body,20_000).await;let _=self.node.engine().close_link(&link).await;
-                let reply=reply?;if reply["status"]!="issued"||reply["node"]!=hex(h)||reply["invite_id"]!=hex(&grant.id){bail!("issue not acknowledged")};Ok(())
-            }.await};
-            if result.is_ok(){accepted.push(*h)}
+        let _io=self.io.lock().unwrap();let dir=issue_outbox(&self.state)?;
+        let existing=std::fs::read_dir(&dir)?.flatten().filter(|e|e.path().extension().is_some_and(|x|x=="json")).count();
+        if existing>=16{bail!("Очередь приглашений заполнена; дождитесь доставки или истечения старых приглашений")}
+        let mut acked=vec![];
+        if invite.nodes.contains(self.identity.hash()){
+            let tr=self.trust.lock().unwrap();let mut chain=tr.chain_for(&tr.me_pk);chain.retain(|r|r.root==root);
+            Store::new(&self.state)?.issue(&tr,&grant,&invite.pin,&self.identity.public_key_bytes(),&chain,now_ms()as u64/1000)?;
+            acked.push(*self.identity.hash());
         }
-        if accepted.is_empty(){bail!("Ни одна выбранная нода не подтвердила выпуск. Подключите VPN и повторите; приглашение не создано")}
-        Invite{nodes:accepted,pin:invite.pin}.encode()
+        let item=IssueOutbox{delivery:IssueDelivery{grant:hex(&grant.wire()),pin:hex(&invite.pin)},acked};
+        // Commit before exposing the ticket. No network wait, and no silent subset of selected nodes.
+        enroll::write(&dir.join(format!("{}.json",hex(&grant.id))),&serde_json::to_vec(&item)?)?;
+        drop(_io);self.deliver_issues();
+        invite.encode()
     }
 }
 
@@ -294,6 +364,28 @@ impl Service{
         {let mut rate=self.rate.lock().unwrap();let (global,per)=&mut*rate;
             let now=Instant::now();global.retain(|t|t.elapsed()<Duration::from_secs(60));per.retain(|_,v|{v.retain(|t|t.elapsed()<Duration::from_secs(60));!v.is_empty()});
             if global.len()>=60||per.get(&actor).is_some_and(|v|v.len()>=10){bail!("enrollment rate")};global.push_back(now);per.entry(actor).or_default().push_back(now);}
+        if env.op=="issue"{
+            let bytes=enroll::raw(&env.body)?;if bytes.len()>4096{bail!("issue delivery size")}
+            let item:IssueDelivery=serde_json::from_slice(&bytes)?;let g=Grant::parse(&enroll::raw(&item.grant)?)?;
+            if g.expires!=env.exp||g.issuer!=actor{bail!("issue delivery binding")}
+            let pin:[u8;24]=enroll::raw(&item.pin)?.try_into().map_err(|_|anyhow::anyhow!("issue pin length"))?;
+            {let _io=self.io.lock().unwrap();let tr=self.trust.lock().unwrap();let mut chain=tr.chain_for(&pk);chain.retain(|r|r.root==g.root);
+                Store::new(&self.state)?.issue(&tr,&g,&pin,&pk,&chain,now_ms()as u64/1000)?;}
+            let body=serde_json::to_vec(&serde_json::json!({"id":hex(&g.id),"digest":hex(&g.digest())}))?;
+            let ack=Envelope{v:4,op:"issued".into(),sender:hex(&self.identity.public_key_bytes()),exp:g.expires,body:hex(&body),receipt:None};
+            self.transmit(pk,ack,g,pk);lxmf_sync::acknowledge(&self.state,message,pk);return Ok(())
+        }
+        if env.op=="issued"{
+            let bytes=enroll::raw(&env.body)?;if bytes.len()>256{bail!("issue ack size")};let ack:serde_json::Value=serde_json::from_slice(&bytes)?;
+            let id:Hash=enroll::raw(ack["id"].as_str().context("issue ack id")?)?.try_into().map_err(|_|anyhow::anyhow!("issue ack id length"))?;
+            let _io=self.io.lock().unwrap();let path=issue_outbox(&self.state)?.join(format!("{}.json",hex(&id)));
+            if path.exists(){let mut item=read_issue(&path)?;let g=Grant::parse(&enroll::raw(&item.delivery.grant)?)?;
+                if g.expires!=env.exp||ack["digest"]!=hex(&g.digest())||!g.nodes.contains(&actor){bail!("issue ack binding")}
+                if !item.acked.contains(&actor){item.acked.push(actor);enroll::write(&path,&serde_json::to_vec(&item)?)?;}
+                if g.nodes.iter().all(|n|item.acked.contains(n)){std::fs::remove_file(&path)?;}
+            }
+            lxmf_sync::acknowledge(&self.state,message,pk);return Ok(())
+        }
         let p=Proof::parse(&enroll::raw(&env.body)?)?;
         if p.grant.expires!=env.exp{bail!("enroll TTL binding")}
         match env.op.as_str(){
@@ -329,8 +421,8 @@ pub struct Declined;
 impl std::fmt::Display for Declined{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("Вступление отменено; pin не погашен")}}
 impl std::error::Error for Declined{}
 
-/// Нода ответила определённо: приглашение неизвестно, погашено или просрочено. Если так ответили все ноды, повторять бессмысленно
-/// (каждая попытка только растит fail2ban нод).
+/// Ticket was not accepted by this node, or the local waiting deadline expired.
+/// Unknown replies alone are non-terminal: asynchronous ISSUE may still be in transit.
 #[derive(Debug)]
 pub struct Refused;
 impl std::fmt::Display for Refused{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("Приглашение неизвестно, погашено или просрочено. Попросите новое приглашение")}}
@@ -338,30 +430,32 @@ impl std::error::Error for Refused{}
 
 /// Newcomer flow, including human consent bound to the signed offer digest and this Link.
 pub async fn join(s:&Arc<Service>,invite:&Invite)->Result<Vec<serde_json::Value>>{
-    let mut nodes=invite.nodes.clone();let offset=(rand16()[0]as usize)%nodes.len();nodes.rotate_left(offset);
-    let mut last=anyhow::anyhow!("Ноды приглашения недоступны");
-    let mut refused=0usize;let total=nodes.len();
-    for h in nodes {
-        match join_one(s,invite,h).await {
-            Ok(hints)=>return Ok(hints),
-            Err(e)if e.downcast_ref::<Declined>().is_some()=>return Err(e),
-            Err(e)if e.downcast_ref::<Refused>().is_some()=>refused+=1,
-            Err(e)=>last=e}
-    }
-    // терминально, когда определённо отказало большинство нод (часть нод может быть недоступна, как fin1 без зачисления);
-    // при меньшем числе отказов возвращается ошибка недоступности и клиент повторяет с нарастающей паузой
-    if refused*2>total{
+    // Unknown at a node can mean the administrator's LXMF ISSUE has not arrived yet.
+    // Keep the private ticket for bounded retries, including after a process restart.
+    let existing=std::fs::read(pending_join(&s.state)).ok().and_then(|b|serde_json::from_slice::<PendingJoin>(&b).ok());
+    if existing.as_ref().is_some_and(|p|p.until<=now_ms()as u64/1000&&Invite::parse(&p.ticket).ok().as_ref()==Some(invite)){
+        let _=std::fs::remove_file(pending_join(&s.state));
         let _=enroll::write(&s.state.join("enrollment.json"),br#"{"v":4,"state":"refused"}"#);
         return Err(anyhow::Error::new(Refused))
     }
+    remember_join(&s.state,invite,None)?;
+    let mut nodes=invite.nodes.clone();let offset=(rand16()[0]as usize)%nodes.len();nodes.rotate_left(offset);
+    let mut last=anyhow::anyhow!("Ноды приглашения недоступны");
+    for h in nodes {
+        match join_one(s,invite,h,true).await {
+            Ok(hints)=>return Ok(hints),
+            Err(e)if e.downcast_ref::<Declined>().is_some()=>return Err(e),
+            Err(e)if e.downcast_ref::<Refused>().is_some()=>last=anyhow::anyhow!("Нода ещё не получила разрешение или pin недействителен; повторим позже"),
+            Err(e)=>last=e}
+    }
     Err(last)
 }
-async fn join_one(s:&Arc<Service>,invite:&Invite,h:Hash)->Result<Vec<serde_json::Value>>{
+async fn join_one(s:&Arc<Service>,invite:&Invite,h:Hash,allow_consent:bool)->Result<Vec<serde_json::Value>>{
     let link=s.open(h,false).await?;
-    let result=join_link(s,invite,h,link).await;
+    let result=join_link(s,invite,h,link,allow_consent).await;
     let _=s.node.engine().close_link(&link).await;result
 }
-async fn join_link(s:&Arc<Service>,invite:&Invite,h:Hash,link:LinkId)->Result<Vec<serde_json::Value>>{
+async fn join_link(s:&Arc<Service>,invite:&Invite,h:Hash,link:LinkId,allow_consent:bool)->Result<Vec<serde_json::Value>>{
     let client_nonce=rand16();let mut body=vec![1];body.extend(invite.pin);body.extend(client_nonce);
     let offer=rpc(&s.node,link,&body,70_000).await?;
     if offer["status"]=="nodes" {return repeat_nodes(&s.trust,&s.identity,&s.state,invite,h,&offer)}
@@ -376,6 +470,18 @@ async fn join_link(s:&Arc<Service>,invite:&Invite,h:Hash,link:LinkId)->Result<Ve
     let mut temporary=Trust::new(s.identity.clone(),None);temporary.add_anchor(&root)?;
     for _ in 0..=trust::MAX_DEPTH{for r in &chain{if r.root!=g.root{bail!("foreign offer record")};temporary.offer(r.clone());}}
     g.verify(&temporary,&admin)?;
+    remember_join(&s.state,invite,Some(g.expires))?;
+    let prior=s.trust.lock().unwrap().enrollment_proofs(&s.identity.public_key_bytes()).into_iter()
+        .find(|p|p.grant==g);
+    // The same signed Grant was explicitly accepted before. Reuse THAT consent, never consent to
+    // a changed root/rights/node set just because the ticket contains the same pin.
+    if let Some(prior)=prior{
+        let nonce:[u8;16]=enroll::raw(offer["nonce"].as_str().context("offer nonce")?)?.try_into().map_err(|_|anyhow::anyhow!("nonce"))?;
+        let mut redeem=vec![2];redeem.extend(prior.rec.rights.to_le_bytes());redeem.extend(prior.rec.consent);redeem.extend(nonce);
+        let result=rpc(&s.node,link,&redeem,25_000).await?;
+        return apply_result(s,invite,h,&result,Some(&hex(&g.digest())))
+    }
+    if !allow_consent{bail!("Нода предложила другое разрешение; фоновое согласие запрещено")}
     let request=hex(&g.digest());let nonce:[u8;16]=enroll::raw(offer["nonce"].as_str().context("offer nonce")?)?.try_into().map_err(|_|anyhow::anyhow!("nonce"))?;
     let confirm=s.state.join("enroll-consent.json");let _=std::fs::remove_file(&confirm);
     let view=serde_json::json!({"v":4,"state":"offer","request":request,"root":hex(&g.root),"issuer":hex(&g.issuer),"rights":g.cap,"expires":g.expires,"nodes":g.nodes.iter().map(|h|hex(h)).collect::<Vec<_>>(),
@@ -391,32 +497,49 @@ async fn join_link(s:&Arc<Service>,invite:&Invite,h:Hash,link:LinkId)->Result<Ve
     if !accepted{
         // R-3: приложение по этому состоянию стирает сохранённое приглашение (иначе pin лежал бы в профиле бессрочно)
         let _=enroll::write(&s.state.join("enrollment.json"),br#"{"v":4,"state":"declined"}"#);
+        let _=std::fs::remove_file(pending_join(&s.state));
         return Err(anyhow::Error::new(Declined))
     }
     enroll::write(&consent_marker(&s.state),&serde_json::to_vec(&serde_json::json!({"id":hex(&g.id),"digest":request}))?)?;
     let consent=EnRec::consent(&s.identity,&g,g.cap)?;let mut redeem=vec![2];redeem.extend(g.cap.to_le_bytes());redeem.extend(consent);redeem.extend(nonce);
     let result=rpc(&s.node,link,&redeem,25_000).await?;
-    let mut hints=apply_result(s,invite,h,&result,Some(&request))?;
-    let started=Instant::now();let mut complete=result["complete"].as_bool()==Some(true);
-    while !complete&&started.elapsed()<Duration::from_secs(30){
-        tokio::time::sleep(Duration::from_secs(10)).await;let mut request=vec![3];request.extend(g.id);
-        if let Ok(reply)=rpc(&s.node,link,&request,10_000).await {
-            hints.extend(apply_result(s,invite,h,&reply,Some(&hex(&g.digest())))?);complete=reply["complete"].as_bool()==Some(true);
-        }
-    }
-    Ok(hints)
+    apply_result(s,invite,h,&result,Some(&request))
 }
 fn apply_result(s:&Service,invite:&Invite,commissioner:Hash,result:&serde_json::Value,consent:Option<&str>)->Result<Vec<serde_json::Value>>{
     apply_to(&s.trust,&s.identity,&s.state,enroll::invite_id(&invite.pin),commissioner,result,consent,true)
 }
-/// Дожим расписок после зачисления. Окно `join` (30 с) короче времени, за которое остальные ноды гранта закрывают выдачу по LXMF
-/// (при нестабильной mesh это минуты), поэтому телефон мог остаться только с частью нод. Здесь для каждого свежего гранта, по которому
-/// записей меньше, чем нод, спрашиваем (`[3]`) ноды, уже подтвердившие права: их ответ несёт все расписки, что у них есть.
-/// Якорь не ставится (он уже стоит), согласие - digest сохранённого гранта. `None` - дожимать нечего.
+/// Progress counts distinct (root,node) receipts, not the last reply's list length.
+pub fn receipt_progress(s:&Service)->(usize,usize,bool){
+    let proofs=s.trust.lock().unwrap().enrollment_proofs(&s.identity.public_key_bytes());
+    let got=proofs.iter().map(|p|(p.grant.root,p.rec.scope)).collect::<HashSet<_>>();
+    let expected=proofs.iter().flat_map(|p|p.grant.nodes.iter().map(|n|(p.grant.root,*n))).collect::<HashSet<_>>();
+    let fresh=proofs.iter().any(|p|p.grant.fresh(now_ms()as u64/1000)&&p.grant.nodes.iter().any(|n|!got.contains(&(p.grant.root,*n))));
+    (got.len(),expected.len(),fresh)
+}
+/// Resume missing-node redemption with previously signed consent, then collect receipts from known peers.
+/// `None` means no actionable fresh enrollment, not necessarily a complete node list.
 pub async fn refresh(s:&Arc<Service>)->Result<Option<Vec<serde_json::Value>>>{
+    let mut pending_hints=vec![];let mut pending_work=false;
+    if let Some(mut pending)=read_join(&s.state)?{
+        let inv=Invite::parse(&pending.ticket)?;let id=enroll::invite_id(&inv.pin);
+        let proofs=s.trust.lock().unwrap().enrollment_proofs(&s.identity.public_key_bytes());
+        let missing=inv.nodes.iter().copied().filter(|h|!proofs.iter().any(|p|p.grant.id==id&&p.rec.scope==*h)).collect::<Vec<_>>();
+        if missing.is_empty(){std::fs::remove_file(pending_join(&s.state))?;}
+        else{
+            // Two destinations per round, rotating; the client's 2 -> 30 min backoff bounds absent-node retries.
+            // Never re-open the consent dialog if no proof of a previously accepted Grant is stored.
+            if proofs.iter().any(|p|p.grant.id==id){
+                pending_work=true;
+                let targets=(0..missing.len().min(2)).map(|i|missing[(pending.cursor+i)%missing.len()]).collect::<Vec<_>>();
+                pending.cursor=pending.cursor.wrapping_add(targets.len());
+                enroll::write(&pending_join(&s.state),&serde_json::to_vec(&pending)?)?;
+                for h in targets{if s.state.join("fin").exists(){break}if let Ok(v)=join_one(s,&inv,h,false).await{pending_hints.extend(v);}}
+            }
+        }
+    }
     let proofs=s.trust.lock().unwrap().enrollment_proofs(&s.identity.public_key_bytes());
     let mut ids:Vec<Hash>=vec![];for p in &proofs{if !ids.contains(&p.grant.id){ids.push(p.grant.id)}}
-    let (mut hints,mut worked,mut last)=(vec![],false,None);
+    let (mut hints,mut worked,mut last,mut answered)=(pending_hints,pending_work,None,pending_work);
     for id in ids{
         let have:Vec<&Proof>=proofs.iter().filter(|p|p.grant.id==id).collect();let grant=&have[0].grant;
         if !grant.fresh(now_ms()as u64/1000)||grant.nodes.iter().all(|n|have.iter().any(|p|p.rec.scope==*n)){continue}
@@ -429,10 +552,15 @@ pub async fn refresh(s:&Arc<Service>)->Result<Option<Vec<serde_json::Value>>>{
                 let reply=rpc(&s.node,link,&req,60_000).await;let _=s.node.engine().close_link(&link).await;
                 apply_to(&s.trust,&s.identity,&s.state,id,h,&reply?,Some(&hex(&grant.digest())),false)
             }.await;
-            match r{Ok(v)=>{hints.extend(v);last=None;break}Err(e)=>last=Some(e)}
+            match r{Ok(v)=>{hints.extend(v);answered=true;}Err(e)=>last=Some(e)}
+            // A successful sparse reply is NOT a complete receipt set. Other known nodes may hold more
+            // (in particular the original commissioner). Stop only on locally verified completeness.
+            let current=s.trust.lock().unwrap().enrollment_proofs(&s.identity.public_key_bytes());
+            if grant.nodes.iter().all(|n|current.iter().any(|p|p.grant.id==id&&p.rec.scope==*n)){break}
+            if s.state.join("fin").exists(){break}
         }
     }
-    match last{Some(e)=>Err(e),None=>Ok(worked.then_some(hints))}
+    match last{Some(e)if !answered=>Err(e),_=>Ok(worked.then_some(hints))}
 }
 /// Маркер принятого предложения: пишется перед REDEEM (id приглашения и digest grant, без pin) и живёт до применения ответа.
 /// Нужен, если ответ на REDEEM потерян после погашения: повтор приглашения тогда приходит как `nodes`, а доказательства ещё нет.
@@ -468,9 +596,18 @@ fn apply_to(trust:&Mutex<Trust>,id:&Identity,state:&Path,want:Hash,commissioner:
     if !seen.contains(&commissioner){bail!("commissioner receipt missing")}
     // Persist the trust anchor ONLY after holder-signed consent and independently verified node evidence.
     let mut tr=trust.lock().unwrap();
-    for p in parsed {if add_anchor{tr.add_anchor(&p.root)?;}tr.offer_enrollment(p)?;}tr.save()?;drop(tr);
+    let allowed=parsed[0].grant.nodes.clone();
+    let expected=read_join(state)?.and_then(|p|Invite::parse(&p.ticket).ok())
+        .filter(|i|enroll::invite_id(&i.pin)==want&&i.nodes.iter().all(|n|allowed.contains(n)))
+        .map(|i|i.nodes).unwrap_or(allowed);
+    for p in parsed {if add_anchor{tr.add_anchor(&p.root)?;}tr.offer_enrollment(p)?;}tr.save()?;
+    let stored=tr.enrollment_proofs(&id.public_key_bytes());
+    let count=expected.iter().filter(|n|stored.iter().any(|p|p.grant.id==want&&p.rec.scope==**n)).count();drop(tr);
+    if count==expected.len(){
+        if read_join(state)?.and_then(|p|Invite::parse(&p.ticket).ok()).is_some_and(|i|enroll::invite_id(&i.pin)==want){let _=std::fs::remove_file(pending_join(state));}
+    }
     let _=std::fs::remove_file(consent_marker(state));
-    enroll::write(&state.join("enrollment.json"),&serde_json::to_vec(&serde_json::json!({"v":4,"state":"enrolled","complete":result["complete"],"nodes":seen.len()}))?)?;
+    enroll::write(&state.join("enrollment.json"),&serde_json::to_vec(&serde_json::json!({"v":4,"state":"enrolled","complete":count==expected.len(),"nodes":count,"expected":expected.len()}))?)?;
     Ok(hints)
 }
 
@@ -504,6 +641,215 @@ mod tests {
         assert_eq!(stale,["a.out","b.err","c.req","d.x.tmp"]);std::fs::remove_dir_all(dir).unwrap();
     }
     fn tmp_state(tag:&str,id:&Identity)->PathBuf{let p=std::env::temp_dir().join(format!("kh-v4-{tag}-{}",hex(id.hash())));std::fs::create_dir_all(&p).unwrap();p}
+
+    fn multi_fixture()->(Identity,Vec<Identity>,Identity,Trust,Invite,Vec<Proof>){
+        let root=leviculum_std::api::generate_identity();let holder=leviculum_std::api::generate_identity();
+        let mut nodes=(0..3).map(|_|leviculum_std::api::generate_identity()).collect::<Vec<_>>();nodes.sort_by_key(|n|*n.hash());
+        let mut tr=Trust::new(root.clone(),None);
+        for n in &nodes{tr.issue(*root.hash(),n.public_key_bytes(),trust::USE|trust::TRANSIT|trust::EXIT).unwrap();}
+        let inv=Invite::new(nodes.iter().map(|n|*n.hash()).collect()).unwrap();
+        let g=Grant::create(&root,*root.hash(),&inv,trust::USE,now_ms()as u64/1000).unwrap();
+        let consent=EnRec::consent(&holder,&g,trust::USE).unwrap();
+        let proofs=nodes.iter().map(|n|Proof{root:root.public_key_bytes(),admin:root.public_key_bytes(),chain:tr.chain_for(&n.public_key_bytes()),grant:g.clone(),
+            rec:EnRec::create(n,&g,holder.public_key_bytes(),trust::USE,consent,now_ms()as u64).unwrap()}).collect();
+        (root,nodes,holder,tr,inv,proofs)
+    }
+    fn signed_receipt(node:&Identity,p:&Proof)->Receipt{Receipt{proof:hex(&p.wire()),closed:hex(&enroll::closed(node,p,dest_from_pub_tag(&p.rec.node,T13_TAG)).unwrap()),hints:vec![]}}
+
+    #[test]
+    fn scoped_policy_is_visible_without_root_wide_authority_and_receipt_count_never_regresses(){
+        let(root,nodes,holder,_,inv,proofs)=multi_fixture();let state=tmp_state("scoped-ui",&holder);
+        let tr=Mutex::new(Trust::new(holder.clone(),Some(state.join("trust.json"))));let digest=hex(&proofs[0].grant.digest());
+        let apply=|indices:&[usize]|{
+            let receipts=indices.iter().map(|i|signed_receipt(&nodes[*i],&proofs[*i])).collect::<Vec<_>>();
+            let reply=serde_json::json!({"status":"nodes","complete":false,"receipts":receipts});
+            apply_to(&tr,&holder,&state,proofs[0].grant.id,*nodes[indices[0]].hash(),&reply,Some(&digest),true).unwrap();
+        };
+        remember_join(&state,&inv,None).unwrap();apply(&[0]);apply(&[1]);apply(&[2]);apply(&[0]);
+        let view:serde_json::Value=serde_json::from_slice(&std::fs::read(state.join("enrollment.json")).unwrap()).unwrap();
+        assert_eq!(view["nodes"],3);assert_eq!(view["expected"],3);assert_eq!(view["complete"],true,"last sparse response must not erase local progress");
+        assert!(!pending_join(&state).exists(),"pin deleted after all selected nodes acknowledged");
+        let t=tr.lock().unwrap();
+        assert_eq!(t.my_rights_in(root.hash()),0,"display aggregation must not grant root-wide delegation");
+        assert_eq!(t.rights_at(root.hash(),holder.hash(),leviculum_std::api::generate_identity().hash()),0);
+        let policy=t.policy_view(now_ms()as u64);let p=policy.iter().find(|(r,_,_,_)|r==root.hash()).unwrap();
+        assert_eq!((p.1,p.3),(trust::USE,trust::USE));assert_eq!(t.policy_scope_view(root.hash(),now_ms()as u64).len(),3);
+        drop(t);std::fs::remove_dir_all(state).unwrap();
+    }
+
+    fn envelope_message(from:&Identity,to:&Identity,env:&Envelope)->leviculum_lxmf::Message{
+        leviculum_lxmf::Message::create(lxmf_admin::lxmf_destination(to.hash()),lxmf_admin::lxmf_destination(from.hash()),from,now_ms()as f64/1000.0,
+            TITLE.to_vec(),serde_json::to_vec(env).unwrap(),vec![],leviculum_lxmf::DeliveryMethod::Propagated).unwrap()
+    }
+    #[tokio::test]
+    async fn async_issue_is_durable_signed_scoped_and_resumes_only_unacknowledged_nodes(){
+        use std::os::unix::fs::PermissionsExt;
+        let(root,nodes,_,root_tr,_,_)=multi_fixture();let state=tmp_state("async-issue",&root);
+        let make=|id:&Identity,tr:Trust,path:&Path|{
+            let n=Arc::new(NodeBuilder::new().identity(id.clone()).build().unwrap());
+            register(n,id.clone(),Arc::new(Mutex::new(tr)),path,None)
+        };
+        let admin=make(&root,root_tr,&state);let(tx,rx)=std::sync::mpsc::sync_channel(32);let _guard=lxmf_sync::register(&state,tx);
+        let started=Instant::now();let code=admin.issue_invite(*root.hash(),nodes.iter().map(|n|*n.hash()).collect(),trust::USE).await.unwrap();
+        assert!(started.elapsed()<Duration::from_secs(2));let inv=Invite::parse(&code).unwrap();assert_eq!(inv.nodes.len(),3);
+        let path=issue_outbox(&state).unwrap().join(format!("{}.json",hex(&enroll::invite_id(&inv.pin))));
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode()&0o777,0o600);
+        assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode()&0o777,0o700);
+        let commands=rx.try_iter().filter_map(|c|if let lxmf_sync::Command::Send(m)=c{Some(m)}else{None}).collect::<Vec<_>>();assert_eq!(commands.len(),3);
+        let first:&lxmf_sync::Outbound=commands.iter().find(|c|c.pk==nodes[0].public_key_bytes()).unwrap();
+        let env:Envelope=serde_json::from_slice(&first.content).unwrap();
+        let node_state=tmp_state("async-receiver",&nodes[0]);let mut node_tr=Trust::new(nodes[0].clone(),None);node_tr.add_anchor(&root.public_key_bytes()).unwrap();
+        let receiver=make(&nodes[0],node_tr,&node_state);let(ntx,nrx)=std::sync::mpsc::sync_channel(32);let _ng=lxmf_sync::register(&node_state,ntx);
+        let attacker=leviculum_std::api::generate_identity();
+        let mut forged=envelope_message(&attacker,&nodes[0],&env);forged.source_hash=lxmf_admin::lxmf_destination(root.hash());
+        assert!(receiver.on_lxmf(&forged).is_err());assert!(Store::new(&node_state).unwrap().lookup(&inv.pin,now_ms()as u64/1000).is_err());
+        receiver.on_lxmf(&envelope_message(&root,&nodes[0],&env)).unwrap();
+        assert!(Store::new(&node_state).unwrap().lookup(&inv.pin,now_ms()as u64/1000).is_ok());
+        let ack=nrx.try_iter().filter_map(|c|if let lxmf_sync::Command::Send(m)=c{serde_json::from_slice::<Envelope>(&m.content).ok()}else{None}).find(|e|e.op=="issued").unwrap();
+        admin.on_lxmf(&envelope_message(&nodes[0],&root,&ack)).unwrap();
+        admin.on_lxmf(&envelope_message(&nodes[0],&root,&ack)).unwrap();
+        assert_eq!(read_issue(&path).unwrap().acked,vec![*nodes[0].hash()]);
+        // Reconstruct the sender, with no in-memory delivery state. Only the remaining nodes are sent.
+        let restored=Trust::new(root.clone(),None);let restarted=make(&root,restored,&state);
+        // Root signing authority survives independently of cached peer keys; install public server records for addressing.
+        {let mut tr=restarted.trust.lock().unwrap();for n in &nodes{tr.issue(*root.hash(),n.public_key_bytes(),trust::USE|trust::TRANSIT|trust::EXIT).unwrap();}}
+        restarted.deliver_issues();
+        let resumed=rx.try_iter().filter_map(|c|if let lxmf_sync::Command::Send(m)=c{
+            serde_json::from_slice::<Envelope>(&m.content).ok().filter(|e|e.op=="issue").map(|_|m.pk)
+        }else{None}).collect::<Vec<_>>();
+        assert_eq!(resumed.len(),2);assert!(!resumed.contains(&nodes[0].public_key_bytes()));
+        drop(restarted);drop(receiver);drop(admin);std::fs::remove_dir_all(state).unwrap();std::fs::remove_dir_all(node_state).unwrap();
+    }
+
+    #[test]
+    fn pending_ticket_is_private_bounded_and_preserves_deadline_across_restart(){
+        use std::os::unix::fs::PermissionsExt;
+        let id=leviculum_std::api::generate_identity();let state=tmp_state("join-retry",&id);let inv=Invite::new(vec![[1;16]]).unwrap();
+        remember_join(&state,&inv,None).unwrap();let first=read_join(&state).unwrap().unwrap();
+        assert_eq!(std::fs::metadata(pending_join(&state)).unwrap().permissions().mode()&0o777,0o600);
+        remember_join(&state,&inv,Some(first.until-100)).unwrap();remember_join(&state,&inv,None).unwrap();
+        let mut saved=read_join(&state).unwrap().unwrap();assert_eq!(saved.until,first.until-100);
+        saved.until=now_ms()as u64/1000-1;enroll::write(&pending_join(&state),&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(read_join(&state).unwrap().is_none());assert!(!pending_join(&state).exists());std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn async_enroll_control_size_budget(){
+        let root=leviculum_std::api::generate_identity();
+        for n in [1,8]{
+            let inv=Invite::new((1..=n).map(|i|[i as u8;16]).collect()).unwrap();
+            let grant=Grant::create(&root,*root.hash(),&inv,trust::USE,now_ms()as u64/1000).unwrap();
+            let body=serde_json::to_vec(&IssueDelivery{grant:hex(&grant.wire()),pin:hex(&inv.pin)}).unwrap();
+            let content=serde_json::to_vec(&Envelope{v:4,op:"issue".into(),sender:hex(&root.public_key_bytes()),exp:grant.expires,body:hex(&body),receipt:None}).unwrap();
+            let old_rpc_payload=3+grant.wire().len()+24;
+            eprintln!("enroll ISSUE payload: nodes={n}, LXMF content={} B, previous binary RPC={old_rpc_payload} B (not transport/airtime)",content.len());
+            assert!(content.len()<=2048,"control message must stay bounded independently of transport");
+        }
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn refresh_continues_after_sparse_first_reply_and_collects_commissioner_receipts(){
+        let(root,nodes,holder,root_tr,_,proofs)=multi_fixture();let base=tmp_state("receipt-merge",&holder);
+        for name in ["a","b","client"]{std::fs::create_dir_all(base.join(name)).unwrap();}
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let addr=listener.local_addr().unwrap();drop(listener);
+        let mut a=NodeBuilder::new().identity(nodes[0].clone()).storage_path(base.join("a/transport")).enable_transport(true)
+            .add_tcp_server(addr).accept_cbc_links(true).build().unwrap();a.start().await.unwrap();let arx=a.take_event_receiver().unwrap();let mut a=Arc::new(a);destination(&a,&nodes[0]);
+        let mut b=NodeBuilder::new().identity(nodes[1].clone()).storage_path(base.join("b/transport")).add_tcp_client(addr)
+            .accept_cbc_links(true).build().unwrap();b.start().await.unwrap();let brx=b.take_event_receiver().unwrap();let mut b=Arc::new(b);destination(&b,&nodes[1]);
+        let node_tr=|id:&Identity|{let mut t=Trust::new(id.clone(),None);t.add_anchor(&root.public_key_bytes()).unwrap();for r in root_tr.export_all(){t.offer(r);}t};
+        let sa=register(a.clone(),nodes[0].clone(),Arc::new(Mutex::new(node_tr(&nodes[0]))),&base.join("a"),None);
+        let sb=register(b.clone(),nodes[1].clone(),Arc::new(Mutex::new(node_tr(&nodes[1]))),&base.join("b"),None);
+        Store::new(&sa.state).unwrap().claim(&proofs[0]).unwrap();sa.publish(&proofs[0]).unwrap();
+        Store::new(&sb.state).unwrap().claim(&proofs[1]).unwrap();sb.publish(&proofs[1]).unwrap();
+        for i in [0,2]{Store::new(&sb.state).unwrap().receipt(&proofs[0].grant.id,signed_receipt(&nodes[i],&proofs[i])).unwrap();}
+        tokio::spawn(pump(sa.state.clone(),arx));tokio::spawn(pump(sb.state.clone(),brx));
+        let mut c=NodeBuilder::new().identity(holder.clone()).storage_path(base.join("client/transport")).add_tcp_client(addr).accept_cbc_links(true).build().unwrap();
+        c.start().await.unwrap();let crx=c.take_event_receiver().unwrap();let mut c=Arc::new(c);destination(&c,&holder);
+        let mut tr=Trust::new(holder.clone(),Some(base.join("client/trust.json")));tr.add_anchor(&root.public_key_bytes()).unwrap();
+        tr.offer_enrollment(proofs[0].clone()).unwrap();tr.offer_enrollment(proofs[1].clone()).unwrap();tr.save().unwrap();
+        let client=register(c.clone(),holder.clone(),Arc::new(Mutex::new(tr)),&base.join("client"),None);tokio::spawn(pump(client.state.clone(),crx));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for i in 0..2{let n=if i==0{&a}else{&b};n.announce(&DestinationHash::new(dest_from_pub_tag(&nodes[i].public_key_bytes(),T13_TAG)),None).await.unwrap();}
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(receipt_progress(&client),(2,3,true));
+        tokio::time::timeout(Duration::from_secs(35),refresh(&client)).await.unwrap().expect("both known peers must be polled");
+        assert_eq!(receipt_progress(&client),(3,3,false),"a sparse success must not prevent polling the next peer");
+        assert_eq!(client.trust.lock().unwrap().my_rights_in(root.hash()),0);
+        drop(client);drop(sa);drop(sb);tokio::time::sleep(Duration::from_secs(2)).await;
+        Arc::get_mut(&mut c).unwrap().stop().await.unwrap();Arc::get_mut(&mut b).unwrap().stop().await.unwrap();Arc::get_mut(&mut a).unwrap().stop().await.unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn queued_issue_reaches_late_node_via_pn_after_admin_disconnects(){
+        let(root,exit,pn_id)=(leviculum_std::api::generate_identity(),leviculum_std::api::generate_identity(),leviculum_std::api::generate_identity());
+        let base=tmp_state("pn-issue",&root);for n in ["root","exit","pn"]{std::fs::create_dir_all(base.join(n)).unwrap();}
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let addr=listener.local_addr().unwrap();drop(listener);
+        let(pp,_)=lxmf_admin::AdminProcessor::new(pn_id.clone());let pn=lxmf_sync::propagation_processor(&base.join("pn"),pn_id.clone()).unwrap();
+        let mut server=NodeBuilder::new().identity(pn_id.clone()).storage_path(base.join("pn/transport")).enable_transport(true).add_tcp_server(addr)
+            .core_processor(lxmf_sync::Processors(pp,pn)).build().unwrap();server.start().await.unwrap();
+        let mut tr=Trust::new(root.clone(),None);let pn_rec=tr.issue(*root.hash(),pn_id.public_key_bytes(),trust::TRANSIT).unwrap();
+        let exit_rec=tr.issue(*root.hash(),exit.public_key_bytes(),trust::USE|trust::TRANSIT|trust::EXIT).unwrap();let authority=Arc::new(Mutex::new(tr));
+        let(ap,art)=lxmf_admin::AdminProcessor::new(root.clone());art.pn.set_source(authority.clone());
+        let mut a=NodeBuilder::new().identity(root.clone()).storage_path(base.join("root/transport")).add_tcp_client(addr).core_processor(ap).build().unwrap();
+        a.start().await.unwrap();let mut a=Arc::new(a);let admin=register(a.clone(),root.clone(),authority,&base.join("root"),None);
+        let _ag=lxmf_sync::register(&base.join("root"),art.sync.clone());
+        let code=admin.issue_invite(*root.hash(),vec![*exit.hash()],trust::USE).await.unwrap();let inv=Invite::parse(&code).unwrap();
+        let until=Instant::now();
+        loop{
+            let stored=std::fs::read_dir(base.join("pn/lxmf/propagation")).ok().is_some_and(|entries|entries.flatten().any(|e|
+                e.file_name().to_string_lossy().contains('_')&&e.metadata().is_ok_and(|m|m.is_file()&&m.len()>100)));
+            if stored{break}
+            assert!(until.elapsed()<Duration::from_secs(40),"ISSUE was not stored on PN while recipient was offline");tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        drop(admin);tokio::time::sleep(Duration::from_secs(2)).await;Arc::get_mut(&mut a).unwrap().stop().await.unwrap();
+        let mut etr=Trust::new(exit.clone(),Some(base.join("exit/trust.json")));etr.add_anchor(&root.public_key_bytes()).unwrap();etr.offer(pn_rec);etr.offer(exit_rec);
+        let etr=Arc::new(Mutex::new(etr));let(ep,ert)=lxmf_admin::AdminProcessor::new(exit.clone());ert.pn.set_source(etr.clone());
+        let mut e=NodeBuilder::new().identity(exit.clone()).storage_path(base.join("exit/transport")).add_tcp_client(addr).core_processor(ep).build().unwrap();
+        e.start().await.unwrap();let mut e=Arc::new(e);let receiver=register(e.clone(),exit.clone(),etr,&base.join("exit"),None);
+        let _eg=lxmf_sync::register(&base.join("exit"),ert.sync.clone());let until=Instant::now();
+        let message=loop{if let Ok(m)=ert.inbound.try_recv(){if m.title==TITLE{break m}}
+            assert!(until.elapsed()<Duration::from_secs(60),"late node did not fetch ISSUE from PN");tokio::time::sleep(Duration::from_millis(100)).await;};
+        assert_eq!(message.method,leviculum_lxmf::DeliveryMethod::Propagated);
+        receiver.on_lxmf(&message).expect("signed ISSUE from offline administrator");
+        assert!(Store::new(&receiver.state).unwrap().lookup(&inv.pin,now_ms()as u64/1000).is_ok());
+        drop(receiver);tokio::time::sleep(Duration::from_secs(2)).await;Arc::get_mut(&mut e).unwrap().stop().await.unwrap();server.stop().await.unwrap();std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn newcomer_before_issue_is_not_rejected_and_can_join_after_delivery(){
+        let(root,node,client)=(leviculum_std::api::generate_identity(),leviculum_std::api::generate_identity(),leviculum_std::api::generate_identity());
+        let base=tmp_state("issue-late-retry",&client);for n in ["node","client"]{std::fs::create_dir_all(base.join(n)).unwrap();}
+        let mut root_tr=Trust::new(root.clone(),None);let rec=root_tr.issue(*root.hash(),node.public_key_bytes(),trust::USE|trust::TRANSIT|trust::EXIT).unwrap();
+        let mut server_tr=Trust::new(node.clone(),None);server_tr.add_anchor(&root.public_key_bytes()).unwrap();server_tr.offer(rec);
+        let inv=Invite::new(vec![*node.hash()]).unwrap();let grant=Grant::create(&root,*root.hash(),&inv,trust::USE,now_ms()as u64/1000).unwrap();
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let addr=listener.local_addr().unwrap();drop(listener);
+        let mut e=NodeBuilder::new().identity(node.clone()).storage_path(base.join("node/transport")).add_tcp_server(addr).accept_cbc_links(true).build().unwrap();
+        e.start().await.unwrap();let erx=e.take_event_receiver().unwrap();let mut e=Arc::new(e);destination(&e,&node);
+        let server=register(e.clone(),node.clone(),Arc::new(Mutex::new(server_tr)),&base.join("node"),None);tokio::spawn(pump(server.state.clone(),erx));
+        let mut c=NodeBuilder::new().identity(client.clone()).storage_path(base.join("client/transport")).add_tcp_client(addr).accept_cbc_links(true).build().unwrap();
+        c.start().await.unwrap();let crx=c.take_event_receiver().unwrap();let mut c=Arc::new(c);destination(&c,&client);
+        let receiver=register(c.clone(),client.clone(),Arc::new(Mutex::new(Trust::new(client.clone(),Some(base.join("client/trust.json"))))),&base.join("client"),None);
+        tokio::spawn(pump(receiver.state.clone(),crx));tokio::time::sleep(Duration::from_millis(500)).await;
+        e.announce(&DestinationHash::new(dest_from_pub_tag(&node.public_key_bytes(),T13_TAG)),None).await.unwrap();tokio::time::sleep(Duration::from_millis(500)).await;
+        let error=tokio::time::timeout(Duration::from_secs(20),join(&receiver,&inv)).await.unwrap().expect_err("ISSUE has not arrived yet");
+        assert!(error.downcast_ref::<Refused>().is_none(),"unknown must not terminate pending async enrollment");
+        assert!(pending_join(&receiver.state).exists());assert!(!receiver.state.join("enrollment.json").exists());
+        {let tr=server.trust.lock().unwrap();Store::new(&server.state).unwrap().issue(&tr,&grant,&inv.pin,&root.public_key_bytes(),&[],now_ms()as u64/1000).unwrap();}
+        let state=receiver.state.clone();let consent=tokio::spawn(async move{
+            let until=Instant::now();loop{
+                if let Ok(b)=std::fs::read(state.join("enrollment.json")){let v:serde_json::Value=serde_json::from_slice(&b).unwrap();if v["state"]=="offer"{
+                    enroll::write(&state.join("enroll-consent.json"),&serde_json::to_vec(&serde_json::json!({"request":v["request"],"accept":true})).unwrap()).unwrap();break
+                }}
+                assert!(until.elapsed()<Duration::from_secs(20));tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30),join(&receiver,&inv)).await.unwrap().unwrap();consent.await.unwrap();
+        assert_eq!(receipt_progress(&receiver),(1,1,false));assert!(!pending_join(&receiver.state).exists());
+        assert_eq!(receiver.trust.lock().unwrap().my_rights_in(root.hash()),0);
+        drop(receiver);drop(server);tokio::time::sleep(Duration::from_secs(2)).await;
+        Arc::get_mut(&mut c).unwrap().stop().await.unwrap();Arc::get_mut(&mut e).unwrap().stop().await.unwrap();std::fs::remove_dir_all(base).unwrap();
+    }
 
     /// R-1: чужой корень не получает якорь по `nodes` на первый LOOKUP, пока нет принятого на этом устройстве доказательства.
     #[test]
@@ -582,17 +928,31 @@ mod tests {
         let erx=e.take_event_receiver().unwrap();let mut e=Arc::new(e);destination(&e,&exit);
         let service=register(e.clone(),exit.clone(),Arc::new(Mutex::new(exit_tr)),&base.join("exit"),None);
         let _sync=lxmf_sync::register(&base.join("exit"),rt.sync.clone());
+        let exit_state=base.join("exit");
+        std::thread::spawn(move||{while let Ok(message)=rt.inbound.recv(){on_lxmf(&exit_state,&message);}});
         tokio::spawn(pump(base.join("exit"),erx));
-        let mut a=NodeBuilder::new().identity(root.clone()).storage_path(base.join("root/transport")).add_tcp_client(addr).accept_cbc_links(true).build().unwrap();a.start().await.unwrap();
+        let(ap,art)=lxmf_admin::AdminProcessor::new(root.clone());
+        let mut a=NodeBuilder::new().identity(root.clone()).storage_path(base.join("root/transport")).add_tcp_client(addr).accept_cbc_links(true).core_processor(ap).build().unwrap();a.start().await.unwrap();
         let arx=a.take_event_receiver().unwrap();let mut a=Arc::new(a);destination(&a,&root);
         let admin=register(a.clone(),root.clone(),Arc::new(Mutex::new(root_tr)),&base.join("root"),None);
+        let _admin_sync=lxmf_sync::register(&base.join("root"),art.sync.clone());
+        let admin_state=base.join("root");
+        std::thread::spawn(move||{while let Ok(message)=art.inbound.recv(){on_lxmf(&admin_state,&message);}});
         tokio::spawn(pump(base.join("root"),arx));
         tokio::time::sleep(Duration::from_millis(300)).await;
         e.announce(&DestinationHash::new(dest_from_pub_tag(&exit.public_key_bytes(),T13_TAG)),None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let code=admin.issue_invite(*root.hash(),vec![*exit.hash()],trust::USE).await.expect("remote durable ISSUE ACK");
+        let started=Instant::now();
+        let code=admin.issue_invite(*root.hash(),vec![*exit.hash()],trust::USE).await.expect("local durable ISSUE queue");
+        assert!(started.elapsed()<Duration::from_secs(2),"QR must not wait for remote ISSUE ACK");
         let inv=Invite::parse(&code).unwrap();assert_eq!(inv.nodes,vec![*exit.hash()]);
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let until=Instant::now();
+        loop{
+            if Store::new(&base.join("exit")).unwrap().lookup(&inv.pin,now_ms()as u64/1000).is_ok()
+                && std::fs::read_dir(issue_outbox(&base.join("root")).unwrap()).unwrap().next().is_none(){break}
+            assert!(until.elapsed()<Duration::from_secs(40),"LXMF ISSUE/issued was not durably applied");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         drop(admin);
         Arc::get_mut(&mut a).unwrap().stop().await.unwrap(); // the administrator is NOT online for redemption
         let mut c=NodeBuilder::new().identity(client.clone()).storage_path(base.join("client/transport")).add_tcp_client(addr).accept_cbc_links(true).build().unwrap();c.start().await.unwrap();

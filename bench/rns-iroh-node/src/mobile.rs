@@ -53,6 +53,68 @@ pub fn network_changes() -> watch::Receiver<u64> {
     network().subscribe()
 }
 
+/// Почтовый ящик устройства TUN: Java подключает и снимает VPN, не перезапуская узел. В ящике дескриптор лежит только до того, как его
+/// заберёт клиент (иначе процесс держал бы интерфейс после остановки приложением).
+fn tun_mailbox() -> &'static std::sync::Mutex<Option<std::os::fd::OwnedFd>> {
+    static VALUE: OnceLock<std::sync::Mutex<Option<std::os::fd::OwnedFd>>> = OnceLock::new();
+    VALUE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn tun_changed() -> &'static watch::Sender<u64> {
+    static VALUE: OnceLock<watch::Sender<u64>> = OnceLock::new();
+    VALUE.get_or_init(|| watch::channel(0).0)
+}
+
+/// `fd >= 0` - подключить TUN (берём свой дубликат, Java держит и закрывает свой), `fd < 0` - снять.
+pub fn set_tun_fd(fd: i32) -> bool {
+    use std::os::fd::FromRawFd;
+    let owned = if fd >= 0 {
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if dup < 0 { return false; }
+        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) })
+    } else {
+        None
+    };
+    *tun_mailbox().lock().unwrap() = owned;
+    tun_changed().send_modify(|g| *g = g.wrapping_add(1));
+    true
+}
+
+/// Забрать последнее выставленное устройство (`None` - снять или не выставлялось).
+pub(crate) fn take_tun() -> Option<std::os::fd::OwnedFd> {
+    tun_mailbox().lock().unwrap().take()
+}
+
+pub(crate) fn tun_commands() -> watch::Receiver<u64> {
+    tun_changed().subscribe()
+}
+
+/// Выход клиента: брошенный непринятый дескриптор не должен держать интерфейс.
+pub(crate) fn clear_tun() {
+    let _ = take_tun();
+}
+
+/// Просьбы пользователя (потяни-чтобы-обновить): 0 - внеочередной анонс, 1 - проверка связи со всеми нодами. Без опроса файлов:
+/// узел просыпается только по просьбе, периоды анонсов не меняются.
+pub const KICK_ANNOUNCE: i32 = 0;
+pub const KICK_PING: i32 = 1;
+
+fn kicks() -> &'static [watch::Sender<u64>; 2] {
+    static VALUE: OnceLock<[watch::Sender<u64>; 2]> = OnceLock::new();
+    VALUE.get_or_init(|| [watch::channel(0).0, watch::channel(0).0])
+}
+
+pub fn kick(kind: i32) -> bool {
+    match usize::try_from(kind).ok().and_then(|k| kicks().get(k)) {
+        Some(tx) => { tx.send_modify(|g| *g = g.wrapping_add(1)); true }
+        None => false,
+    }
+}
+
+pub(crate) fn kick_rx(kind: i32) -> watch::Receiver<u64> {
+    kicks()[kind as usize].subscribe()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

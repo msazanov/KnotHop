@@ -171,6 +171,15 @@ pub struct NodeArgs {
     /// то же приглашение из файла
     #[arg(long)]
     pub invite_file: Option<PathBuf>,
+    /// iroh-relay для hole punching: TLS-relay делит TCP-порт `--port` с носителем, QAD слушает отдельный UDP-порт (по умолчанию выключено)
+    #[arg(long)]
+    pub iroh_relay: bool,
+    /// UDP-порт QAD (определение собственного публичного адреса); нужен файрвол-разрешение владельца узла
+    #[arg(long, default_value_t = 47002)]
+    pub relay_quic_port: u16,
+    /// iroh-relay для hole punching, `host:порт` (TLS на TCP-порту ноды с `--iroh-relay`), через запятую: ключ relay должен быть ключом доверенной ноды
+    #[arg(long, default_value = "")]
+    pub relay_url: String,
 }
 
 /// Файл настроек узла: всё по умолчанию.
@@ -195,6 +204,9 @@ struct NodeConf {
     /// модель 0013: приглашение kh- (одноразовое; после зачисления игнорируется)
     invite: Option<String>,
     invite_file: Option<PathBuf>,
+    iroh_relay: bool,
+    relay_quic_port: Option<u16>,
+    relay_urls: Vec<String>,
 }
 
 /// Минимальный HTTP GET по 80 порту без зависимостей: тело ответа или None.
@@ -276,7 +288,14 @@ fn platform() -> &'static str {
 /// Тип платформы одним байтом (в приглашении) и обратно.
 /// Имя клиента для сети: телефон - «телефон-XXXXXX» по хешу identity. Имя и тип узла раздаёт сам узел
 /// (клиент сообщает их выходу в T_USE, выход передаёт дальше в T_NBRS); приглашение их не переносит.
-fn client_display_name(identity: &Identity) -> String {
+fn client_display_name(identity: &Identity, state: &Path) -> String {
+    // имя, которое пользователь задал сам (оболочка кладёт state/node-name.txt), важнее автоимени
+    if let Ok(t) = std::fs::read_to_string(state.join("node-name.txt")) {
+        let n: String = t.chars().filter(|c| name_char_ok(*c)).take(32).collect();
+        if !n.trim().is_empty() {
+            return n.trim().to_string();
+        }
+    }
     match trust::hash_of(&identity.public_key_bytes()) {
         Some(h) => format!("телефон-{}", &hex(&h)[..6]),
         None => "телефон".into(),
@@ -284,8 +303,8 @@ fn client_display_name(identity: &Identity) -> String {
 }
 
 /// Тело T_USE от клиента: тип и имя узла, чтобы выход раздал их другим клиентам.
-fn client_info_body(identity: &Identity) -> Vec<u8> {
-    let name = client_display_name(identity);
+fn client_info_body(identity: &Identity, state: &Path) -> Vec<u8> {
+    let name = client_display_name(identity, state);
     let pl = platform();
     let mut b = Vec::with_capacity(2 + pl.len() + name.len());
     b.push(pl.len() as u8);
@@ -502,6 +521,9 @@ pub struct ClientArgs {
     pub quic_cc_mbit: u64,
     #[arg(long, default_value_t = 4)]
     pub workers: usize,
+    /// iroh-relay доверенных нод для hole punching, `host:порт` через запятую (по умолчанию выключено)
+    #[arg(long, default_value = "")]
+    pub relay_url: String,
 }
 
 #[derive(Args, Clone)]
@@ -782,7 +804,7 @@ mod tests {
     #[test]
     fn client_info_roundtrip_and_garbage() {
         let id = leviculum_std::api::generate_identity();
-        let (name, pl) = parse_client_info(&client_info_body(&id)).unwrap();
+        let (name, pl) = parse_client_info(&client_info_body(&id, std::path::Path::new("/nonexistent"))).unwrap();
         assert!(name.starts_with("телефон-"));
         assert_eq!(pl, platform());
         assert_eq!(parse_client_info(b""), None);
@@ -1034,6 +1056,35 @@ mod tests {
     }
 
     #[test]
+    fn relay_gate_admits_only_keys_with_rights() {
+        let (root_id, node_id, holder, stranger) = (leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity());
+        let root = *root_id.hash();
+        let mut issuer = trust::Trust::new(root_id.clone(), None);
+        let rec = issuer.issue(root, holder.public_key_bytes(), trust::USE).unwrap();
+        let mut node = trust::Trust::new(node_id, None);
+        let key = |i: &Identity| i.ed25519_verifying().to_bytes();
+        // без якоря и записи ключ не допущен
+        assert!(!key_has_rights(&node, &key(&holder)));
+        node.add_anchor(&root_id.public_key_bytes()).unwrap();
+        assert!(!key_has_rights(&node, &key(&holder)), "якорь без записи держателя прав не даёт");
+        assert_eq!(node.offer(rec), trust::Offer::Added);
+        assert!(key_has_rights(&node, &key(&holder)));
+        assert!(!key_has_rights(&node, &key(&stranger)));
+        assert!(!key_has_rights(&node, &[0u8; 32]));
+    }
+
+    #[test]
+    fn relay_urls_are_filtered_like_hints() {
+        // частные и служебные адреса, мусор и схемы отбрасываются; больше трёх не берём
+        let list = "127.0.0.1:47001, 10.0.0.5:47001, https://evil.example:1, 8.8.8.8:47001, relay.example.org:47001, bad host:1, 1.1.1.1:0, 9.9.9.9:47001, 4.4.4.4:47001";
+        let urls = parse_relay_urls(list);
+        assert!(urls.iter().all(|u| { let s = u.to_string(); !s.contains("127.0.0.1") && !s.contains("10.0.0.5") && !s.contains("evil") }), "{urls:?}");
+        assert!(urls.iter().any(|u| u.to_string().contains("8.8.8.8")), "{urls:?}");
+        assert!(urls.len() <= 3);
+        assert!(parse_relay_urls("").is_empty());
+    }
+
+    #[test]
     fn iroh_key_equals_rns_signing_key() {
         let id = leviculum_std::api::generate_identity();
         let sk = iroh_key_from_identity(&id).unwrap();
@@ -1124,7 +1175,7 @@ struct Base {
 }
 
 /// Узел RNS + конечная точка QUIC. Общие настройки носителя те же, что у стенда (датаграммы QUIC, GCM на Link).
-async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>, key: SecretKey, admin_identity: Option<Identity>, mbit: u64, extra: &[&str], tcp: Option<u16>) -> Result<Base> {
+async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>, key: SecretKey, admin_identity: Option<Identity>, mbit: u64, extra: &[&str], tcp: Option<u16>, relays: &[RelayUrl]) -> Result<Base> {
     std::fs::create_dir_all(state).context("create state dir")?;
     let mut args: Vec<String> = ["knothopd", "--role", role, "--ip", "0.0.0.0", "--relay", "none", "--mode", "tun", "--carrier", "datagram", "--dgram-mtu",
         "1400", "--cipher", "gcm", "--data-cap", "4096", "--chan-buf", "4096", "--quic-initial-mtu", "1452", "--quic-cc", "tunnel", "--quic-cc-mbit"]
@@ -1186,6 +1237,11 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
     let node = Arc::new(node);
 
     let mut eb = Endpoint::builder(presets::Minimal).secret_key(key).alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled);
+    if !relays.is_empty() {
+        // relay нужен для сигнализации hole punching и QAD; сертификат принимается только от ключа доверенной ноды (relay.rs)
+        let _ = RELAY_URLS.set(relays.to_vec());
+        eb = eb.relay_mode(RelayMode::custom(relays.iter().cloned())).ca_tls_config(relay::pinned_ca(relay_trusted()));
+    }
     if let Some(p) = port {
         eb = eb.bind_addr(SocketAddr::from(([0, 0, 0, 0], p)))?;
     }
@@ -1209,6 +1265,36 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
         }
     }
     Ok(Base { node, events, ep, sh, cli, admin_lxmf })
+}
+
+/// Relay-серверы, заданные для этого процесса: к адресу пира добавляются как подсказка пути (hole punching), когда прямой IP неизвестен или закрыт.
+static RELAY_URLS: std::sync::OnceLock<Vec<RelayUrl>> = std::sync::OnceLock::new();
+/// Права доверенных ключей читаются из Trust процесса; пока он не задан, relay никому не доверяет.
+static RELAY_TRUST: std::sync::OnceLock<Arc<Mutex<trust::Trust>>> = std::sync::OnceLock::new();
+
+/// Есть ли у ключа Ed25519 (он же EndpointId iroh и подпись identity RNS) хоть какое-то право в нашем Trust.
+fn key_has_rights(tr: &trust::Trust, k: &[u8; 32]) -> bool {
+    tr.holders_with(trust::USE | trust::TRANSIT | trust::EXIT | trust::ADD | trust::REMOVE | trust::CONFIG).iter().any(|pk| &pk[32..64] == k)
+}
+
+fn relay_trusted() -> relay::Trusted {
+    Arc::new(|k: &[u8; 32]| RELAY_TRUST.get().is_some_and(|t| key_has_rights(&t.lock().unwrap(), k)))
+}
+
+/// `host:порт` -> `https://host:порт`; адрес проходит тот же фильтр, что и подсказки (публичный IP или нормальное имя).
+fn parse_relay_urls(list: &str) -> Vec<RelayUrl> {
+    list.split(',').map(str::trim).filter(|s| !s.is_empty()).filter_map(|s| {
+        if !sane_hint_addr(s) { return None; }
+        format!("https://{s}").parse::<RelayUrl>().ok()
+    }).take(3).collect()
+}
+
+/// Добавить к адресу пира relay-подсказки (если заданы).
+fn with_relays(mut addr: EndpointAddr) -> EndpointAddr {
+    for u in RELAY_URLS.get().into_iter().flatten() {
+        addr = addr.with_relay_url(u.clone());
+    }
+    addr
 }
 
 fn transport_cfg(cli: &Cli) -> Option<QuicTransportConfig> {
@@ -2039,17 +2125,20 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
         }
         let cur = book.get();
         let resolved = resolve_addrs(&cur).await;
-        if resolved.is_empty() {
+        // без адресов можно дозвониться только через relay (hole punching по EndpointId); TCP-носителю нужен адрес
+        let relay_only = resolved.is_empty() && RELAY_URLS.get().is_some();
+        if resolved.is_empty() && !relay_only {
             sh.note(format!("{label}: адрес {cur:?} не разрешился"));
             book.pause(Duration::from_secs(5)).await;
             continue;
         }
-        if !(ctl.prefer_tcp.load(Relaxed) || quic_bad) {
+        if relay_only || !(ctl.prefer_tcp.load(Relaxed) || quic_bad) {
             let mut addr = EndpointAddr::new(id);
             for a in &resolved {
                 addr = addr.with_ip_addr(*a);
             }
-            match tokio::time::timeout(Duration::from_secs(6), ep.connect(addr, ALPN)).await {
+            let addr = with_relays(addr);
+            match tokio::time::timeout(Duration::from_secs(if resolved.is_empty() { 15 } else { 6 }), ep.connect(addr, ALPN)).await {
                 Ok(Ok(conn)) => {
                     n += 1;
                     quic_fail = 0;
@@ -2057,6 +2146,10 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                     ctl.set_mode("quic");
                     sh.note(format!("quic connected to {label}"));
                     quic_session(&node, &sh, &ctl, &alive, &label, &peer, conn, QuicSide::Fresh(format!("iroh-dg-out-{label}-{n}")), Instant::now(), &mut back_off, first_back).await;
+                }
+                _ if relay_only => {
+                    sh.note(format!("{label}: через relay не соединилось, повторю"));
+                    book.pause(Duration::from_secs(10)).await;
                 }
                 _ => {
                     quic_fail += 1;
@@ -3451,10 +3544,19 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         a.client_net = c.client_net.unwrap_or(a.client_net);
         a.invite = c.invite.unwrap_or(a.invite.clone());
         a.invite_file = c.invite_file.or(a.invite_file.clone());
+        a.iroh_relay = c.iroh_relay;
+        a.relay_quic_port = c.relay_quic_port.unwrap_or(a.relay_quic_port);
+        if !c.relay_urls.is_empty() { a.relay_url = c.relay_urls.join(","); }
     }
     let _ = CLIENT_NET.set(parse_net(&a.client_net)?);
     let region = detect_region(&a.state).await;
     let _ = REGION.set(region.clone());
+    if a.name.is_empty() {
+        // то же имя, что телефон задаёт в настройках своей ноды: state/node-name.txt (--name и config имеют приоритет)
+        if let Ok(t) = std::fs::read_to_string(a.state.join("node-name.txt")) {
+            a.name = t.chars().filter(|c| name_char_ok(*c)).take(32).collect::<String>().trim().to_string();
+        }
+    }
     if a.name.is_empty() {
         // имя вида knothop-<РЕГИОН>-<что угодно>: регион по внешнему IP, хвост - имя хоста (или KNOTHOP_NAME_SUFFIX)
         let suffix = std::env::var("KNOTHOP_NAME_SUFFIX").ok().filter(|v| !v.is_empty()).unwrap_or_else(hostname);
@@ -3474,8 +3576,10 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     };
     let identity = load_or_create_identity(&a.state)?;
     let key = iroh_key_from_identity(&identity)?;
+    // сертификат relay делается из ключа ноды; копию держим только если relay включён
+    let relay_seed = a.iroh_relay.then(|| key.to_bytes());
     let exit_args = ["--tun-mtu", "1327", "--tun-ip", "10.99.0.1/24", "--tun-txqlen", "10240", "--tun-qdisc", "fq_codel", "--tun-name", a.tun_name.as_str()];
-    let b = start_base("n", &a.state, true, Some(a.port), key, Some(identity.clone()), a.quic_cc_mbit, if a.no_exit { &[] } else { &exit_args[..] }, None).await?;
+    let b = start_base("n", &a.state, true, Some(a.port), key, Some(identity.clone()), a.quic_cc_mbit, if a.no_exit { &[] } else { &exit_args[..] }, None, &parse_relay_urls(&a.relay_url)).await?;
     let (node, sh, ep, cli, events, admin_lxmf) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events, b.admin_lxmf);
 
     // тег назначения един для всей сети: нода находит соседей по тегам корней в анонсе
@@ -3506,6 +3610,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         Some(T13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), 
             trust_dirty: AtomicBool::new(false),  dir_sent: Mutex::new(HashMap::new()) })
     };
+    if let Some(t) = &t13 { let _ = RELAY_TRUST.set(t.trust.clone()); }
 
     // Clear stale host-access kernel leases before any ordinary admission.
     // Без TUN (--no-exit) клиентов нет; --no-host-nft - лаборатория без таблицы: наборы пусты, TCP к хосту закрыт.
@@ -3579,7 +3684,19 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     sh.note(format!("node {} tag {} dest {} iroh {}", ctx.name, tag, hex(&my_dest), ctx.ep_id));
 
     tokio::spawn(accept_loop(ep.clone(), node.clone(), sh.clone()));
-    tokio::spawn(tcpc::listen(node.clone(), sh.clone(), a.port));
+    let relay_host = match (relay_seed, &ctx.t13) {
+        (Some(seed), Some(t)) => {
+            // relay не даёт прав: к нему допускаются только ключи, у которых в нашей сети есть хоть какое-то право (цепочка до якоря проверена в Trust)
+            let trust = t.trust.clone();
+            let trusted: relay::Trusted = Arc::new(move |k: &[u8; 32]| key_has_rights(&trust.lock().unwrap(), k));
+            match relay::Host::start(&seed, SocketAddr::from(([0, 0, 0, 0], a.relay_quic_port)), trusted).await {
+                Ok(h) => { sh.note(format!("iroh-relay: TLS на {}/tcp (общий с носителем), QAD на {}/udp", a.port, a.relay_quic_port)); Some(Arc::new(h)) }
+                Err(e) => { sh.note(format!("iroh-relay не запущен: {e:#}")); None }
+            }
+        }
+        _ => None,
+    };
+    tokio::spawn(tcpc::listen(node.clone(), sh.clone(), a.port, relay_host));
     for s in a.seed.split(',').filter(|s| !s.is_empty()) {
         if let Some((id, addrs)) = parse_peer(s) {
             tokio::spawn(dial_direct(ep.clone(), node.clone(), sh.clone(), format!("seed-{}", id.fmt_short()), id, Addrs::new(addrs), Arc::new(AtomicBool::new(true)), CarrierCtl::new(), None));
@@ -6178,8 +6295,7 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
             let st = serde_json::json!({"uptime_s": ctx.started.elapsed().as_secs(), "links": ctx.links.lock().unwrap().len(), "vpn_paths": vpn_paths,
                 "clients": n_clients, "tun": ctx.tun.as_ref().map(|t| t.stats()),
                 "pol": pol_counters(),
-                "policy": ctx.t13.as_ref().map(|t| t.trust.lock().unwrap().policy_view(now_ms() as u64).iter()
-                    .map(|(r, g, o, e)| serde_json::json!({"tag": trust::root_tag(r), "grant": g, "offer": o, "eff": e})).collect::<Vec<_>>())});
+                "policy": ctx.t13.as_ref().map(|t| policy_status(&t.trust.lock().unwrap(), now_ms() as u64))});
             crate::bgwrite::put(&ctx.state.join("status.json"), st.to_string().into_bytes(), Duration::from_secs(20));
         }
     }
@@ -6190,7 +6306,7 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
 pub async fn run_hub(a: HubArgs) -> Result<()> {
     let hub_id = load_or_create_identity(&a.state)?;
     let key = iroh_key_from_identity(&hub_id)?;
-    let b = start_base("h", &a.state, true, Some(a.port), key, None, 500, &[], Some(a.tcp_port)).await?;
+    let b = start_base("h", &a.state, true, Some(a.port), key, None, 500, &[], Some(a.tcp_port), &[]).await?;
     tokio::spawn(accept_loop(b.ep.clone(), b.node.clone(), b.sh.clone()));
     let mut ev = b.events;
     tokio::spawn(async move { while ev.recv().await.is_some() {} });
@@ -6407,6 +6523,15 @@ fn client_inbox_step(
     Ok(stats)
 }
 
+/// Presentation only; node-scoped rights stay scoped in all admission/delegation checks.
+fn policy_status(tr: &trust::Trust, now: u64) -> Vec<serde_json::Value> {
+    tr.policy_view(now).iter().map(|(r, g, o, e)| {
+        let scopes = tr.policy_scope_view(r, now).iter().map(|(scope, grant, eff)|
+            serde_json::json!({"node": hex(scope), "grant": grant, "eff": eff})).collect::<Vec<_>>();
+        serde_json::json!({"root": hex(r), "tag": trust::root_tag(r), "grant": g, "offer": o, "eff": e, "scopes": scopes})
+    }).collect()
+}
+
 /// Проверки выдающего при подготовке делегированного приглашения выполняются до создания pin.
 fn admin_invite(a: InviteArgs) -> Result<()> {
     let nodes = a.nodes.iter().map(|h| unhex(h).try_into().map_err(|_|anyhow::anyhow!("node identity hash"))).collect::<Result<Vec<trust::Hash>>>()?;
@@ -6507,11 +6632,11 @@ fn my_node_view(state: &Path) -> Result<String> {
         if let Some(q) = queue.get(&hx) { p["queued"] = serde_json::json!(q); }
         p
     }).collect();
-    let networks: Vec<_> = tr.anchors().into_iter().filter(|(r, _)| *r != me)
-        .map(|(r, _)| serde_json::json!({"root": hex(&r), "tag": trust::root_tag(&r), "rights": tr.my_rights_in(&r) & trust::ALL})).collect();
+    let networks: Vec<_> = tr.policy_view(now_ms() as u64).into_iter().filter(|(r, _, _, _)| *r != me)
+        .map(|(r, g, _, _)| serde_json::json!({"root": hex(&r), "tag": trust::root_tag(&r), "rights": g & trust::ALL})).collect();
     Ok(serde_json::json!({"version": 1, "me": hex(&me), "root": hex(&me), "my_rights": mine,
         "can_add": mine & trust::ADD != 0, "can_remove": mine & trust::REMOVE != 0, "grantable": mine,
-        "queued": queued, "participants": participants, "networks": networks}).to_string())
+        "queued": queued, "participants": participants, "networks": networks, "policy": policy_status(&tr, now_ms() as u64)}).to_string())
 }
 
 /// Задать права держателя в СВОЕЙ сети (маска без HOST_ACCESS). Полномочия и подмножество своих прав проверяет `Trust::issue`;
@@ -6681,7 +6806,7 @@ fn forget_network_cmd(state: &Path) -> Result<()> {
     if std::fs::metadata(state.join("status.json")).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < Duration::from_secs(60)) {
         bail!("узел, похоже, работает (status.json свежий): остановите VPN и повторите");
     }
-    for f in ["enrollment.json", "enroll-consent.json", "enroll-consented.json"] { let _ = std::fs::remove_file(state.join(f)); }
+    for f in ["enrollment.json", "enroll-consent.json", "enroll-consented.json", "enroll-join.json"] { let _ = std::fs::remove_file(state.join(f)); }
     if state.join("identity.key").exists() {
         let n = trust::Trust::load(load_identity_strict(state)?, state)?.forget_foreign_roots()?;
         println!("забыто якорей: {n}");
@@ -7354,8 +7479,7 @@ impl ClientCtx {
             "exits": exits, "edges": edges, "tun": self.tun.stats(), "udp": udp_stats(), "failovers": self.failovers.lock().unwrap().clone(), "status": self.status.lock().unwrap().clone(),
             "users": self.c13.as_ref().map(|c| c.users.lock().unwrap().iter().map(|(h, t)| serde_json::json!({"h": &h[..8], "t": t})).collect::<Vec<_>>()).unwrap_or_default(),
             "pol": pol_counters(),
-            "policy": self.c13.as_ref().map(|c| c.trust.lock().unwrap().policy_view(now_ms() as u64).iter()
-                .map(|(r, g, o, e)| serde_json::json!({"root": hex(r), "tag": trust::root_tag(r), "grant": g, "offer": o, "eff": e})).collect::<Vec<_>>()).unwrap_or_default(),
+            "policy": self.c13.as_ref().map(|c| policy_status(&c.trust.lock().unwrap(), now_ms() as u64)).unwrap_or_default(),
             "ts_ms": now_ms() as u64});
         // раз в секунду читает интерфейс приложения: частота прежняя, но запись не в async-задаче
         crate::bgwrite::put(&self.state.join("status.json"), j.to_string().into_bytes(), Duration::ZERO);
@@ -7384,6 +7508,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
     let c13 = Some(C13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), rejected: Mutex::new(None), peers: Mutex::new(HashMap::new()), hints: Mutex::new(hints),
         enrollees: Mutex::new(HashMap::new()),
         users: Mutex::new(Vec::new()) });
+    if let Some(c) = &c13 { let _ = RELAY_TRUST.set(c.trust.clone()); }
     let identity = id;
     let tun_arg = a.tun_fd.to_string();
     // без дескриптора от VpnService (лаборатория, Linux) TUN создаётся самим процессом и получает адрес, выведенный из identity
@@ -7392,11 +7517,33 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
     if a.tun_fd < 0 {
         extra.extend(["--tun-ip", &tun_ip]);
     }
-    let b = start_base("c", &a.state, false, None, SecretKey::generate(), Some(identity.clone()), a.quic_cc_mbit, &extra, None).await?;
+    // с relay EndpointId клиента должен быть связан с identity, иначе relay не отличит допущенного от чужого
+    let relays = parse_relay_urls(&a.relay_url);
+    let ep_key = if relays.is_empty() { SecretKey::generate() } else { iroh_key_from_identity(&identity)? };
+    let b = start_base("c", &a.state, false, None, ep_key, Some(identity.clone()), a.quic_cc_mbit, &extra, None, &relays).await?;
     let (node, sh, ep, cli, events, admin_lxmf) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events, b.admin_lxmf);
     let tun = TunState::open(&cli, false)?;
     let _ = sh.tun.set(tun.clone());
     tokio::spawn(tun_reader(tun.clone(), node.clone(), sh.clone()));
+    if a.tun_fd == crate::TUN_DETACHED {
+        // Режим «в сети без VPN»: оболочка подключает и снимает TUN на лету, узел и его Link при этом живут (mobile::set_tun_fd).
+        let (tun2, sh2) = (tun.clone(), sh.clone());
+        tokio::spawn(async move {
+            let mut commands = crate::mobile::tun_commands();
+            commands.borrow_and_update();
+            if let Some(fd) = crate::mobile::take_tun() {
+                if let Err(e) = tun2.set_device(Some(fd)) { sh2.note(format!("TUN не подключён: {e:#}")); }
+            }
+            while commands.changed().await.is_ok() {
+                let fd = crate::mobile::take_tun();
+                let attach = fd.is_some();
+                match tun2.set_device(fd) {
+                    Ok(()) => sh2.note(if attach { "TUN подключён: режим VPN" } else { "TUN снят: узел остаётся в сети без VPN" }),
+                    Err(e) => sh2.note(format!("TUN не переключён: {e:#}")),
+                }
+            }
+        });
+    }
 
     let servers: Vec<CServer> = Vec::new();
     let client_addr = ip_str(client_ip(identity.hash()));
@@ -7423,6 +7570,19 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
         let dh = *dest.hash().as_bytes();
         node.register_destination(dest);
         tokio::spawn(client_announce(ctx.clone(), dh));
+        {
+            // Проверка связи со всеми нодами по просьбе: поднять носители (QUIC/TCP) к нодам, у которых их нет; RTT носителя виден в списке нод.
+            let ctx2 = ctx.clone();
+            tokio::spawn(async move {
+                let mut kicks = crate::mobile::kick_rx(crate::mobile::KICK_PING);
+                kicks.borrow_and_update();
+                while kicks.changed().await.is_ok() {
+                    ctx2.refresh_servers13();
+                    start_dialers(&ctx2);
+                    ctx2.sh.note("проверка связи: носители ко всем нодам запрошены".to_string());
+                }
+            });
+        }
         ctx.refresh_servers13();
         tokio::spawn(client_policy_loop(ctx.clone()));
         tokio::spawn(client_enroll_refresh(ctx.clone()));
@@ -7558,6 +7718,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
     client_supervisor(ctx.clone()).await;
     drop(public_handles);
     ep.close().await;
+    crate::mobile::clear_tun();
     let rejected = ctx.c13.as_ref().and_then(|c| c.rejected.lock().unwrap().clone());
     if let Some(why) = rejected {
         bail!("зачисление прекращено: {why}");
@@ -7608,14 +7769,19 @@ async fn client_enroll_refresh(ctx: Arc<ClientCtx>) {
         let res = enroll_net::refresh(&service).await;
         wait = if manual || count() > before { 120 } else { (wait * 2).min(1800) };
         let after = count();
+        let (received, expected, refreshable) = enroll_net::receipt_progress(&service);
+        let summary = format!("Расписок нод: {received} из {expected}");
         match res {
             Ok(Some(hints)) => {
                 for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.hint_name(e.dest, &e.name); }
-                ctx.sh.note("зачисление: дополучены расписки остальных нод".to_string());
+                if after > before { ctx.sh.note(format!("зачисление: дополучены расписки, {received} из {expected}")); }
                 ctx.refresh_servers13(); start_dialers(&ctx);
-                if manual { report(format!("Расписок нод: {after} (новых {})", after.saturating_sub(before))); }
+                if manual { report(format!("{summary} (новых {}). {}", after.saturating_sub(before), if received < expected { "Остальные подтверждения ещё не доставлены" } else { "Все подтверждения получены" })); }
             }
-            Ok(None) => { if manual { report(format!("Список полный: расписок {after}, дожимать нечего")); } }
+            Ok(None) => { if manual { report(if expected == 0 { "Нет сохранённых подтверждений зачисления".into() }
+                else if received == expected { format!("{summary}. Все подтверждения получены") }
+                else if !refreshable { format!("{summary}. Не все подтверждения получены; срок опроса приглашения истёк") }
+                else { format!("{summary}. Подтверждения ещё ожидаются") }); } }
             Err(e) => {
                 ctx.sh.note(format!("зачисление: дожим расписок не удался: {e:#}"));
                 if manual { report(format!("Не удалось: {}", format!("{e:#}").chars().take(160).collect::<String>())); }
@@ -7818,11 +7984,17 @@ async fn direct_link(ctx: &Arc<ClientCtx>, cand: &CServer) -> Result<LinkId> {
 async fn client_announce(ctx: Arc<ClientCtx>, dest: [u8; 16]) {
     let Some(c) = &ctx.c13 else { return };
     let mut wait = [Duration::ZERO, Duration::from_secs(20)].into_iter().chain(std::iter::repeat(Duration::from_secs(600)));
+    let mut kicks = crate::mobile::kick_rx(crate::mobile::KICK_ANNOUNCE);
+    kicks.borrow_and_update();
+    let mut last: Option<Instant> = None;
     while let Some(d) = wait.next() {
-        tokio::time::sleep(d).await;
+        // Просьба пользователя будит раньше срока, но не чаще раза в 30 с: штатный период анонса (600 с) остаётся прежним.
+        let manual = tokio::select! { _ = tokio::time::sleep(d) => false, r = kicks.changed() => r.is_ok() };
+        if manual && last.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) { continue; }
         if c.invite.lock().unwrap().is_some() {
             continue; // пока ждём зачисления, своих нод у нас нет
         }
+        last = Some(Instant::now());
         // This destination exists only to publish the admin anchor for discovery; it rejects incoming Links.
         let data = serde_json::json!({"lc": false});
         let _ = ctx.node.announce(&DestinationHash::new(dest), Some(data.to_string().as_bytes())).await;
@@ -8276,7 +8448,7 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     // 0013: «пришёл за выходом» (T_USE) уходит ДО identify: у клиента с правами транзита (админ, телефон-админ) сервер иначе допустил бы его
     // соседом в момент identify. Цепочка идёт после identify (у ответчика identity появляется только после него).
     if ctx.c13.is_some() {
-        send_ctl(&ctx.node, id, T_USE, &client_info_body(&ctx.identity)).await;
+        send_ctl(&ctx.node, id, T_USE, &client_info_body(&ctx.identity, &ctx.state)).await;
     }
     ctx.node.identify_link(&id, &ctx.identity).await.map_err(|e| anyhow::anyhow!("identify: {e:?}"))?;
     if let Some(c) = &ctx.c13 {
@@ -8285,7 +8457,7 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
             if let Some(s) = enroll_net::find(&ctx.state) { s.send_proofs(pk); }
         }
         // повтор T_USE после identify: если первый пакет отстал, узел уже увидит намерение стать клиентом
-        send_ctl(&ctx.node, id, T_USE, &client_info_body(&ctx.identity)).await;
+        send_ctl(&ctx.node, id, T_USE, &client_info_body(&ctx.identity, &ctx.state)).await;
     }
     let reply = match tokio::time::timeout(Duration::from_secs(6), rx).await {
         Ok(Ok(Ok(v))) => v,

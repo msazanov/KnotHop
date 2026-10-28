@@ -38,8 +38,17 @@ public class KnotHopVpnService extends VpnService {
     static final String A_STOP = "com.knothop.vpn.STOP";
     /** Только лабораторная сборка (см. labNativeFail): имитация сбоя нативной части. */
     static final String A_LAB_NATIVE_FAIL = "com.knothop.vpn.LAB_NATIVE_FAIL";
+    /** Выбрать режим (EXTRA_MODE): 0 - отключено, 1 - в сети нод без VPN, 2 - VPN. Узел при переключении 1/2 не перезапускается. */
+    static final String A_MODE = "com.knothop.vpn.MODE";
+    static final String EXTRA_MODE = "mode";
     static final String EXTRA_ARGS = "args";
     private static final String CHANNEL = "knothop";
+
+    /** Выбранный режим (0 - сервис не работает). */
+    static volatile int mode = 0;
+    /** Подключение и снятие TUN идут строго по очереди. */
+    private final Object modeLock = new Object();
+    private String tunIp = "";
 
     /** idle | tun | connecting | up | stopping | error */
     static volatile String phase = "idle";
@@ -72,8 +81,23 @@ public class KnotHopVpnService extends VpnService {
             labNativeFail();
             return START_NOT_STICKY;
         }
-        if ("stopping".equals(phase) || (worker != null && worker.isAlive())) return START_NOT_STICKY;
+        int want = A_MODE.equals(a) ? intent.getIntExtra(EXTRA_MODE, 2) : 2;
+        if (want == 0) {
+            stopVpn();
+            return START_NOT_STICKY;
+        }
+        if (want != 1) want = 2;
+        if ("stopping".equals(phase)) {
+            foreground("останавливаю");   // startForegroundService обязывает вызвать startForeground даже для отклонённой просьбы
+            return START_NOT_STICKY;
+        }
+        if (worker != null && worker.isAlive()) {
+            foreground(statusText());
+            if (!"error".equals(phase)) switchMode(want);
+            return START_NOT_STICKY;
+        }
         if (tun != null) cleanup();   // TUN, оставленный после сбоя (tunHeld), заменяем новым
+        mode = want;
         extraArgs = intent != null && intent.getStringExtra(EXTRA_ARGS) != null ? intent.getStringExtra(EXTRA_ARGS) : "";
         foreground("подключаюсь");
         state = new File(getFilesDir(), "state");
@@ -100,8 +124,8 @@ public class KnotHopVpnService extends VpnService {
         PendingIntent open = PendingIntent.getActivity(this, 2, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
         Notification n = new Notification.Builder(this, CHANNEL).setContentTitle("KnotHop").setContentText(text)
                 .setSmallIcon(android.R.drawable.ic_lock_lock).setOngoing(true).setContentIntent(open)
-                .addAction(new Notification.Action.Builder(null, "Отключить VPN", pi).build()).build();
-        if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED);
+                .addAction(new Notification.Action.Builder(null, "Отключить", pi).build()).build();
+        if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED);
         else startForeground(1, n);
     }
 
@@ -132,26 +156,13 @@ public class KnotHopVpnService extends VpnService {
                 bindCarrierBeforeTun();
                 phase = "tun";
             }
-            Builder b;
-            // раздельное туннелирование: подсети правил «мимо VPN» исключаются из туннеля (Android 13+). Нативная часть собирает их из списков
-            // (самые крупные блоки первыми, не больше предела Binder). Если система всё же отказывает, берём вдвое меньше, затем без исключений.
-            List<String> direct = directRoutes();
-            int excluded = Build.VERSION.SDK_INT >= 33 ? direct.size() : 0;
-            while (true) {
-                try {
-                    excluded = addExcluded(b = newBuilder(tunIp), direct, excluded);
-                    tun = b.establish();
-                    excludedRouteCount = excluded;
-                    break;
-                } catch (Throwable t) {
-                    if (excluded == 0) throw t;
-                    Util.lab("establish with " + excluded + " excluded failed: " + t);
-                    excluded = excluded > 200 ? excluded / 2 : 0;
-                }
+            this.tunIp = tunIp;
+            synchronized (modeLock) {
+                // Узел всегда стартует без TUN (--tun-fd -2), дескриптор ему передаётся через почтовый ящик: так же, как при переключении режимов.
+                if (mode == 2 && tun == null) establishTun();
+                if (tun != null) Native.setTun(tun.getFd());
+                else Native.setTun(-1);
             }
-            getSharedPreferences("p", MODE_PRIVATE).edit().putString("routing_sig", RoutingCfg.load(state).directSig()).apply();
-            Util.lab("excluded routes: " + excluded + " of " + direct.size());
-            if (tun == null) throw new IllegalStateException("система не выдала TUN (разрешение VPN отозвано?)");
 
             synchronized (this) {
                 if (watchSession != session) return;
@@ -159,9 +170,9 @@ public class KnotHopVpnService extends VpnService {
                 phase = "connecting";
                 serviceUi.post(() -> startServiceWatcher(session));
             }
-            Util.lab("phase connecting, tun fd " + tun.getFd());
+            Util.lab("phase connecting, mode " + mode);
             String args = "client --state " + state.getAbsolutePath() + " " + clientArgs
-                    + " --tun-fd " + tun.getFd() + " --fail-ms 3000 --workers 4 " + extraArgs;
+                    + " --tun-fd -2 --fail-ms 3000 --workers 4 " + extraArgs;
             if (Util.LAB_BUILD) {
                 try {
                     // Частные адреса разрешены только в явно настроенной изолированной лаборатории, не при диагностике пилота.
@@ -180,6 +191,73 @@ public class KnotHopVpnService extends VpnService {
         } catch (Throwable t) {
             fail(t.toString(), session);
         }
+    }
+
+    /**
+     * Создаёт TUN с адресом клиента. Раздельное туннелирование: подсети правил «мимо VPN» исключаются из туннеля (Android 13+). Нативная
+     * часть собирает их из списков (самые крупные блоки первыми, не больше предела Binder). Если система отказывает, берём вдвое меньше,
+     * затем без исключений. Вызывать под modeLock.
+     */
+    private void establishTun() throws Exception {
+        List<String> direct = directRoutes();
+        int excluded = Build.VERSION.SDK_INT >= 33 ? direct.size() : 0;
+        ParcelFileDescriptor made;
+        while (true) {
+            try {
+                Builder b;
+                excluded = addExcluded(b = newBuilder(tunIp), direct, excluded);
+                made = b.establish();
+                break;
+            } catch (Throwable t) {
+                if (excluded == 0) throw t;
+                Util.lab("establish with " + excluded + " excluded failed: " + t);
+                excluded = excluded > 200 ? excluded / 2 : 0;
+            }
+        }
+        if (made == null) throw new IllegalStateException("система не выдала TUN (разрешение VPN отозвано?)");
+        tun = made;
+        excludedRouteCount = excluded;
+        getSharedPreferences("p", MODE_PRIVATE).edit().putString("routing_sig", RoutingCfg.load(state).directSig()).apply();
+        Util.lab("excluded routes: " + excluded + " of " + direct.size() + ", tun fd " + made.getFd());
+        try { if (carrierNetwork != null) setUnderlyingNetworks(new Network[]{carrierNetwork}); } catch (Throwable ignored) { }
+    }
+
+    /**
+     * Переключение 1 <-> 2 у работающего узла: TUN подключается и снимается на лету, Link и носители не перезапускаются.
+     * Режим 0 - это stopVpn. Выполняется вне главного потока (создание TUN может ждать систему).
+     */
+    private void switchMode(final int want) {
+        mode = want;
+        new Thread(() -> {
+            synchronized (modeLock) {
+                if (mode != want || "stopping".equals(phase) || "idle".equals(phase) || "error".equals(phase)) return;
+                try {
+                    if (want == 2 && tun == null) {
+                        establishTun();
+                        Native.setTun(tun.getFd());
+                    } else if (want == 1 && tun != null) {
+                        Native.setTun(-1);
+                        synchronized (KnotHopVpnService.this) {
+                            try { tun.close(); } catch (Throwable ignored) { }
+                            tun = null;
+                            excludedRouteCount = 0;
+                        }
+                    }
+                    updateNotification(statusText());
+                } catch (Throwable t) {
+                    Util.lab("смена режима на " + want + " не удалась: " + t);
+                    lastError = "режим VPN не включён: " + t;
+                    mode = 1;
+                }
+            }
+        }, "knothop-mode").start();
+    }
+
+    private String statusText() {
+        String s = serviceKey.isEmpty() ? "" : serviceKey.split("\n", 3)[2];
+        boolean up = serviceKey.startsWith("up");
+        if (mode == 1) return up ? "в сети без VPN: " + s : "в сети без VPN, ищу выход";
+        return up ? "подключено: " + s : "ищу выход";
     }
 
     /** One-time file migration on the service worker, before any native VPN command or TUN setup. */
@@ -228,20 +306,36 @@ public class KnotHopVpnService extends VpnService {
     }
 
     private Builder newBuilder(String tunIp) throws Exception {
-        Builder b = new Builder().setSession("knothop").setMtu(Util.MTU).addAddress(tunIp, 32).addRoute("0.0.0.0", 0)
-                .addDnsServer("1.1.1.1").addDnsServer("8.8.8.8").setMetered(false);
+        Builder b = new Builder().setSession("KnotHop").setMtu(Util.MTU).addAddress(tunIp, 32).addRoute("0.0.0.0", 0)
+                .addDnsServer("1.1.1.1").addDnsServer("8.8.8.8");
+        if (Build.VERSION.SDK_INT >= 29) b.setMetered(false);
         // IPv6 туннелем не переносится: маршрут по умолчанию загоняет его в туннель, где пакеты отбрасываются (нет утечки мимо VPN).
         b.addAddress("fd99:99::2", 128).addRoute("::", 0);
         return b;
     }
 
+    /**
+     * Сеть для носителя: настоящая (не VPN) с интернетом. Активной сетью бывает чужой VPN или наш собственный остаточный туннель, поэтому
+     * её берём, только если она не VPN, иначе ищем среди всех: сначала проверенную системой, затем любую с интернетом.
+     */
+    private Network physicalNetwork() {
+        Network best = null;
+        int bestScore = -1;
+        Network active = cm.getActiveNetwork();
+        for (Network n : cm.getAllNetworks()) {
+            NetworkCapabilities c = cm.getNetworkCapabilities(n);
+            if (c == null || !c.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) || !c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue;
+            int score = (c.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ? 2 : 0) + (n.equals(active) ? 1 : 0);
+            if (score > bestScore) { best = n; bestScore = score; }
+        }
+        return best;
+    }
+
     /** Process binding replaces UID exclusion. Never clear it while TUN exists (loop guard). */
     private void bindCarrierBeforeTun() {
         cm = (ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);
-        Network candidate = cm.getActiveNetwork();
-        NetworkCapabilities caps = candidate == null ? null : cm.getNetworkCapabilities(candidate);
-        if (caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN))
-            throw new IllegalStateException("Нет физической сети для носителя VPN");
+        Network candidate = physicalNetwork();
+        if (candidate == null) throw new IllegalStateException("Нет физической сети для носителя VPN");
         if (!cm.bindProcessToNetwork(candidate)) throw new IllegalStateException("Не удалось привязать носитель к сети");
         carrierNetwork = candidate;
         live = this;
@@ -278,7 +372,8 @@ public class KnotHopVpnService extends VpnService {
             for (Network n : s.cm.getAllNetworks()) {
                 NetworkCapabilities caps = s.cm.getNetworkCapabilities(n);
                 if (caps == null || !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue;
-                if (Build.VERSION.SDK_INT >= 29 && caps.getOwnerUid() != android.os.Process.myUid()) continue;
+                // getOwnerUid появился только в API 30; на Android 10 вызов ронял экран теста (NoSuchMethodError).
+                if (Build.VERSION.SDK_INT >= 30 && caps.getOwnerUid() != android.os.Process.myUid()) continue;
                 if (selected != null) return null;
                 selected = n;
             }
@@ -354,7 +449,7 @@ public class KnotHopVpnService extends VpnService {
             if (key.equals(serviceKey)) return;
             serviceKey = key;
             phase = st;
-            updateNotification("up".equals(st) ? "подключено: " + name : "ищу выход");
+            updateNotification(statusText());
         } catch (Exception ignored) { } // A missed/partial event is reconciled within 30 s.
     }
 
@@ -385,7 +480,7 @@ public class KnotHopVpnService extends VpnService {
                     if (caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) return;
                     if (!cm.bindProcessToNetwork(n)) { fail("Носитель потерял физическую сеть", session); return; }
                     carrierNetwork = n;
-                    setUnderlyingNetworks(new Network[]{n});
+                    try { if (tun != null) setUnderlyingNetworks(new Network[]{n}); } catch (Throwable ignored) { }
                 }
                 poke();
             }
@@ -409,6 +504,7 @@ public class KnotHopVpnService extends VpnService {
         carrierNetwork = null;
         if (live == this) live = null;
         tunHeld = false;
+        mode = 0;
         dropProfile();
     }
 

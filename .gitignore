@@ -30,6 +30,8 @@ invite*.txt
 **/invite*.txt
 hints.json
 **/state/
+**/enroll-outbox/
+enroll-join.json
 identity.key
 **/.profile
 **/profiles/
