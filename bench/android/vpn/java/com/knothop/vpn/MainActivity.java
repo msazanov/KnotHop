@@ -134,12 +134,9 @@ public class MainActivity extends Activity {
         header = new TextView(this);
         header.setTextSize(13);
         mainBox.addView(header);
-        nodesMsg = new TextView(this);
-        nodesMsg.setTextSize(12);
-        nodesMsg.setText("Потяните страницу вниз, чтобы обновить ноды и права");
+        nodesMsg = new LogText(this, "ноды");
         mainBox.addView(nodesMsg);
-        updMsg = new TextView(this);
-        updMsg.setTextSize(12);
+        updMsg = new LogText(this, "версия");
         updMsg.setText("Версия " + installedName() + " (" + installedCode() + ")");
         mainBox.addView(updMsg);
         // --- админ: приглашения. Видны только в своей сети (профиль «своя сеть»); пользователь по чужому приглашению их не видит.
@@ -181,6 +178,22 @@ public class MainActivity extends Activity {
         topo.setPingMode(pingBox.isChecked());
         pingBox.setOnCheckedChangeListener((v, on) -> { sp.edit().putBoolean("ping_layout", on).apply(); topo.setPingMode(on); });
         mainBox.addView(pingBox);
+        android.widget.CheckBox debugBox = new android.widget.CheckBox(this);
+        debugBox.setText("Отладка (расширенный журнал)");
+        debugBox.setTextSize(13);
+        debugBox.setChecked(Util.debug);
+        Button shareLog = new Button(this);
+        shareLog.setText("Поделиться журналом");
+        shareLog.setVisibility(Util.debug ? View.VISIBLE : View.GONE);
+        shareLog.setOnClickListener(v -> { Ui.tick(v); shareLog(); });
+        debugBox.setOnCheckedChangeListener((v, on) -> {
+            sp.edit().putBoolean("debug", on).apply();
+            Util.setDebug(on);
+            shareLog.setVisibility(on ? View.VISIBLE : View.GONE);
+            Util.log(on ? "отладка включена: в журнал пишутся снимки состояния, причины обрывов, паузы процесса" : "отладка выключена");
+        });
+        mainBox.addView(debugBox);
+        mainBox.addView(shareLog);
         benchBtn = new Button(this);
         benchBtn.setText("Обновить и проверить");
         benchBtn.setOnClickListener(v -> { Ui.tick(v); refreshAndTest(); });
@@ -253,6 +266,7 @@ public class MainActivity extends Activity {
         super.onResume();
         if (!sp.contains("profile")) offerShown = "";   // профиль мог быть забыт на экране своей ноды
         topo.setActive(true);
+        Util.dbg("экран открыт");
         ui.post(tick);
     }
 
@@ -260,6 +274,7 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         topo.setActive(false);
+        Util.dbg("экран закрыт");
         ui.removeCallbacks(tick);
     }
 
@@ -611,7 +626,7 @@ public class MainActivity extends Activity {
         if (geoBusy) return;
         geoBusy = true;
         if (geoMsg == null) {
-            geoMsg = new TextView(this); geoMsg.setTextSize(12);
+            geoMsg = new LogText(this, "геоданные");
             mainBox.addView(geoMsg, Math.min(2, mainBox.getChildCount()));
         }
         geoMsg.setText("Проверяю геоданные…");
@@ -663,6 +678,7 @@ public class MainActivity extends Activity {
         String d = dest.toLowerCase(java.util.Locale.ROOT);
         File st = new File(getFilesDir(), "state");
         boolean same = d.equals(Util.read(new File(st, "select")).trim().toLowerCase(java.util.Locale.ROOT));
+        Util.dbg("тап по ноде " + name + (same ? ": выход - авто" : ": выход по умолчанию"));
         try {
             st.mkdirs();
             File tmp = new File(st, "select.tmp");
@@ -774,6 +790,58 @@ public class MainActivity extends Activity {
         return String.format("%.1f МБ", b / 1e6);
     }
 
+    /** Текст, которого на экране нет: всё, что в него пишут, попадает в журнал приложения (консоль внизу). */
+    private final class LogText extends TextView {
+        private String tag;
+        private String last = "";
+        LogText(Context c, String tag) {
+            super(c);
+            this.tag = tag;
+            super.setVisibility(View.GONE);
+        }
+        @Override public void setText(CharSequence t, BufferType type) {
+            super.setText(t, type);
+            if (tag == null || t == null) return;
+            String v = t.toString();
+            if (v.isEmpty() || v.equals(last)) return;
+            last = v;
+            Util.log(tag + ": " + v);
+        }
+        @Override public void setVisibility(int v) { /* всегда скрыт */ }
+    }
+
+    /** Отправить журнал (нативный и приложения, без профиля, ключей и приглашений) по действию пользователя: хвост до 150 КБ. */
+    private void shareLog() {
+        String[] ls = Util.mergedLog(Util.read(new File(new File(getFilesDir(), "state"), "log.txt")));
+        StringBuilder b = new StringBuilder("KnotHop " + installedName() + " (" + installedCode() + "), Android " + android.os.Build.VERSION.SDK_INT + " " + android.os.Build.MODEL + "\n");
+        int from = ls.length;
+        int size = 0;
+        while (from > 0 && size < 150_000) size += ls[--from].length() + 1;
+        for (int i = from; i < ls.length; i++) b.append(ls[i]).append('\n');
+        Intent in = new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, b.toString()).putExtra(Intent.EXTRA_SUBJECT, "Журнал KnotHop");
+        startActivity(Intent.createChooser(in, "Поделиться журналом"));
+    }
+
+    private final java.util.Map<String, String> loggedOnce = new java.util.HashMap<>();
+
+    /** В журнал только при изменении значения (экран обновляется раз в секунду). */
+    private void logChange(String key, String val) {
+        if (val == null || val.isEmpty() || val.equals(loggedOnce.get(key))) return;
+        loggedOnce.put(key, val);
+        Util.log(key + ": " + val.replace('\n', ' '));
+    }
+
+    /** Заголовок виден, только если от пользователя нужно действие; остальное уходит в журнал. */
+    private void showHeader(String text, boolean action) {
+        if (action) {
+            header.setText(text);
+            header.setVisibility(View.VISIBLE);
+        } else {
+            header.setVisibility(View.GONE);
+            logChange("заголовок", text);
+        }
+    }
+
     private void refresh() {
         retirePin();
         String saved = sp.getString("profile", "");
@@ -788,17 +856,19 @@ public class MainActivity extends Activity {
             Profile pr = Profile.parse(saved);
             adminBox.setVisibility(pr.own() ? View.VISIBLE : View.GONE);   // приглашать может только администратор своей сети
             if (pr.own()) refreshUsers();
-            if (pr.own()) header.setText("Вы администратор своей сети. Для первой настройки привяжите корень телефона к своей серверной ноде командой knothopd trust-anchor на сервере. "
-                    + "Для выпуска приглашения включите «Сеть» и выберите ноды в «Пригласить»; VPN не обязателен. QR готов сразу, разрешения доставляются в фоне. Приглашение одноразовое, действует 48 часов. Оставьте «Сеть» включённой для доставки");
-            else header.setText(enrolled()
-                    ? grantedHeader()
-                    : "Приглашение принято, зачисление ещё не завершено. Передвиньте ползунок внизу в «Сеть» или «VPN»: телефон свяжется с нодами приглашения и покажет, какие права вам предлагают; согласитесь в диалоге");
+            if (pr.own()) showHeader("Вы администратор своей сети. Для первой настройки привяжите корень телефона к своей серверной ноде командой knothopd trust-anchor на сервере. "
+                    + "Для выпуска приглашения включите «Сеть» и выберите ноды в «Пригласить»; VPN не обязателен. QR готов сразу, разрешения доставляются в фоне. Приглашение одноразовое, действует 48 часов. Оставьте «Сеть» включённой для доставки", false);
+            else if (enrolled()) showHeader(grantedHeader(), false);
+            else showHeader("Приглашение принято, зачисление ещё не завершено. Передвиньте ползунок внизу в «Сеть» или «VPN»: телефон свяжется с нодами приглашения и покажет, какие права вам предлагают; согласитесь в диалоге", true);
         } catch (Throwable e) {
-            header.setText("профиль повреждён: " + e.getMessage());
+            showHeader("профиль повреждён: " + e.getMessage(), true);
         }
         updateModePanel();
-        StringBuilder s = new StringBuilder("состояние: ").append(KnotHopVpnService.phase).append('\n');
-        if (!KnotHopVpnService.lastError.isEmpty()) s.append("ОШИБКА: ").append(KnotHopVpnService.lastError).append('\n');
+        // Верх экрана: что происходит сейчас, активное соединение, скорость. Остальное - в журнал (консоль внизу).
+        String phase = KnotHopVpnService.phase;
+        logChange("состояние", phase);
+        String doing = null, conn = null, speed = null;
+        if (!KnotHopVpnService.lastError.isEmpty()) doing = "ОШИБКА: " + KnotHopVpnService.lastError;
         File state = new File(getFilesDir(), "state");
         JSONObject j = null;
         try {
@@ -809,17 +879,25 @@ public class MainActivity extends Activity {
             try {
                 JSONObject cur = j.optJSONObject("current");
                 String pinned = j.optString("selected");
-                s.append("выход: ").append(cur == null ? "— (ищу)" : TopologyView.shortName(cur.optString("n")) + " (" + cur.optString("d").substring(0, 8) + ")")
-                        .append(cur != null && pinned.equalsIgnoreCase(cur.optString("d")) ? "  ★ по умолчанию" : "").append('\n');
-                if (pinned.matches("[0-9a-fA-F]{32}") && (cur == null || !pinned.equalsIgnoreCase(cur.optString("d")))) s.append("выбран вами: ").append(pinned, 0, 8).append(" (подключаюсь)\n");
-                if (cur != null && !cur.isNull("via")) {
-                    String vd = cur.optString("via"); String vn = vd;
-                    JSONArray exs = j.optJSONArray("exits");
-                    for (int q = 0; exs != null && q < exs.length(); q++) if (vd.equals(exs.optJSONObject(q).optString("d"))) vn = TopologyView.shortName(exs.optJSONObject(q).optString("n"));
-                    s.append("маршрут: телефон -> ").append(vn).append(" -> ").append(TopologyView.shortName(cur.optString("n"))).append('\n');
+                String st = TopologyView.prettify(j.optString("status"));
+                logChange("статус", st);
+                if (doing == null && !st.isEmpty() && !st.startsWith("выход:")) doing = st;   // «подключаюсь к …», «выбранный выход недоступен …»
+                if (cur != null) {
+                    StringBuilder c = new StringBuilder("выход: ").append(TopologyView.shortName(cur.optString("n")));
+                    if (pinned.equalsIgnoreCase(cur.optString("d"))) c.append("  ★");
+                    if (!cur.isNull("via")) {
+                        String vd = cur.optString("via"); String vn = vd;
+                        JSONArray exs = j.optJSONArray("exits");
+                        for (int q = 0; exs != null && q < exs.length(); q++) if (vd.equals(exs.optJSONObject(q).optString("d"))) vn = TopologyView.shortName(exs.optJSONObject(q).optString("n"));
+                        c.append("  через ").append(vn);
+                    }
+                    c.append("  · ").append(TopologyView.carrierName(cur.optString("carrier")));
+                    conn = c.toString();
+                    logChange("соединение", conn + " (носитель - открытый сокет, не путь RNS)");
+                } else if (doing == null) {
+                    doing = "ищу выход…";
                 }
-                if (cur != null) s.append("носитель: ").append(TopologyView.carrierName(cur.optString("carrier"))).append(" (открытый сокет, не путь RNS)\n");
-                s.append(TopologyView.prettify(j.optString("status"))).append('\n');
+                if (pinned.matches("[0-9a-fA-F]{32}") && (cur == null || !pinned.equalsIgnoreCase(cur.optString("d")))) logChange("выбор", "выбран вами " + pinned.substring(0, 8) + ", подключаюсь");
                 updateBenchUi(state, j, cur);
                 JSONObject t = j.getJSONObject("tun");
                 long up = t.getLong("from_tun_bytes"), down = t.getLong("to_tun_bytes"), sts = j.getLong("ts_ms");
@@ -829,7 +907,7 @@ public class MainActivity extends Activity {
                     rDown = (down - prevDown) * 8 / dt / 1e6;
                 }
                 if (sts != prevTs) { prevUp = up; prevDown = down; prevTs = sts; }
-                s.append(String.format("вверх %s  %.1f Мбит/с\nвниз  %s  %.1f Мбит/с\n", mb(up), rUp, mb(down), rDown));
+                speed = String.format("↑ %.1f Мбит/с (%s)   ↓ %.1f Мбит/с (%s)", rUp, mb(up), rDown, mb(down));
                 JSONArray us = j.optJSONArray("users");
                 StringBuilder ut = new StringBuilder();
                 for (int q = 0; us != null && q < us.length(); q++) ut.append(q == 0 ? "" : ", ").append(us.optJSONObject(q).optString("h"));
@@ -839,18 +917,24 @@ public class MainActivity extends Activity {
                 if (lt != null) for (int q = lt.length() - 1; q >= 0; q--) { String ln = lt.optString(q); if (logSeen.add(ln)) Util.lab("NLOG " + ln); }
                 buildList(j);
             } catch (Throwable e) {
-                s.append("статус: ").append(e);
+                doing = "статус: " + e;
             }
         } else {
             prevTs = 0;
             rUp = rDown = 0;
             try { topo.update(new JSONObject("{\"state\":\"idle\",\"ip\":\"\"}")); } catch (Exception ignored) { }
             updateBenchUi(state, null, null);
+            if (doing == null) doing = "idle".equals(phase) ? "VPN выключен" : "состояние: " + phase;
         }
+        StringBuilder s = new StringBuilder();
+        if (doing != null) s.append(doing).append('\n');
+        if (conn != null) s.append(conn).append('\n');
+        if (speed != null) s.append(speed).append('\n');
+        if (s.length() > 0) s.setLength(s.length() - 1);
         status.setText(s);
         Util.lab("STATUS " + s.toString().replace("\n", " | "));
         String log = Util.read(new File(state, "log.txt"));
-        String[] lines = log.split("\n");
+        String[] lines = Util.mergedLog(log);
         logConsole.setLines(lines);
         if (lines.length > 0) Util.lab("LOG " + lines[lines.length - 1]);
     }

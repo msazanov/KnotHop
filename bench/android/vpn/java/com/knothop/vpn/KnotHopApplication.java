@@ -27,6 +27,7 @@ public final class KnotHopApplication extends Application implements Application
 
     @Override public void onCreate() {
         super.onCreate();
+        Util.init(this);
         power = (PowerManager) getSystemService(POWER_SERVICE);
         Native.setUiVisible(false); // Initializes the hint before a native runtime exists.
         registerActivityLifecycleCallbacks(this);

@@ -119,6 +119,12 @@ pub extern "system" fn Java_com_knothop_vpn_Native_setUiVisible(_env: JNIEnv, _c
     rns_iroh_node::mobile::set_ui_visible(visible != 0);
 }
 
+/// Расширенный журнал (флажок «debug» в приложении). Действует сразу, без перезапуска узла; на права и допуск не влияет.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_knothop_vpn_Native_setDebug(_env: JNIEnv, _c: JClass, on: jboolean) {
+    rns_iroh_node::set_debug(on != 0);
+}
+
 /// Подключить (fd >= 0) или снять (fd < 0) TUN у работающего узла без перезапуска. Узел берёт свой дубликат дескриптора.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_knothop_vpn_Native_setTun(_env: JNIEnv, _c: JClass, fd: jint) -> jboolean {

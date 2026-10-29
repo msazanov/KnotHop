@@ -13,4 +13,6 @@ final class Native {
     static native boolean setTun(int fd);
     /** 0 - внеочередной анонс, 1 - проверка связи со всеми нодами. */
     static native boolean kick(int kind);
+    /** Расширенный журнал нативной части (флажок debug). */
+    static native void setDebug(boolean on);
 }

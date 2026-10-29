@@ -295,6 +295,29 @@ fn udp_stats() -> serde_json::Value {
 
 static LOG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// Расширенный журнал (флажок «debug» в приложении, `"debug": true` в node.json, `KNOTHOP_DEBUG` в окружении).
+/// Только больше строк журнала и снимков состояния: права, допуск, шифрование и лимиты от него не зависят.
+/// Журнал не содержит секретов (ключи, профиль, приглашения, pin), адреса пиров не пишутся.
+static DEBUG_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn debug() -> bool {
+    DEBUG_LOG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_debug(on: bool) {
+    DEBUG_LOG.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Нагрузка хоста одной строкой для журнала: loadavg и PSI (cpu/io). Пусто там, где /proc недоступен (часть Android).
+pub fn host_pressure() -> String {
+    let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let load = rd("/proc/loadavg");
+    let load = load.split_whitespace().take(3).collect::<Vec<_>>().join("/");
+    let psi = |p: &str| rd(p).lines().next().and_then(|l| l.split_whitespace().nth(1).map(|s| s.trim_start_matches("avg10=").to_string())).unwrap_or_default();
+    if load.is_empty() { return String::new(); }
+    format!("load {load} psi cpu {} io {}", psi("/proc/pressure/cpu"), psi("/proc/pressure/io"))
+}
+
 const DGRAM_MAGIC: &[u8; 8] = b"KNOTDGRM";
 const DGRAM_HDR: usize = 24;
 const DGRAM_BUCKET_US: u64 = 50;

@@ -130,7 +130,7 @@ public class KnotHopVpnService extends VpnService {
     }
 
     private void run(Object session) {
-        Util.lab("service run() start");
+        Util.svc("service run() start");
         try {
             migrateLegacyRoutingBeforeNative();
             RoutingCfg.ensureDefaults(state);
@@ -171,7 +171,7 @@ public class KnotHopVpnService extends VpnService {
                 phase = "connecting";
                 serviceUi.post(() -> startServiceWatcher(session));
             }
-            Util.lab("phase connecting, mode " + mode);
+            Util.svc("phase connecting, mode " + mode);
             String args = "client --state " + state.getAbsolutePath() + " " + clientArgs
                     + " --tun-fd -2 --fail-ms 3000 --workers 4 " + extraArgs;
             if (Util.LAB_BUILD) {
@@ -183,10 +183,11 @@ public class KnotHopVpnService extends VpnService {
                     android.system.Os.setenv("KNOTHOP_DEBUG", "1", true);
                 } catch (Exception ignored) { }
             }
+            Native.setDebug(Util.debug);
             int rc = Native.runVpn(args, state.getAbsolutePath());
             if (!"stopping".equals(phase)) {
                 String err = Util.read(new File(state, "error.txt"));
-                Util.lab("native exited rc=" + rc + " err=" + err);
+                Util.svc("native exited rc=" + rc + " err=" + err);
                 fail(err.isEmpty() ? "нативная часть завершилась (rc=" + rc + ")" : err, session);
             }
         } catch (Throwable t) {
@@ -211,7 +212,7 @@ public class KnotHopVpnService extends VpnService {
                 break;
             } catch (Throwable t) {
                 if (excluded == 0) throw t;
-                Util.lab("establish with " + excluded + " excluded failed: " + t);
+                Util.svc("establish with " + excluded + " excluded failed: " + t);
                 excluded = excluded > 200 ? excluded / 2 : 0;
             }
         }
@@ -219,7 +220,7 @@ public class KnotHopVpnService extends VpnService {
         tun = made;
         excludedRouteCount = excluded;
         getSharedPreferences("p", MODE_PRIVATE).edit().putString("routing_sig", RoutingCfg.load(state).directSig()).apply();
-        Util.lab("excluded routes: " + excluded + " of " + direct.size() + ", tun fd " + made.getFd());
+        Util.svc("excluded routes: " + excluded + " of " + direct.size() + ", tun fd " + made.getFd());
         try { if (carrierNetwork != null) setUnderlyingNetworks(new Network[]{carrierNetwork}); } catch (Throwable ignored) { }
     }
 
@@ -246,7 +247,7 @@ public class KnotHopVpnService extends VpnService {
                     }
                     updateNotification(statusText());
                 } catch (Throwable t) {
-                    Util.lab("смена режима на " + want + " не удалась: " + t);
+                    Util.svc("смена режима на " + want + " не удалась: " + t);
                     lastError = "режим VPN не включён: " + t;
                     mode = 1;
                 }
@@ -278,10 +279,10 @@ public class KnotHopVpnService extends VpnService {
      */
     private synchronized void labNativeFail() {
         if (tun == null || !("up".equals(phase) || "connecting".equals(phase)) || state == null) {
-            Util.lab("LAB native-fail пропущен, фаза " + phase);
+            Util.svc("LAB native-fail пропущен, фаза " + phase);
             return;
         }
-        Util.lab("LAB native-fail: имитация сбоя нативной части");
+        Util.svc("LAB native-fail: имитация сбоя нативной части");
         try { new File(state, "fin").createNewFile(); } catch (Exception ignored) { }
     }
 
@@ -294,6 +295,7 @@ public class KnotHopVpnService extends VpnService {
         if (watchSession != session || "stopping".equals(phase) || "idle".equals(phase)) return;
         lastError = err;
         phase = "error";
+        Util.dbg("служба: ошибка: " + err);
         stopServiceWatcher();
         if (tun == null) {
             cleanup();
@@ -454,6 +456,7 @@ public class KnotHopVpnService extends VpnService {
             if (key.equals(serviceKey)) return;
             serviceKey = key;
             phase = st;
+            Util.dbg("служба: фаза " + st + ", выход " + name);
             updateNotification(statusText());
         } catch (Exception ignored) { } // A missed/partial event is reconciled within 30 s.
     }
@@ -473,6 +476,7 @@ public class KnotHopVpnService extends VpnService {
         cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
         netCb = new ConnectivityManager.NetworkCallback() {
             private void poke() {
+                Util.dbg("сеть изменилась (Wi-Fi/мобильная), сообщаю нативной части");
                 synchronized (KnotHopVpnService.this) {
                     if (watchSession != session) return;
                     Native.networkChanged();
@@ -485,12 +489,14 @@ public class KnotHopVpnService extends VpnService {
                     if (caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) return;
                     if (!cm.bindProcessToNetwork(n)) { fail("Носитель потерял физическую сеть", session); return; }
                     carrierNetwork = n;
+                    Util.dbg("физическая сеть доступна: " + (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ? "Wi-Fi" : caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ? "мобильная" : "другая"));
                     try { if (tun != null) setUnderlyingNetworks(new Network[]{n}); } catch (Throwable ignored) { }
                 }
                 poke();
             }
             @Override public void onLost(Network n) {
                 // Do NOT unbind: new native sockets must not fall back into our TUN.
+                Util.dbg("физическая сеть потеряна");
                 poke();
             }
         };
@@ -525,6 +531,7 @@ public class KnotHopVpnService extends VpnService {
 
     private synchronized void stopVpn() {
         if ("stopping".equals(phase)) return;
+        Util.dbg("служба: остановка VPN");
         final Thread w = worker;
         phase = "stopping";
         stopServiceWatcher();
@@ -544,11 +551,13 @@ public class KnotHopVpnService extends VpnService {
 
     @Override
     public void onRevoke() {
+        Util.dbg("служба: система отозвала VPN (onRevoke)");
         stopVpn();
     }
 
     @Override
     public void onDestroy() {
+        Util.dbg("служба: onDestroy");
         cleanup();
         super.onDestroy();
     }

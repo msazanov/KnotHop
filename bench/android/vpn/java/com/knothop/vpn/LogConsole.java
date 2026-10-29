@@ -21,7 +21,7 @@ import java.util.Locale;
  * от верхней части экрана до клавиатуры - это делает `MainActivity` через `setExpanded`.
  */
 final class LogConsole extends LinearLayout {
-    private static final int KEEP = 400;
+    private static final int KEEP = 800;
     private final TextView handle, text;
     private final EditText filter;
     private final ScrollView scroll;

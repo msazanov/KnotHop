@@ -197,6 +197,8 @@ struct NodeConf {
     no_exit: bool,
     announce_s: Option<u64>,
     dead_s: Option<u64>,
+    /// расширенный журнал (снимки состояния, причины закрытия Link, задержки цикла)
+    debug: Option<bool>,
     quic_cc_mbit: Option<u64>,
     workers: Option<usize>,
     tun_name: Option<String>,
@@ -2551,6 +2553,23 @@ impl DiagBudget {
 
 static DIAG_BUDGET: Mutex<DiagBudget> = Mutex::new(DiagBudget::new());
 
+/// Недавно закрытые Link: `close_link` для того же Link в течение 10 с ничего не делает. Окно ограничено по размеру.
+static RECENT_CLOSED: Mutex<Vec<(LinkId, Instant)>> = Mutex::new(Vec::new());
+
+fn close_first(link: LinkId) -> bool {
+    let now = Instant::now();
+    let mut v = RECENT_CLOSED.lock().unwrap();
+    v.retain(|(_, t)| now.duration_since(*t) < Duration::from_secs(10));
+    if v.iter().any(|(l, _)| *l == link) {
+        return false;
+    }
+    if v.len() >= 256 {
+        v.remove(0);
+    }
+    v.push((link, now));
+    true
+}
+
 /// Помечает причину для Link; `true` - первый раз (запись и ответ положены). Нет Link - `false`.
 fn diag_first(links: &Mutex<HashMap<LinkId, LinkInfo>>, link: LinkId, d: AdmitDiag) -> bool {
     let mut l = links.lock().unwrap();
@@ -2734,6 +2753,25 @@ impl NodeCtx {
         serde_json::json!({"n": self.name, "d": hex(&self.my_dest), "k": hex(&self.my_key), "e": self.ep_id, "a": self.adv(), "t": self.tag, "cn": net_str()})
     }
 
+    /// Расширенный журнал (debug): раз в 10 с одна строка с состоянием соседей, клиентов и нагрузкой хоста. Адресов и ключей нет.
+    fn debug_snapshot(&self) {
+        let now = Instant::now();
+        let nb: Vec<String> = self.neigh.lock().unwrap().values().map(|n| {
+            let st = if n.link.is_some() {
+                format!("up {} rtt {} смен {}", if n.ctl.is_quic() { "QUIC" } else { "TCP" },
+                    n.rtt_ms.map(|r| format!("{r:.0}")).unwrap_or_else(|| "?".into()), n.ctl.switches.load(Relaxed))
+            } else {
+                format!("seen {} с назад", now.duration_since(n.last_announce).as_secs())
+            };
+            format!("{}: {st}", n.name)
+        }).collect();
+        let (links, clients) = {
+            let l = self.links.lock().unwrap();
+            (l.len(), l.values().filter(|x| matches!(x.role, Role::Client { .. })).count())
+        };
+        self.sh.note(format!("снимок: аптайм {} с, Link {links}, клиентов {clients}; соседи [{}]; {}", self.started.elapsed().as_secs(), nb.join("; "), crate::host_pressure()));
+    }
+
     /// Диагностика для файла neighbors.json: мы сами и соседи (живые и просто виденные).
     fn table(&self) -> serde_json::Value {
         let now = Instant::now();
@@ -2851,7 +2889,19 @@ impl NodeCtx {
     }
 
     fn close_link(self: &Arc<Self>, link: LinkId, why: &str) {
-        self.sh.note(format!("close link {} ({why})", &hex(link.as_bytes())[..8]));
+        // Повторное закрытие того же Link (запись от пира приходит пачкой) не пишем и не повторяем: 922 строки за 3 ч засоряли журнал и диск.
+        if !close_first(link) {
+            return;
+        }
+        // Роль, возраст и тишина Link в момент закрытия: по ним видно, рвётся сосед, клиент или неизвестный Link.
+        let who = self.links.lock().unwrap().get(&link).map(|l| {
+            let role = match l.role { Role::Unknown => "новый", Role::Server { .. } => "сосед", Role::Client { .. } => "клиент" };
+            format!("{role}, живёт {} с, тишина {} мс", l.since.elapsed().as_secs(), l.last_heard.elapsed().as_millis())
+        });
+        match who {
+            Some(w) => self.sh.note(format!("close link {} ({why}; {w})", &hex(link.as_bytes())[..8])),
+            None => self.sh.note(format!("close link {} ({why})", &hex(link.as_bytes())[..8])),
+        }
         self.drop_link_state(&link);
         let node = self.node.clone();
         tokio::spawn(async move {
@@ -2953,6 +3003,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         a.no_exit = c.no_exit;
         a.announce_s = c.announce_s.unwrap_or(a.announce_s);
         a.dead_s = c.dead_s.unwrap_or(a.dead_s);
+        if c.debug.unwrap_or(false) || std::env::var("KNOTHOP_DEBUG").is_ok() { crate::set_debug(true); }
         a.quic_cc_mbit = c.quic_cc_mbit.unwrap_or(a.quic_cc_mbit);
         a.workers = c.workers.unwrap_or(a.workers);
         a.tun_name = c.tun_name.unwrap_or(a.tun_name);
@@ -3183,7 +3234,7 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
                 if !is_initiator && !vpn_incoming_destination(&ctx.my_dest, &destination_hash) { continue; }
                 ctx.sh.established.lock().unwrap().insert(hex(link_id.as_bytes()));
                 if !is_initiator {
-                    if std::env::var("KNOTHOP_DEBUG").is_ok() {
+                    if crate::debug() {
                         ctx.sh.note(format!("входящий Link {}", &hex(link_id.as_bytes())[..8]));
                     }
                     // H10: интерфейс носителя известен из состояния Link (если его ещё нет - лимит на интерфейс не применяем, общий работает)
@@ -3226,7 +3277,7 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
 }
 
 fn on_announce(ctx: &Arc<NodeCtx>, ann: &leviculum_std::ReceivedAnnounce) {
-    if std::env::var("KNOTHOP_DEBUG").is_ok() {
+    if crate::debug() {
         ctx.sh.note(format!("announce from {} path_response={} data={}", hex(&ann.destination_hash().as_bytes()[..4]), ann.is_path_response(), String::from_utf8_lossy(ann.app_data()).chars().take(60).collect::<String>()));
     }
     let dest = *ann.destination_hash().as_bytes();
@@ -5500,10 +5551,22 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
     let mut last_ping = Instant::now();
     let mut last_table = Instant::now();
     let fin = ctx.state.join("fin");
+    let mut last_wake = Instant::now();
+    let mut last_snap = Instant::now();
     while !fin.exists() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         tick += 1;
         let now = Instant::now();
+        // Задержка тика: цикл спит 500 мс; если проснулся намного позже, процесс стоял (CPU/диск/планировщик), и таймауты Link могут быть следствием этого.
+        let lag = now.duration_since(last_wake).saturating_sub(Duration::from_millis(500));
+        last_wake = now;
+        if lag >= Duration::from_secs(3) || (crate::debug() && lag >= Duration::from_secs(1)) {
+            ctx.sh.note(format!("главный цикл опоздал на {} мс (процесс стоял: нагрузка хоста или диск); {}", lag.as_millis(), crate::host_pressure()));
+        }
+        if crate::debug() && now.duration_since(last_snap) >= Duration::from_secs(10) {
+            last_snap = now;
+            ctx.debug_snapshot();
+        }
 
         // сторож слушателя: если сокет пропал (смена сетевых интерфейсов и т. п.), завершаемся - systemd перезапустит
         if tick % 10 == 0 {
@@ -5661,7 +5724,12 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
             for nb in n.values_mut() {
                 if let Some(l) = nb.link {
                     if path::link_timed_out(now, heard.get(&l).copied(), ctx.dead) {
-                        to_close.push((l, nb.name.clone()));
+                        let silent = heard.get(&l).map(|t| now.duration_since(*t).as_millis()).unwrap_or(0);
+                        let detail = format!("тишина {silent} мс, носитель {}, смен носителя {}, потери пингов {}, rtt {}, допущен {} с назад",
+                            if nb.ctl.is_quic() { "QUIC" } else { "TCP" }, nb.ctl.switches.load(Relaxed),
+                            nb.loss.loss(Duration::from_secs(10), 1).map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "?".into()),
+                            nb.rtt_ms.map(|r| format!("{r:.0} мс")).unwrap_or_else(|| "?".into()), nb.admitted_at.elapsed().as_secs());
+                        to_close.push((l, nb.name.clone(), detail));
                     }
                 }
                 if nb.link.is_none() && now.duration_since(nb.last_announce) > announce_ttl {
@@ -5676,8 +5744,8 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
                 }
             }
         }
-        for (l, name) in to_close {
-            ctx.sh.note(format!("локальный Link к {name}: нет аутентифицированного приёма дольше {} с, закрываю связь", ctx.dead.as_secs()));
+        for (l, name, detail) in to_close {
+            ctx.sh.note(format!("локальный Link к {name}: нет аутентифицированного приёма дольше {} с, закрываю связь ({detail}); {}", ctx.dead.as_secs(), crate::host_pressure()));
             ctx.close_link(l, "таймаут локального Link");
         }
         for (_, name) in forget {
@@ -6892,6 +6960,7 @@ impl ClientCtx {
 }
 
 pub async fn run_client13(a: ClientArgs) -> Result<()> {
+    if std::env::var("KNOTHOP_DEBUG").is_ok() { crate::set_debug(true); }
     std::fs::create_dir_all(&a.state)?;
     let id = load_or_create_identity(&a.state)?;
     let my_pk = id.public_key_bytes();
@@ -8225,7 +8294,11 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             *ctx.status.lock().unwrap() = format!("подключаюсь к {}", c.name);
             let av = avoid.get(&c.dest).copied();
             // Старый Link обслуживает штатный keepalive RNS и во время подключения нового.
+            let t_conn = Instant::now();
             let result = connect_exit(&ctx, &c, av).await;
+            if crate::debug() {
+                ctx.sh.note(format!("подключение к {}: {} за {} мс", c.name, if result.is_ok() { "успех" } else { "неудача" }, t_conn.elapsed().as_millis()));
+            }
             match result {
                 Ok((id, h)) => {
                     avoid.remove(&c.dest);
@@ -8312,9 +8385,18 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         let mut better_since: Option<Instant> = None;
         let mut last_eval = Instant::now();
         let connected_at = ctx.cur.lock().unwrap().map(|c| c.2).unwrap_or_else(Instant::now);
+        let mut last_wake = Instant::now();
+        let mut last_snap = Instant::now();
+        let mut last_silent = 0u64;
         let reason = loop {
             if fin.exists() {
                 break "fin".to_string();
+            }
+            // Пауза цикла (250 мс сна): Doze/энергосбережение или нагрузка могли заморозить процесс; от неё зависят «нет ответа» и обрывы.
+            let lag = last_wake.elapsed().saturating_sub(Duration::from_millis(250));
+            last_wake = Instant::now();
+            if lag >= Duration::from_secs(2) || (crate::debug() && lag >= Duration::from_millis(800)) {
+                ctx.sh.note(format!("цикл клиента опоздал на {} мс (процесс стоял: сон или нагрузка)", lag.as_millis()));
             }
             banned.healthy(&cand.dest, connected_at, Instant::now());
             let want: Option<[u8; 16]> = std::fs::read_to_string(&sel_file).ok().and_then(|t| dest32(t.trim()));
@@ -8363,6 +8445,16 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                 }
             }
             ctx.contact_window_ms.store(step.contact_window_ms, Relaxed);
+            last_silent = step.silent_ms;
+            if crate::debug() && last_snap.elapsed() >= Duration::from_secs(5) {
+                last_snap = Instant::now();
+                let car = ctx.carriers.lock().unwrap().get(&cand.dest).cloned();
+                let car = car.map(|c| format!("{} смен {}", if c.is_quic() { "QUIC" } else { "TCP" }, c.switches.load(Relaxed))).unwrap_or_else(|| "?".into());
+                let rtt = ctx.rtt_ms.lock().unwrap().map(|r| format!("{r:.0} мс")).unwrap_or_else(|| "?".into());
+                let loss = ctx.loss.lock().unwrap().loss(Duration::from_secs(10), 1).map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "?".into());
+                ctx.sh.note(format!("снимок: выход {}, живёт {} с, носитель {car}, rtt {rtt}, потери {loss}, тишина {} мс, keepalive ack {acked}, пакетов TUN {}",
+                    cand.name, connected_at.elapsed().as_secs(), step.silent_ms, ctx.tun.traffic_pkts()));
+            }
             if step.silent_ms >= ctx.fail_ms.max(3000) {
                 // Тишина на QUIC: носитель меняется внутри интерфейса пира (`mux.rs`), Link при этом не рвётся. Link держим, пока TCP не подтвердится
                 // или не кончится `SILENCE_GRACE`; тишина без шансов (TCP уже выбран, либо время вышло) - прежний отказ выхода.
@@ -8408,6 +8500,9 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         };
         if reason == "fin" {
             break;
+        }
+        if crate::debug() {
+            ctx.sh.note(format!("уход с выхода {}: {reason}; Link жил {} с, последняя тишина {last_silent} мс", cand.name, connected_at.elapsed().as_secs()));
         }
         let user = reason == "выбор пользователя" || reason.starts_with("авто:");
         if reason.starts_with("авто:") { primary = None; }
