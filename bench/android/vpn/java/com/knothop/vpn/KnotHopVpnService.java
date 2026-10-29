@@ -64,6 +64,8 @@ public class KnotHopVpnService extends VpnService {
     private ConnectivityManager.NetworkCallback netCb;
     private Network carrierNetwork;
     private int excludedRouteCount;
+    /** Подсети (a.b.c.d/n), реально исключённые из туннеля; тест скорости не должен ходить на такие адреса. */
+    private List<String> excludedRoutes = new ArrayList<>();
     private static volatile KnotHopVpnService live;
     private final Handler serviceUi = new Handler(Looper.getMainLooper());
     private FileObserver serviceObserver;
@@ -219,6 +221,7 @@ public class KnotHopVpnService extends VpnService {
         if (made == null) throw new IllegalStateException("система не выдала TUN (разрешение VPN отозвано?)");
         tun = made;
         excludedRouteCount = excluded;
+        excludedRoutes = new ArrayList<>(direct.subList(0, Math.min(excluded, direct.size())));
         getSharedPreferences("p", MODE_PRIVATE).edit().putString("routing_sig", RoutingCfg.load(state).directSig()).apply();
         Util.svc("excluded routes: " + excluded + " of " + direct.size() + ", tun fd " + made.getFd());
         try { if (carrierNetwork != null) setUnderlyingNetworks(new Network[]{carrierNetwork}); } catch (Throwable ignored) { }
@@ -243,6 +246,7 @@ public class KnotHopVpnService extends VpnService {
                             try { tun.close(); } catch (Throwable ignored) { }
                             tun = null;
                             excludedRouteCount = 0;
+                            excludedRoutes = new ArrayList<>();
                         }
                     }
                     updateNotification(statusText());
@@ -357,6 +361,25 @@ public class KnotHopVpnService extends VpnService {
             this.service = service; this.session = service.watchSession; this.network = network;
             this.exit = service.serviceKey;
         }
+        /** Адрес попадает в подсеть «мимо VPN»: такой замер не прошёл бы через туннель. */
+        boolean bypasses(java.net.InetAddress a) {
+            byte[] b = a.getAddress();
+            if (b.length != 4) return false;
+            long ip = ((b[0] & 0xffL) << 24) | ((b[1] & 0xffL) << 16) | ((b[2] & 0xffL) << 8) | (b[3] & 0xffL);
+            List<String> ex;
+            synchronized (service) { ex = service.excludedRoutes; }
+            for (String c : ex) {
+                try {
+                    String[] pr = c.split("/");
+                    byte[] n = InetAddress.getByName(pr[0]).getAddress();
+                    int len = Integer.parseInt(pr[1]);
+                    long net = ((n[0] & 0xffL) << 24) | ((n[1] & 0xffL) << 16) | ((n[2] & 0xffL) << 8) | (n[3] & 0xffL);
+                    long mask = len == 0 ? 0 : (0xffffffffL << (32 - len)) & 0xffffffffL;
+                    if ((ip & mask) == (net & mask)) return true;
+                } catch (Throwable ignored) { }
+            }
+            return false;
+        }
         boolean valid() {
             synchronized (service) {
                 NetworkCapabilities caps = service.cm.getNetworkCapabilities(network);
@@ -367,24 +390,37 @@ public class KnotHopVpnService extends VpnService {
         }
     }
 
+    /** Почему последний вызов speedPath() не нашёл путь (для диалога и отладочного журнала); пусто, если путь найден. */
+    static volatile String speedWhy = "";
+
     /** Only our current VPN, never the default/physical Network. Ambiguity is an error. */
     static SpeedPath speedPath() {
         KnotHopVpnService s = live;
-        if (s == null) return null;
+        if (s == null) { speedWhy = "служба VPN не запущена"; return null; }
         synchronized (s) {
-            if (!"up".equals(phase) || tunHeld || s.tun == null || s.watchSession == null) return null;
-            // excludeRoute can intentionally bypass VPN; do not claim a through-VPN measurement in that mode.
-            if (s.excludedRouteCount != 0) return null;
+            if (!"up".equals(phase) || tunHeld || s.tun == null || s.watchSession == null) {
+                speedWhy = "фаза=" + phase + (tunHeld ? ", TUN удержан" : "") + (s.tun == null ? ", TUN нет (режим «Сеть»?)" : "") + (s.watchSession == null ? ", нет сессии" : "");
+                Util.dbg("speedPath: " + speedWhy);
+                return null;
+            }
             Network selected = null;
+            int vpns = 0, foreign = 0;
             for (Network n : s.cm.getAllNetworks()) {
                 NetworkCapabilities caps = s.cm.getNetworkCapabilities(n);
                 if (caps == null || !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue;
+                vpns++;
                 // getOwnerUid появился только в API 30; на Android 10 вызов ронял экран теста (NoSuchMethodError).
-                if (Build.VERSION.SDK_INT >= 30 && caps.getOwnerUid() != android.os.Process.myUid()) continue;
-                if (selected != null) return null;
+                if (Build.VERSION.SDK_INT >= 30 && caps.getOwnerUid() != android.os.Process.myUid()) { foreign++; continue; }
+                if (selected != null) { speedWhy = "несколько VPN-сетей нашего приложения"; Util.dbg("speedPath: " + speedWhy); return null; }
                 selected = n;
             }
-            return selected == null ? null : new SpeedPath(s, selected);
+            if (selected == null) {
+                speedWhy = "VPN-сеть приложения не найдена (VPN-сетей " + vpns + ", чужих по владельцу " + foreign + ")";
+                Util.dbg("speedPath: " + speedWhy);
+                return null;
+            }
+            speedWhy = "";
+            return new SpeedPath(s, selected);
         }
     }
 

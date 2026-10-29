@@ -941,7 +941,7 @@ public class MainActivity extends Activity {
 
     private void confirmBench() {
         if (KnotHopVpnService.speedPath() == null) {
-            new AlertDialog.Builder(this).setMessage("Тест требует подключённый VPN без исключённых подсетей. Сокеты теста не могут идти мимо туннеля.").setPositiveButton("OK", null).show();
+            new AlertDialog.Builder(this).setMessage("Тест требует включённый режим «VPN» (ползунок справа) и готовый выход. Сокеты теста идут только через туннель." + (KnotHopVpnService.speedWhy.isEmpty() ? "" : "\n\nПричина: " + KnotHopVpnService.speedWhy)).setPositiveButton("OK", null).show();
             return;
         }
         LinearLayout fields = new LinearLayout(this);
