@@ -226,15 +226,18 @@ fn build(sender: &[u8; 16], typ: u64, room: Option<&str>, body: Option<&[u8]>) -
 fn text_item(s: &str) -> Vec<u8> { let mut o = Vec::new(); put_text(&mut o, s); o }
 fn bytes_item(b: &[u8]) -> Vec<u8> { let mut o = Vec::new(); put_bytes(&mut o, b); o }
 
+/// Ключи WELCOME и пределов числовые, как в rrcd (B_WELCOME_*, B_LIMIT_*); текстовые ключи клиенты не понимают.
 fn welcome_body(name: &str) -> Vec<u8> {
     let mut o = Vec::new();
-    put_head(&mut o, 5, 2);
+    put_head(&mut o, 5, 4);
     put_uint(&mut o, 0); put_text(&mut o, name);
+    put_uint(&mut o, 1); put_text(&mut o, env!("CARGO_PKG_VERSION"));
+    // возможности: ACTION (1) ретранслируется
+    put_uint(&mut o, 2); put_head(&mut o, 5, 1); put_uint(&mut o, 1); o.push(0xf5);
     put_uint(&mut o, 3);
     put_head(&mut o, 5, 5);
-    for (k, v) in [("max_nick_bytes", MAX_NICK_BYTES), ("max_rooms_per_session", MAX_ROOMS_PER_SESSION), ("max_room_name_bytes", MAX_ROOM_BYTES),
-        ("max_msg_body_bytes", MAX_BODY_BYTES - 4), ("rate_limit_msgs_per_minute", MSGS_PER_MINUTE as usize)] {
-        put_text(&mut o, k); put_uint(&mut o, v as u64);
+    for (k, v) in [(0u64, MAX_NICK_BYTES), (1, MAX_ROOM_BYTES), (2, MAX_BODY_BYTES - 4), (3, MAX_ROOMS_PER_SESSION), (4, MSGS_PER_MINUTE as usize)] {
+        put_uint(&mut o, k); put_uint(&mut o, v as u64);
     }
     o
 }
@@ -277,6 +280,7 @@ struct Session {
     pkts: Bucket,
     msgs: Bucket,
     ctl: Bucket,
+    ping: Bucket,
     strikes: u8,
     strikes_at: u64,
 }
@@ -284,7 +288,7 @@ struct Session {
 impl Session {
     fn new(now: u64) -> Self {
         Session { since: now, last_rx: now, last_ping: now, ident: None, hello: false, welcomed: false, rooms: Vec::new(),
-            pkts: Bucket::new(20.0, 2.0, now), msgs: Bucket::new(10.0, MSGS_PER_MINUTE as f64 / 60.0, now), ctl: Bucket::new(6.0, 10.0 / 60.0, now),
+            pkts: Bucket::new(20.0, 2.0, now), msgs: Bucket::new(10.0, MSGS_PER_MINUTE as f64 / 60.0, now), ctl: Bucket::new(6.0, 10.0 / 60.0, now), ping: Bucket::new(10.0, 20.0 / 60.0, now),
             strikes: 0, strikes_at: now }
     }
 }
@@ -395,13 +399,14 @@ impl Hub {
         if !s.welcomed { return; }
         let Some(ident) = s.ident else { return };
         match env.typ {
-            T_JOIN | T_PART | T_PING => {
+            T_JOIN | T_PART => {
                 if !s.ctl.take(now) { return self.strike(l, now, acts); }
-                match env.typ {
-                    T_JOIN => self.join(l, &env, acts),
-                    T_PART => self.part(l, &ident, &env, acts),
-                    _ => self.send(acts, l, T_PONG, None, env.body),
-                }
+                if env.typ == T_JOIN { self.join(l, &ident, &env, acts) } else { self.part(l, &ident, &env, acts) }
+            }
+            // клиенты (rrc-tui) пингуют раз в 5 с: PING идёт отдельной корзиной, лишнее молча отбрасывается
+            // (поток всё равно ограничен корзиной пакетов)
+            T_PING => {
+                if s.ping.take(now) { self.send(acts, l, T_PONG, None, env.body) } else { DROPPED.fetch_add(1, Relaxed); }
             }
             T_MSG | T_ACTION => {
                 if !s.msgs.take(now) { return self.strike(l, now, acts); }
@@ -412,12 +417,15 @@ impl Hub {
         }
     }
 
-    fn join(&mut self, l: LinkId, env: &Env<'_>, acts: &mut Vec<Act>) {
+    fn join(&mut self, l: LinkId, ident: &[u8; 16], env: &Env<'_>, acts: &mut Vec<Act>) {
         let Some(room) = env.room.and_then(norm_room) else { return self.error(acts, l, "bad room") };
         let member = self.sessions.get(&l).is_some_and(|s| s.rooms.contains(&room));
         if !member {
             if self.sessions.get(&l).map_or(true, |s| s.rooms.len() >= MAX_ROOMS_PER_SESSION) { return self.error(acts, l, "too many rooms"); }
             if !self.rooms.contains_key(&room) && self.rooms.len() >= MAX_ROOMS { return self.error(acts, l, "hub is full"); }
+            // остальные участники узнают о новичке (как в rrcd): JOINED с identity в списке
+            let others: Vec<LinkId> = self.rooms.get(&room).cloned().unwrap_or_default();
+            for m in others { self.send(acts, m, T_JOINED, Some(&room), Some(&members_body(&[*ident]))); }
             self.rooms.entry(room.clone()).or_default().push(l);
             if let Some(s) = self.sessions.get_mut(&l) { s.rooms.push(room.clone()); }
         }
@@ -436,10 +444,12 @@ impl Hub {
         let Some(pos) = s.rooms.iter().position(|r| *r == room) else { return };
         s.rooms.remove(pos);
         self.leave_room(&room, l);
-        self.send(acts, l, T_PARTED, Some(&room), Some(&bytes_item(ident)));
+        let rest: Vec<LinkId> = self.rooms.get(&room).cloned().unwrap_or_default();
+        for m in rest { self.send(acts, m, T_PARTED, Some(&room), Some(&members_body(&[*ident]))); }
+        self.send(acts, l, T_PARTED, Some(&room), Some(&members_body(&[*ident])));
     }
 
-    /// Пересылка участникам комнаты: байты конверта не меняются, отправителю они не возвращаются.
+    /// Пересылка всем участникам комнаты, включая отправителя (эхо = подтверждение для клиента): байты конверта не меняются.
     fn relay(&mut self, l: LinkId, ident: &[u8; 16], env: &Env<'_>, raw: &[u8], now: u64, acts: &mut Vec<Act>) {
         if env.sender != Some(&ident[..]) { self.error(acts, l, "sender mismatch"); return self.strike(l, now, acts); }
         let Some(room) = env.room.and_then(norm_room) else { return self.error(acts, l, "bad room") };
@@ -448,7 +458,8 @@ impl Hub {
         if body.len() > MAX_BODY_BYTES || env.nick.is_some_and(|n| n.len() > MAX_NICK_BYTES) { return self.error(acts, l, "too long"); }
         if !self.fanout.take(now) { DROPPED.fetch_add(1, Relaxed); return; }
         MSGS.fetch_add(1, Relaxed);
-        for m in self.rooms.get(&room).into_iter().flatten().filter(|m| **m != l) {
+        // отправителю тоже: так делает rrcd, и клиенты (rrc-tui) принимают собственное эхо за подтверждение доставки
+        for m in self.rooms.get(&room).into_iter().flatten() {
             acts.push(Act::Send(*m, raw.to_vec()));
         }
     }
@@ -672,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn message_is_relayed_unchanged_to_other_members_only() {
+    fn message_is_relayed_unchanged_to_room_members_only() {
         let mut h = hub();
         let (a, b, c) = (connect(&mut h, 1, A, 0), connect(&mut h, 2, B, 0), connect(&mut h, 3, C, 0));
         let ja = sends(&join(&mut h, a, &A, "Lobby", 1));
@@ -681,13 +692,14 @@ mod tests {
         join(&mut h, c, &C, "other", 1);
         // JOINED второго содержит обоих
         let jb = sends(&join(&mut h, b, &B, "LOBBY", 2));
+        assert!(jb.is_empty() || jb.iter().all(|(l, _)| *l == b), "повторный JOIN не рассылается другим");
         let list = parse(&jb[0].1).unwrap().body.unwrap().to_vec();
         assert_eq!(list[0], 0x82);
         let mut body = text_item("hi");
         body.shrink_to_fit();
         let m = msg(&A, T_MSG, Some("lobby"), Some(&body));
         let acts = h.step(3, Ev::Data(a, &m));
-        assert_eq!(acts, vec![Act::Send(b, m)]);
+        assert_eq!(acts, vec![Act::Send(a, m.clone()), Act::Send(b, m)]);
     }
 
     #[test]
@@ -719,7 +731,9 @@ mod tests {
         join(&mut h, a, &A, "lobby", 0);
         join(&mut h, b, &B, "lobby", 0);
         let s = sends(&h.step(1, Ev::Data(a, &msg(&A, T_PART, Some("lobby"), None))));
-        assert_eq!(typ_of(&s[0].1), T_PARTED);
+        // оставшиеся узнают об уходе, ушедший получает подтверждение; в обоих случаях тело - список identity
+        assert_eq!(s.iter().map(|(l, b)| (*l, typ_of(b))).collect::<Vec<_>>(), vec![(b, T_PARTED), (a, T_PARTED)]);
+        assert_eq!(parse(&s[1].1).unwrap().body, Some(&members_body(&[A])[..]));
         assert_eq!(h.rooms["lobby"], vec![b]);
         // PING: тело возвращается без изменений
         let payload = bytes_item(&[1, 2, 3]);
@@ -729,6 +743,34 @@ mod tests {
         // закрытие Link снимает членство без уведомлений, пустая комната исчезает
         assert!(h.step(3, Ev::Closed(b)).is_empty());
         assert!(h.rooms.is_empty());
+    }
+
+    #[test]
+    fn newcomer_is_announced_to_members_and_pings_do_not_strike() {
+        let mut h = hub();
+        let (a, b) = (connect(&mut h, 1, A, 0), connect(&mut h, 2, B, 0));
+        join(&mut h, a, &A, "lobby", 0);
+        let s = sends(&join(&mut h, b, &B, "lobby", 1));
+        assert_eq!(s.iter().map(|(l, x)| (*l, typ_of(x))).collect::<Vec<_>>(), vec![(a, T_JOINED), (b, T_JOINED)]);
+        assert_eq!(parse(&s[0].1).unwrap().body, Some(&members_body(&[B])[..]));
+        // клиент пингует раз в 5 с, час подряд: ни ошибок, ни закрытия
+        for i in 0..720u64 {
+            let acts = h.step(10_000 + i * 5_000, Ev::Data(b, &msg(&B, T_PING, None, None)));
+            assert_eq!(acts.len(), 1, "PONG на каждый PING {i}");
+        }
+        assert!(h.sessions.contains_key(&b));
+    }
+
+    #[test]
+    fn welcome_uses_numeric_keys_like_rrcd() {
+        let mut r = Rd { b: &welcome_body("x"), i: 0 };
+        assert_eq!(r.head(), Some((5, 4)));
+        assert_eq!((r.uint(), r.text()), (Some(0), Some("x")));
+        assert_eq!(r.uint(), Some(1)); r.text().unwrap();
+        assert_eq!(r.uint(), Some(2)); r.skip(0).unwrap();
+        assert_eq!((r.uint(), r.head()), (Some(3), Some((5, 5))));
+        for (k, v) in [(0u64, 32u64), (1, 64), (2, 350), (3, 8), (4, 30)] { assert_eq!((r.uint(), r.uint()), (Some(k), Some(v))); }
+        assert_eq!(r.i, r.b.len());
     }
 
     #[test]
@@ -885,13 +927,17 @@ mod tests {
         assert_eq!(parse(&a.recv(15).await.expect("JOINED")).unwrap().typ, T_JOINED);
         b.say(T_JOIN, Some("lobby"), None);
         assert_eq!(parse(&b.recv(15).await.expect("JOINED")).unwrap().typ, T_JOINED);
+        // первый участник узнаёт о втором
+        let note = a.recv(15).await.expect("JOINED другому участнику");
+        assert_eq!((parse(&note).unwrap().typ, parse(&note).unwrap().body), (T_JOINED, Some(&members_body(&[b.who])[..])));
 
-        // сообщение доходит до второго участника теми же байтами; отправителю ничего не возвращается
+        // сообщение доходит до второго участника теми же байтами; отправитель получает эхо (подтверждение)
         let body = text_item("привет");
         let sent = build(&a.who, T_MSG, Some("lobby"), Some(&body));
         a.outbox.lock().unwrap().push((a.link, sent.clone()));
         assert_eq!(b.recv(15).await.expect("MSG не дошёл"), sent);
-        assert!(a.recv(3).await.is_none(), "отправитель получил своё сообщение");
+        assert_eq!(a.recv(15).await.expect("эхо отправителю"), sent);
+        assert!(a.recv(2).await.is_none(), "эхо одно");
 
         // PING -> PONG с тем же телом
         let payload = bytes_item(&[7, 7, 7]);
@@ -903,6 +949,29 @@ mod tests {
         b.node.stop().await.unwrap();
         hub.stop().await.unwrap();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Стенд интероперабельности (только локально): хаб на 127.0.0.1:$KH_RRC_PORT без иных интерфейсов, хеш назначения
+    /// пишется в $KH_RRC_OUT, работает $KH_RRC_SECS секунд. К нему подключаются Python-клиенты (rrc-tui) из изолированного конфига RNS.
+    /// `cargo test --lib rrc_interop_server -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn rrc_interop_server() {
+        use leviculum_std::api::{generate_identity, NodeBuilder};
+        let port: u16 = std::env::var("KH_RRC_PORT").ok().and_then(|v| v.parse().ok()).expect("KH_RRC_PORT");
+        let secs: u64 = std::env::var("KH_RRC_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
+        let hub_id = generate_identity();
+        let dir = std::env::temp_dir().join(format!("kh-rrc-interop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dest = *Destination::new(Some(hub_id.clone()), Direction::In, DestinationType::Single, "rrc", &["hub"]).unwrap().hash();
+        if let Ok(out) = std::env::var("KH_RRC_OUT") { std::fs::write(out, dest.to_string()).unwrap(); }
+        let mut hub = NodeBuilder::new().storage_path(dir.clone()).add_tcp_server(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .core_processor(HubProcessor::new(hub_id)).build().unwrap();
+        hub.start().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        eprintln!("rrc status: {}", status());
+        hub.stop().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
