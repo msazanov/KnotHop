@@ -20,6 +20,8 @@ mod lxmf_admin;
 mod lxmf_sync;
 #[path = "enroll_net.rs"]
 mod enroll_net;
+#[path = "rrc.rs"]
+mod rrc;
 
 #[cfg(test)]
 #[path = "../../tests/client_inbox13_tests.rs"]
@@ -203,6 +205,9 @@ struct NodeConf {
     workers: Option<usize>,
     /// потолок хранилища PN, МиБ; нет — 1% свободного места в пределах 2…100
     pn_cap_mb: Option<u64>,
+    /// хаб RRC на серверной ноде: включён по умолчанию, `false` отключает; `rrc_name` - имя в WELCOME (по умолчанию «hub»)
+    rrc: Option<bool>,
+    rrc_name: Option<String>,
     tun_name: Option<String>,
     client_net: Option<String>,
     /// модель 0013: приглашение kh- (одноразовое; после зачисления игнорируется)
@@ -1117,6 +1122,8 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
         nb = nb.add_tcp_server(SocketAddr::from(([0, 0, 0, 0], tp)));
     }
     let pn_identity = transport.then(|| admin_identity.clone()).flatten();
+    // хаб RRC (rrc.rs) - только на серверных узлах, на телефоне его нет
+    let hub_identity = pn_identity.clone().filter(|_| rrc::enabled());
     let admin_lxmf = admin_identity.map(|i| {
         let (p, r) = lxmf_admin::AdminProcessor::new(i);
         (if transport { p.with_fetch_ms(lxmf_admin::PN_FETCH_SERVER_MS) } else { p }, r)
@@ -1124,7 +1131,11 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
     let (admin_lxmf, nb) = match admin_lxmf {
         Some((processor, runtime)) => {
             let nb = if let Some(identity) = pn_identity {
-                nb.core_processor(lxmf_sync::Processors(processor, lxmf_sync::propagation_processor(state, identity)?))
+                let both = lxmf_sync::Processors(processor, lxmf_sync::propagation_processor(state, identity)?);
+                match hub_identity {
+                    Some(hub) => nb.core_processor(lxmf_sync::Processors(both, rrc::HubProcessor::new(hub))),
+                    None => nb.core_processor(both),
+                }
             } else { nb.core_processor(processor) };
             (Some(runtime), nb)
         }
@@ -2206,6 +2217,7 @@ fn pol_counters() -> serde_json::Value {
         "sync_tx_n":lxmf_sync::TX_MESSAGES.load(Relaxed), "sync_rx_n":lxmf_sync::RX_MESSAGES.load(Relaxed)});
     // PN грузится в фоне (W110): pn_ready/pn_load_ms показывают, когда встроенный PN начал обслуживать пиров
     if let (Some(o), serde_json::Value::Object(pn)) = (v.as_object_mut(), lxmf_sync::pn_status()) { o.extend(pn); }
+    if let (Some(o), serde_json::Value::Object(hub)) = (v.as_object_mut(), rrc::status()) { o.extend(hub); }
     v
 }
 
@@ -2909,6 +2921,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         a.quic_cc_mbit = c.quic_cc_mbit.unwrap_or(a.quic_cc_mbit);
         a.workers = c.workers.unwrap_or(a.workers);
         lxmf_sync::set_pn_cap_mb(c.pn_cap_mb);
+        rrc::configure(c.rrc, c.rrc_name);
         a.tun_name = c.tun_name.unwrap_or(a.tun_name);
         a.client_net = c.client_net.unwrap_or(a.client_net);
         a.invite = c.invite.unwrap_or(a.invite.clone());
@@ -3158,6 +3171,8 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
                     on_control(&ctx, link_id, &data);
                 }
             }
+            // Link хаба RRC обслуживает rrc.rs; в разбор VPN-пакетов они не попадают
+            NodeEvent::LinkDataReceived { link_id, .. } if rrc::is_hub_link(&link_id) => {}
             NodeEvent::LinkDataReceived { link_id, .. } if ctx.link_is_cbc(&link_id) => {}
             NodeEvent::LinkDataReceived { link_id, data, .. } => {
                 if is_rgp(&data) {
