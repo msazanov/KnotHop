@@ -829,14 +829,17 @@ final class TopologyView extends View {
         float x = e.getX(), y = e.getY();
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                disallowIntercept(true);  // ScrollView не должен перехватывать жест
                 downX = x; downY = y; dragged = false;
                 synchronized (nodes) { dragNode = hit(x, y); }
                 dragPhone = dragNode == null && hitPhone(x, y);
+                // Перетаскивание узла или телефона не должна перехватывать прокрутка; на пустом месте граф - часть страницы:
+                // вертикальный жест прокручивает приложение (ScrollView заберёт его сам, мы получим CANCEL).
+                disallowIntercept(dragNode != null || dragPhone);
                 longPicked = false;
                 if (dragNode != null || dragPhone) postDelayed(longPress, android.view.ViewConfiguration.getLongPressTimeout());
                 return true;
             case MotionEvent.ACTION_MOVE: {
+                if (dragNode == null && !dragPhone) return true;   // пустое место: ничего не тянем, жест остаётся за прокруткой
                 float dx = x - downX, dy = y - downY;
                 if (!dragged && dx * dx + dy * dy > (8 * d) * (8 * d)) dragged = true;
                 if (dragged) removeCallbacks(longPress);
@@ -859,7 +862,9 @@ final class TopologyView extends View {
                 boolean wasDrag = dragged;
                 removeCallbacks(longPress);
                 dragged = false;
-                if (!wasDrag && !longPicked) {
+                float mdx = x - downX, mdy = y - downY;
+                boolean slid = mdx * mdx + mdy * mdy > (8 * d) * (8 * d);   // пальцем провели по пустому месту: это не тап
+                if (!wasDrag && !longPicked && !slid) {
                     Node n;
                     synchronized (nodes) { n = hit(x, y); }
                     if (n != null && onPick != null) {

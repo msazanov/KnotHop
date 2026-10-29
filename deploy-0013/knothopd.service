@@ -23,13 +23,12 @@ ProtectSystem=strict
 ReadWritePaths=/opt/knothop/state
 ProtectHome=yes
 PrivateTmp=yes
-# 21.10: жёсткая квота CPU снята владельцем; knothopd уступает Xray/AWG по весу.
-# CPUWeight задаёт относительный приоритет при конкуренции, не ограничение скорости.
+# 28.10: владелец снял все ограничения CPU: квоты нет, CPUWeight по умолчанию (100), Nice=0 (до этого 50 и 10 из-за голодания Link на de/fin1, W127).
 # Предел памяти: node-migrate.sh подставляет предел старого узла (200M или 300M), значение здесь - по умолчанию.
 CPUQuota=
-CPUWeight=50
+CPUWeight=100
 MemoryMax=300M
-Nice=10
+Nice=0
 LimitNOFILE=4096
 
 [Install]

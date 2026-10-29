@@ -9,7 +9,7 @@
 #      юниты и /usr/local/sbin/rawgd-hostfix убираются (копии в резерве);
 #   4. пользователь knothopd (без логина), /opt/knothop (state пустой, 0700), бинарник, public_rns.txt, node.json (rgd0->khd0,
 #      пути), env (RAWGD_*/RAWG_* -> KNOTHOP_*);
-#   5. knothopd.service: CPUWeight=50, Nice=10, без CPUQuota, MemoryMax как был на узле; node-hostfix.sh persist; start knothop-hostfix;
+#   5. knothopd.service: CPUWeight=100, Nice=0, без CPUQuota, MemoryMax как был на узле; node-hostfix.sh persist; start knothop-hostfix;
 #   6. enable+start knothopd; 20 с наблюдения: active, NRestarts 0, процесс от knothopd, khd0, nft knothop/knothop_nat с метками.
 # Сбой после первого изменения: откат - revert hostfix нового, новые юниты и каталог /opt/knothop уходят в резерв (не удаляются),
 # старые юниты, nft и iptables восстанавливаются, rawgd-pilot запускается снова. Состояние и identity старого узла не трогаются:
@@ -81,7 +81,7 @@ fi
 MEM="$((mem / 1048576))M"
 ok "предел памяти старого юнита: $MEM (переносится)"
 echo "     старый юнит: CPUQuotaPerSecUSec=$(systemctl show "$OLD_UNIT" -p CPUQuotaPerSecUSec --value) CPUWeight=$(systemctl show "$OLD_UNIT" -p CPUWeight --value) Nice=$(systemctl show "$OLD_UNIT" -p Nice --value)"
-echo "     новый юнит: CPUWeight=50 Nice=10, квоты CPU нет (решение владельца 21.10 и план миграции)"
+echo "     новый юнит: CPUWeight=100 Nice=0, квоты CPU нет (решение владельца 28.10)"
 if [ -d "$DIR/state" ] && [ -n "$(ls -A "$DIR/state" 2>/dev/null)" ]; then bad "$DIR/state непуст"; exit 4; fi
 ok "предусловия выполнены"
 [ "$DRY" = 1 ] && { echo "dry-run: изменений не сделано"; exit 0; }
