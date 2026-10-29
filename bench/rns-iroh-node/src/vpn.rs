@@ -211,92 +211,24 @@ struct NodeConf {
     relay_urls: Vec<String>,
 }
 
-/// Минимальный HTTP GET по 80 порту без зависимостей: тело ответа или None.
-async fn http_get(host: &str, path: &str) -> Option<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::time::timeout(Duration::from_secs(4), tokio::net::TcpStream::connect((host, 80))).await.ok()?.ok()?;
-    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: knothopd\r\nConnection: close\r\n\r\n").as_bytes()).await.ok()?;
-    let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(4), s.take(8192).read_to_end(&mut buf)).await.ok()?.ok()?;
-    let t = String::from_utf8_lossy(&buf).to_string();
-    if !t.starts_with("HTTP/1.") || !t.contains(" 200") {
-        return None;
-    }
-    t.split_once("\r\n\r\n").map(|x| x.1.trim().to_string())
-}
-
-/// Двухбуквенный код страны узла по его внешнему IP: несколько сервисов по очереди, результат кэшируется в каталоге состояния.
-/// Порядок: KNOTHOP_REGION (задаёт оператор/стенд) -> сервисы -> кэш -> "XX".
-async fn detect_region(state: &Path) -> String {
-    let ok = |c: &str| c.len() == 2 && c.chars().all(|x| x.is_ascii_alphabetic());
-    if let Ok(r) = std::env::var("KNOTHOP_REGION") {
-        let r = r.trim().to_uppercase();
-        if ok(&r) {
-            return r;
-        }
-    }
-    let cache = state.join("region.txt");
-    // (хост, путь, как достать код из тела)
-    let svcs: [(&str, &str, fn(&str) -> String); 3] = [
-        ("ip-api.com", "/line/?fields=countryCode", |b| b.lines().next().unwrap_or("").trim().to_string()),
-        ("ipinfo.io", "/country", |b| b.lines().next().unwrap_or("").trim().to_string()),
-        ("ifconfig.co", "/country-iso", |b| b.lines().next().unwrap_or("").trim().to_string()),
-    ];
-    for (host, path, f) in svcs {
-        if let Some(body) = http_get(host, path).await {
-            let c = f(&body).to_uppercase();
-            if ok(&c) {
-                let _ = std::fs::write(&cache, &c);
-                return c;
-            }
-        }
-    }
-    let c = std::fs::read_to_string(&cache).unwrap_or_default().trim().to_uppercase();
-    if ok(&c) { c } else { "XX".into() }
-}
-
-/// Имя узла от допущенного пира: до 32 знаков без управляющих; код страны `cc` (две латинские буквы) нужен интерфейсу для флага.
-/// Имя вида `knothop-XX-…` не трогаем, прочее заворачиваем в него (интерфейс разбирает только эту форму).
 /// Символ допустим в отображаемом имени от пира: без управляющих и без невидимых/меняющих направление текста (подмена имени в UI).
 fn name_char_ok(c: char) -> bool {
     !c.is_control() && !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
 }
 
-fn norm_peer_name(name: &str, cc: &str) -> Option<String> {
+/// Единственная нормализация имени узла (своего, из настроек и от пира): до 32 знаков, без управляющих и невидимых, без пробелов по краям.
+/// Больше в имени ничего не разбирается: иконку интерфейс берёт из самого имени (ведущий эмодзи или первые два знака).
+fn norm_name(name: &str) -> Option<String> {
     let name: String = name.chars().filter(|c| name_char_ok(*c)).take(32).collect();
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return None;
-    }
-    let cc = cc.trim().to_uppercase();
-    let cc_ok = cc.len() == 2 && cc.chars().all(|x| x.is_ascii_alphabetic());
-    let parts: Vec<&str> = name.splitn(3, '-').collect();
-    if parts.len() == 3 && parts[0] == "knothop" && parts[1].len() == 2 {
-        return Some(name);
-    }
-    Some(if cc_ok { format!("knothop-{cc}-{name}") } else { name })
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Тип узла, три значения: «android», «ios», «server» (knothopd node или приложение на Windows/Linux/macOS).
-/// Только по допущенному Link, не в анонсе (ADR 0016).
-fn platform() -> &'static str {
-    match std::env::consts::OS {
-        "android" => "android",
-        "ios" => "ios",
-        _ => "server",
-    }
-}
-
-/// Тип платформы одним байтом (в приглашении) и обратно.
-/// Имя клиента для сети: телефон - «телефон-XXXXXX» по хешу identity. Имя и тип узла раздаёт сам узел
-/// (клиент сообщает их выходу в T_USE, выход передаёт дальше в T_NBRS); приглашение их не переносит.
+/// Имя клиента для сети: заданное пользователем (оболочка кладёт state/node-name.txt), иначе «телефон-XXXXXX» по хешу identity.
+/// Имя раздаёт сам узел (клиент сообщает его выходу в T_USE, выход передаёт дальше в T_NBRS); приглашение его не переносит.
 fn client_display_name(identity: &Identity, state: &Path) -> String {
-    // имя, которое пользователь задал сам (оболочка кладёт state/node-name.txt), важнее автоимени
-    if let Ok(t) = std::fs::read_to_string(state.join("node-name.txt")) {
-        let n: String = t.chars().filter(|c| name_char_ok(*c)).take(32).collect();
-        if !n.trim().is_empty() {
-            return n.trim().to_string();
-        }
+    if let Some(n) = std::fs::read_to_string(state.join("node-name.txt")).ok().and_then(|t| norm_name(&t)) {
+        return n;
     }
     match trust::hash_of(&identity.public_key_bytes()) {
         Some(h) => format!("телефон-{}", &hex(&h)[..6]),
@@ -304,13 +236,10 @@ fn client_display_name(identity: &Identity, state: &Path) -> String {
     }
 }
 
-/// Тело T_USE от клиента: тип и имя узла, чтобы выход раздал их другим клиентам.
+/// Тело T_USE от клиента: длина и имя узла, чтобы выход раздал его другим клиентам.
 fn client_info_body(identity: &Identity, state: &Path) -> Vec<u8> {
     let name = client_display_name(identity, state);
-    let pl = platform();
-    let mut b = Vec::with_capacity(2 + pl.len() + name.len());
-    b.push(pl.len() as u8);
-    b.extend_from_slice(pl.as_bytes());
+    let mut b = Vec::with_capacity(1 + name.len());
     b.push(name.len() as u8);
     b.extend_from_slice(name.as_bytes());
     b
@@ -321,7 +250,7 @@ fn node_like(tr: &trust::Trust, pk: &[u8; 64]) -> bool {
     trust::hash_of(pk).map(|h| tr.has_anchor(&h)).unwrap_or(false) || tr.rights(pk) & (trust::TRANSIT | trust::EXIT) != 0
 }
 
-/// T_CINFO от соседа-сервера: клиенты-узлы с именем и типом. Права каждого ключа проверяем сами; заявке соседа не верим.
+/// T_CINFO от соседа-сервера: клиенты-узлы с именем. Права каждого ключа проверяем сами; заявке соседа не верим.
 fn on_cinfo(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
     let Some(t) = &ctx.t13 else { return };
     if body.len() > 4096 || !ctx.links.lock().unwrap().get(&link).map(|l| matches!(l.role, Role::Server { .. })).unwrap_or(false) {
@@ -329,46 +258,34 @@ fn on_cinfo(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
     }
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else { return };
     let Some(arr) = v["c"].as_array() else { return };
-    let mut got: Vec<([u8; 16], String, &'static str)> = Vec::new();
+    let mut got: Vec<([u8; 16], String)> = Vec::new();
     {
         let tr = t.trust.lock().unwrap();
         for x in arr.iter().take(16) {
             let Some(pk) = x["k"].as_str().filter(|k| k.len() == 128 && k.bytes().all(|b| b.is_ascii_hexdigit())).and_then(|k| <[u8; 64]>::try_from(unhex(k)).ok()) else { continue };
-            let Some(pl) = x["pl"].as_str().and_then(|p| parse_platform(p.as_bytes())) else { continue };
-            let name: String = x["n"].as_str().unwrap_or("").chars().filter(|c| name_char_ok(*c)).take(32).collect();
-            if name.is_empty() || !node_like(&tr, &pk) {
+            let Some(name) = x["n"].as_str().and_then(norm_name) else { continue };
+            if !node_like(&tr, &pk) {
                 continue;
             }
-            got.push((dest_from_pub_tag(&pk, T13_TAG), name, pl));
+            got.push((dest_from_pub_tag(&pk, T13_TAG), name));
         }
     }
     let mut pc = ctx.peer_clients.lock().unwrap();
-    pc.retain(|_, v| v.2.elapsed() < CINFO_TTL);
-    for (d, n, pl) in got {
+    pc.retain(|_, v| v.1.elapsed() < CINFO_TTL);
+    for (d, n) in got {
         if pc.len() < CINFO_MAX || pc.contains_key(&d) {
-            pc.insert(d, (n, pl, Instant::now()));
+            pc.insert(d, (n, Instant::now()));
         }
     }
 }
 
-/// Разбор тела T_USE клиента: (имя, тип). None - клиент ничего не сообщил или прислал мусор.
-fn parse_client_info(body: &[u8]) -> Option<(String, &'static str)> {
-    let pl_len = *body.first()? as usize;
-    let pl = body.get(1..1 + pl_len)?;
-    let name_len = *body.get(1 + pl_len)? as usize;
-    if body.len() != 2 + pl_len + name_len {
+/// Разбор тела T_USE клиента: имя. None - клиент ничего не сообщил или прислал мусор.
+fn parse_client_info(body: &[u8]) -> Option<String> {
+    let name_len = *body.first()? as usize;
+    if body.len() != 1 + name_len {
         return None;
     }
-    let name = std::str::from_utf8(&body[2 + pl_len..]).ok()?;
-    let name: String = name.chars().filter(|c| name_char_ok(*c)).take(32).collect();
-    Some((name, parse_platform(pl)?))
-}
-
-/// Тип от пира: только значения из списка (произвольную строку не храним и не показываем).
-fn parse_platform(b: &[u8]) -> Option<&'static str> {
-    const ALL: [&str; 3] = ["android", "ios", "server"];
-    let t = std::str::from_utf8(b).ok()?.trim();
-    ALL.iter().copied().find(|x| *x == t)
+    norm_name(std::str::from_utf8(&body[1..]).ok()?)
 }
 
 fn hostname() -> String {
@@ -582,7 +499,7 @@ const T_NBRS: u8 = 16;     // выход -> клиент: соседи с жив
 /// Advisory observations are bounded by both count and negotiated Channel MDU.
 const NBRS_MAX: usize = crate::observations::MAX_NEIGHBORS;
 const T_OBSERVE: u8 = 21; // admitted client -> exit: UI visible (one byte 0/1), request fresh T_NBRS
-/// сосед-сервер -> сосед-сервер: клиенты-узлы (якорь/TRANSIT/EXIT) с их именем и типом {"c":[{"k","n","pl"}]};
+/// сосед-сервер -> сосед-сервер: клиенты-узлы (якорь/TRANSIT/EXIT) с их именем {"c":[{"k","n"}]};
 /// получатель проверяет права ключа по своим записям, держит не дольше CINFO_TTL; только для отображения
 const T_CINFO: u8 = 22;
 const CINFO_TTL: Duration = Duration::from_secs(60);
@@ -618,8 +535,6 @@ fn rand16() -> [u8; 16] {
 /// Подсеть адресов клиентов (одна на всю группу: клиент сохраняет адрес при смене выхода). Задаётся в конфиге узла (`client_net`),
 /// выбирается так, чтобы не пересекаться с сетями узлов (на ru1 10.130.0.0/24 попадает в 10.128.0.0/10 - для пилота 198.18.0.0/15).
 static CLIENT_NET: std::sync::OnceLock<(u32, u8)> = std::sync::OnceLock::new();
-/// Двухбуквенный код страны этого узла (по внешнему IP или KNOTHOP_REGION); уходит только допущенным по Link (в анонсе его нет, ADR 0016).
-static REGION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn parse_net(t: &str) -> Result<(u32, u8)> {
     let (a, p) = t.split_once('/').ok_or_else(|| anyhow::anyhow!("client_net: нужен вид a.b.c.d/N"))?;
@@ -664,7 +579,7 @@ fn ip_str(ip: u32) -> String {
 fn load_names(state: &Path) -> HashMap<[u8; 16], String> {
     let Ok(t) = std::fs::read_to_string(state.join("names.json")) else { return HashMap::new() };
     let Ok(m) = serde_json::from_str::<HashMap<String, String>>(&t) else { return HashMap::new() };
-    m.into_iter().take(64).filter_map(|(d, n)| Some((dest32(&d)?, norm_peer_name(&n, "")?))).collect()
+    m.into_iter().take(64).filter_map(|(d, n)| Some((dest32(&d)?, norm_name(&n)?))).collect()
 }
 
 fn write_atomic(p: &Path, data: &[u8]) {
@@ -787,44 +702,29 @@ mod tests {
     }
 
     #[test]
-    fn platform_allowlist() {
-        assert_eq!(parse_platform(b"android"), Some("android"));
-        assert_eq!(parse_platform(b" server\n"), Some("server"));
-        assert_eq!(parse_platform(b"ios"), Some("ios"));
-        assert_eq!(parse_platform(b""), None);
-        assert_eq!(parse_platform(b"app/android"), None);
-        assert_eq!(parse_platform(b"<script>"), None);
-        assert_eq!(parse_platform(&[0xff, 0xfe]), None);
-        assert!(parse_platform(platform().as_bytes()).is_some());
-    }
-
-    #[test]
     fn client_info_roundtrip_and_garbage() {
         let id = leviculum_std::api::generate_identity();
-        let (name, pl) = parse_client_info(&client_info_body(&id, std::path::Path::new("/nonexistent"))).unwrap();
+        let name = parse_client_info(&client_info_body(&id, std::path::Path::new("/nonexistent"))).unwrap();
         assert!(name.starts_with("телефон-"));
-        assert_eq!(pl, platform());
         assert_eq!(parse_client_info(b""), None);
         assert_eq!(parse_client_info(&[7, b'a', b'n', b'd']), None, "обрезано");
-        assert_eq!(parse_client_info(&[3, b'i', b'o', b's', 1, b'x', b'y']), None, "лишний хвост");
-        assert_eq!(parse_client_info(&[4, b'm', b'a', b'c', b'x', 0]), None, "тип вне списка");
-        assert_eq!(parse_client_info(&[3, b'i', b'o', b's', 2, b'a', 0x07]), Some(("a".into(), "ios")), "управляющие символы вырезаны");
-        let mut b = vec![3, b'i', b'o', b's'];
+        assert_eq!(parse_client_info(&[1, b'x', b'y']), None, "лишний хвост");
+        assert_eq!(parse_client_info(&[0]), None, "пустое имя");
+        assert_eq!(parse_client_info(&[2, b'a', 0x07]), Some("a".into()), "управляющие символы вырезаны");
         let nm = "a\u{202E}b";
-        b.push(nm.len() as u8);
+        let mut b = vec![nm.len() as u8];
         b.extend_from_slice(nm.as_bytes());
-        assert_eq!(parse_client_info(&b), Some(("ab".into(), "ios")), "смена направления текста вырезана");
+        assert_eq!(parse_client_info(&b), Some("ab".into()), "смена направления текста вырезана");
     }
 
     #[test]
     fn peer_name_normalized() {
-        assert_eq!(norm_peer_name("knothop-FI-ubuntu24", "").as_deref(), Some("knothop-FI-ubuntu24"));
-        assert_eq!(norm_peer_name("legacy-FI-ubuntu24", "").as_deref(), Some("legacy-FI-ubuntu24"));
-        assert_eq!(norm_peer_name("Home", "fi").as_deref(), Some("knothop-FI-Home"));
-        assert_eq!(norm_peer_name("Home", "").as_deref(), Some("Home"));
-        assert_eq!(norm_peer_name("Home", "F1").as_deref(), Some("Home"));
-        assert_eq!(norm_peer_name("  \n\t ", "FI"), None);
-        assert_eq!(norm_peer_name(&"я".repeat(80), "").unwrap().chars().count(), 32);
+        assert_eq!(norm_name("knothop-FI-ubuntu24").as_deref(), Some("knothop-FI-ubuntu24"), "имя не переписывается");
+        assert_eq!(norm_name("Home").as_deref(), Some("Home"));
+        assert_eq!(norm_name("  Home \n").as_deref(), Some("Home"));
+        assert_eq!(norm_name("🇫🇮 Хельсинки").as_deref(), Some("🇫🇮 Хельсинки"));
+        assert_eq!(norm_name("  \n\t "), None);
+        assert_eq!(norm_name(&"я".repeat(80)).unwrap().chars().count(), 32);
     }
 
     #[test]
@@ -2633,10 +2533,10 @@ struct NodeCtx {
     announce_s: u64,
     dead: Duration,
     path_gate: path::PathGate,
-    /// имя и тип клиента из T_USE (Link -> (имя, «android»/«ios»/«server»)); раздаются дальше в T_NBRS; не больше 256 записей
-    client_info: Mutex<HashMap<LinkId, (String, &'static str)>>,
-    /// клиенты-узлы соседей по T_CINFO: dest -> (имя, тип, когда); не больше CINFO_MAX, живут CINFO_TTL
-    peer_clients: Mutex<HashMap<[u8; 16], (String, &'static str, Instant)>>,
+    /// имя клиента из T_USE (Link -> имя); раздаётся дальше в T_NBRS; не больше 256 записей
+    client_info: Mutex<HashMap<LinkId, String>>,
+    /// клиенты-узлы соседей по T_CINFO: dest -> (имя, когда); не больше CINFO_MAX, живут CINFO_TTL
+    peer_clients: Mutex<HashMap<[u8; 16], (String, Instant)>>,
     links: Mutex<HashMap<LinkId, LinkInfo>>,
     neigh: Mutex<HashMap<[u8; 16], Neighbor>>,
     tun: Option<Arc<TunState>>,
@@ -2798,35 +2698,35 @@ impl NodeCtx {
         // имя соседа - подсказка для отображения: клиент без Link к соседу узнаёт, какой он страны; идёт только допущенному клиенту
         // соседи-транзиты - серверы (телефон транзитом пока не бывает)
         let mut out: Vec<serde_json::Value> = v.iter().take(NBRS_MAX)
-            .map(|(d, r, nm)| serde_json::json!({"d": hex(d), "r": r.map(|x| x.round() as i64), "n": nm.chars().take(32).collect::<String>(), "pl": "server"})).collect();
+            .map(|(d, r, nm)| serde_json::json!({"d": hex(d), "r": r.map(|x| x.round() as i64), "n": nm.chars().take(32).collect::<String>()})).collect();
         // Клиенты с правами узла сети (якорь, TRANSIT или EXIT), например телефон-админ - свои и сообщённые соседями (T_CINFO):
-        // только имя и тип ("c":1), ребром соседа они не становятся. Рядовых пользователей (только USE) другим клиентам не раскрываем.
-        let mut cl: Vec<([u8; 16], String, &'static str)> = self.node_clients().into_iter().map(|(pk, n, pl)| (dest_from_pub_tag(&pk, T13_TAG), n, pl)).collect();
+        // только имя ("c":1), ребром соседа они не становятся. Рядовых пользователей (только USE) другим клиентам не раскрываем.
+        let mut cl: Vec<([u8; 16], String)> = self.node_clients().into_iter().map(|(pk, n)| (dest_from_pub_tag(&pk, T13_TAG), n)).collect();
         {
             let mut pc = self.peer_clients.lock().unwrap();
-            pc.retain(|_, v| v.2.elapsed() < CINFO_TTL);
-            for (d, (n, pl, _)) in pc.iter() {
+            pc.retain(|_, v| v.1.elapsed() < CINFO_TTL);
+            for (d, (n, _)) in pc.iter() {
                 if !cl.iter().any(|c| c.0 == *d) {
-                    cl.push((*d, n.clone(), *pl));
+                    cl.push((*d, n.clone()));
                 }
             }
         }
         cl.sort_by(|a, b| a.0.cmp(&b.0));
-        out.extend(cl.into_iter().take(NBRS_MAX.saturating_sub(out.len())).map(|(d, n, pl)| serde_json::json!({"d": hex(&d), "c": 1, "n": n, "pl": pl})));
+        out.extend(cl.into_iter().take(NBRS_MAX.saturating_sub(out.len())).map(|(d, n)| serde_json::json!({"d": hex(&d), "c": 1, "n": n})));
         out
     }
 
-    /// Допущенные напрямую клиенты с правами узла сети (якорь, TRANSIT или EXIT): (ключ, имя, тип) из их T_USE.
-    fn node_clients(&self) -> Vec<([u8; 64], String, &'static str)> {
+    /// Допущенные напрямую клиенты с правами узла сети (якорь, TRANSIT или EXIT): (ключ, имя) из их T_USE.
+    fn node_clients(&self) -> Vec<([u8; 64], String)> {
         let Some(t) = &self.t13 else { return vec![] };
         let info = self.client_info.lock().unwrap().clone();
         let peers: Vec<(LinkId, [u8; 64])> = self.links.lock().unwrap().iter()
             .filter(|(_, l)| matches!(l.role, Role::Client { .. }) && !l.enroll_only)
             .filter_map(|(k, l)| l.peer_pk.map(|pk| (*k, pk))).collect();
         let tr = t.trust.lock().unwrap();
-        let mut v: Vec<([u8; 64], String, &'static str)> = peers.iter().filter_map(|(link, pk)| {
-            let (name, pl) = info.get(link)?;
-            node_like(&tr, pk).then(|| (*pk, name.clone(), *pl))
+        let mut v: Vec<([u8; 64], String)> = peers.iter().filter_map(|(link, pk)| {
+            let name = info.get(link)?;
+            node_like(&tr, pk).then(|| (*pk, name.clone()))
         }).collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v.dedup_by(|a, b| a.0 == b.0);
@@ -2843,8 +2743,8 @@ impl NodeCtx {
         for link in servers {
             let budget = self.node.engine().link_mdu(&link).unwrap_or(0).saturating_sub(7).min(4096);
             let mut c: Vec<serde_json::Value> = Vec::new();
-            for (pk, n, pl) in &mine {
-                c.push(serde_json::json!({"k": hex(pk), "n": n, "pl": pl}));
+            for (pk, n) in &mine {
+                c.push(serde_json::json!({"k": hex(pk), "n": n}));
                 if serde_json::json!({"c": c}).to_string().len() > budget {
                     c.pop();
                     break;
@@ -3015,19 +2915,11 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         if !c.relay_urls.is_empty() { a.relay_url = c.relay_urls.join(","); }
     }
     let _ = CLIENT_NET.set(parse_net(&a.client_net)?);
-    let region = detect_region(&a.state).await;
-    let _ = REGION.set(region.clone());
-    if a.name.is_empty() {
-        // то же имя, что телефон задаёт в настройках своей ноды: state/node-name.txt (--name и config имеют приоритет)
-        if let Ok(t) = std::fs::read_to_string(a.state.join("node-name.txt")) {
-            a.name = t.chars().filter(|c| name_char_ok(*c)).take(32).collect::<String>().trim().to_string();
-        }
-    }
-    if a.name.is_empty() {
-        // имя вида knothop-<РЕГИОН>-<что угодно>: регион по внешнему IP, хвост - имя хоста (или KNOTHOP_NAME_SUFFIX)
-        let suffix = std::env::var("KNOTHOP_NAME_SUFFIX").ok().filter(|v| !v.is_empty()).unwrap_or_else(hostname);
-        a.name = format!("knothop-{region}-{suffix}").chars().take(48).collect();
-    }
+    // Имя узла: --name / config, иначе state/node-name.txt (его же задаёт телефон в настройках), иначе имя хоста. Одна нормализация на все пути.
+    a.name = norm_name(&a.name)
+        .or_else(|| std::fs::read_to_string(a.state.join("node-name.txt")).ok().and_then(|t| norm_name(&t)))
+        .or_else(|| norm_name(&hostname()))
+        .unwrap_or_else(|| "узел".into());
     if a.state == Path::new("-") {
         bail!("нужен --state (флагом или в --config)");
     }
@@ -3522,12 +3414,12 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
             if let Some(l) = ctx.links.lock().unwrap().get_mut(&link) {
                 l.want_use = true;
             }
-            if let Some((name, pl)) = parse_client_info(body) {
+            if let Some(name) = parse_client_info(body) {
                 let live: HashSet<LinkId> = ctx.links.lock().unwrap().keys().copied().collect();
                 let mut m = ctx.client_info.lock().unwrap();
                 m.retain(|l, _| live.contains(l));
                 if m.len() < 256 || m.contains_key(&link) {
-                    m.insert(link, (name, pl));
+                    m.insert(link, name);
                 }
             }
             ctx.evaluate(link);
@@ -4821,7 +4713,7 @@ impl NodeCtx {
             let mut list = vec![];
             let mine = self.adv();
             if !mine.is_empty() {
-                list.push(serde_json::json!({"d":hex(&self.my_dest),"k":hex(&self.my_pk),"e":self.ep_id,"a":mine,"n":self.name,"pl":platform()}));
+                list.push(serde_json::json!({"d":hex(&self.my_dest),"k":hex(&self.my_pk),"e":self.ep_id,"a":mine,"n":self.name}));
             }
             let n = self.neigh.lock().unwrap();
             list.extend(n.values().filter(|nb| !nb.addrs.is_empty() && directory_node_visible(&tr, &roots, &nb.pk))
@@ -5203,10 +5095,9 @@ impl NodeCtx {
         }
         crate::host_acl::notify_nft();
         let (idh, ip) = (admission.id, admission.ip);
-        let pl = self.client_info.lock().unwrap().get(&link).map(|(_, p)| *p).unwrap_or("?");
-        self.sh.note(format!("client {} ({pl}) admitted on {}", &hex(&idh)[..8], &hex(link.as_bytes())[..8]));
+        self.sh.note(format!("client {} admitted on {}", &hex(&idh)[..8], &hex(link.as_bytes())[..8]));
         self.node.engine().set_link_keepalive(&link, Some(CLIENT_KEEPALIVE_S));
-        let ok = serde_json::json!({"name": self.name, "ip": ip_str(ip), "cc": REGION.get().cloned().unwrap_or_default(), "pl": platform()}).to_string().into_bytes();
+        let ok = serde_json::json!({"name": self.name, "ip": ip_str(ip)}).to_string().into_bytes();
         let c = self.clone();
         tokio::spawn(async move {
             if !c.send_admitted_ctl(link, &pk, OrdinaryAdmission::Client, T_AUTH_OK, &ok).await { return; }
@@ -5332,8 +5223,6 @@ struct DirEnt {
     ep: String,
     addrs: Vec<String>,
     name: String,
-    /// тип платформы узла («android»/«ios»/«server») - для значка в интерфейсе
-    pl: Option<String>,
 }
 
 /// Разбор каталога: не более DIR_MAX записей; dest обязан совпасть с ключом (тег `tag`); без адресов запись бесполезна.
@@ -5361,8 +5250,7 @@ fn parse_dir_values(arr: &[serde_json::Value], tag: &str, max: usize) -> Vec<Dir
         }
         let ep = x["e"].as_str().filter(|s| s.len() <= 64).unwrap_or("").to_string();
         let name: String = x["n"].as_str().unwrap_or("?").chars().take(32).collect();
-        let pl = x["pl"].as_str().and_then(|s| parse_platform(s.as_bytes())).map(String::from);
-        out.push(DirEnt { dest, pk, ep, addrs, name, pl });
+        out.push(DirEnt { dest, pk, ep, addrs, name });
     }
     out
 }
@@ -6590,12 +6478,8 @@ struct ClientCtx {
     carriers: Mutex<HashMap<[u8; 16], Arc<CarrierCtl>>>,
     /// интерфейсы подключения к публичным узлам RNS (перебор путей при зачислении)
     public_ids: Mutex<Vec<usize>>,
-    /// имена узлов, которые они сами сообщили по допущенному Link (dest -> имя); хранятся в state/names.json
+    /// имена узлов (dest -> имя) от них самих по допущенному Link, от выхода про его соседей и из каталога; хранятся в state/names.json
     names: Mutex<HashMap<[u8; 16], String>>,
-    /// имена этой сессии от допущенных пиров: от самого узла (T_AUTH_OK) и от выхода про его соседей (T_NBRS); не сохраняются; свежее сохранённого в `names`
-    hints: Mutex<HashMap<[u8; 16], String>>,
-    /// тип узла из T_AUTH_OK («android», «ios», «server»); узлы, к которым ещё не подключались, - неизвестен
-    platforms: Mutex<HashMap<[u8; 16], &'static str>>,
     /// адреса выходов для диалеров (dest -> общее хранилище): анонс обновляет, диалер читает на каждой попытке (0014 R4)
     books: Mutex<HashMap<[u8; 16], Arc<Addrs>>>,
     loss: Mutex<LossWin>,
@@ -6731,35 +6615,10 @@ impl ClientCtx {
 
     /// Выходы 0013 строятся из записей, а не из профиля: держатели с EXIT, у которых общий с нами корень, и админ ожидающего приглашения.
     /// Адреса приходят только подсказками (приглашение, анонс).
-    /// Имя соседа из T_NBRS: в список выходов, на диск не пишем (сохраняет только имя от самого узла, learn_name).
-    fn hint_name(&self, dest: [u8; 16], name: &str) {
-        let Some(n) = norm_peer_name(name, "") else { return };
-        {
-            let mut h = self.hints.lock().unwrap();
-            if h.len() >= 64 && !h.contains_key(&dest) {
-                return;
-            }
-            h.insert(dest, n.clone());
-        }
-        if let Some(e) = self.servers.lock().unwrap().iter_mut().find(|e| e.dest == dest) {
-            e.name = n;
-        }
-    }
-
-    /// Имя для интерфейса: сохранённое с прошлого допуска, если в записи только короткий dest.
-    fn shown_name(&self, e: &CServer) -> String {
-        if e.name == "?" || e.name == hex(&e.dest)[..8] {
-            if let Some(n) = self.hints.lock().unwrap().get(&e.dest).cloned().or_else(|| self.names.lock().unwrap().get(&e.dest).cloned()) {
-                return n;
-            }
-        }
-        e.name.clone()
-    }
-
-    /// Имя, которое узел сообщил по допущенному Link (T_AUTH_OK): в списке выходов и в хранилище. Вызывать только после проверки прав узла.
-    fn learn_name(&self, dest: [u8; 16], name: &str, cc: &str) {
-        let Some(n) = norm_peer_name(name, cc) else { return };
-        self.hints.lock().unwrap().insert(dest, n.clone());
+    /// Единственное место, где узел получает имя: от самого узла (T_AUTH_OK), от выхода про его соседей (T_NBRS) или из каталога.
+    /// Побеждает последнее; имя нормализуется `norm_name` и хранится в state/names.json (не больше 64). Вызывать только для узла, чьи права проверены.
+    fn set_name(&self, dest: [u8; 16], name: &str) {
+        let Some(n) = norm_name(name) else { return };
         {
             let mut m = self.names.lock().unwrap();
             if m.get(&dest) != Some(&n) && (m.len() < 64 || m.contains_key(&dest)) {
@@ -6773,6 +6632,11 @@ impl ClientCtx {
         if let Some(e) = self.servers.lock().unwrap().iter_mut().find(|e| e.dest == dest) {
             e.name = n;
         }
+    }
+
+    /// Имя для интерфейса: известное имя узла, иначе то, что в записи (в ней может быть только короткий dest).
+    fn shown_name(&self, e: &CServer) -> String {
+        self.names.lock().unwrap().get(&e.dest).cloned().unwrap_or_else(|| e.name.clone())
     }
 
     fn refresh_servers13(&self) {
@@ -6807,7 +6671,7 @@ impl ClientCtx {
                 e.pk = Some(pk);
                 // имя, сохранённое с прошлого допуска: пока узел не отвечал в этой сессии, в записи только короткий dest
                 if e.name == "?" || e.name == hex(&dest)[..8] {
-                    let known = self.hints.lock().unwrap().get(&dest).cloned().or_else(|| self.names.lock().unwrap().get(&dest).cloned());
+                    let known = self.names.lock().unwrap().get(&dest).cloned();
                     if let Some(n) = known {
                         e.name = n;
                     }
@@ -6816,7 +6680,7 @@ impl ClientCtx {
                     e.addrs = addrs;
                 }
             } else if s.len() < 32 {
-                let name = self.hints.lock().unwrap().get(&dest).cloned().or_else(|| self.names.lock().unwrap().get(&dest).cloned()).unwrap_or_else(|| hex(&dest)[..8].to_string());
+                let name = self.names.lock().unwrap().get(&dest).cloned().unwrap_or_else(|| hex(&dest)[..8].to_string());
                 s.push(CServer { dest, key, name, ep: hex(&key), addrs, hops: None, rtt_ms: None,
                     state: "seen".into(), seen: Instant::now(), pinned: true, pk: Some(pk) });
             }
@@ -6923,7 +6787,7 @@ impl ClientCtx {
             // cannot establish global death: another (unobserved) neighbour may see it.
             let contact = is_cur && (now_ms() as u64).saturating_sub(self.last_pong.load(Relaxed)) <= self.contact_window_ms.load(Relaxed).max(self.fail_ms);
             let presence = crate::observations::presence(contact, ra);
-            serde_json::json!({"n": self.shown_name(e), "d": hex(&e.dest), "h": hops.or(e.hops), "r": e.rtt_ms, "s": if is_cur { "current" } else { e.state.as_str() }, "pinned": e.pinned, "pl": self.platforms.lock().unwrap().get(&e.dest).copied(), "presence": presence,
+            serde_json::json!({"n": self.shown_name(e), "d": hex(&e.dest), "h": hops.or(e.hops), "r": e.rtt_ms, "s": if is_cur { "current" } else { e.state.as_str() }, "pinned": e.pinned, "presence": presence,
                 "v": carrier != "none", "c": carrier, "lk": lk, "why": why,
                 "pr": pr, "id": id, "adm": adm, "ra": ra,
                 "vis": vis, "nh": nh.map(|n| hex(&n)), "q": {"ok": q.ok, "fail": q.fail, "rtt": rtt, "pc": pc, "age": age}})
@@ -7024,7 +6888,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
     let ctx = Arc::new(ClientCtx { node: node.clone(), sh: sh.clone(), ep: ep.clone(), identity, ip: client_addr, servers: Mutex::new(servers.clone()), tun,
         auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), cur: Mutex::new(None), last_pong: Default::default(), contact_window_ms: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
         state: a.state.clone(), status: Mutex::new("подключаюсь".into()), dialers: Mutex::new(HashMap::new()),
-        carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), hints: Mutex::new(HashMap::new()), platforms: Mutex::new(HashMap::new()), books: Mutex::new(HashMap::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
+        carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), books: Mutex::new(HashMap::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
         c13, path_gate: path::PathGate::default(), nbrs: Mutex::new(HashMap::new()), admitted_exits: Mutex::new(HashMap::new()), ctrl: Mutex::new(HashMap::new()), lk_fail: Mutex::new(HashMap::new()), vis: Mutex::new(HashMap::new()), qstat: Mutex::new(HashMap::new()),
          rcfg: std::sync::RwLock::new(Arc::new(route::Cfg::default())), rreport: Mutex::new(serde_json::Value::Null), rpending: Mutex::new(HashSet::new()), rback: Mutex::new(HashMap::new()) });
     let _enrollment_service = ctx.c13.as_ref().map(|c| enroll_net::register(node.clone(), ctx.identity.clone(), c.trust.clone(), &a.state, Some(Arc::downgrade(&ctx))));
@@ -7208,7 +7072,7 @@ async fn pair_client(ctx: &Arc<ClientCtx>) -> Result<()> {
     let service = enroll_net::find(&ctx.state).context("enrollment runtime")?;
     *ctx.status.lock().unwrap() = "Связываюсь с нодами приглашения".into();
     let hints = enroll_net::join(&service, &inv).await?;
-    for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.hint_name(e.dest, &e.name); }
+    for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.set_name(e.dest, &e.name); }
     *c.invite.lock().unwrap() = None;
     ctx.refresh_servers13(); start_dialers(ctx); Ok(())
 }
@@ -7295,7 +7159,7 @@ async fn client_enroll_refresh(ctx: Arc<ClientCtx>) {
         let summary = format!("Расписок нод: {received} из {expected}");
         match res {
             Ok(Some(hints)) => {
-                for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.hint_name(e.dest, &e.name); }
+                for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.set_name(e.dest, &e.name); }
                 if after > before { ctx.sh.note(format!("зачисление: дополучены расписки, {received} из {expected}")); }
                 ctx.refresh_servers13(); start_dialers(&ctx);
                 if manual { report(format!("{summary} (новых {}). {}", after.saturating_sub(before), if received < expected { "Остальные подтверждения ещё не доставлены" } else { "Все подтверждения получены" })); }
@@ -7327,15 +7191,9 @@ fn on_nbrs_client(ctx: &ClientCtx, link: LinkId, body: &[u8]) {
             let dest = dest32(d)?;
             if !known.contains(&dest) { return None; }
             if let Some(n) = x["n"].as_str() {
-                ctx.hint_name(dest, n);
+                ctx.set_name(dest, n);
             }
-            if let Some(pl) = x["pl"].as_str().and_then(|p| parse_platform(p.as_bytes())) {
-                let mut m = ctx.platforms.lock().unwrap();
-                if m.len() < 64 || m.contains_key(&dest) {
-                    m.insert(dest, pl);
-                }
-            }
-            // клиент выхода с правами узла (телефон-админ): только имя и тип, не ребро соседства
+            // клиент выхода с правами узла (телефон-админ): только имя, не ребро соседства
             if x["c"].as_u64() == Some(1) { return None; }
             Some((dest, x["r"].as_f64().filter(|r| *r >= 0.0)))
         }).collect()
@@ -7542,15 +7400,7 @@ fn on_dir_client(ctx: &Arc<ClientCtx>, sender: trust::Pk, dir: &[serde_json::Val
         }
         accepted += 1;
         ctx.remember_addrs(&e.dest, &e.addrs);
-        ctx.hint_name(e.dest, &e.name);
-        if let Some(pl) = e.pl.as_deref() {
-            if let Some(pl) = parse_platform(pl.as_bytes()) {
-                let mut m = ctx.platforms.lock().unwrap();
-                if m.len() < 64 || m.contains_key(&e.dest) {
-                    m.insert(e.dest, pl);
-                }
-            }
-        }
+        ctx.set_name(e.dest, &e.name);
         // F-05: известный выход не перенацеливаем - endpoint уже задан и идентифицирует носитель; адреса каталога - подсказка, только если их нет
         let set_book = {
             let mut servers = ctx.servers.lock().unwrap();
@@ -7613,7 +7463,7 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                 let v: serde_json::Value = serde_json::from_slice(announce.app_data()).unwrap_or_default();
                 let dest = *announce.destination_hash().as_bytes();
                 let addrs: Vec<String> = v["a"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).take(3).collect()).unwrap_or_default();
-                let name: Option<String> = v["n"].as_str().and_then(|n| norm_peer_name(n, ""));
+                let name: Option<String> = v["n"].as_str().and_then(norm_name);
                 let known = {
                     let mut s = ctx.servers.lock().unwrap();
                     match s.iter_mut().find(|e| e.dest == dest) {
@@ -7972,13 +7822,7 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
             let _ = ctx.node.engine().close_link(&id).await;
             bail!("{} не имеет права EXIT в общей с нами сети", cand.name);
         }
-        ctx.learn_name(cand.dest, reply["name"].as_str().unwrap_or(""), reply["cc"].as_str().unwrap_or(""));
-        if let Some(pl) = reply["pl"].as_str().and_then(|p| parse_platform(p.as_bytes())) {
-            let mut m = ctx.platforms.lock().unwrap();
-            if m.len() < 64 || m.contains_key(&cand.dest) {
-                m.insert(cand.dest, pl);
-            }
-        }
+        ctx.set_name(cand.dest, reply["name"].as_str().unwrap_or(""));
         {
             let mut admitted = ctx.admitted_exits.lock().unwrap();
             if admitted.len() < 32 { admitted.insert(id, cand.dest); }

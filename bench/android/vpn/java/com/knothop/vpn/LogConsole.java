@@ -116,7 +116,7 @@ final class LogConsole extends LinearLayout {
     void setLines(String[] src) {
         lines.clear();
         for (int i = Math.max(0, src.length - KEEP); i < src.length; i++) {
-            String ln = TopologyView.prettify(src[i]);
+            String ln = src[i];
             if (ln.length() > 240) ln = ln.substring(0, 240);
             lines.add(ln);
         }

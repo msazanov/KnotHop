@@ -1,7 +1,6 @@
 package com.knothop.vpn;
 
 import android.content.Context;
-import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.DashPathEffect;
 import android.graphics.Paint;
@@ -35,12 +34,11 @@ final class TopologyView extends View {
     interface OnLongPick { void pick(String dest, String name); }
 
     static final class Node {
-        String name = "?", dest = "", state = "seen", cc = "XX", carrier = "none";
+        String name = "?", dest = "", state = "seen", carrier = "none";
         boolean visible, isVia;
         int hops = -1;
         double rtt = -1;
         String lk = "none", why = "";   // состояние RNS Link к узлу: up | fail | none; причина последнего отказа
-        String pl = "";                // тип узла из T_AUTH_OK: server/<ОС>, app/<ОС>; "" - ещё не подключались
         String presence = "unknown";   // alive | reported | unknown; absence of reports is not death
         String rules = "", extraVia = "";
         boolean extraLink, extraFlow, extraPathKnown;
@@ -191,9 +189,7 @@ final class TopologyView extends View {
                 n.vis = e.isNull("vis") ? "" : e.optString("vis", "");   // старая нативная часть поля не пишет: ""
                 n.nh = e.isNull("nh") ? "" : e.optString("nh", "");
                 n.presence = e.optString("presence", "unknown");
-                n.pl = e.isNull("pl") ? "" : e.optString("pl", "");
                 n.ra = e.optInt("ra", 0);
-                n.cc = countryOf(n.name);
                 n.isVia = !viaDest.isEmpty() && viaDest.equals(n.dest);
                 for (int j = 0; extras != null && j < extras.length(); j++) {
                     JSONObject extra = extras.optJSONObject(j);
@@ -267,31 +263,8 @@ final class TopologyView extends View {
         return w.length() > 40 ? w.substring(0, 40) + "…" : w;
     }
 
-    /** Код страны из имени `knothop-XX-что-угодно`; иначе XX. */
-    static String countryOf(String name) {
-        String[] a = name.split("-");
-        if (a.length >= 2 && a[1].length() == 2 && Character.isLetter(a[1].charAt(0))) return a[1].toUpperCase();
-        return "XX";
-    }
-
-    private static final java.util.regex.Pattern RAW_NAME = java.util.regex.Pattern.compile("knothop-[A-Za-z]{2}-[^\\s,():;]+");
-
-    /** Строка статуса или журнала с именами узлов вида `knothop-XX-имя`: заменяем их на флаг и страну, как в списках. */
-    static String prettify(String text) {
-        java.util.regex.Matcher m = RAW_NAME.matcher(text);
-        StringBuffer b = new StringBuffer();
-        while (m.find()) m.appendReplacement(b, java.util.regex.Matcher.quoteReplacement(shortName(m.group())));
-        m.appendTail(b);
-        return b.toString();
-    }
-
+    /** Имя узла для списков и подписей: как есть (имя нормализует и раздаёт сам узел), не длиннее 18 знаков. */
     static String shortName(String name) {
-        String cc = countryOf(name);
-        String[] a = name.split("-", 3);
-        if (a.length == 3 && a[0].equals("knothop")) {
-            if (cc.equals("XX")) return plainName(a[2]);
-            return flagOf(cc) + " " + countryName(cc) + " " + (a[2].length() > 9 ? a[2].substring(0, 9) : a[2]);
-        }
         return plainName(name);
     }
 
@@ -427,27 +400,6 @@ final class TopologyView extends View {
 
     // ------------------------------------------------------------------ имя, флаг, цвет
 
-    /** Флаг страны эмодзи (региональные индикаторы); неизвестная страна - глобус. */
-    static String flagOf(String cc) {
-        if (cc == null || cc.length() != 2 || !Character.isLetter(cc.charAt(0)) || !Character.isLetter(cc.charAt(1)) || cc.equals("XX")) return "\uD83C\uDF10";
-        StringBuilder b = new StringBuilder();
-        for (char ch : cc.toUpperCase().toCharArray()) b.appendCodePoint(0x1F1E6 + (ch - 'A'));
-        return b.toString();
-    }
-
-    /** Название страны на языке телефона; без кода страны - «?». */
-    static String countryName(String cc) {
-        if (cc == null || cc.equals("XX")) return "?";
-        String n = new java.util.Locale("", cc).getDisplayCountry();
-        return n == null || n.isEmpty() || n.equalsIgnoreCase(cc) ? cc : n;
-    }
-
-    /** Часть имени после `knothop-XX-` (то, что узел назвал сам); у прочих имён - всё имя. */
-    static String suffixOf(String name) {
-        String[] a = name.split("-", 3);
-        return a.length == 3 && a[0].equals("knothop") ? a[2] : name;
-    }
-
     /** Эмодзи в начале строки (одна графема: флаг, символ с модификатором); иначе "". */
     static String leadingEmoji(String s) {
         if (s == null || s.isEmpty()) return "";
@@ -469,11 +421,14 @@ final class TopologyView extends View {
         return s.substring(0, end);
     }
 
-    /** Надпись в кружке: эмодзи в начале имени узла, иначе код страны (имя хоста по умолчанию ничего не говорит). */
-    static String badgeOf(String name, String cc) {
-        String e = leadingEmoji(suffixOf(name).trim());
+    /** Надпись в кружке: эмодзи в начале имени узла (одна графема), иначе первые два знака имени. */
+    static String badgeOf(String name) {
+        String s = name == null ? "" : name.trim();
+        String e = leadingEmoji(s);
         if (!e.isEmpty()) return e;
-        return cc == null || cc.equals("XX") ? "?" : cc;
+        if (s.isEmpty()) return "?";
+        int end = s.offsetByCodePoints(0, Math.min(2, s.codePointCount(0, s.length())));
+        return s.substring(0, end);
     }
 
     /** Устойчивый цвет узла из его dest (или имени): оттенок из хеша, два уровня яркости, чтобы соседние оттенки различались. */
@@ -486,100 +441,37 @@ final class TopologyView extends View {
         return android.graphics.Color.HSVToColor(new float[]{hue, light ? 0.50f : 0.70f, light ? 0.92f : 0.68f});
     }
 
-    private final Map<String, Bitmap> flagBmp = new HashMap<>();
-
-    /** Эмодзи флага, обрезанный по видимым пикселям (шрифт даёт вокруг пустые поля); null - шрифт флага не нарисовал. */
-    private Bitmap flagBitmap(String cc) {
-        if (flagBmp.containsKey(cc)) return flagBmp.get(cc);
-        Bitmap res = null;
-        try {
-            String f = flagOf(cc);
-            Paint q = new Paint(Paint.ANTI_ALIAS_FLAG);
-            q.setTextSize(160);
-            Bitmap full = Bitmap.createBitmap(320, 260, Bitmap.Config.ARGB_8888);
-            new Canvas(full).drawText(f, 20, 180, q);
-            int w = full.getWidth(), h = full.getHeight();
-            int[] px = new int[w * h];
-            full.getPixels(px, 0, w, 0, 0, w, h);
-            int x0 = w, y0 = h, x1 = -1, y1 = -1;
-            for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++)
-                    if ((px[y * w + x] >>> 24) > 40) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
-            if (x1 > x0 && y1 > y0) res = Bitmap.createBitmap(full, x0, y0, x1 - x0 + 1, y1 - y0 + 1);
-        } catch (RuntimeException e) { /* без флага: рисуем код страны */ }
-        flagBmp.put(cc, res);
-        return res;
-    }
-
-    /** Кружок узла: эмодзи флага страны растянут на весь круг, кольцо - цвет из хеша узла (различает узлы одной страны). Своё эмодзи в имени - на цветной заливке. */
+    /** Кружок узла: заливка цветом из хеша узла, внутри эмодзи из начала имени либо первые два знака имени. */
     private void drawBadge(Canvas c, Node n, float cx, float cy, float r, boolean dim) {
         int col = colorOf(n.dest.isEmpty() ? n.name : n.dest);
-        String own = leadingEmoji(suffixOf(n.name).trim());
-        Bitmap fb = own.isEmpty() && !n.cc.equals("XX") ? flagBitmap(n.cc) : null;
         p.setStyle(Paint.Style.FILL);
-        if (fb != null) {
-            Path clip = new Path();
-            clip.addCircle(cx, cy, r, Path.Direction.CW);
-            c.save();
-            c.clipPath(clip);
-            Paint bp = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
-            c.drawBitmap(fb, null, new RectF(cx - r, cy - r, cx + r, cy + r), bp);
-            c.restore();
-            p.setStyle(Paint.Style.STROKE);
-            p.setStrokeWidth(4 * d);
-            p.setColor(col);
-            c.drawCircle(cx, cy, r - 2 * d, p);
-            p.setStyle(Paint.Style.FILL);
-        } else {
-            p.setColor(col);
-            c.drawCircle(cx, cy, r, p);
-            String s = badgeOf(n.name, n.cc);
-            boolean emoji = !own.isEmpty();
-            // узел без страны, но с известным типом (телефон-админ, сервер без флага) - значок типа вместо «?»
-            if (!emoji && "?".equals(s) && !kindIcon(n.pl).isEmpty()) { s = kindIcon(n.pl); emoji = true; }
-            Paint b = new Paint(Paint.ANTI_ALIAS_FLAG);
-            b.setTextAlign(Paint.Align.CENTER);
-            b.setTextSize(r * (emoji ? 1.0f : 0.78f));
-            b.setFakeBoldText(!emoji);
-            b.setColor(0xFFFFFFFF);
-            if (!emoji) b.setShadowLayer(2 * d, 0, 0, 0x99000000);
-            Paint.FontMetrics m = b.getFontMetrics();
-            c.drawText(s, cx, cy - (m.ascent + m.descent) / 2f, b);
-        }
+        p.setColor(col);
+        c.drawCircle(cx, cy, r, p);
+        String s = badgeOf(n.name);
+        boolean emoji = !leadingEmoji(n.name.trim()).isEmpty();
+        Paint b = new Paint(Paint.ANTI_ALIAS_FLAG);
+        b.setTextAlign(Paint.Align.CENTER);
+        b.setTextSize(r * (emoji ? 1.0f : 0.78f));
+        b.setFakeBoldText(!emoji);
+        b.setColor(0xFFFFFFFF);
+        if (!emoji) b.setShadowLayer(2 * d, 0, 0, 0x99000000);
+        Paint.FontMetrics m = b.getFontMetrics();
+        c.drawText(s, cx, cy - (m.ascent + m.descent) / 2f, b);
         if (dim) {
             p.setColor(Ui.dark(getContext()) ? 0x99000000 : 0x99FFFFFF);
             c.drawCircle(cx, cy, r, p);
         }
     }
 
-    /** Значок типа узла (три типа): android и ios - телефон, server - сервер или приложение на компьютере; неизвестный - без значка. */
-    static String kindIcon(String pl) {
-        if (pl == null) return "";
-        switch (pl) {
-            case "android": case "ios": return "\uD83D\uDCF1";
-            case "server": return "\uD83D\uDDA5";
-            default: return "";
-        }
+    /** Подпись под кружком: имя узла. */
+    static String labelOf(Node n) {
+        return plainName(n.name);
     }
 
-    /** Подпись под кружком: флаг и название страны; если в стране несколько узлов - добавляем имя узла. */
-    static String labelOf(Node n, boolean twin) {
-        String l;
-        if (n.cc.equals("XX")) {
-            // страна неизвестна (телефон-админ, узел без страны): имя показываем как есть, без «🌐 ?»
-            l = plainName(n.name);
-        } else {
-            l = flagOf(n.cc) + " " + countryName(n.cc);
-            String suf = suffixOf(n.name);
-            if (twin) l = l + " " + (suf.length() > 9 ? suf.substring(0, 9) : suf);
-        }
-        String k = kindIcon(n.pl);
-        return k.isEmpty() ? l : l + " " + k;
-    }
-
-    /** Имя без страны: не обрезаем до 12 символов - там имя телефона с хешем. */
+    /** Имя не длиннее 18 знаков (по символам Unicode, эмодзи не рвём). */
     static String plainName(String name) {
-        return name.length() > 18 ? name.substring(0, 18) : name;
+        if (name.codePointCount(0, name.length()) <= 18) return name;
+        return name.substring(0, name.offsetByCodePoints(0, 18));
     }
 
     // ------------------------------------------------------------------ рисование
@@ -755,9 +647,7 @@ final class TopologyView extends View {
         h.setColor(Ui.dark(getContext()) ? 0xDD000000 : 0xDDFFFFFF);
         for (Node n : ns) {
             boolean isCur = "current".equals(n.state);
-            int same = 0;
-            for (Node o : ns) if (o.cc.equals(n.cc)) same++;
-            String l1 = labelOf(n, same > 1);
+            String l1 = labelOf(n);
             // Local reachability and neighbour observations are separate; neither missing data nor local failure means global death.
             String l2, l3 = null;
             if ("fail".equals(n.lk)) { l2 = "мой Link недоступен"; l3 = n.why; }

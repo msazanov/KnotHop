@@ -879,7 +879,7 @@ public class MainActivity extends Activity {
             try {
                 JSONObject cur = j.optJSONObject("current");
                 String pinned = j.optString("selected");
-                String st = TopologyView.prettify(j.optString("status"));
+                String st = j.optString("status");
                 logChange("статус", st);
                 if (doing == null && !st.isEmpty() && !st.startsWith("выход:")) doing = st;   // «подключаюсь к …», «выбранный выход недоступен …»
                 if (cur != null) {

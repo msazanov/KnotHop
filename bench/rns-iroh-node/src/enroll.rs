@@ -236,8 +236,17 @@ impl Store {
         for r in tr.chain_for(&received.admin){if r.root==received.grant.root&&!own.chain.contains(&r){own.chain.push(r)}}
         own.chain.retain(|r|r.root==received.grant.root);
         own.rec=EnRec::create(node,&received.grant,received.rec.holder,received.rec.rights,received.rec.consent,now)?;
-        Ok(Some(self.claim(&own)?))
+        let own=self.claim(&own)?;
+        // Закрытие пришло от ноды, которой пользователь уже подтвердил получение расписки: дальше его не ждём.
+        self.confirm(&own.grant.id,own.grant.expires)?;
+        Ok(Some(own))
     }
+    /// Подтверждение пользователя: он получил и сохранил расписку этой ноды. До него `.spent` лишь бронь для того же держателя,
+    /// и закрытие у остальных нод не рассылается. Файл хранит срок приглашения для уборки.
+    pub fn confirm(&self,id:&Hash,expires:u64)->Result<()> {
+        let p=self.path(id,"ok");if p.exists(){return Ok(())}write(&p,expires.to_string().as_bytes())
+    }
+    pub fn confirmed(&self,id:&Hash)->bool{self.path(id,"ok").exists()}
     pub fn receipts(&self,id:&Hash)->Result<Vec<Receipt>>{let p=self.path(id,"closes");if !p.exists(){return Ok(vec![])}let r:Vec<Receipt>=read(&p)?;if r.len()>8{bail!("receipt quota")};Ok(r)}
     pub fn receipt(&self,id:&Hash,r:Receipt)->Result<()> {
         let proof=Proof::parse(&raw(&r.proof)?)?;let mut all=self.receipts(id)?;
@@ -257,6 +266,7 @@ impl Store {
                 "tmp"=>f.metadata().and_then(|m|m.modified()).ok().and_then(|t|t.elapsed().ok()).is_some_and(|d|d>std::time::Duration::from_secs(600)),
                 "json"=>expired(read::<Open>(&p).ok().and_then(|o|Grant::parse(&raw(&o.grant).ok()?).ok())),
                 "spent"=>expired(read::<Spent>(&p).ok().and_then(|s|Proof::parse(&raw(&s.proof).ok()?).ok()).map(|p|p.grant)),
+                "ok"=>std::fs::read_to_string(&p).ok().and_then(|t|t.trim().parse::<u64>().ok()).is_some_and(|e|now>e.saturating_add(GC_MARGIN)),
                 "closes"=>expired(read::<Vec<Receipt>>(&p).ok().and_then(|r|Proof::parse(&raw(&r.first()?.proof).ok()?).ok()).map(|p|p.grant)),
                 _=>false};
             if dead&&std::fs::remove_file(&p).is_ok(){n+=1}
@@ -345,5 +355,15 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test] fn concurrent_claim_has_one_winner(){let(_,node,_,_,p,_)=fixture();let dir=std::env::temp_dir().join(format!("kh-enroll-race-{}",hex(node.hash())));Store::new(&dir).unwrap();let barrier=std::sync::Arc::new(std::sync::Barrier::new(8));let mut workers=vec![];for _ in 0..8{let(dir,b,mut p)=(dir.clone(),barrier.clone(),p.clone());p.rec.holder=id().public_key_bytes();workers.push(std::thread::spawn(move||{b.wait();Store::new(&dir).unwrap().claim(&p).unwrap().wire()}));}let wins=workers.into_iter().map(|w|w.join().unwrap()).collect::<Vec<_>>();assert!(wins.iter().all(|w|w==&wins[0]));std::fs::remove_dir_all(dir).unwrap();}
+    /// `.spent` без `.ok` - бронь; закрытие от другой ноды подтверждение даёт сразу; `.ok` убирается вместе с остальным после срока.
+    #[test] fn confirmation_marks_reservation_and_is_collected_with_it(){
+        let(_,node,_,tr,p,inv)=fixture();let dir=std::env::temp_dir().join(format!("kh-enroll-ok-{}",hex(node.hash())));let store=Store::new(&dir).unwrap();
+        let mut receiver=Trust::new(node.clone(),None);receiver.add_anchor(&p.root).unwrap();for r in tr.export_all(){receiver.offer(r);}
+        store.issue(&receiver,&p.grant,&inv.pin,&p.admin,&p.chain,p.grant.issued).unwrap();store.claim(&p).unwrap();
+        assert!(!store.confirmed(&p.grant.id));assert_eq!(store.recover().unwrap().len(),1,"reservation is still recoverable for the holder");
+        store.confirm(&p.grant.id,p.grant.expires).unwrap();store.confirm(&p.grant.id,p.grant.expires).unwrap();assert!(store.confirmed(&p.grant.id));
+        assert_eq!(store.gc(p.grant.expires+GC_MARGIN),0);assert_eq!(store.gc(p.grant.expires+GC_MARGIN+1),3,"json, spent and ok");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test] fn evidence_survives_restart_and_revoke(){let(root,node,holder,_,p,_)=fixture();let dir=std::env::temp_dir().join(format!("kh-enroll-save-{}",hex(node.hash())));std::fs::create_dir_all(&dir).unwrap();let mut t=Trust::new(root.clone(),Some(dir.join("trust.json")));t.offer_enrollment(p).unwrap();t.save().unwrap();let mut restored=Trust::load(root.clone(),&dir).unwrap();assert_eq!(restored.rights_at(root.hash(),holder.hash(),node.hash()),trust::USE);restored.issue(*root.hash(),holder.public_key_bytes(),0).unwrap();restored.save().unwrap();let reloaded=Trust::load(root.clone(),&dir).unwrap();assert_eq!(reloaded.rights_at(root.hash(),holder.hash(),node.hash()),0);std::fs::remove_dir_all(dir).unwrap();}
 }

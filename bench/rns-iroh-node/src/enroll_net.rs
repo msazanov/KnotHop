@@ -96,6 +96,18 @@ pub fn session_live(state:&Path,link:&LinkId)->bool{
     find(state).is_some_and(|s|s.sessions.lock().unwrap().get(link).is_some_and(|x|x.until>Instant::now()))
 }
 
+/// Ответ должен помещаться в `MAX_WIRE`: восемь расписок (около 2,9 КиБ каждая) его превышают, и такой ответ терялся.
+/// Своя расписка идёт первой, остальные - сколько влезает, начиная с `start`, чтобы повторные опросы приносили разные.
+const REPLY_BUDGET:usize=enroll::MAX_WIRE-2048;
+fn fit_receipts(own:Receipt,others:Vec<Receipt>,start:usize)->Vec<Receipt>{
+    let mut size=serde_json::to_vec(&own).map(|b|b.len()).unwrap_or(0);let mut out=vec![own];let n=others.len();
+    for i in 0..n{
+        let r=&others[(start+i)%n];let l=serde_json::to_vec(r).map(|b|b.len()+1).unwrap_or(usize::MAX);
+        if size.saturating_add(l)>REPLY_BUDGET{continue}
+        size+=l;out.push(r.clone());
+    }
+    out
+}
 /// One msgpack bin value, including exact-length validation. Bodies never exceed 16 KiB.
 fn pack(b:&[u8])->Result<Vec<u8>>{if b.len()>enroll::MAX_WIRE{bail!("enrollment message too large")};let mut out=vec![0xc6];out.extend((b.len() as u32).to_be_bytes());out.extend(b);Ok(out)}
 fn unpack(b:&[u8])->Result<&[u8]>{if b.len()<5||b[0]!=0xc6{bail!("enrollment msgpack")};let n=u32::from_be_bytes(b[1..5].try_into()?)as usize;if n>enroll::MAX_WIRE||n+5!=b.len(){bail!("enrollment length")};Ok(&b[5..])}
@@ -131,7 +143,12 @@ pub fn dispatch(state:&Path,link:LinkId,request_id:[u8;16],data:Vec<u8>){
         let started=Instant::now();
         let response=service.handle(link,peer,&body).await.unwrap_or_else(|e|{trace(&service.state,&format!("зачисление: запрос {} не выполнен: {e:#}",body[0]));serde_json::json!({"status":"unknown"})});
         if body[0]==3{trace(&service.state,&format!("зачисление: опрос расписок обработан за {} мс, статус {}",started.elapsed().as_millis(),response["status"]))}
-        let Ok(raw)=serde_json::to_vec(&response).and_then(|b|pack(&b).map_err(serde::ser::Error::custom))else{return};
+        // Ответ, который не упаковался, раньше терялся молча (клиент ждал таймаут): теперь пишем в журнал и отвечаем коротко.
+        let raw=match serde_json::to_vec(&response).map_err(anyhow::Error::from).and_then(|b|pack(&b)){
+            Ok(raw)=>raw,
+            Err(e)=>{trace(&service.state,&format!("зачисление: ответ на запрос {} не упакован: {e:#}",body[0]));
+                match pack(br#"{"status":"unknown"}"#){Ok(raw)=>raw,Err(_)=>return}}
+        };
         if service.node.send_response(&link,&request_id,&raw).await.is_err(){let _=service.node.send_response_resource(&link,&request_id,&raw).await;}
     });
 }
@@ -176,8 +193,10 @@ impl Service {
     }
     fn recover_closes(&self,cursor:&mut usize){
         self.deliver_issues();
-        let proofs=match Store::new(&self.state).and_then(|s|s.recover()){
-            Ok(v)=>v.into_iter().filter(|p|p.rec.node==self.identity.public_key_bytes()).collect::<Vec<_>>(),
+        // Без подтверждения пользователя закрытие не рассылается: бронь остаётся только на этой ноде.
+        let store=match Store::new(&self.state){Ok(s)=>s,Err(_)=>return};
+        let proofs=match store.recover(){
+            Ok(v)=>v.into_iter().filter(|p|p.rec.node==self.identity.public_key_bytes()&&store.confirmed(&p.grant.id)).collect::<Vec<_>>(),
             Err(_)=>return,
         };
         if proofs.is_empty(){return}
@@ -263,8 +282,15 @@ impl Service {
                     store.claim(&p)?};
                 if p.rec.holder!=peer{return Ok(self.unknown(link,peer).await)}
                 self.ban.lock().unwrap().success(); // k сбрасывает только успешная выдача, не LOOKUP (иначе валидный pin обнуляет бан перебора)
-                self.publish(&p)?;let response=self.nodes_reply(&p,false)?;
-                let _=self.announce_close(&p);Ok(response)
+                // Бронь для этого держателя; остальным нодам закрытие рассылается только после его подтверждения (операция 5 или "proof" по LXMF).
+                self.publish(&p)?;self.nodes_reply(&p,false)
+            }
+            5=>{
+                if body.len()!=17{bail!("confirm length")}
+                let id:Hash=body[1..].try_into()?;
+                let p=Store::new(&self.state)?.spent(&id)?.context("unknown")?;
+                if p.rec.holder!=peer||p.rec.node!=self.identity.public_key_bytes(){return Ok(self.unknown(link,peer).await)}
+                self.confirm_close(&p)?;Ok(serde_json::json!({"status":"confirmed"}))
             }
             3=>{
                 if body.len()!=17{bail!("nodes length")};let id=body[1..].try_into()?;
@@ -275,9 +301,18 @@ impl Service {
             _=>bail!("unknown enrollment request"),
         }
     }
+    /// Пользователь подтвердил получение расписки этой ноды: помечаем и только теперь рассылаем закрытие остальным нодам.
+    fn confirm_close(&self,p:&Proof)->Result<()> {
+        {let _io=self.io.lock().unwrap();Store::new(&self.state)?.confirm(&p.grant.id,p.grant.expires)?;}
+        // Очередь LXMF может быть занята: `recover_closes` повторит рассылку для подтверждённых бронирований.
+        let _=self.announce_close(p);Ok(())
+    }
     fn nodes_reply(&self,p:&Proof,repeat:bool)->Result<serde_json::Value>{
-        let store=Store::new(&self.state)?;let mut receipts=store.receipts(&p.grant.id)?;
-        if !receipts.iter().any(|r|r.proof==enroll::hex(&p.wire())){receipts.push(self.base(p)?)}
+        let store=Store::new(&self.state)?;let all=store.receipts(&p.grant.id)?;let mine=enroll::hex(&p.wire());
+        let own=match all.iter().find(|r|r.proof==mine){Some(r)=>r.clone(),None=>self.base(p)?};
+        let others=all.into_iter().filter(|r|r.proof!=mine).collect::<Vec<_>>();
+        let start=(now_ms()as usize/1000)%(others.len()+1);
+        let receipts=fit_receipts(own,others,start);
         Ok(serde_json::json!({"status":if repeat{"nodes"}else{"result"},"complete":receipts.len()==p.grant.nodes.len(),"receipts":receipts}))
     }
 
@@ -405,7 +440,14 @@ impl Service{
                 if mine.rec.holder!=p.rec.holder||mine.rec.rights!=p.rec.rights||mine.grant!=p.grant{bail!("closed holder/grant")}
                 self.trust.lock().unwrap().offer_enrollment(p.clone())?;self.trust.lock().unwrap().save()?;store.receipt(&p.grant.id,receipt)?;
             }
-            "proof"=>{if p.rec.holder!=pk{bail!("proof holder")};self.trust.lock().unwrap().offer_enrollment(p)?;self.trust.lock().unwrap().save()?;}
+            "proof"=>{
+                if p.rec.holder!=pk{bail!("proof holder")}
+                {let mut tr=self.trust.lock().unwrap();tr.offer_enrollment(p.clone())?;tr.save()?;}
+                // Держатель прислал расписку этой ноды: значит, он её получил и сохранил. Это подтверждение пользователя, в том числе через propagation node.
+                if p.rec.node==self.identity.public_key_bytes(){
+                    if let Some(own)=Store::new(&self.state)?.spent(&p.grant.id)?{if own.rec==p.rec{self.confirm_close(&own)?;}}
+                }
+            }
             _=>bail!("enrollment operation"),
         }
         lxmf_sync::acknowledge(&self.state,message,pk);Ok(())
@@ -459,7 +501,10 @@ async fn join_one(s:&Arc<Service>,invite:&Invite,h:Hash,allow_consent:bool)->Res
 async fn join_link(s:&Arc<Service>,invite:&Invite,h:Hash,link:LinkId,allow_consent:bool)->Result<Vec<serde_json::Value>>{
     let client_nonce=rand16();let mut body=vec![1];body.extend(invite.pin);body.extend(client_nonce);
     let offer=rpc(&s.node,link,&body,70_000).await?;
-    if offer["status"]=="nodes" {return repeat_nodes(&s.trust,&s.identity,&s.state,invite,h,&offer)}
+    if offer["status"]=="nodes" {
+        let hints=repeat_nodes(&s.trust,&s.identity,&s.state,invite,h,&offer)?;
+        confirm_receipt(s,link,enroll::invite_id(&invite.pin),h).await;return Ok(hints)
+    }
     if offer["status"]=="busy"{bail!("Нода занята, повторите позже")}
     if offer["status"]!="offer"{return Err(anyhow::Error::new(Refused))}
     let root:Pk=enroll::raw(offer["root"].as_str().context("offer root")?)?.try_into().map_err(|_|anyhow::anyhow!("root"))?;
@@ -480,7 +525,8 @@ async fn join_link(s:&Arc<Service>,invite:&Invite,h:Hash,link:LinkId,allow_conse
         let nonce:[u8;16]=enroll::raw(offer["nonce"].as_str().context("offer nonce")?)?.try_into().map_err(|_|anyhow::anyhow!("nonce"))?;
         let mut redeem=vec![2];redeem.extend(prior.rec.rights.to_le_bytes());redeem.extend(prior.rec.consent);redeem.extend(nonce);
         let result=rpc(&s.node,link,&redeem,25_000).await?;
-        return apply_result(s,invite,h,&result,Some(&hex(&g.digest())))
+        let hints=apply_result(s,invite,h,&result,Some(&hex(&g.digest())))?;
+        confirm_receipt(s,link,g.id,h).await;return Ok(hints)
     }
     if !allow_consent{bail!("Нода предложила другое разрешение; фоновое согласие запрещено")}
     let request=hex(&g.digest());let nonce:[u8;16]=enroll::raw(offer["nonce"].as_str().context("offer nonce")?)?.try_into().map_err(|_|anyhow::anyhow!("nonce"))?;
@@ -504,7 +550,16 @@ async fn join_link(s:&Arc<Service>,invite:&Invite,h:Hash,link:LinkId,allow_conse
     enroll::write(&consent_marker(&s.state),&serde_json::to_vec(&serde_json::json!({"id":hex(&g.id),"digest":request}))?)?;
     let consent=EnRec::consent(&s.identity,&g,g.cap)?;let mut redeem=vec![2];redeem.extend(g.cap.to_le_bytes());redeem.extend(consent);redeem.extend(nonce);
     let result=rpc(&s.node,link,&redeem,25_000).await?;
-    apply_result(s,invite,h,&result,Some(&request))
+    let hints=apply_result(s,invite,h,&result,Some(&request))?;
+    confirm_receipt(s,link,g.id,h).await;Ok(hints)
+}
+/// Подтверждение пользователя: расписка ноды проверена и сохранена. Нода закрывает приглашение у остальных нод только после него.
+/// Прямой запрос может потеряться; тогда то же подтверждение дойдёт по LXMF (`send_proofs`, в том числе через propagation node).
+async fn confirm_receipt(s:&Arc<Service>,link:LinkId,id:Hash,h:Hash){
+    let mut req=vec![5];req.extend(id);
+    let _=rpc(&s.node,link,&req,15_000).await;
+    let dh=DestinationHash::new(*Destination::compute_destination_hash(&Destination::compute_name_hash("node",&["mesh"]),&h).as_bytes());
+    if let Some(i)=s.node.get_identity(&dh){s.send_proofs(i.public_key_bytes());}
 }
 fn apply_result(s:&Service,invite:&Invite,commissioner:Hash,result:&serde_json::Value,consent:Option<&str>)->Result<Vec<serde_json::Value>>{
     apply_to(&s.trust,&s.identity,&s.state,enroll::invite_id(&invite.pin),commissioner,result,consent,true)
@@ -729,6 +784,41 @@ mod tests {
         }else{None}).collect::<Vec<_>>();
         assert_eq!(resumed.len(),2);assert!(!resumed.contains(&nodes[0].public_key_bytes()));
         drop(restarted);drop(receiver);drop(admin);std::fs::remove_dir_all(state).unwrap();std::fs::remove_dir_all(node_state).unwrap();
+    }
+
+    /// Корень бага зачисления: ответ с 8 расписками (около 23 КиБ) превышал `MAX_WIRE` и терялся молча.
+    #[test]
+    fn nodes_reply_with_eight_receipts_fits_wire_limit_and_keeps_own_first(){
+        let r=|i:usize|Receipt{proof:format!("{i:02}{}","a".repeat(1400)),closed:"b".repeat(954),hints:vec![]};
+        let others=(1..8).map(r).collect::<Vec<_>>();
+        let full=serde_json::to_vec(&serde_json::json!({"receipts":std::iter::once(r(0)).chain(others.clone()).collect::<Vec<_>>()})).unwrap();
+        assert!(full.len()>enroll::MAX_WIRE,"the premise: the whole set does not fit ({} B)",full.len());
+        let mut seen=HashSet::new();
+        for start in 0..others.len(){
+            let fit=fit_receipts(r(0),others.clone(),start);
+            assert_eq!(fit[0].proof,r(0).proof,"own receipt is always first");
+            let bytes=serde_json::to_vec(&serde_json::json!({"status":"nodes","complete":false,"receipts":fit})).unwrap();
+            assert!(pack(&bytes).is_ok(),"reply of {} B must pack",bytes.len());
+            for x in fit.iter().skip(1){seen.insert(x.proof.clone());}
+        }
+        assert_eq!(seen.len(),7,"successive polls rotate through every receipt");
+    }
+
+    /// Закрытие приглашения рассылается другим нодам только после подтверждения пользователя.
+    #[tokio::test]
+    async fn close_is_announced_only_after_user_confirmation(){
+        let(root,nodes,_,root_tr,_,proofs)=multi_fixture();let state=tmp_state("confirm-gate",&nodes[0]);
+        let mut tr=Trust::new(nodes[0].clone(),None);tr.add_anchor(&root.public_key_bytes()).unwrap();for rec in root_tr.export_all(){tr.offer(rec);}
+        let node=Arc::new(NodeBuilder::new().identity(nodes[0].clone()).build().unwrap());
+        let svc=register(node,nodes[0].clone(),Arc::new(Mutex::new(tr)),&state,None);
+        let(tx,rx)=std::sync::mpsc::sync_channel(32);let _guard=lxmf_sync::register(&state,tx);
+        let closes=||rx.try_iter().filter_map(|c|if let lxmf_sync::Command::Send(m)=c{serde_json::from_slice::<Envelope>(&m.content).ok().filter(|e|e.op=="close").map(|_|m.pk)}else{None}).count();
+        let store=Store::new(&state).unwrap();store.claim(&proofs[0]).unwrap();
+        svc.recover_closes(&mut 0);assert_eq!(closes(),0,"reserved but unconfirmed: nothing leaves the node");
+        assert!(!store.confirmed(&proofs[0].grant.id));
+        svc.confirm_close(&proofs[0]).unwrap();assert!(store.confirmed(&proofs[0].grant.id));
+        assert_eq!(closes(),2,"after confirmation the other two nodes are told");
+        std::fs::remove_dir_all(state).unwrap();
     }
 
     #[test]
