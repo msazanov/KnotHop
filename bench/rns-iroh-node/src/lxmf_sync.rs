@@ -222,6 +222,49 @@ impl<A: leviculum_std::api::CoreProcessor, B: leviculum_std::api::CoreProcessor>
 pub const PN_CAP_BYTES: u64 = 2 * 1024 * 1024;
 /// Сколько файлов вообще имеет смысл открывать: потолок / минимально реальная запись (≈256 Б). Остальное удаляется по имени, без чтения.
 pub const PN_MAX_FILES: usize = 8192;
+/// Верхняя граница автоподбора: 100 МиБ ≈ 6 суток трафика зачислений; больше публичному буферу не нужно.
+pub const PN_CAP_AUTO_MAX: u64 = 100 * 1024 * 1024;
+/// Файлов при большом потолке: фоновая загрузка читает каждый файл (на вращающемся диске ≈165 файлов/с),
+/// а трафик за срок хранения (48 ч) укладывается примерно в 40 тыс. записей.
+const PN_MAX_FILES_LARGE: usize = 65_536;
+static PN_CAP_OVERRIDE_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `pn_cap_mb` из node.json: 0/нет — автоподбор по свободному месту.
+pub fn set_pn_cap_mb(mb: Option<u64>) { PN_CAP_OVERRIDE_MB.store(mb.unwrap_or(0), std::sync::atomic::Ordering::Relaxed); }
+
+/// Потолок хранилища PN и число файлов, которое имеет смысл открывать.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PnLimits { pub cap_bytes: u64, pub max_files: usize }
+
+impl Default for PnLimits { fn default() -> Self { Self { cap_bytes: PN_CAP_BYTES, max_files: PN_MAX_FILES } } }
+
+impl PnLimits {
+    pub fn for_cap(cap_bytes: u64) -> Self {
+        Self { cap_bytes, max_files: ((cap_bytes / 256) as usize).clamp(PN_MAX_FILES, PN_MAX_FILES_LARGE) }
+    }
+    /// Явный `pn_cap_mb` (1…4096 МиБ), иначе 1% свободного места каталога состояния в пределах 2…100 МиБ:
+    /// узлам с малым диском достаётся малый буфер без отдельной настройки.
+    pub fn auto(state: &Path) -> Self {
+        let mb = PN_CAP_OVERRIDE_MB.load(std::sync::atomic::Ordering::Relaxed);
+        if mb > 0 { return Self::for_cap(mb.clamp(1, 4096) * 1024 * 1024); }
+        Self::for_cap(free_bytes(state).map_or(PN_CAP_BYTES, |free| (free / 100).clamp(PN_CAP_BYTES, PN_CAP_AUTO_MAX)))
+    }
+}
+
+/// Свободно для непривилегированного процесса в файловой системе `path` (или ближайшего существующего родителя).
+fn free_bytes(path: &Path) -> Option<u64> {
+    let mut probe = Some(path);
+    while let Some(p) = probe {
+        if let Ok(c) = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) {
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0 {
+                return Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64));
+            }
+        }
+        probe = p.parent();
+    }
+    None
+}
 const PN_LOADING: u8 = 1;
 const PN_READY: u8 = 2;
 const PN_FAILED: u8 = 3;
@@ -234,6 +277,7 @@ pub struct PnStatus {
     trimmed: std::sync::atomic::AtomicU64,
     files: std::sync::atomic::AtomicU64,
     bytes: std::sync::atomic::AtomicU64,
+    cap: std::sync::atomic::AtomicU64,
 }
 static PN_CURRENT: Mutex<Option<Arc<PnStatus>>> = Mutex::new(None);
 
@@ -241,11 +285,11 @@ static PN_CURRENT: Mutex<Option<Arc<PnStatus>>> = Mutex::new(None);
 pub fn pn_status() -> serde_json::Value {
     use std::sync::atomic::Ordering::Relaxed;
     let current = PN_CURRENT.lock().ok().and_then(|g| g.clone());
-    let Some(s) = current else { return serde_json::json!({"pn_state":"off","pn_ready":false,"pn_load_ms":0,"pn_trimmed":0,"pn_files":0,"pn_bytes":0}) };
+    let Some(s) = current else { return serde_json::json!({"pn_state":"off","pn_ready":false,"pn_load_ms":0,"pn_trimmed":0,"pn_files":0,"pn_bytes":0,"pn_cap_bytes":0}) };
     let state = s.state.load(Relaxed);
     serde_json::json!({"pn_state":match state { PN_LOADING=>"loading", PN_READY=>"ready", PN_FAILED=>"failed", _=>"off" },
         "pn_ready":state == PN_READY, "pn_load_ms":s.load_ms.load(Relaxed), "pn_trimmed":s.trimmed.load(Relaxed),
-        "pn_files":s.files.load(Relaxed), "pn_bytes":s.bytes.load(Relaxed)})
+        "pn_files":s.files.load(Relaxed), "pn_bytes":s.bytes.load(Relaxed), "pn_cap_bytes":s.cap.load(Relaxed)})
 }
 
 /// (received_at, sequence) из имени файла хранилища `<64hex>_<received_at>[_<stamp>[_<seq>]]`; чужие имена — `None`.
@@ -343,10 +387,10 @@ impl leviculum_std::api::CoreProcessor for PnProcessor {
 
 /// Штатный PN engine, а не ещё один протокол хранилища. Только серверы; постоянный store вне стираемого lev-role,
 /// `PN_CAP_BYTES`, bounded transfer/fetch. Возвращается сразу: хранилище открывается и подрезается в потоке `lxmf-pn-load`.
-pub fn propagation_processor(state: &Path, identity: Identity) -> anyhow::Result<PnProcessor> { spawn_pn(state, identity, None) }
+pub fn propagation_processor(state: &Path, identity: Identity) -> anyhow::Result<PnProcessor> { spawn_pn(state, identity, PnLimits::auto(state), None) }
 
 /// `hold` — тестовые ворота: фон не начинает загрузку, пока не придёт сигнал (или не закроется канал).
-fn spawn_pn(state: &Path, identity: Identity, hold: Option<mpsc::Receiver<()>>) -> anyhow::Result<PnProcessor> {
+fn spawn_pn(state: &Path, identity: Identity, limits: PnLimits, hold: Option<mpsc::Receiver<()>>) -> anyhow::Result<PnProcessor> {
     use lnpnd::engine::{Engine, EngineConfig};
     use leviculum_lxmf::{PropagationNodeConfig, peering::{PeeringConfig, MemoryPeerStore}};
     use leviculum_std::FilePropagationStore;
@@ -356,6 +400,7 @@ fn spawn_pn(state: &Path, identity: Identity, hold: Option<mpsc::Receiver<()>>) 
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     let status = Arc::new(PnStatus::default());
     status.state.store(PN_LOADING, Relaxed);
+    status.cap.store(limits.cap_bytes, Relaxed);
     if let Ok(mut current) = PN_CURRENT.lock() { *current = Some(status.clone()); }
     let (tx, rx) = mpsc::sync_channel(1);
     let st = status.clone();
@@ -363,12 +408,12 @@ fn spawn_pn(state: &Path, identity: Identity, hold: Option<mpsc::Receiver<()>>) 
         if let Some(hold) = hold { let _ = hold.recv(); }
         let t0 = std::time::Instant::now();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let mut trimmed = trim_by_name(&dir, now, crate::enroll::TTL, PN_MAX_FILES);
-        let mut store = match FilePropagationStore::open(&dir, PN_CAP_BYTES) {
+        let mut trimmed = trim_by_name(&dir, now, crate::enroll::TTL, limits.max_files);
+        let mut store = match FilePropagationStore::open(&dir, limits.cap_bytes) {
             Ok(store) => store,
             Err(_) => { st.state.store(PN_FAILED, Relaxed); return; }
         };
-        trimmed += fit(&mut store, PN_CAP_BYTES);
+        trimmed += fit(&mut store, limits.cap_bytes);
         let (mut files, mut bytes) = (0u64, 0u64);
         let _ = leviculum_lxmf::propagation_store::PropagationStore::for_each(&store, &mut |m| { files += 1; bytes += m.size as u64; });
         let (engine, events) = Engine::new(EngineConfig {
@@ -378,7 +423,7 @@ fn spawn_pn(state: &Path, identity: Identity, hold: Option<mpsc::Receiver<()>>) 
             announce_interval_secs:600, announce_delay_secs:if cfg!(test) {2} else {20}, announce_at_start:false,
             peering:PeeringConfig { max_peers:8, max_inbound_syncs:2, ..Default::default() },
             peer_store:Box::new(MemoryPeerStore::default()), control_allowed:vec![], auth_allowed:None,
-            mailbox:None, store_limit_bytes:PN_CAP_BYTES, delivery_limit_kb:8,
+            mailbox:None, store_limit_bytes:limits.cap_bytes, delivery_limit_kb:8,
         });
         st.trimmed.store(trimmed as u64, Relaxed);
         st.files.store(files, Relaxed);
@@ -412,6 +457,17 @@ mod tests {
     fn dir_totals(dir: &Path) -> (usize, u64) {
         std::fs::read_dir(dir).unwrap().flatten().filter(|e| name_key(&e.file_name().to_string_lossy()).is_some())
             .fold((0, 0), |(n, b), e| (n + 1, b + e.metadata().unwrap().len()))
+    }
+
+    #[test]
+    fn pn_limits_follow_free_space_and_override() {
+        // свободное место определяется; нет каталога — берётся ближайший существующий родитель
+        assert!(free_bytes(&std::env::temp_dir().join("kh-no-such/dir")).is_some());
+        let big = PnLimits::for_cap(PN_CAP_AUTO_MAX);
+        assert_eq!((big.cap_bytes, big.max_files), (PN_CAP_AUTO_MAX, PN_MAX_FILES_LARGE));
+        assert_eq!(PnLimits::for_cap(PN_CAP_BYTES), PnLimits::default());
+        let auto = PnLimits::auto(&std::env::temp_dir());
+        assert!(auto.cap_bytes >= PN_CAP_BYTES && auto.cap_bytes <= PN_CAP_AUTO_MAX);
     }
 
     #[test]
@@ -471,7 +527,7 @@ mod tests {
         prefill(&dir, 12_000, now_secs(), 0);
         let (gate_tx, gate_rx) = mpsc::channel();
         let t0 = Instant::now();
-        let mut pn = spawn_pn(&base, generate_identity(), Some(gate_rx)).unwrap();
+        let mut pn = spawn_pn(&base, generate_identity(), PnLimits::default(), Some(gate_rx)).unwrap();
         assert!(t0.elapsed() < Duration::from_secs(5), "конструктор ждал загрузки");
         assert!(!pn.poll_ready());
         let status = pn.status();
@@ -494,7 +550,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("kh-pn-fail-{}", now_secs() ^ std::process::id() as u64));
         let _ = std::fs::remove_dir_all(&base);
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
-        let mut pn = spawn_pn(&base, generate_identity(), Some(gate_rx)).unwrap();
+        let mut pn = spawn_pn(&base, generate_identity(), PnLimits::default(), Some(gate_rx)).unwrap();
         // каталог-файл вместо каталога: open() вернёт ошибку, узел при этом не падает
         std::fs::remove_dir_all(base.join("lxmf/propagation")).unwrap();
         std::fs::write(base.join("lxmf/propagation"), b"x").unwrap();

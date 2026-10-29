@@ -201,6 +201,8 @@ struct NodeConf {
     debug: Option<bool>,
     quic_cc_mbit: Option<u64>,
     workers: Option<usize>,
+    /// потолок хранилища PN, МиБ; нет — 1% свободного места в пределах 2…100
+    pn_cap_mb: Option<u64>,
     tun_name: Option<String>,
     client_net: Option<String>,
     /// модель 0013: приглашение kh- (одноразовое; после зачисления игнорируется)
@@ -2906,6 +2908,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         if c.debug.unwrap_or(false) || std::env::var("KNOTHOP_DEBUG").is_ok() { crate::set_debug(true); }
         a.quic_cc_mbit = c.quic_cc_mbit.unwrap_or(a.quic_cc_mbit);
         a.workers = c.workers.unwrap_or(a.workers);
+        lxmf_sync::set_pn_cap_mb(c.pn_cap_mb);
         a.tun_name = c.tun_name.unwrap_or(a.tun_name);
         a.client_net = c.client_net.unwrap_or(a.client_net);
         a.invite = c.invite.unwrap_or(a.invite.clone());

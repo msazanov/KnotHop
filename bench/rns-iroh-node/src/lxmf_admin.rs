@@ -4,7 +4,7 @@
 //! CoreProcessor tap. Application work and filesystem commits run on a bounded
 //! worker outside the core lock; replies return through a bounded channel.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -84,6 +84,15 @@ pub enum TransportEvent {
 
 /// Прямая доставка без ответа дольше этого срока дублируется через PN сети (офлайн-доставка).
 const PN_FALLBACK_SECS: u64 = if cfg!(test) { 3 } else { 30 };
+/// Копия на PN, которая не ушла из очереди роутера дольше этого срока, считается зависшей: PN не отвечает.
+const PN_COPY_STUCK_SECS: u64 = 180;
+/// Исход копии (ушла из очереди, события нет) выясняется не позже этого срока, иначе PN отмечается плохим.
+const PN_COPY_OUTCOME_SECS: u64 = 10;
+/// Выдержка плохого PN и интервал между копиями: 60, 120, 240, 480, 960, затем 1800 с.
+const PN_BACKOFF_BASE_SECS: u64 = if cfg!(test) { 1 } else { 60 };
+const PN_BACKOFF_MAX_SECS: u64 = if cfg!(test) { 16 } else { 1800 };
+/// Копий одного сообщения через PN (≈10 ч при расписании выше); дальше остаётся только прямая доставка до `exp`.
+const PN_MAX_COPIES: u8 = 32;
 /// Плановая выборка почты с PN: по расписанию анонса, без новых пробуждений телефона.
 const PN_FETCH_MS: u64 = 600_000;
 /// Узлы-серверы (постоянная связь, без батареи) забирают почту чаще: закрытие зачисления между нодами иначе ждёт до 10 минут.
@@ -185,6 +194,9 @@ pub struct AdminProcessor {
     pn_nodes: BTreeSet<DestinationHash>,
     pn_checked_ms: u64,
     pn_fetch_due: bool,
+    pn_health: PnHealth,
+    /// исходы копий на PN, собранные из событий роутера (`absorb`), разбираются в `sync_tick`
+    pn_outcomes: Vec<([u8; 32], leviculum_lxmf::router::MessageState)>,
     last_fetch_ms: u64,
     fetch_ms: u64,
     stamp_jobs: SyncSender<PropagationStampRequest>,
@@ -198,6 +210,51 @@ struct PendingSync {
     transport: Option<[u8;32]>,
     /// копия для офлайн-доставки через PN (только если нужен прикладной ACK)
     pn_copy: Option<[u8;32]>,
+    /// PN, которому отдана текущая копия, и время отдачи (с)
+    pn_node: Option<DestinationHash>,
+    pn_since: u64,
+    /// PN принял копию (`AwaitingCollection`); хранит ли он её до сих пор, отправитель узнать не может
+    pn_held: bool,
+    pn_copies: u8,
+    /// не раньше этого времени (с): новая копия или повтор принятой, но не подтверждённой адресатом
+    pn_retry_at: u64,
+}
+
+impl PendingSync {
+    fn new(request: super::lxmf_sync::Outbound) -> Self {
+        Self { request, last_try: None, first_try: None, transport: None, pn_copy: None, pn_node: None, pn_since: 0, pn_held: false, pn_copies: 0, pn_retry_at: 0 }
+    }
+}
+
+/// Отправитель не может спросить PN, хранит ли он письмо (в LXMF такого запроса для не-адресата нет), поэтому PN
+/// оценивается по исходу загрузки и по отсутствию прикладного ACK адресата: подозрительный PN откладывается с
+/// нарастающей выдержкой, копия уходит через другой PN.
+#[derive(Default)]
+struct PnHealth {
+    /// PN → (до какого времени избегать (с), число подряд неудач)
+    bad: BTreeMap<DestinationHash, (u64, u8)>,
+}
+
+impl PnHealth {
+    fn backoff(strikes: u8) -> u64 { (PN_BACKOFF_BASE_SECS << strikes.min(8)).min(PN_BACKOFF_MAX_SECS) }
+    fn strike(&mut self, pn: DestinationHash, now: u64) {
+        let entry = self.bad.entry(pn).or_insert((0, 0));
+        entry.0 = now + Self::backoff(entry.1);
+        entry.1 = entry.1.saturating_add(1);
+    }
+    fn forgive(&mut self, pn: &DestinationHash) { self.bad.remove(pn); }
+    fn is_bad(&self, pn: &DestinationHash, now: u64) -> bool { self.bad.get(pn).is_some_and(|(until, _)| *until > now) }
+    /// Выдержка истекла давно: счётчик неудач не копится вечно, таблица не растёт
+    fn prune(&mut self, now: u64, keep: &BTreeSet<DestinationHash>) {
+        self.bad.retain(|pn, (until, _)| keep.contains(pn) && until.saturating_add(PN_BACKOFF_MAX_SECS * 2) > now);
+    }
+    /// Пауза до следующей копии: 60, 120, 240 … с, по числу уже отданных копий
+    fn copy_wait(copies: u8) -> u64 { Self::backoff(copies.saturating_sub(1)) }
+    /// Лучший PN без выдержки: услышанный анонс, затем ближайший по хопам. Все в выдержке — тот, у кого она кончится раньше.
+    fn pick(&self, nodes: &BTreeSet<DestinationHash>, now: u64, rank: impl Fn(&DestinationHash) -> (bool, u8)) -> Option<DestinationHash> {
+        nodes.iter().filter(|n| !self.is_bad(n, now)).min_by_key(|n| (rank(n), **n)).copied()
+            .or_else(|| nodes.iter().min_by_key(|n| (self.bad.get(*n).map_or(0, |b| b.0), **n)).copied())
+    }
 }
 
 enum ResourceBuildResult { Ready(Box<BuiltResource>), Failed([u8;32]) }
@@ -261,6 +318,8 @@ impl AdminProcessor {
             pn_nodes: BTreeSet::new(),
             pn_checked_ms: 0,
             pn_fetch_due: false,
+            pn_health: PnHealth::default(),
+            pn_outcomes: Vec::new(),
             last_fetch_ms: 0,
             fetch_ms: PN_FETCH_MS,
             stamp_jobs: stamp_tx,
@@ -333,6 +392,10 @@ impl AdminProcessor {
                         if request.target_cost <= PN_MAX_STAMP_COST { let _ = self.stamp_jobs.try_send(request); }
                     }
                     RouterEvent::MessageState { message_id, state } => {
+                        use leviculum_lxmf::router::MessageState as S;
+                        if matches!(state, S::AwaitingCollection | S::Failed | S::Rejected | S::Cancelled) && self.pn_outcomes.len() < 64 {
+                            self.pn_outcomes.push((message_id, state));
+                        }
                         if let Some(tracked) = outbound_ids.get(&message_id).cloned() {
                             match state {
                                 leviculum_lxmf::router::MessageState::Delivered => {
@@ -450,17 +513,24 @@ impl AdminProcessor {
             }
         }
         router.retain_known_propagation_nodes(&self.pn_nodes);
+        let wall = super::now_ms() as u64 / 1000;
+        self.pn_health.prune(wall, &self.pn_nodes);
         // выбранный вслепую узел (анонса не слышали) уступает узлу с услышанным анонсом PN
         let blind = router.outbound_propagation_node().is_some_and(|c| router.known_propagation_node(&c).is_none())
             && router.known_propagation_nodes().next().is_some();
         if blind || router.outbound_propagation_node().is_some_and(|c| !self.pn_nodes.contains(&c)) {
             if let Ok(output) = router.set_outbound_propagation_node(core, None) { outputs.push(output); }
         }
-        if router.outbound_propagation_node().is_none() && !self.pn_nodes.is_empty() {
-            // сначала услышанный анонс PN; иначе первый доверенный (путь запросит сам роутер)
-            let chosen = router.select_outbound_propagation_node(core, None)
-                .or_else(|_| router.select_outbound_propagation_node(core, self.pn_nodes.iter().next().copied()));
-            if let Ok(output) = chosen { outputs.push(output); self.pn_fetch_due = true; }
+        // PN нет или текущий в выдержке (не принимает загрузки / письма на нём не подтверждаются): берём лучший без выдержки.
+        // Сначала услышанный анонс PN, затем ближайший по хопам; не услышанный выбирается вслепую (путь запросит роутер).
+        let current = router.outbound_propagation_node();
+        if !self.pn_nodes.is_empty() && current.is_none_or(|c| self.pn_health.is_bad(&c, wall)) {
+            let rank = |n: &DestinationHash| (router.known_propagation_node(n).is_none(), core.hops_to(n).unwrap_or(u8::MAX));
+            if let Some(best) = self.pn_health.pick(&self.pn_nodes, wall, rank) {
+                if Some(best) != current && (current.is_none() || !self.pn_health.is_bad(&best, wall)) {
+                    if let Ok(output) = router.select_outbound_propagation_node(core, Some(best)) { outputs.push(output); self.pn_fetch_due = true; }
+                }
+            }
         }
         for (request, stamp) in self.stamp_results.try_iter().take(4) {
             if let Ok(output) = router.set_outbound_propagation_stamp_result(&request, stamp, now) { outputs.push(output); }
@@ -482,7 +552,7 @@ impl AdminProcessor {
                 Command::Send(request) => {
                     let id = format!("{}:{}", super::hex(&request.pk), lxmf_sync::digest(&request.content));
                     if self.sync_pending.len() < lxmf_sync::LIMIT && !self.sync_pending.contains_key(&id) {
-                        self.sync_pending.insert(id, PendingSync { request, last_try:None, first_try:None, transport:None, pn_copy:None });
+                        self.sync_pending.insert(id, PendingSync::new(request));
                     }
                 }
                 Command::Acknowledged { source, digest } => {
@@ -499,6 +569,24 @@ impl AdminProcessor {
                 }
             }
         }
+        use leviculum_lxmf::router::MessageState as S;
+        for (id, state) in std::mem::take(&mut self.pn_outcomes) {
+            let Some(p) = self.sync_pending.values_mut().find(|p| p.pn_copy == Some(id)) else { continue };
+            match (state, p.pn_node) {
+                (S::AwaitingCollection, node) => {
+                    // PN принял копию. Судьба письма дальше решается только прикладным ACK адресата.
+                    p.pn_held = true;
+                    p.pn_since = now;
+                    if let Some(node) = node { self.pn_health.forgive(&node); }
+                }
+                (_, node) => {
+                    // PN не принял (Failed после исчерпания повторов роутера, Rejected): в выдержку, копия уйдёт на другой PN.
+                    if let Some(node) = node { self.pn_health.strike(node, now); }
+                    p.pn_copy = None;
+                    p.pn_held = false;
+                }
+            }
+        }
         let mut remove = Vec::new();
         // Не более одной новой передачи за tick; retry ограничен пятью секундами.
         let mut enqueued = false;
@@ -512,19 +600,44 @@ impl AdminProcessor {
                 remove.push(id.clone());
                 continue;
             }
-            // Прямая доставка без ACK дольше PN_FALLBACK_SECS: кладём копию на PN сети, адресат заберёт её при подключении.
-            if !pending.request.ack && pending.pn_copy.is_none() && !pn_enqueued && permission == Some(true)
-                && pending.first_try.is_some_and(|t| now.saturating_sub(t) >= PN_FALLBACK_SECS)
-                && router.outbound_propagation_node().is_some() {
-                if let Some(identity) = lxmf_sync::public_identity(&pending.request.pk) {
-                    let destination = lxmf_destination(identity.hash());
-                    core.remember_identity(DestinationHash::new(destination), identity);
-                    if let Ok(message) = router.create_message(core, destination, pending.request.title.clone(), pending.request.content.clone(), Vec::new(), DeliveryMethod::Propagated) {
-                        let copy = message.message_id;
-                        if let Ok(output) = router.enqueue(core, message) {
-                            outputs.push(output);
-                            pending.pn_copy = Some(copy);
-                            pn_enqueued = true;
+            // Копия на PN: прямая доставка без ACK дольше PN_FALLBACK_SECS, адресат заберёт письмо при подключении.
+            // Принятое PN письмо может быть вытеснено или потеряно, а спросить об этом PN нельзя: пока нет ACK адресата,
+            // копия повторяется через другой PN с растущей паузой (60 с … 30 мин), не больше PN_MAX_COPIES.
+            if !pending.request.ack && permission == Some(true) {
+                if let Some(copy) = pending.pn_copy {
+                    let age = now.saturating_sub(pending.pn_since);
+                    let queued = router.outbound().contains_key(&copy);
+                    let lapse = if pending.pn_held { now >= pending.pn_retry_at }
+                        else if queued { age >= PN_COPY_STUCK_SECS }
+                        else { age >= PN_COPY_OUTCOME_SECS };
+                    if lapse {
+                        if queued { if let Ok(output) = router.cancel(core, &copy) { out.merge(output.core); } }
+                        if let Some(node) = pending.pn_node { self.pn_health.strike(node, now); }
+                        pending.pn_copy = None;
+                        pending.pn_held = false;
+                    }
+                }
+                let node = router.outbound_propagation_node();
+                // PN в выдержке пропускается, пока есть другой; единственный PN используется снова после паузы
+                let usable = node.is_some_and(|n| !self.pn_health.is_bad(&n, now)
+                    || !self.pn_nodes.iter().any(|o| *o != n && !self.pn_health.is_bad(o, now)));
+                if pending.pn_copy.is_none() && !pn_enqueued && usable && pending.pn_copies < PN_MAX_COPIES && now >= pending.pn_retry_at
+                    && pending.first_try.is_some_and(|t| now.saturating_sub(t) >= PN_FALLBACK_SECS) {
+                    if let Some(identity) = lxmf_sync::public_identity(&pending.request.pk) {
+                        let destination = lxmf_destination(identity.hash());
+                        core.remember_identity(DestinationHash::new(destination), identity);
+                        if let Ok(message) = router.create_message(core, destination, pending.request.title.clone(), pending.request.content.clone(), Vec::new(), DeliveryMethod::Propagated) {
+                            let copy = message.message_id;
+                            if let Ok(output) = router.enqueue(core, message) {
+                                outputs.push(output);
+                                pending.pn_copy = Some(copy);
+                                pending.pn_node = node;
+                                pending.pn_since = now;
+                                pending.pn_held = false;
+                                pending.pn_copies += 1;
+                                pending.pn_retry_at = now + PnHealth::copy_wait(pending.pn_copies);
+                                pn_enqueued = true;
+                            }
                         }
                     }
                 }
@@ -1424,6 +1537,59 @@ mod tests {
         assert!(shared.view(crate::now_ms() as u64).is_none());
     }
     use leviculum_std::api::generate_identity;
+
+    fn pn(i: u8) -> DestinationHash { DestinationHash::new([i; 16]) }
+
+    // PN, на котором письмо не подтвердилось, откладывается с растущей выдержкой; выбор уходит на другой PN
+    #[test]
+    fn pn_health_switches_to_another_node_and_backs_off() {
+        let nodes = BTreeSet::from([pn(1), pn(2), pn(3)]);
+        let mut health = PnHealth::default();
+        let rank = |n: &DestinationHash| (false, n.as_bytes()[0]);
+        assert_eq!(health.pick(&nodes, 100, rank), Some(pn(1)));
+        health.strike(pn(1), 100);
+        assert!(health.is_bad(&pn(1), 100) && !health.is_bad(&pn(2), 100));
+        assert_eq!(health.pick(&nodes, 100, rank), Some(pn(2)));
+        // выдержка растёт при повторных неудачах и ограничена
+        let first = health.bad[&pn(1)].0 - 100;
+        health.strike(pn(1), 100);
+        assert!(health.bad[&pn(1)].0 - 100 > first);
+        for _ in 0..20 { health.strike(pn(1), 100); }
+        assert_eq!(health.bad[&pn(1)].0 - 100, PN_BACKOFF_MAX_SECS);
+        // после выдержки узел снова доступен; удачная загрузка снимает неудачи
+        assert!(!health.is_bad(&pn(1), 100 + PN_BACKOFF_MAX_SECS));
+        health.forgive(&pn(1));
+        assert!(!health.is_bad(&pn(1), 100));
+    }
+
+    // Все PN в выдержке: берётся тот, у кого она кончится раньше (письмо не остаётся без PN); один PN используется снова после паузы
+    #[test]
+    fn pn_health_falls_back_to_earliest_expiring_node() {
+        let nodes = BTreeSet::from([pn(1), pn(2)]);
+        let mut health = PnHealth::default();
+        health.strike(pn(1), 100);
+        health.strike(pn(2), 100);
+        health.strike(pn(2), 100);
+        let rank = |_: &DestinationHash| (false, 0);
+        assert_eq!(health.pick(&nodes, 100, rank), Some(pn(1)));
+        assert_eq!(health.pick(&BTreeSet::new(), 100, rank), None);
+        // узлы, пропавшие из доверенных, и давно забытые неудачи вычищаются
+        health.prune(100, &BTreeSet::from([pn(2)]));
+        assert!(!health.bad.contains_key(&pn(1)) && health.bad.contains_key(&pn(2)));
+        health.prune(100 + PN_BACKOFF_MAX_SECS * 4, &nodes);
+        assert!(health.bad.is_empty());
+    }
+
+    // Пауза между копиями растёт 60, 120, 240 … и упирается в потолок: копий мало, а охват по времени большой
+    #[test]
+    fn pn_copy_schedule_grows_and_is_capped() {
+        let waits: Vec<u64> = (1..=8).map(PnHealth::copy_wait).collect();
+        assert!(waits.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(*waits.last().unwrap(), PN_BACKOFF_MAX_SECS);
+        assert_eq!(waits[0], PN_BACKOFF_BASE_SECS);
+        let total: u64 = (1..=PN_MAX_COPIES).map(PnHealth::copy_wait).sum();
+        assert!(total >= PN_BACKOFF_MAX_SECS * 4);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn node_worker_can_schedule_revocation_and_process_next_operation() {
