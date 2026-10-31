@@ -241,7 +241,7 @@ impl Service {
     async fn handle(self:&Arc<Self>,link:LinkId,peer:Pk,body:&[u8])->Result<serde_json::Value>{
         match body[0] {
             4=>{ // ISSUE: already identified, signed ADD authority, GCM only. No pin on CBC.
-                if self.node.engine().link_stats(&link).is_none_or(|s|s.cipher()!=leviculum_std::api::LinkCipher::Gcm){bail!("issue requires GCM")}
+                if self.node.engine().with_link(&link,|l|l.cipher()).is_none_or(|c|c!=leviculum_std::api::LinkCipher::Gcm){bail!("issue requires GCM")}
                 if body.len()<3+148+24{bail!("issue length")};let n=u16::from_le_bytes(body[1..3].try_into()?)as usize;
                 if body.len()!=3+n+24{bail!("issue trailing")};let g=Grant::parse(&body[3..3+n])?;let pin=body[3+n..].try_into()?;
                 if trust::hash_of(&peer)!=Some(g.issuer){bail!("issue identify")}
@@ -254,7 +254,7 @@ impl Service {
                 let mut proof=match Store::new(&self.state)?.lookup(&pin,now_ms()as u64/1000){Ok(p)=>p,Err(_)=>return Ok(self.unknown(link,peer).await)};
                 if proof.rec.rights!=0 && proof.rec.holder!=peer{return Ok(self.unknown(link,peer).await)}
                 proof.grant.verify(&self.trust.lock().unwrap(),&proof.admin)?;
-                let nonce=rand16();let iface=self.node.engine().link_stats(&link).and_then(|s|s.attached_interface()).unwrap_or(usize::MAX);
+                let nonce=rand16();let iface=self.node.engine().with_link(&link,|l|l.attached_interface()).flatten().unwrap_or(usize::MAX);
                 {let mut sessions=self.sessions.lock().unwrap();sessions.retain(|_,s|s.until>Instant::now());
                     if sessions.get(&link).is_some_and(|s|s.peer!=peer){bail!("changed identify")}
                     if !sessions.contains_key(&link) && (sessions.len()>=8 || sessions.values().filter(|s|s.iface==iface).count()>=2 || sessions.values().any(|s|s.peer==peer)){bail!("enrollment sessions busy")}

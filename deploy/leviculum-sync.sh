@@ -5,7 +5,8 @@
 #   leviculum-sync.sh body ФОРК_КАТАЛОГ      текст PR: что пришло из апстрима и какие чувствительные пути затронуты
 # prepare печатает в stdout строки KEY=VALUE (их же дописывает в $GITHUB_OUTPUT):
 #   state=uptodate|conflict|merged  upstream=<sha>  pin=<sha>  candidate=<sha, только merged>  branch=<имя, только merged>
-#   conflicts=<файлы через запятую, только conflict>
+#   conflicts=<файлы через запятую, только conflict>  lockfile=regenerated <если конфликт был только в Cargo.lock>
+# Конфликт только в Cargo.lock разрешается сам (lock апстрима + cargo metadata), поэтому нужен cargo в PATH.
 # Апстрим - чужой код: слияние попадает в main только PR после ревью человеком. Автослияния нет: релиз раскатывается на узлы сам.
 set -euo pipefail
 
@@ -31,13 +32,21 @@ prepare() {
   branch="knothop/upstream-$(date -u +%Y%m%d)-${up:0:8}"
   git switch --quiet -c "$branch"
   merge_msg="Слияние апстрима Leviculum ${up:0:12} в knothop"
-  if git -c user.name="knothop-sync" -c user.email="knothop-sync@users.noreply.github.com" merge --no-ff --no-edit -m "$merge_msg" "$up" >/dev/null 2>&1; then
+  local git_sync=(git -c user.name="knothop-sync" -c user.email="knothop-sync@users.noreply.github.com")
+  if "${git_sync[@]}" merge --no-ff --no-edit -m "$merge_msg" "$up" >/dev/null 2>&1; then
     emit "state=merged"; emit "candidate=$(git rev-parse HEAD)"; emit "branch=$branch"
-  else
-    local files; files="$(git diff --name-only --diff-filter=U | paste -sd, -)"
-    git merge --abort 2>/dev/null || true
-    emit "state=conflict"; emit "conflicts=${files}"
+    return 0
   fi
+  local files; files="$(git diff --name-only --diff-filter=U | paste -sd, -)"
+  # Конфликт только в Cargo.lock механический: берём lock апстрима, cargo дописывает зависимости форка с минимальными изменениями.
+  # Кандидат дальше проходит те же сборку, тесты и ручное ревью PR.
+  if [ "$files" = "Cargo.lock" ] && git checkout --theirs Cargo.lock && cargo metadata --format-version 1 >/dev/null \
+     && git add Cargo.lock && "${git_sync[@]}" commit --quiet --no-edit; then
+    emit "state=merged"; emit "candidate=$(git rev-parse HEAD)"; emit "branch=$branch"; emit "lockfile=regenerated"
+    return 0
+  fi
+  git merge --abort 2>/dev/null || true
+  emit "state=conflict"; emit "conflicts=${files}"
 }
 
 body() {

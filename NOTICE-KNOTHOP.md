@@ -1,13 +1,418 @@
 # NOTICE для Leviculum (зависимость KnotHop)
 
 Первоисточник: https://codeberg.org/Lew_Palm/Leviculum (автор Lew_Palm).
-Используется изменённый форк https://github.com/msazanov/leviculum на коммите `5938c438aa1012bce89aaa950cce8f22aef7ab7d` (см. deploy/leviculum.ref).
+Используется изменённый форк https://github.com/msazanov/leviculum на коммите `b73cedc3600de37d31ba4167324796e2432d5a27` (см. deploy/leviculum.ref).
 База в Cargo.toml: `77c4ff13f59116adaf0190d455b83c286c135066`.
 Лицензия Leviculum и форка: AGPL-3.0-or-later; см. LICENSE.
 
 ## Коммиты форка поверх базы
 
+- b73cedc3 Merge upstream master e2e4c055
+- 4c9a3efb Move driver fork code into driver/ext.rs
+- 94cf0e1a Move transport and Link fork code into ext modules
+- 3d534735 Prove GCM Link data with the vanilla packet hash
+- c6ff3785 Give applications the Link itself instead of mirroring its fields
+- cbaf9d34 Derive the Link proof binding from the cipher; drop the binding policy API
+- 29122983 Merge upstream master f0325c4f
+- 2c4f5522 Drop the Android rustflags from .cargo/config.toml
+- 799e980e Move fork extensions out of shared node and packet files
+- e2e4c055 Merge the home node branch: NomadNet history and blocks reach every device, an import wakes them, the pinch draws only what is missing (Refs #474, #232)
+- 55de6a58 docs: the map page's store citation follows the fields line it names (Refs #232)
+- 18652ac6 loquax: an import beside the running mailbox wakes every watching device (Refs #232)
+- 6e0c7103 loquax: a pinch with tiles owed draws stand-ins only where tiles are missing (Refs #474, #232)
+- 20968652 Merge branch 'master' into homenode
+- 4af705e8 loquax: the palette's import shows what it wrote at once (Refs #232)
+- 9cbdbfee loquax: a NomadNet import on a mailbox archives its history and blocks (Refs #232)
+- 960179d8 Merge the home node branch: imported history and names reach every device, the map renders faster (Refs #474, #232)
+- b8a868a6 loquax: a placed name's sprite is a box of levels, blended in integers (Refs #474, #232)
+- fbd9680c loquax: map_fps measures the names' sprite draw and memory (Refs #474, #232)
+- 69017655 docs: the map page's store citation follows the fields line it names (Refs #232)
+- 58ec0ee2 loquax: imported history shows in the running session after its pull (Refs #232)
+- 16028a3c loquax: an import on a mailbox archives each contact's name as a petname (Refs #232)
+- c9ad1a5f loquax: the phone's map is drawn into its Bitmap, a pinch scaled by the Canvas (Refs #474, #232)
+- 27aeaa2a loquax: a tile is drawn without allocating the filler's storage (Refs #474, #232)
+- 3e7df241 Merge branch 'master' into homenode
+- d0a8527d loquax: a frame with every tile there is composed the fast way (Refs #474, #232)
+- a80c1be0 loquax: the map's names are set from what the last frame set (Refs #474, #232)
+- f0325c4f loquax import: read Ratspeak schema 33, with replies and reactions (Refs #232)
+- daa62832 Merge branch 'master' into homenode
+- d152ba03 build-deb: an armhf package build, for the 32-bit Raspberry Pis (Refs #232)
+- c0ce5598 loquax: Loquax Mailbox, its system service, and propagation node in the UI (Refs #232)
+- 9ba65e39 check-publish-nightly-gate: read the whole pipe instead of grep -q
+- d6b167e9 docs: the first start and the mailbox on the phone (Refs #232)
+- 78ab4a93 loquax-android: scan a mailbox's code and a paper backup (Refs #232)
+- 0fabd18b loquax-android: the first start, and the backup of the address (Refs #232)
+- 1ad32d09 loquax: a propagated send no longer says mailbox (Refs #232)
+- 0ed193a1 loquax: an address backup sealed with a passphrase (Refs #232)
+- f1cf6614 loquax-android: the mailbox can live on the phone (Refs #232)
+- e6956e96 Merge branch 'master' into homenode
+- 508e22ec loquax gui: the window opens on the chat, after the phone's design (Refs #232)
+- 48979eef loquax: the chat's rows, bubbles, groups and tokens move into the library (Refs #232)
+- f1dd7b58 loquax-android: the map glue's doc links Motion where it now lives (Refs #474)
+- 11d273fc loquax: an example measures the window's frame time before and after 1144 (Refs #474)
+- 280a6ac9 loquax gui: the window draws the phone's frames, at the zoom the wheel leaves (Refs #474)
+- e0b9e7c0 loquax: the phone's frame glue moves into the library as mapframe (Refs #474)
+- 336e7cdf Merge the home node branch: the map never shows black tiles (Refs #474, #232)
+- f516220d loquax import: a one-time Ratspeak history importer, into the mailbox archive too (Refs #232)
+- 8ae0f83f loquax-android: the app is called Loquax in what people read (Refs #232)
+- ff097ff8 Merge branch 'master' into homenode
+- 68258f35 loquax-android: a tap on a contact's name opens its detail screen, after Signal (Refs #232)
+- d5f3f6a2 loquax-android: the facade tells a contact screen and pins, mutes, archives, blocks (Refs #232)
+- 345b32a1 loquax: pin, mute, archive and block travel through the home node, verified stays local (Refs #232)
+- a56e9d1a docs: onboarding for Loquax and Loquax Mailbox, a concept (Refs #232)
+- 4d5fac94 just loquax-name: the docs keep calling the messenger Loquax (Refs #232)
+- 41011b34 loquax: the messenger is called Loquax in what people read (Refs #232)
+- 1b04ff70 loquax: an example measures what the outline adds to a frame (Refs #474)
+- 8ee54b78 loquax: the map never shows black, owed tiles come from any cached step and the outline (Refs #474, #232)
+- 4f01f806 loquax: the home directory exists before anything opens a file in it (Refs #232)
+- 983f8957 Merge the home node branch: the Android client, the shared map renderer and tile cache, names and replies (Refs #232, #474)
+- e3015846 loquax-android: the map prefetches tiles while idle, first in the direction it moved (Refs #474, #232)
+- ccb9ccdd loquax: the tile cache prefetches around a view at rest, ahead of the last pan first (Refs #474, #232)
+- 167f158f docs: the home node page tells /petname, and citations follow the moved lines (Refs #232)
+- 841e3895 loquax-android: the app links people to the phone's address book (Refs #232)
+- b8a0cfd6 loquax-android: the facade links addresses to the address book, renames and ranks (Refs #232)
+- af8e47f8 loquax: a petname set on one device reaches the home's others (Refs #232)
+- a155a27a loquax: an address book name sits between petname and announce, and a matcher ranks contacts (Refs #232)
+- 7cd6f045 docs, leviculum-lxmf: citations follow the lines the reply work moved (Refs #232)
+- 7e614343 scripts: the reply vectors get their census verdict (Refs #232)
+- 6d56cc74 loquax-android: the facade test checks the reaction it waited for (Refs #232)
+- 0148ee71 loquax-android: a long press on a message opens reactions and actions, after Signal (Refs #232)
+- eec4a12c loquax-android: the facade replies, forwards, deletes, tells a message's detail and keeps recent emoji (Refs #232)
+- 30f14fcd loquax: replies, forwards and a frontend's delete in the shared model (Refs #232)
+- 6262e3fa loquax: an emoji table from Unicode data, and the reader's recent emoji (Refs #232)
+- 2caaaa1b leviculum-lxmf: a reply codec, FIELD_REPLY_TO with its quote, read as FIELD_COMMENT too (Refs #232)
+- 5b78b0ae Merge branch 'master' into homenode
+- fd8752b4 loquax-android: the status line says a message, not a pull (Refs #232)
+- 7a2da14e loquax: the home node archives only names that matter, and wakes nobody for one (Refs #232)
+- e7bbe694 loquax: a pull counts messages, and a wake's pull is quiet (Refs #232)
+- aa39b9d1 docs: a study of loquax on Android and the phone's address book (Refs #232)
+- d634841d loquax-android: the map keeps its names and its zoom, from a tile cache (Refs #474, #232)
+- 1ff4cd52 loquax: a tile cache for the map, names kept as sprites (Refs #474, #232)
+- b299670b leviculum-map: a view at the zoom a pinch leaves (Refs #474, #232)
+- 82e2744c loquax-android: the conversation list after Signal's overview (Refs #232)
+- 73e21188 loquax-android: the list row says what its last message is (Refs #232)
+- 1a129c88 loquax-android: a light/dark switch for the map only (Refs #232, #474)
+- 32529fe5 loquax, loquax-android: a message that came with a position shows it and opens the map (Refs #232)
+- 48554cf5 loquax: home clients learn the names the home node hears (Refs #232)
+- dd23d987 loquax-android: the map draws while the finger pans and pinches (Refs #474, #232)
+- 28ef29b5 leviculum-map, loquax: the map never shows the world twice (Refs #474, #232)
+- 4a64d7dc source-invariant census: a verdict for loquax-android's map test
+- bc243210 loquax-android: the chat looks like a modern messenger (Refs #232)
+- a4ae69f0 loquax-android: the facade carries each peer's avatar (Refs #232)
+- d063d6dc loquax-android: the map, drawn by loquax's own renderer (Refs #232, #474)
+- fbab579b notices and citations follow loquax's screenmap feature (Refs #474)
+- 9bd426a3 loquax: the map's names and the pins' places move into the library (Refs #474, #232)
+- 96adbabf loquax-android: follow the phone's light or dark setting (Refs #232)
+- 0566a34c loquax-android: a recreated join screen does not join with a shared code again
+- 1b1445aa loquax: the terminal names streets and rivers where they run level (Refs #474)
+- bed71998 map: rivers are named, and a street's pieces are joined before its name is placed (Refs #474)
+- e994bc5a mapcut: a name the locale cannot read falls back to English (Refs #474)
+- bb252b6d Harvest the notices with the features the packages ship
+- ddfb1ff6 Merge the home node: shared client runners, pairing, recovery and the wake (Refs #232)
+- 0cf71683 loquax: the terminal and the phone pull when their home node wakes them
+- 8e0009e7 loquax: the home node wakes the clients that keep a link to it
+- 20c5b194 Merge branch 'master' into homenode
+- 47b8100f Draw each terminal frame as one synchronized update
+- 6e91c5d2 loquax: pin one picture send per drag frame over a sixel map with names
+- b1639d14 loquax-android: the join screen takes the code with its address
+- 5ee5ede1 loquax-android: a dead session is replaced, and the link is shown
+- 93fe9469 docs: citations moved by the home code's address and revoke-token
+- 4e8dffdf loquax: the home code carries the address, as text and QR
+- 37a9a074 Merge branch 'master' into homenode
+- 61b4ed22 docs: citations moved by the key-mode, listen_ip and RPC-key changes
+- 18e7e70e loquax: take --config before the subcommand as well as after it
+- d438e888 Ask the shared instance's RPC with its key, not the client's own identity
+- 0de121c2 Bind listen_ip as an address, so lnsd takes listen_ip = :: like rnsd
+- a2754b59 Write private keys 0600 whatever the umask, and narrow wide ones at load
+- 9e92e169 docs: the Android study's status after 1116
+- 5c6ae235 loquax-android: a foreground service holds the session
+- ef709a69 loquax: one copy of the home client runners, in the library
+- aa6e8a54 Merge the home node: leaf attach and the Android client (Refs #232)
+- 0352e7dd Merge branch 'master' into homenode
+- cfb1ebac census: a verdict for loquax-android's facade test
+- ccac0242 docs: loquax on Android after 1113, and citations moved by it
+- 92c12fb2 loquax-android: join, conversations and chat on Android's own views
+- 2fd63104 loquax: a list apart, and closing the open conversation
+- 0e6b717a Repoint citations into the lxmf router and node (Refs #232)
+- e184f210 loquax-android: the facade over the shell's Outbox seam
+- e6392566 lxmf: log the router's delivery decisions under tracing (Refs #232)
+- b698ee6f loquax: a leaf attach with its own TCP interface, and taps for the model
+- 3439dc36 lxmf: spend a direct link want on the link it starts (Refs #232)
+- 94b9ec54 Merge branch 'master' into homenode
+- f6675ed2 docs: loquax on Android, the study behind loquax-android
+- ea0c85a0 loquax-android: the APK, built by make with the library inside
+- e5d5a47f loquax-android: a JNI library over the loquax shell for the Android app
+- 7cde6d96 loquax store: pin the schema 5 to 6 migration (Refs #232)
+- b9832fc1 Merge the home node: propagated leg, local lock, read and sent state (Refs #232)
+- a24b5a05 loquax: show and send reactions (Refs #232)
+- 687b38cc lxmf: FIELD_REACTION codec, pinned against the reference (Refs #232)
+- 55776d98 Merge branch 'master' into homenode
+- 07de8825 loquax: import from other messengers, and the export they read (Refs #232)
+- b8e49cfb loquax store: schema 6, imported history below seq 0 (Refs #232)
+- 355b5d24 docs: loquax home node slice 4, the propagated leg and the local lock on the concept page and in loquax(1), citations moved
+- c0bae0c9 loquax: end to end tests for the propagated leg, the local lock and read and sent state across two clients
+- 780294f2 loquax: the home node selects its --pn before a propagated leg and answers /mark
+- 272e8ef1 loquax: read and sent state on every client of a home node, and a pull right after a client's send
+- 4e734bd8 loquax: send and fetch refuse beside the home node, which says once per message that it has no propagation node
+- 2186509a Merge the home node, slice 2 (Refs #232)
+- 18dbad82 Merge branch 'master' into homenode
+- 2f71ad8e loquax: the window sets the map's names into its picture, streets along their lines (Refs #474)
+- 2df0382c map: one placement rule for names, and the terminal sets them by it (Refs #474)
+- ef68e790 docs: the region format's version 2 and the names a loaded region carries (Refs #474)
+- 1454ef77 map: LMR2, the region carries names in one string table (Refs #474)
+- 69193645 docs: loquax home node slice 2 on the concept page and in loquax(1), citations moved (Refs #232)
+- db30e2a3 loquax: register /send on the home destination, end to end against Python (Refs #232)
+- efe2661c docs: remove the conflict markers the master merge left in two concept pages
+- 311fc870 loquax: home node slice 2, send through the home node with a seven-day outbox (Refs #232)
+- 0bc26891 loquax: log raw input on request, the tilted wheel pans the map (Refs #232)
+- 206dbc0d Merge branch 'master' into homenode
+- 64eef252 Merge the home node, slice 1 (Refs #232)
+- 2eae7722 docs: loquax home node concept page and loquax(1) sections, gates for home_node (Refs #232)
+- 7bf59978 docs: map_theme in the man page, the flags byte in the region format (Refs #474)
+- 371a6fdd loquax: an example that times the map per profile (Refs #474)
+- 2844075b map: golden images per profile, gated by counts (Refs #474)
+- a814bc0e map: palette, dark table, casings and round joins, forest, bridges and tunnels (Refs #474)
+- ffa2328c loquax: a client's fetch pulls from its home node, end to end against Python (Refs #232)
+- 48076dd5 loquax: home node slice 1, daemon, archive, admission and pull (Refs #232)
+- 0df00908 docs: map renderer roadmap study, labels, detail tiers, AA, GPU and hillshade (Refs #474)
+- 28c1bb80 lxmf: retain_synced_on_node also withholds the acknowledgement after a download (Refs #232)
+- 8474627c loquax: the map takes the most beautiful drawing the terminal can show, and t cycles them (Refs #474)
+- 116b351b loquax: the config remembers a map drawing per terminal context (Refs #474)
+- c5c3c7bf map: the terminal cell encoders live in the map core (Refs #474)
+- bab732de map: the world outline shows country borders (Refs #474)
+- 98d32da7 docs: home node and light clients, research and concept draft (Refs #232)
+- e9a72d1c loquax: the help and the detail view scroll (Refs #232)
+- 9a894f3f ui: help rows wrap in the model, and the scroll rule is shared
+- 7bfa70cd mapcut: the census and the citations follow the moved code
+- 6b5abc3b loquax: map regions load by themselves when you look at a place
+- 0829cc4e mapcut: the cut as a library, read from a file or by HTTP range requests
+- 8f41ccac map: a box around a place, a view's box, and every region a view reaches
+- 8ee88113 docs: a concept for importing identities and histories from other LXMF messengers (Refs #232)
+- 9905ab05 docs: the terminal map rendering draft and samples to cat (Refs #474)
+- bde84d1d loquax: a throwaway example that encodes one map view in every cell technique (Refs #474)
+- bb0d239e nrf: the T114 runs the shared node loop (Refs #469)
+- 0b38f59b nrf: the node loop skeleton, once, in leviculum_nrf::node_loop (Refs #469)
+- 40836451 loquax: the window's gate and its page (Refs #474, #232)
+- f5271e1a loquax: a window over the same shell, with the map first (Refs #474, #232)
+- 9deea104 loquax: the clock's tick and a pin's words are the shell's and the model's (Refs #474, #232)
+- dd85cd6f loquax: the shell moves below the terminal, for the GUI to share (Refs #474, #232)
+- 945baf03 loquax: the map's picture moves below the terminal, into loquax::picture (Refs #474, #232)
+- 04068a2e leviculum-map: lines can be drawn wider for a dense screen (Refs #474, #232)
+- bcd58d07 leviculum-map: the pin label rule moves into the core, in cells or pixels (Refs #474, #232)
+- 6d008bca docs: infrastructure page keeps Codeberg as an active mirror and names the issue decisions (Refs #260)
+- 37acaf32 loquax: blocking stores silently, and the palette names and blocks (Refs #232)
+- ef0c9bdb loquax: the contacts file can be rewritten one peer at a time (Refs #232)
+- 1eb09cd2 loquax: the map picks braille behind mosh and says why in tui.log (Refs #474, #232)
+- e27b42a8 leviculum-ui-ratatui: name what stands between a program and its terminal (Refs #474, #232)
+- f8cbd83d lnpnd: an upload is proven once the store's writer made it durable, off the core lock (Refs #384, #427)
+- c1ca4832 leviculum-std: the peer store writes off its caller, and only on a change (Refs #384, #427)
+- 617995ee leviculum-std: the propagation store can write behind its caller (Refs #384, #427)
+- 8a2e4306 leviculum-ui-ratatui: clear the screen after entering the alternate screen (Refs #232)
+- 261a8d3e loquax: a shrinking terminal no longer panics the map (Refs #232, #474)
+- a68994a7 leviculum-ui-ratatui: a terminal guard can enter the UI again (Refs #474)
+- 02a28698 docs: self-hosted infrastructure page follows the 2026-10-28 decisions (Refs #260)
+- 689df895 loquax: a message from a sender not yet heard is verified once its key arrives (Refs #232)
+- 4bdd928e loquax: the map is painted on its own thread and a held key is one frame (Refs #474, #232)
+- 76f69612 loquax: a map key pans an eighth of the view, Shift a half (Refs #474, #232)
+- 6d79a2a4 leviculum-ui-ratatui: a sixel of a picture's own colours, without the quantiser (Refs #474, #232)
+- 8cd15818 leviculum-map: a region is drawn into its box, so its edge stays put on zoom (Refs #474, #232)
+- 76b7d400 leviculum-map: zooming in and out keeps the view centre exactly (Refs #474, #232)
+- ccd09a77 loquax: Enter or a click on a position opens the map at that fix (Refs #474, #232)
+- 0dbade44 loquax: a fit goes no deeper than the region under it has data for (Refs #474, #232)
+- 6ee89d77 loquax: a pin label that moves over a sixel or kitty map leaves no old text (Refs #474, #232)
+- e3fb6c5b loquax: the map pans by dragging with the mouse and the wheel zooms about the pointer (Refs #474, #232)
+- c9b66345 leviculum-map: the world outline is Natural Earth 1:50m at one pixel a step (Refs #474, #232)
+- aa028ea0 loquax: a send never waits behind a mailbox collection, and a mailbox that never answers is replaced (#232)
+- 309bae0a loquax: a mailbox copy of a message held before a restart is not kept twice (#232)
+- b5a5e4c8 loquax: collect the mailbox by itself, on start, a bounded timer, after activity and on the node's announce (#232)
+- 7cc67e6c test-under-quota: build and run targets with required-features
+- 09ba2e4f loquax: map pin names no longer cover each other or a marker
+- 2644be31 loquax: a report's line names the sender's own fix beside a stream
+- c9be98e7 loquax: the map view in the terminal, by sixel, kitty, half-blocks or braille (#474, #232)
+- c40531a2 Map core for the terminal view: per-zoom widths, the world outline, region choice (#474, #232)
+- 43e669b4 loquax: --to is for a first message, the history holds the rest
+- e506efc0 Follow periculum's loquax rename: cite the new cell and step, drop the alias
+- 33d20118 Docs: the region file, profile 1 and the size per region (#474, #232)
+- 07e56a5c Map core and region tool: leviculum-map, leviculum-map-tool, the region file (#474, #232)
+- 86ba89c2 mapfill: draw one feature at a placement, so several fixtures share a frame (#474)
+- ac67390f Docs: record Lew's map decisions (#232, #474)
+- 9303379d loquax(1): say what the messenger shows of telemetry (#232, #474)
+- 230c5e4d loquax: read telemetry, show a peer's position (#232, #474)
+- 2c4a004e Docs: plan the map inside loquax (#232, #474)
+- 7ff3df07 nrf: name the step a hung boot stopped in, on both boot paths (#469)
+- 1efa1a38 test: no board binary may spin on nop at boot (#469)
+- ba7b2966 nrf: run the boot blink on a timer so USB enumerates during it (#469)
+- d5981450 nrf: stamp the boot stages a reset's back_ms is spent in (#469)
+- fd399f55 Docs: the history is built; loquax(1) gains HISTORY
+- 381706c9 loquax: history in SQLite across restarts, with delete, pin and FTS5
+- e018638a Docs: names are built; loquax(1) gains NAMES and the contacts file
+- 3427390d loquax: names from announces, sanitised, with collision and change marks
+- e0f49982 Docs: the search is built; loquax(1) gains SEARCH
+- 7a4f57f8 loquax: search over the session's conversations and messages
+- c065767c leviculum-ui: a footer button can show a whole spelling
+- 12b84f69 The messenger is called loquax: crate, binary, package, pages, recipes
+- 1108407b leviculum-std: tests stop resolving or writing the host's config dirs
+- 43540e06 leviculum-std: the Python storage compat tests read reference fixtures, not ~/.reticulum
+- d5d90cce leviculum-ui: link the tokens module, not the function of the same name
+- c3451465 Docs: the Colour section is decided and built; lnmsg(1) and lnomad(1) gain --color 16, --theme and NO_COLOR
+- ddff9dd2 lnmsg: the colour tokens on the chat screen, and the styles script step
+- 53b6c159 leviculum-ui: the colour token table, the tier ladder and Ink
+- f35a245f lnflash: the CLI bundle tests hold on a host with the package
+- 79888eed lnflash: locate walks roots a test can replace
+- 395efc0f Docs: the mouse is built; lnmsg(1) gains MOUSE and --no-mouse
+- 91dfc862 lnmsg: the mouse on the chat screen, and click, wheel and drag in scripts
+- 36c8a80e leviculum-ui: the clipboard, the link rule and the help's rectangle, shared
+- 465a057e lnmsg: mark where the undecided colour tokens would apply
+- 339b32f5 Docs: the chat layout is built; lnmsg(1) describes the screen
+- 27e356f0 lnmsg: the chat layout, the new rule and the detail view
+- 7b72a2ef leviculum-std: the host's UTC offset for a time of day on screen
+- d13c1a6d leviculum-ui: a reverse video attribute on the styled cell
+- b59e5cfd Docs: lnmsg chat colour, proposed for decision before the layout slice
+- 2b6818cf Docs: the keymap slice is decided and built; lnmsg(1) gets the compose keys
+- 654ff43d lnmsg: keys, help, footer and palette read one table; the four decided changes
+- 55fa7b45 leviculum-ui: one keymap table, lnomad's scroll rows moved into it
+- f721906f ci-gate: leave required-features targets to their recipe, as standard does
+- d376adfc lnmsg: plain lnmsg opens the messenger, tui stays as its alias
+- b930807a lnflash: the replay test waits for the read's flush, not for an empty queue
+- 5200f410 Docs: lnflash's product goal (zero config, power-user parameters, a GUI on the shared widgets)
+- 499fd4c6 Docs: the M9's map-fill rows and the bench facts of 2026-10-26 (GNSS is an AG3352)
+- 4fbfbf14 core: a link packet proof with the LINKPROOF context confirms its receipt
+- e6e8c21b nrf: vext and the ST7789 wiring name no board's pins
+- d08adfcc nrf bins: the RAK and T1000-E module docs say what the files do
+- 607df2db nrf boards: drop the board constants nothing reads, give GNSS_BAUD its reader
+- cb5b6979 Docs: the M9 page takes the 2026-10-26 research (revision probe, display, keyboard, the two conflicts)
 - 5938c438 Per-link keepalive override and keepalive telemetry in LinkStats
+- 395edd42 Draft: the four node loops diffed for step 7 (1017)
+- a3ac403b Docs: the lnmsg tui script steps sleep and until leg, the settle on leaving, the wrapped toast (1014)
+- 4f9f7ab0 lnmsg tui: a long toast wraps to three rows, so a two-leg failure names both legs (1014)
+- ae2f658a lnmsg tui: leaving lets the running send read its last states, so tui.log keeps sending and proof (1014)
+- 76c65f4f lnmsg tui: script steps sleep and until leg, so the leg label can be graded (1014)
+- f8ba021c lnpnd: rotation counts unhandled messages by sorting once, not per peer (1011)
+- 7b067bd2 status_under_transport_load waits for both start announces before the fill (1012)
+- 3167b6d3 lnpnd: an event that queued nothing stores nothing, so one dispatch stores one slice (1009)
+- 1a9f9ef0 lnpnd: profile each hook invocation by section, and a load harness that measures them (1009)
+- 83878825 Docs: the decisions of 2026-10-25 reach the concept pages (GUI toolkit B, 8 s is sleep, slide switch, replay limits)
+- 22941162 lnmsg concept: the key table, the mouse and the chat layout, proposed for decision (1005, #232)
+- bfb30031 The BLE link table moves up and trait BleLink gets its shape (1003, #469)
+- 731982c0 lnmsg tui: multi-line bodies in and out, Alt-Enter breaks the line (1002)
+- 08c0736f lnmsg: a message on the link without a proof is sent, not a reason to fall back; tui.log says what each leg did (1002)
+- 3db996d0 A queued message goes out on the next router tick, not on the next processing pass (1002)
+- f3464786 standard-integ claims lnmsg/tui_snapshot and its guard learns required-features (1006)
+- 5298d470 The dial primes the write socket with a keepalive before its identity (1004)
+- 79d752cf Every program ships as a deb: lnmsg and lnflash join the nightly packages (1000)
+- 9ed7f25e lnflash and lnpnd name their commit in --version, as lnsd and lnomad do (1000)
+- a4356c28 The BLE link's message half moves behind the seam: events, channels, interface, the media lines (999, #469)
+- 1f9036f8 The BLE link's node side moves behind the seam: carrier, pacing, link table, census (998, #469)
+- ed4b53fb The source-invariant census gives leviculum-mapfill's three test targets their verdicts (997, #474)
+- 914a6181 The map draft gets its device measurement section, the concept page Lew's decision (997, #474)
+- 7a6ee24e leviculum-mapfill/m9: bare M9 firmware that times the filler on the device (997, #474)
+- 94837282 leviculum-mapfill/measure: the map measurement's host harness (997, #474)
+- 4e317299 leviculum-mapfill: a scanline polygon filler on embedded-graphics (997, #474)
+- c0bdf4b6 The BLE peripheral refuses an unsubscribed identity handshake (996, #412)
+- 4bd07b47 lnmsg tui, slice one: three panes, Tab focus, read and send over the existing engine (994, #232)
+- 0db2b646 lnmsg's --via auto orchestration moves into the library as run_send_auto (994, #232)
+- 6b5272e0 leviculum-ui builds no_std and carries the palette's names and a text-field seam (994, #232)
+- 9272b26b just lnmsg-core-no-std is green and joins guards (993, #232)
+- 1e6ea37b The lnmsg engine is generic over the node core and the shell owns the driver, the miner and the channels (993, #232)
+- 0cbcd4f6 The lnmsg send and fetch runners take a Clock, and fetch prints through Effects (992, #232)
+- ad8afcde The lnmsg no-std gate's red list gets a grouper in the tree (992, #232)
+- f99fff2a The battery's sampling task and its lines move to the firmware crate behind a gauge seam (991, #469)
+- 72fbf7b1 The lnmsg core says what to write and the shell writes it (990, #232)
+- a6601655 The lnmsg core takes its prelude from alloc and Scalar from leviculum-core (990, #232)
+- b8fa411f The terminal widgets lnomad and lnmsg share move into leviculum-ui and leviculum-ui-ratatui (984)
+- 4d6c380e The display's page and power move to the firmware crate behind a panel seam (#469)
+- a2a9d339 The lnmsg core gets a no_std gate, red, and its plan from the measured list (982)
+- 072e81aa A reconnect or peer event for a retired index touches no core state (989)
+- b3a0d158 tmp-leftovers starts sccache before it moves TMPDIR to the scratch it deletes (987)
+- b5fd1c10 The learned-not-relayed rate is a client-uptime gauge, the doc says so (981)
+- 1cbb9b15 A stale interface-up stops announcing to an index the core tore down (981)
+- a3d7958f The listener identify-loss test owes an answer only behind the sender's RTT
+- a2b2a027 lnstatus names the shared instance of a fileless lnsd default when no section is left (#471)
+- d0f3d813 The button's press handling moves to the firmware crate behind an input seam (#469)
+- 20966383 The feedback policy moves to the firmware crate behind a Sinks trait (#469)
+- 89c0f453 rig-cell's standing readers capture for a year, not the witness default of 90 s
+- 8f909129 scripts/rig-cell.sh runs single bench cells and waits for each board's reader link
+- cda3d4f9 The witness reader can attach at once, as a standing reader between runs
+- d22ddd54 The M9 and messenger pages record the bench revision and Lew's scope change (#473, #232)
+- ebbcc621 The mailbox page records the no-table rule, lnsd's replay arm and the limits (#471)
+- f193af39 lnmsg keeps a stored mailbox when the daemon's path table cannot be read (#471, Refs #232)
+- 9c404cde The mailbox pages record Lew's adoption decision and how the own node is told apart (#471)
+- 48ca7329 lnmsg adopts a mailbox by itself, never the node on its own device, and remembers it (#471, Refs #232)
+- 2329227c The shared-instance RPC client moves into leviculum-std so lnmsg can read the path table (#471)
+- 033c8df4 The GUI toolkit question gets measured answers before any GUI code (#232, #219, #473)
+- 2c6fd369 lnomad builds without its terminal frontend, and a gate holds it there (#219)
+- b973a6a5 lnomad's browser core moves out of the terminal module (#219)
+- 6de9ac18 lnmsg gains the mailbox adoption rule as a pure function (#471, Refs #232)
+- 70cd2adc The map's first measurement is recorded before any map code (#474)
+- 3958220c The M9 page records how the rig should recognise the board (#473)
+- ebe3368b install-ci warns when no flasher with an ESP32-S3 stub is on the host (#473)
+- 39071420 lnflash learns the ESP32 ROM loader as a transport and a catalogue section (#473)
+- 279d4987 The concept pages record the product goals of 2026-10-25 (963, #178, #219, #232, #471)
+- 13cc8d33 The firmware-layers page records plan B and what 961 moved (961, #469)
+- aff51678 The global allocator and the heap facts move into the orchestration crate (961, #469)
+- 07f687f7 Rename the board state module from baseboard to board_state (961, #469)
+- 5c820736 Hold a BLE Connection until the link is really down, leak it if never (960, #472)
+- a6f9b728 Pin nrf-softdevice to the fork that does not panic in Drop (960, #472)
+- a71d956b Defer freeing a removed fd in the btvirt event loop until the batch ends (955)
+- 179559f2 Add a btvirt timer-fd churn bench script
+- 35222468 The firmware-layers page and the boards table say what the tree says (959, #469)
+- c524021b The orchestration draws through a set-once Entropy, not the chip's RNG (959, #469)
+- d27cc9b5 The board state moves into the orchestration crate (959, #469)
+- 50262d82 The firmware-layers page records 958's cuts and the seam vocabulary (958, #469)
+- fdbea5bc The interface names become each board's table, and interface moves (958, #469)
+- 7c0f8e77 announce, heap_census and pn read the heap-budget constants from their crate (958, #469)
+- cb646990 The time-source state moves to the orchestration crate's clock (958, #469)
+- baddd1bd The module-reach guard also records the seam vocabulary (958, #469)
+- 4d0f95e5 The firmware-layers page records the measured graph and step 2's new place (957, #469)
+- 6a4322b9 The identity publication moves to the orchestration crate (957, #469)
+- 58fc7c10 The boot breadcrumbs move to the orchestration crate, RESETREAS stays (957, #469)
+- 8702325c The core Clock over embassy-time moves to the orchestration crate (957, #469)
+- 40780b70 The dispatch-loss settle moves to the orchestration crate (957, #469)
+- 16d9de93 The byte counters move to the orchestration crate, their names stay (957, #469)
+- 6b16d809 The nRF module graph becomes a checked-in census and a guard (957, #469)
+- 72ae3004 The firmware-layers page counts the three modules 953 shrank (953, #469)
+- 374ebaa2 The /status request is matched and answered in core (953, #470)
+- ea31de72 The firmware's byte counters run on core's arithmetic (953, #470)
+- d75dba0a A test holds the firmware's byte counters to core's before the move (953, #470)
+- 93468767 The per-interface byte and speed arithmetic moves into core (953, #470)
+- 2d9b80d9 Link counts are answered without copying the link table (953, #470)
+- 12e9d2a9 The message store's policy half moves over the Flash seam (954, #469)
+- 1cdb0ac9 The calendar checkpoint moves over the Flash seam (954, #469)
+- 77d199ce The post-mortem store moves out of lib.rs, the fault handlers stay (954, #469)
+- c2b2749e The SoftDevice RNG is stated as the Entropy seam's implementer (954, #469)
+- 121f05e9 The boot count moves over the Flash seam, the NVMC stays its implementer (954, #469)
+- fe1f9212 The debug log moves to the orchestration crate (954, #469)
+- 33e68f94 lnstatus renders as rnstatus does unless asked for the origin (952, Refs #471)
+- 73b5d4f6 Two guards keep the orchestration crate free of HAL and chip names (949, #469)
+- 60d15079 The orchestration stratum gets its crate, with every seam declared and faked (949, #469)
+- 59d8f0a4 A capture mask lets each extraction step diff its debug log (949, #469)
+- e2054dbd The firmware workspace pins one embassy version set, and a guard holds it (949, #469)
+- 8d8b7b80 The census pins the streamed offer walk against the collected one (947, #470)
+- d5638083 The propagation store splits its body read off, and the board offers as it walks (947, #470)
+- 478720ff The interop helper takes a board's serve ceiling (947, #470)
+- 205143c5 The M9 page takes the community port's bench facts (948, Refs #178)
+- d06d63ae The zero-config page records step 2 as built (942, Refs #471)
+- 637ac568 lnsd reads an [auto] section and states what it starts on its own (942, Refs #471)
+- 1081fa20 The zero-config page records step 1 as built (941, Refs #471)
+- 74192620 lnsd without a config file runs rnsd's first-start file from memory (941, Refs #471)
+- 78f9a13f A 16 KiB link's receive path is held to its allocation bound (944, #470)
+- 3da232ef The link path hashes the packet it parsed instead of repacking it (944, #470)
+- 8f37487d ble-tx: one fragment pump behind a FragmentPort (943, #470)
+- d64555c7 record-log: the read-only mapped walk, behind mapped-read (943, #470)
+- a95437ab gnss-init: the Airoha AG3352 boot init (943, #470)
+- b88ccf9b battery-scale: MAX17048 decoding and cell presence (943, #470)
+- 82fd0bd4 rtc-pcf8563: the PCF8563 register codec (943, #470)
+- ff5e4d3d serial-mux: debug text and HDLC frames on one serial line (943, #470)
+- 8db51fa1 Zero-config lnsd gets its concept page (936, Refs #471)
+- 9efec9dd The firmware-layers page follows 935's columba.rs growth
+- a185f7cd The boot count keeps counting past a torn slot (935, #470)
+- 424be3bb A BLE reassembly holds at most one packet and a bounded slot count (935, #470)
+- 2f8dc142 Three frames no conformant sender produces are refused before they are stored (935, #470)
+- f77bf54d The firmware-layers page follows 933's sx126x and sx1262 growth (937)
+- 8f19d075 The firmware layers get their concept page: one orchestration extracted from leviculum-nrf, seams, bottom-up steps (932)
+- 1c30185c A pre-transmit listen runs the detector's settle past its bound (929, #466)
+- 10bf0b97 A final interface teardown closes the node's own links at once (931, #468)
+- b7ee7933 A double press is answered when its announces leave the radio (930, #459)
 - 85d136de Guard discovery expiry with worker-side record version check
 - ea41ea5c Serialize discovery expiry with local announce generations
 - ce13e3e0 Use cipher-aware proofs in Python CBC interop tests

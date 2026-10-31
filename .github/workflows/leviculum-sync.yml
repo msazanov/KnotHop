@@ -1,8 +1,10 @@
 name: Синхронизация Leviculum
 
-# Раз в неделю пробует слить апстрим Leviculum (codeberg) в закреплённый коммит нашего форка.
+# Раз в сутки пробует слить апстрим Leviculum (codeberg) в закреплённый коммит нашего форка: апстрим делает десятки
+# коммитов в день, мелкие слияния реже конфликтуют. Открытым остаётся один PR/issue: прежние закрываются как заменённые.
 #   uptodate  - ничего не делает.
-#   conflict  - открывает issue со списком конфликтных файлов (слияние делает человек).
+#   conflict  - открывает issue со списком конфликтных файлов (слияние делает человек). Конфликт только в Cargo.lock
+#               разрешается сам (lock апстрима + cargo metadata) и идёт дальше как merged.
 #   merged    - собирает и тестирует кандидата; при зелёных проверках и наличии секрета LEVICULUM_FORK_DEPLOY_KEY
 #               пушит ветку в форк и открывает PR, меняющий deploy/leviculum.ref. Без секрета - только сводка (сухой прогон).
 # В main ничего не сливается само: релиз с main раскатывается на узлы автообновлением, а код апстрима чужой.
@@ -14,7 +16,7 @@ name: Синхронизация Leviculum
 
 on:
   schedule:
-    - cron: '17 4 * * 1'
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -50,6 +52,8 @@ jobs:
           path: leviculum
           fetch-depth: 0
           ssh-key: ${{ secrets.LEVICULUM_FORK_DEPLOY_KEY }}
+      - name: Настроить Rust
+        run: rustup toolchain install stable --profile minimal
       - name: Слияние апстрима
         id: prep
         run: bash deploy/leviculum-sync.sh prepare leviculum
@@ -76,9 +80,6 @@ jobs:
           } > "$RUNNER_TEMP/issue.md"
           gh issue create -R "$GITHUB_REPOSITORY" --title "Конфликт слияния Leviculum $short" --body-file "$RUNNER_TEMP/issue.md"
 
-      - name: Настроить Rust
-        if: steps.prep.outputs.state == 'merged'
-        run: rustup toolchain install stable --profile minimal
       - name: Сборка и тесты кандидата
         id: verify
         if: steps.prep.outputs.state == 'merged'
@@ -144,3 +145,16 @@ jobs:
         if: steps.prep.outputs.state == 'merged' && steps.verify.outcome == 'success' && env.HAS_FORK_KEY != 'true'
         run: |
           echo "Кандидат зелёный, но секрета LEVICULUM_FORK_DEPLOY_KEY нет, ветку в форк и PR не создаю." >> "$GITHUB_STEP_SUMMARY"
+      - name: Закрыть заменённые PR и issue
+        if: always() && steps.prep.outputs.upstream != ''
+        env:
+          UP: ${{ steps.prep.outputs.upstream }}
+        run: |
+          # Ежедневный запуск: открытым остаётся только то, что относится к текущему апстриму; прежнее - устарело.
+          short="${UP:0:8}"
+          gh pr list -R "$GITHUB_REPOSITORY" --state open --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"sync/leviculum-\")) | select(.headRefName != \"sync/leviculum-$short\") | .number" |
+            while read -r n; do gh pr close -R "$GITHUB_REPOSITORY" "$n" --delete-branch --comment "Заменён слиянием более нового апстрима $short."; done
+          gh issue list -R "$GITHUB_REPOSITORY" --state open --search "Leviculum in:title" --json number,title \
+            --jq ".[] | select(.title | test(\"^(Конфликт слияния Leviculum|Слияние Leviculum) \")) | select(.title | contains(\"$short\") | not) | .number" |
+            while read -r n; do gh issue close -R "$GITHUB_REPOSITORY" "$n" --reason "not planned" --comment "Устарело: проверяется апстрим $short."; done

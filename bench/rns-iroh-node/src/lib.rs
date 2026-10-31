@@ -163,11 +163,6 @@ pub struct Cli {
     /// поэтому для замера скорости по умолчанию выключено - сверка идёт по шаблону.
     #[arg(long, default_value_t = false)]
     verify_sha: bool,
-    /// Proof binding: "cipher" (safe default: CBC=hash, GCM=tag), "hash"
-    /// (PacketHash for every Link), or explicit custom "tag" (both peers must agree;
-    /// KnotHop-only for CBC).
-    #[arg(long, default_value = "cipher", value_parser = ["cipher", "tag", "hash"])]
-    proof_binding: String,
     /// Явный крипторежим Link; обе стороны должны совпадать.
     #[arg(long, default_value = "cbc", value_parser = ["cbc", "gcm"])]
     cipher: String,
@@ -239,18 +234,6 @@ pub struct Cli {
     transport: bool,
     #[arg(long, default_value_t = 4433)]
     port: u16,
-}
-
-fn parse_cli_proof_binding_policy(
-    value: &str,
-) -> anyhow::Result<leviculum_std::api::ProofBindingPolicy> {
-    use leviculum_std::api::{ProofBinding, ProofBindingPolicy};
-    match value {
-        "cipher" => Ok(ProofBindingPolicy::ByCipher),
-        "hash" => Ok(ProofBindingPolicy::Explicit(ProofBinding::PacketHash)),
-        "tag" => Ok(ProofBindingPolicy::Explicit(ProofBinding::TokenTag)),
-        other => bail!("unknown --proof-binding {other:?} (want cipher|hash|tag)"),
-    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1273,8 +1256,6 @@ pub async fn run(cli: Cli) -> Result<()> {
     if cli.link_keepalive_s > 0 {
         nb = nb.link_keepalive(cli.link_keepalive_s);
     }
-    let binding_policy = parse_cli_proof_binding_policy(&cli.proof_binding)?;
-    nb = nb.proof_binding_policy(binding_policy);
     if cli.data_cap > 0 {
         nb = nb.data_channel_capacity(cli.data_cap);
     }
@@ -1282,7 +1263,6 @@ pub async fn run(cli: Cli) -> Result<()> {
         "gcm" => leviculum_std::api::LinkCipher::Gcm,
         _ => leviculum_std::api::LinkCipher::Cbc,
     });
-    eprintln!("[{}] proof binding policy: {:?}", now_ms(), binding_policy);
     let mut node = nb.build().context("build node")?;
     sh.note("node built");
     node.start().await.context("start node")?;
@@ -1594,8 +1574,8 @@ async fn client_stream(cli: &Cli, node: Arc<Node>, sh: Arc<Shared>, dest: &Desti
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let mdu = node.engine().link_mdu(handle.link_id());
-    if cli.send_window > 0 { handle.set_send_window_limit(cli.send_window)?; }
-    if cli.window_only { handle.set_send_pacing_enabled(false)?; }
+    if cli.send_window > 0 { node.engine().with_link_mut(handle.link_id(), |l| l.set_send_window_limit(cli.send_window)); }
+    if cli.window_only { node.engine().with_link_mut(handle.link_id(), |l| l.set_send_pacing_enabled(false)); }
     sh.note(format!("stream link {} up, link mdu={mdu:?}, chunk={}", &k[..8], cli.chunk));
     if cli.chunk == 0 { bail!("--chunk must be positive"); }
     let (echo_ready_tx, echo_ready_rx) = tokio::sync::oneshot::channel();
@@ -2568,7 +2548,7 @@ async fn tun_supervisor(cli: Cli, node: Arc<Node>, sh: Arc<Shared>, tun: Arc<Tun
         let hops_before = node.hops_to(&dest);
         sh.note(format!("failover: {reason}; hops={hops_before:?}"));
         sh.note(format!("failover transport stats: {:?}", node.engine().transport_stats()));
-        let link_iface = node.engine().link_stats(&link_id).and_then(|st| st.attached_interface());
+        let link_iface = node.engine().with_link(&link_id, |l| l.attached_interface()).flatten();
         *tun.client_link.write().unwrap() = None;
         let _ = node.engine().close_link(&link_id).await;
         let mut attempts = 0u32;
@@ -3137,29 +3117,6 @@ mod tests {
         p[6..8].copy_from_slice(&0x8000u16.to_be_bytes());
         p[2..4].copy_from_slice(&28u16.to_be_bytes());
         assert!(!valid_ipv4_packet(&p), "reserved fragment flag rejected");
-    }
-
-    #[test]
-    fn proof_binding_cli_defaults_to_safe_cipher_policy_and_keeps_explicit_overrides() {
-        let cli = Cli::try_parse_from(["rns-iroh-node", "--role", "c", "--ip", "127.0.0.1"])
-            .unwrap();
-        assert_eq!(cli.proof_binding, "cipher");
-        assert_eq!(
-            parse_cli_proof_binding_policy(&cli.proof_binding).unwrap(),
-            leviculum_std::api::ProofBindingPolicy::ByCipher
-        );
-        assert_eq!(
-            parse_cli_proof_binding_policy("hash").unwrap(),
-            leviculum_std::api::ProofBindingPolicy::Explicit(
-                leviculum_std::api::ProofBinding::PacketHash
-            )
-        );
-        assert_eq!(
-            parse_cli_proof_binding_policy("tag").unwrap(),
-            leviculum_std::api::ProofBindingPolicy::Explicit(
-                leviculum_std::api::ProofBinding::TokenTag
-            )
-        );
     }
 
     #[test]

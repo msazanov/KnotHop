@@ -1113,7 +1113,6 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
         // Единый интервал также для отдельных LXMF Links: иначе server-initiated
         // LXMF будил бы телефон штатными RTT-derived keepalive каждые 5 с.
         .link_keepalive(CLIENT_KEEPALIVE_S)
-        .proof_binding_policy(leviculum_std::api::ProofBindingPolicy::ByCipher)
         .data_channel_capacity(cli.data_cap)
         .link_cipher(leviculum_std::api::LinkCipher::Gcm)
         // ADR 0016: Link зачисления идёт через чужие транспорты RNS и может быть только стандартным CBC; такой Link допускается лишь на зачисление
@@ -2594,12 +2593,12 @@ impl NodeCtx {
     /// Link пришёл (или ушёл) через публичную сеть RNS? Наши узлы и клиенты общаются только по нашим интерфейсам.
     /// S12: носитель неизвестен (Link не найден или не привязан) - считаем публичным, fail-closed.
     fn link_is_public(&self, link: &LinkId) -> bool {
-        self.node.engine().link_stats(link).and_then(|s| s.attached_interface()).map(|i| self.iface_is_public(i)).unwrap_or(true)
+        self.node.engine().with_link(link, |s| s.attached_interface()).flatten().map(|i| self.iface_is_public(i)).unwrap_or(true)
     }
 
     /// Link установлен стандартным CBC (не нашим GCM)? Шифр неизвестен - да (fail-closed).
     fn link_is_cbc(&self, link: &LinkId) -> bool {
-        self.node.engine().link_stats(link).map(|s| s.cipher() != leviculum_std::api::LinkCipher::Gcm).unwrap_or(true)
+        self.node.engine().with_link(link, |l| l.cipher() != leviculum_std::api::LinkCipher::Gcm).unwrap_or(true)
     }
 
     /// H10: управляющее сообщение на Link в пределах частоты? `false` - отбросить; затяжное нарушение - Link закрывается.
@@ -3146,10 +3145,10 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
                         ctx.sh.note(format!("входящий Link {}", &hex(link_id.as_bytes())[..8]));
                     }
                     // H10: интерфейс носителя известен из состояния Link (если его ещё нет - лимит на интерфейс не применяем, общий работает)
-                    let stats = ctx.node.engine().link_stats(&link_id);
-                    let iface = stats.as_ref().and_then(|s| s.attached_interface());
+                    let (iface, cipher) = ctx.node.engine().with_link(&link_id, |l| (l.attached_interface(), l.cipher())).unzip();
+                    let iface = iface.flatten();
                     // fail-closed: шифр неизвестен - считаем стандартным CBC
-                    let cbc = stats.as_ref().map(|s| s.cipher() != leviculum_std::api::LinkCipher::Gcm).unwrap_or(true);
+                    let cbc = cipher.map(|c| c != leviculum_std::api::LinkCipher::Gcm).unwrap_or(true);
                     let mut l = ctx.links.lock().unwrap();
                     let unauth = l.values().filter(|x| matches!(x.role, Role::Unknown)).count();
                     let unauth_iface = l.values().filter(|x| matches!(x.role, Role::Unknown) && iface.is_some() && x.iface == iface).count();
@@ -3311,7 +3310,7 @@ async fn connect_neighbor(ctx: Arc<NodeCtx>, dest: [u8; 16]) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         // гонка изменения таблицы путей во время connect: установленный Link обязан идти через наш носитель
-        if !path::acceptable(ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface()), &own_carrier_ifaces(&ctx.node), None) {
+        if !path::acceptable(ctx.node.engine().with_link(&id, |s| s.attached_interface()).flatten(), &own_carrier_ifaces(&ctx.node), None) {
             let _ = ctx.node.engine().close_link(&id).await;
             bail!("Link выбрал интерфейс вне наших носителей");
         }
@@ -5114,7 +5113,7 @@ impl NodeCtx {
         crate::host_acl::notify_nft();
         let (idh, ip) = (admission.id, admission.ip);
         self.sh.note(format!("client {} admitted on {}", &hex(&idh)[..8], &hex(link.as_bytes())[..8]));
-        self.node.engine().set_link_keepalive(&link, Some(CLIENT_KEEPALIVE_S));
+        self.node.engine().with_link_mut(&link, |l| l.set_keepalive_override(Some(CLIENT_KEEPALIVE_S)));
         let ok = serde_json::json!({"name": self.name, "ip": ip_str(ip)}).to_string().into_bytes();
         let c = self.clone();
         tokio::spawn(async move {
@@ -6536,8 +6535,9 @@ struct QStat {
 
 impl ClientCtx {
     fn native_rtt(&self, id: &LinkId) -> Option<f64> {
+        let ka = self.node.engine().with_link(id, |l| l.keepalive_rtt_ms()).flatten();
         let s = self.node.engine().link_stats(id)?;
-        s.keepalive_rtt_ms().map(|r| r as f64).or(s.srtt_ms()).or_else(|| s.rtt_ms().map(|r| r as f64))
+        ka.map(|r| r as f64).or(s.srtt_ms()).or_else(|| s.rtt_ms().map(|r| r as f64))
             .filter(|r| r.is_finite() && *r > 0.0)
     }
 
@@ -6770,7 +6770,7 @@ impl ClientCtx {
             };
             // vis (R8): direct - путь 1 хоп через мой носитель к этой ноде; via - путь через носитель другой ноды (nh); none - пути нет.
             // Для текущего выхода интерфейс берётся у его Link, иначе - из таблицы путей
-            let ifc = cur.filter(|c| c.0 == e.dest).and_then(|c| self.node.engine().link_stats(&c.1)).and_then(|s| s.attached_interface())
+            let ifc = cur.filter(|c| c.0 == e.dest).and_then(|c| self.node.engine().with_link(&c.1, |l| l.attached_interface()).flatten())
                 .or_else(|| paths.iter().find(|p| p.hash == e.dest).map(|p| p.interface_index));
             let (vis, nh): (&'static str, Option<[u8; 16]>) = match ifc {
                 None => ("none", None),
@@ -6818,7 +6818,7 @@ impl ClientCtx {
         // Маршрут до текущего выхода: Link идёт через интерфейс, на который телефон набрал узел (его имя в названии интерфейса). Если это не сам выход -
         // выход достигается через транзитный узел (первая пересылка); дальше цепочка клиенту неизвестна.
         let via: Option<String> = cur.and_then(|c| {
-            let ifc = self.node.engine().link_stats(&c.1)?.attached_interface()?;
+            let ifc = self.node.engine().with_link(&c.1, |l| l.attached_interface())??;
             let name = self.node.engine().interface_stats().iter().find(|i| i.interface_id.0 == ifc)?.name.clone();
             let label = name.strip_prefix("iroh-dg-out-").or_else(|| name.strip_prefix("tcp-out-"))?.rsplit_once('-')?.0.to_string();
             let dest_of = self.carriers.lock().unwrap().iter().find(|(_, x)| *x.label.lock().unwrap() == label).map(|(d, _)| *d)?;
@@ -7765,7 +7765,7 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
     }
     // Проверка attached interface закрывает гонку изменения таблицы во время connect. У инициатора интерфейс
     // известен только после proof (у ожидающего Link он None), поэтому проверяем установленный Link.
-    if !path::acceptable(ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface()), &allowed(), avoid_iface) {
+    if !path::acceptable(ctx.node.engine().with_link(&id, |s| s.attached_interface()).flatten(), &allowed(), avoid_iface) {
         let _ = ctx.node.engine().close_link(&id).await;
         bail!("Link до {} выбрал недопустимый интерфейс", cand.name);
     }
@@ -7885,7 +7885,7 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     }
     ctx.data_wait.lock().unwrap().remove(&id);
     if !probe.ready {
-        let iface = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface());
+        let iface = ctx.node.engine().with_link(&id, |s| s.attached_interface()).flatten();
         let _ = ctx.node.engine().close_link(&id).await;
         let why = format!("{}: нет ответа на датаграммы выхода", cand.name);
         return Err(match iface {
@@ -7894,7 +7894,7 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
         });
     }
     ctx.sh.note(format!("выход {} принял клиента за {} мс (хопов {:?})", cand.name, t0.elapsed().as_millis(), ctx.node.hops_to(&dest)));
-    ctx.node.engine().set_link_keepalive(&id, Some(CLIENT_KEEPALIVE_S));
+    ctx.node.engine().with_link_mut(&id, |l| l.set_keepalive_override(Some(CLIENT_KEEPALIVE_S)));
     ctx.remember_rns_rtt(cand.dest, &id);
     Ok((id, handle))
 }
@@ -7945,7 +7945,7 @@ impl ClientCtx {
         let have: Vec<_> = t.extra.read().unwrap().iter().map(|(d,x)|(*d,x.clone())).collect();
         let interfaces = self.node.engine().interface_stats();
         let extras: Vec<serde_json::Value> = have.iter().map(|(d, x)| {
-            let attached = self.node.engine().link_stats(&x.id).and_then(|s|s.attached_interface());
+            let attached = self.node.engine().with_link(&x.id, |s| s.attached_interface()).flatten();
             let label = attached.and_then(|i|interfaces.iter().find(|v|v.interface_id.0==i))
                 .and_then(|i|i.name.strip_prefix("iroh-dg-out-").or_else(||i.name.strip_prefix("tcp-out-")))
                 .and_then(|n|n.rsplit_once('-').map(|v|v.0));
@@ -7968,7 +7968,7 @@ impl ClientCtx {
 /// Раздельное туннелирование клиента: перечитывает `routing.json` и файлы списков, собирает правила и держит дополнительные Link к выходам,
 /// на которые правила шлют трафик. Основной выход выбирает `client_supervisor`; здесь только то, что сверх него.
 fn discover_recovery_path(ctx: &Arc<ClientCtx>, dest: [u8;16], link: LinkId) {
-    let avoid = ctx.node.engine().link_stats(&link).and_then(|s|s.attached_interface());
+    let avoid = ctx.node.engine().with_link(&link, |s| s.attached_interface()).flatten();
     let c = ctx.clone();
     tokio::spawn(async move {
         // Только наши носители, общий PathGate (20 с); RNS выбирает обход, а не KnotHop.
@@ -8017,7 +8017,7 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
         for (d, x) in &have {
             let closed = ctx.sh.closed.lock().unwrap().contains_key(&hex(x.id.as_bytes()));
             let now = now_ms() as u64;
-            let acked = ctx.node.engine().link_stats(&x.id).map(|s| s.keepalives_acked()).unwrap_or(0);
+            let acked = ctx.node.engine().with_link(&x.id, |l| l.keepalives_acked()).unwrap_or(0);
             let pkts = ctx.tun.traffic_pkts();
             let step = pacers.entry(x.id).or_insert_with(|| Pacer { last_pkts: pkts, ..Default::default() })
                 .step(now, pkts, x.last_rx_ms.load(Relaxed), acked, CLIENT_KEEPALIVE_S * 1000, ctx.fail_ms.max(3000));
@@ -8292,7 +8292,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             if let Some(r) = ctx.sh.closed.lock().unwrap().get(&k) {
                 break format!("link закрыт: {r}");
             }
-            let (acked, ka_rtt) = ctx.node.engine().link_stats(&id).map(|s| (s.keepalives_acked(), s.keepalive_rtt_ms())).unwrap_or((0, None));
+            let (acked, ka_rtt) = ctx.node.engine().with_link(&id, |l| (l.keepalives_acked(), l.keepalive_rtt_ms())).unwrap_or((0, None));
             let now = now_ms() as u64;
             let step = pacer.step(now, ctx.tun.traffic_pkts(), ctx.last_pong.load(Relaxed), acked, CLIENT_KEEPALIVE_S * 1000, ctx.fail_ms);
             if step.keepalive_ack {
@@ -8400,7 +8400,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             // Отказавший выход отступает независимо от работающего запасного.
             ctx.lk_fail.lock().unwrap().insert(cand.dest, (Instant::now(), reason.chars().take(80).collect()));
             banned.failed(cand.dest, Instant::now());
-            if let Some(i) = ctx.node.engine().link_stats(&id).and_then(|s| s.attached_interface()) {
+            if let Some(i) = ctx.node.engine().with_link(&id, |s| s.attached_interface()).flatten() {
                 avoid.insert(cand.dest, i);
                 let dest = DestinationHash::new(cand.dest);
                 if ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index) == Some(i) {
