@@ -56,6 +56,18 @@ struct St {
     empty_since: Option<Instant>,
 }
 
+/// Живые интерфейсы по имени (имя видно в `interface_stats` движка RNS): по интерфейсу пути RNS находим мультиплексор и соседа (mesh).
+static BY_NAME: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Weak<Mux>>>> = std::sync::OnceLock::new();
+
+fn by_name_map() -> &'static Mutex<std::collections::HashMap<String, Weak<Mux>>> {
+    BY_NAME.get_or_init(Default::default)
+}
+
+/// Мультиплексор интерфейса с таким именем, если он жив.
+pub fn by_name(name: &str) -> Option<Arc<Mux>> {
+    by_name_map().lock().unwrap().get(name).and_then(|w| w.upgrade()).filter(|m| !m.is_closed())
+}
+
 pub struct Mux {
     pub name: String,
     follow: bool,
@@ -92,6 +104,11 @@ impl Mux {
             rx_pkts: AtomicU64::new(0),
             streak: Mutex::new((0, 0, Instant::now())),
         });
+        {
+            let mut r = by_name_map().lock().unwrap();
+            r.retain(|_, w| w.strong_count() > 0);
+            r.insert(name.clone(), Arc::downgrade(&m));
+        }
         let (_, mtu) = carrier();
         let t = tuning();
         let opts = PacketChannelOptions { hw_mtu: mtu, buffer_size: if t.1 > 0 { t.1 } else { 1024 } };
@@ -129,6 +146,19 @@ impl Mux {
                 dataplane::plane().unregister(conn.remote_id().as_bytes(), self as *const Mux as usize, c.id);
                 conn.close(0u32.into(), b"mux closed");
             }
+        }
+    }
+
+    /// Ключ iroh пира рабочего QUIC-носителя (None - рабочий носитель не QUIC или его нет): сосед, через которого идёт этот интерфейс.
+    pub fn quic_peer(&self) -> Option<[u8; 32]> {
+        if self.is_closed() {
+            return None;
+        }
+        let id = self.send_on.load(Relaxed);
+        let st = self.st.lock().unwrap();
+        match st.cars.iter().find(|c| c.id == id) {
+            Some(Car { tx: Tx::Quic(conn), .. }) => Some(*conn.remote_id().as_bytes()),
+            _ => None,
         }
     }
 
@@ -357,6 +387,17 @@ impl MuxSource {
                                     if dataplane::is_tag(&b) {
                                         // VPN-данные прямого канала: в RNS не идут никогда; ключ пира - только из TLS соединения
                                         dataplane::plane().on_datagram(conn.remote_id().as_bytes(), &b[1..]);
+                                        if filter.ate() {
+                                            yielded = true;
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    if b.first() == Some(&mesh::TAG) {
+                                        // транзитный кадр mesh: пересылка или локальная доставка, в RNS не идёт никогда; сосед - из TLS соединения
+                                        if let Some(mm) = mesh::global() {
+                                            mm.on_datagram(conn, &b);
+                                        }
                                         if filter.ate() {
                                             yielded = true;
                                             break;

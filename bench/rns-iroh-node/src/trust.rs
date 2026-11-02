@@ -402,6 +402,8 @@ pub struct Trust {
     /// Версия durable trust.json, увеличивается под io_gate на каждой попытке записи.
     /// HostCommit не перезаписывает snapshot, если с момента его съёма другой writer успел пройти.
     disk_generation: Arc<AtomicU64>,
+    /// Поколение прав: растёт при любом изменении записей, зачислений, якорей и политик. Кэши решений mesh сверяют его и сбрасываются сразу (отзыв без задержки).
+    rights_gen: Arc<AtomicU64>,
 }
 
 /// Верхняя граница размера файлов host-access.json / host-policy.json: читаем не больше, чем разрешено, до выделения памяти.
@@ -516,7 +518,7 @@ impl Trust {
         anchors.insert(me_hash, me_pk);
         Trust { path, me, me_pk, me_hash, anchors, recs: HashMap::new(), enroll_recs: BTreeMap::new(), holders: HashMap::new(), pols: HashMap::new(), my_offer: BTreeMap::new(), host_recs: BTreeMap::new(),
             host_policy: BTreeMap::new(), host_version: 0, host_commit: Arc::new(Mutex::new(())), io_gate: Arc::new(Mutex::new(())),
-            disk_generation: Arc::new(AtomicU64::new(0)) }
+            disk_generation: Arc::new(AtomicU64::new(0)), rights_gen: Arc::new(AtomicU64::new(1)) }
     }
 
     /// Разрешить принятому корню давать HOST_ACCESS на этой ноде (после явного решения оператора).
@@ -695,6 +697,15 @@ impl Trust {
         self.anchors.iter().map(|(h, p)| (*h, *p)).collect()
     }
 
+    fn bump(&self) {
+        self.rights_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Счётчик поколения прав (общий, читается без замка Trust).
+    pub fn rights_generation(&self) -> Arc<AtomicU64> {
+        self.rights_gen.clone()
+    }
+
     pub fn has_anchor(&self, h: &Hash) -> bool {
         self.anchors.contains_key(h)
     }
@@ -729,6 +740,7 @@ impl Trust {
             bail!("слишком много якорей (не больше {MAX_ROOTS})");
         }
         self.anchors.insert(h, *pk);
+        self.bump();
         Ok(true)
     }
 
@@ -766,6 +778,7 @@ impl Trust {
         self.holders.insert((p.grant.root, hh), p.rec.holder);
         self.holders.insert((p.grant.root, p.rec.scope), p.rec.node);
         self.enroll_recs.insert(key, p);
+        self.bump();
         Ok(true)
     }
 
@@ -774,6 +787,7 @@ impl Trust {
     /// переписывается здесь без чужих записей. Записи собственного корня (админа этого устройства) не трогаются. Возвращает число
     /// забытых якорей. Вызывать только при остановленном узле: файл держит живой процесс.
     pub fn forget_foreign_roots(&mut self) -> Result<usize> {
+        self.bump();
         let me = self.me_hash;
         let before = self.anchors.len();
         self.anchors.retain(|h, _| *h == me);
@@ -818,6 +832,7 @@ impl Trust {
         let dead = self.enroll_recs.iter()
             .filter(|(_, p)| !*alive.entry((p.grant.sig, p.admin)).or_insert_with(|| p.grant.verify(self, &p.admin).is_ok()))
             .min_by_key(|(_, p)| p.rec.seq).map(|(k, _)| *k);
+        self.bump();
         dead.is_some_and(|k| self.enroll_recs.remove(&k).is_some())
     }
 
@@ -876,6 +891,7 @@ impl Trust {
         }
         self.holders.insert((rec.root, rec.hh), rec.holder);
         self.recs.insert(key, rec);
+        self.bump();
         Offer::Added
     }
 
@@ -913,6 +929,7 @@ impl Trust {
         match victim {
             Some((k, _)) => {
                 self.recs.remove(&k);
+                self.bump();
                 true
             }
             None => false,
@@ -1222,6 +1239,75 @@ impl Trust {
         out
     }
 
+
+    // ----------------------------------------------------------------- mesh-транзит (src/mesh.rs)
+
+    /// Хэш держателя с ключом Ed25519 (он же ключ iroh) внутри ОДНОГО корня; сам якорь корня тоже держатель.
+    fn hash_of_key_in(&self, root: &Hash, key: &[u8; 32]) -> Option<Hash> {
+        if self.anchors.get(root).is_some_and(|pk| &pk[32..64] == key) {
+            return Some(*root);
+        }
+        self.holders.iter().find(|((r, _), pk)| r == root && &pk[32..64] == key).map(|((_, h), _)| *h)
+    }
+
+    /// Права ключа в корне с учётом области: для каждой области из `scopes` берётся `rights_at` (тот же путь, что у допуска клиента: отзыв держателя
+    /// достаточным уровнем, отзыв/потеря полномочий издателя зачисления и область выдачи уже в нём), результаты объединяются.
+    /// Зачисление, выданное для другой ноды, прав в этих областях не даёт.
+    fn rights_scoped(&self, root: &Hash, key: &[u8; 32], scopes: &[Hash]) -> u16 {
+        let Some(h) = self.hash_of_key_in(root, key) else { return 0 };
+        scopes.iter().fold(0, |a, s| a | self.rights_at(root, &h, s))
+    }
+
+    /// Права, на которых строится mesh: пользоваться сетью, пересылать или быть выходом.
+    const MESH_BITS: u16 = USE | TRANSIT | EXIT;
+
+    /// Держит ли ключ права USE/TRANSIT/EXIT в принятом корне применительно к ЭТОЙ ноде (для зачисления - выданные для неё).
+    pub fn key_holds_any(&self, key: &[u8; 32]) -> bool {
+        self.anchors.keys().any(|root| self.rights_scoped(root, key, &[self.me_hash]) & Self::MESH_BITS != 0)
+    }
+
+    /// Держит ли ключ право TRANSIT в принятом корне применительно к этой ноде.
+    pub fn key_is_transit(&self, key: &[u8; 32]) -> bool {
+        self.anchors.keys().any(|root| self.rights_scoped(root, key, &[self.me_hash]) & TRANSIT != 0)
+    }
+
+    /// Принятый корень, в котором ЭТА нода вправе пересылать кадр mesh `src -> dst`, пришедший от соседа `prev`: у неё действующее право TRANSIT
+    /// (выдача ∩ её политика); у источника и назначения права USE/TRANSIT/EXIT друг относительно друга или относительно этой ноды (зачисление клиента
+    /// выдано для конкретной ноды: чужое не годится); предыдущий хоп - сам источник либо узел с правом TRANSIT. Объединение корней не применяется.
+    pub fn mesh_forward_root(&self, now: u64, prev: &[u8; 32], src: &[u8; 32], dst: &[u8; 32]) -> Option<Hash> {
+        self.anchors.keys().find(|root| {
+            if self.effective_in(root, &self.me_hash, now) & TRANSIT == 0 {
+                return false;
+            }
+            let (Some(sh), Some(dh)) = (self.hash_of_key_in(root, src), self.hash_of_key_in(root, dst)) else { return false };
+            let ok = |k: &[u8; 32], other: Hash, need: u16| self.rights_scoped(root, k, &[other, self.me_hash]) & need != 0;
+            ok(src, dh, Self::MESH_BITS) && ok(dst, sh, Self::MESH_BITS) && (prev == src || ok(prev, self.me_hash, TRANSIT))
+        }).copied()
+    }
+
+    /// Ключ Ed25519 (iroh) по первым 8 байтам: среди якорей и держателей записей, у которых есть какие-либо права. Неоднозначный id (два ключа) - None.
+    pub fn key_for_id8(&self, id: &[u8; 8]) -> Option<[u8; 32]> {
+        let mut found: Option<[u8; 32]> = None;
+        for pk in self.anchors.values().chain(self.holders.values()) {
+            let k: [u8; 32] = pk[32..64].try_into().unwrap();
+            if &k[..8] == id && found != Some(k) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(k);
+            }
+        }
+        found.filter(|k| self.key_holds_any(k))
+    }
+
+    /// Полный публичный ключ держателя по ключу Ed25519 (для вычисления назначения RNS узла): только ключи, известные хранилищу.
+    pub fn pk_for_key(&self, key: &[u8; 32]) -> Option<Pk> {
+        if let Some(pk) = self.anchors.values().find(|pk| &pk[32..64] == key) {
+            return Some(*pk);
+        }
+        self.holders.values().find(|pk| &pk[32..64] == key).copied()
+    }
+
     // ----------------------------------------------------------------- выдача и отзыв
 
     /// Подписать и принять запись от своего имени. Права проверяются так же, как у чужих: выдать можно только подмножество своих.
@@ -1254,6 +1340,7 @@ impl Trust {
         match self.offer(rec.clone()) {
             Offer::Added => {
                 if self.rights_in(&root, &hh) != rights {
+                    self.bump();
                     if let Some(old) = prior { self.recs.insert(prior_key, old); } else { self.recs.remove(&prior_key); }
                     if let Some(old_pk) = prior_holder { self.holders.insert((root, hh), old_pk); }
                     else if !self.recs.keys().any(|(r, h, _)| *r == root && *h == hh) { self.holders.remove(&(root, hh)); }
@@ -1302,6 +1389,7 @@ impl Trust {
             return Offer::Rejected("подпись");
         }
         self.pols.insert(key, pol);
+        self.bump();
         Offer::Added
     }
 
@@ -1311,6 +1399,7 @@ impl Trust {
         for k in dead {
             self.pols.remove(&k);
         }
+        self.bump();
     }
 
     /// Действующие права `h` в корне: выдача ∩ политика. Нет политики - выдача целиком (нода без поддержки 0015).
@@ -1390,6 +1479,7 @@ impl Trust {
         }
         let pol = self.sign_my_policy(root, offer, now)?;
         self.my_offer.insert(root, offer);
+        self.bump();
         Ok(pol)
     }
 
@@ -1682,6 +1772,127 @@ mod tests {
         assert!(!exit.common_with(
             &client_id.public_key_bytes(), EXIT, USE, true, false, now_ms() as u64
         ));
+    }
+
+    #[test]
+    fn mesh_forward_requires_transit_and_one_common_root() {
+        let (root_id, t_id, a_id, e_id, other_id) = (ident(), ident(), ident(), ident(), ident());
+        let root = *root_id.hash();
+        let mut authority = tr(&root_id);
+        let recs: Vec<Record> = [(&t_id, USE | TRANSIT), (&a_id, USE), (&e_id, USE | EXIT)]
+            .iter().map(|(i, r)| authority.issue(root, i.public_key_bytes(), *r).unwrap()).collect();
+        let key = |i: &Identity| -> [u8; 32] { i.public_key_bytes()[32..64].try_into().unwrap() };
+        // нода-транзит: принимает якорь и записи
+        let mut t = tr(&t_id);
+        t.add_anchor(&root_id.public_key_bytes()).unwrap();
+        for r in &recs { t.offer(r.clone()); }
+        let now = now_ms() as u64;
+        assert_eq!(t.mesh_forward_root(now, &key(&a_id), &key(&a_id), &key(&e_id)), Some(root));
+        // чужой ключ без записей не пересылается ни как источник, ни как назначение, ни как сосед
+        assert_eq!(t.mesh_forward_root(now, &key(&a_id), &key(&other_id), &key(&e_id)), None);
+        assert_eq!(t.mesh_forward_root(now, &key(&a_id), &key(&a_id), &key(&other_id)), None);
+        assert_eq!(t.mesh_forward_root(now, &key(&other_id), &key(&a_id), &key(&e_id)), None);
+        assert!(t.key_holds_any(&key(&e_id)) && !t.key_holds_any(&key(&other_id)));
+        // без права TRANSIT у самой ноды (клиент, обычный пользователь) пересылки нет
+        let mut a = tr(&a_id);
+        a.add_anchor(&root_id.public_key_bytes()).unwrap();
+        for r in &recs { a.offer(r.clone()); }
+        assert_eq!(a.mesh_forward_root(now, &key(&e_id), &key(&e_id), &key(&e_id)), None);
+        // отзыв права TRANSIT у ноды снимает пересылку
+        let rev = authority.issue(root, t_id.public_key_bytes(), 0).unwrap();
+        t.offer(rev);
+        assert_eq!(t.mesh_forward_root(now, &key(&a_id), &key(&a_id), &key(&e_id)), None);
+        assert!(t.pk_for_key(&key(&e_id)).is_some() && t.pk_for_key(&[0xAB; 32]).is_none());
+        assert_eq!(t.key_for_id8(&key(&e_id)[..8].try_into().unwrap()), Some(key(&e_id)));
+        assert_eq!(t.key_for_id8(&[0xAB; 8]), None);
+    }
+
+    /// Зачисление клиента (USE на выход `exit`), выданное подчинённым админом `mid` (ADD) от корня `root`: хранилища транзита T и выхода.
+    struct MeshFx { authority: Trust, root: Hash, mid: Identity, exit: Identity, other_exit: Identity, client: Identity, t: Trust, exit_tr: Trust, other_tr: Trust }
+
+    fn mesh_fx(age_s: u64) -> MeshFx {
+        use crate::enroll::{EnRec, Grant, Invite, Proof};
+        let (root_id, mid, exit, other_exit, client, t_id) = (ident(), ident(), ident(), ident(), ident(), ident());
+        let root = *root_id.hash();
+        let mut authority = tr(&root_id);
+        for (i, r) in [(&exit, USE | EXIT), (&other_exit, USE | EXIT), (&mid, USE | ADD), (&t_id, USE | TRANSIT)] {
+            authority.issue(root, i.public_key_bytes(), r).unwrap();
+        }
+        let now_s = now_ms() as u64 / 1000 - age_s;
+        let invite = Invite::new(vec![*exit.hash()]).unwrap();
+        let grant = Grant::create(&mid, root, &invite, USE, now_s).unwrap();
+        let consent = EnRec::consent(&client, &grant, USE).unwrap();
+        let rec = EnRec::create(&exit, &grant, client.public_key_bytes(), USE, consent, (now_s + 5) * 1000).unwrap();
+        let proof = Proof { root: root_id.public_key_bytes(), admin: mid.public_key_bytes(), chain: authority.chain_for(&mid.public_key_bytes()), grant, rec };
+        let mk = |id: &Identity| {
+            let mut x = tr(id);
+            x.add_anchor(&root_id.public_key_bytes()).unwrap();
+            for r in authority.export_all() { x.offer(r); }
+            x
+        };
+        let (mut t, mut exit_tr, mut other_tr) = (mk(&t_id), mk(&exit), mk(&other_exit));
+        for x in [&mut t, &mut exit_tr, &mut other_tr] {
+            let _ = x.offer_enrollment(proof.clone());
+        }
+        MeshFx { authority, root, mid, exit, other_exit, client, t, exit_tr, other_tr }
+    }
+
+    fn key32(i: &Identity) -> [u8; 32] {
+        i.public_key_bytes()[32..64].try_into().unwrap()
+    }
+
+    #[test]
+    fn mesh_rights_of_enrolled_client_are_scoped_and_follow_revocation() {
+        let now = now_ms() as u64;
+        // исходное состояние: клиент допущен выходу, транзит пропускает клиент<->выход
+        let fx = mesh_fx(0);
+        let (c, e, o) = (key32(&fx.client), key32(&fx.exit), key32(&fx.other_exit));
+        assert_eq!(fx.t.mesh_forward_root(now, &c, &c, &e), Some(fx.root));
+        assert_eq!(fx.t.mesh_forward_root(now, &e, &e, &c), Some(fx.root), "ответное направление");
+        assert!(fx.exit_tr.key_holds_any(&c), "выход принимает сквозное соединение клиента");
+        // чужая область: зачисление выдано для другого выхода
+        assert_eq!(fx.t.mesh_forward_root(now, &c, &c, &o), None, "клиент не зачислен у other_exit");
+        assert!(!fx.other_tr.key_holds_any(&c), "other_exit клиента не принимает");
+        // предыдущий хоп - не источник и без TRANSIT: не годится
+        assert_eq!(fx.t.mesh_forward_root(now, &o, &c, &e), None);
+        // нет TRANSIT у самой ноды (выход): не пересылает
+        assert_eq!(fx.exit_tr.mesh_forward_root(now, &c, &c, &o), None);
+
+        // отзыв держателя (запись корня с пустыми правами): ни транзита, ни приёма
+        let mut fx = mesh_fx(0);
+        let (c, e) = (key32(&fx.client), key32(&fx.exit));
+        let rgen = fx.t.rights_generation();
+        let before = rgen.load(std::sync::atomic::Ordering::Relaxed);
+        let rev = fx.authority.issue(fx.root, fx.client.public_key_bytes(), 0).unwrap();
+        assert_eq!(fx.t.offer(rev.clone()), Offer::Added);
+        assert_eq!(fx.exit_tr.offer(rev), Offer::Added);
+        assert!(rgen.load(std::sync::atomic::Ordering::Relaxed) > before, "отзыв меняет поколение прав");
+        assert_eq!(fx.t.mesh_forward_root(now, &c, &c, &e), None, "отозванный holder не проходит транзит");
+        assert!(!fx.exit_tr.key_holds_any(&c), "отозванный holder не принимается выходом");
+
+        // отзыв издателя зачисления (подчинённый админ потерял ADD): зачисление недействительно
+        let mut fx = mesh_fx(0);
+        let (c, e) = (key32(&fx.client), key32(&fx.exit));
+        assert_eq!(fx.t.mesh_forward_root(now, &c, &c, &e), Some(fx.root));
+        let rev = fx.authority.issue(fx.root, fx.mid.public_key_bytes(), 0).unwrap();
+        assert_eq!(fx.t.offer(rev.clone()), Offer::Added);
+        assert_eq!(fx.exit_tr.offer(rev), Offer::Added);
+        assert_eq!(fx.t.mesh_forward_root(now, &c, &c, &e), None, "издатель отозван");
+        assert!(!fx.exit_tr.key_holds_any(&c));
+
+        // срок: зачисление, впервые увиденное после истечения билета, прав не даёт
+        let fx = mesh_fx(3 * crate::enroll::TTL);
+        let (c, e) = (key32(&fx.client), key32(&fx.exit));
+        assert_eq!(fx.t.mesh_forward_root(now, &c, &c, &e), None, "истёкшее зачисление");
+        assert!(!fx.exit_tr.key_holds_any(&c));
+    }
+
+    #[test]
+    fn mesh_key_for_id8_requires_rights() {
+        let fx = mesh_fx(0);
+        let c = key32(&fx.client);
+        assert_eq!(fx.exit_tr.key_for_id8(&c[..8].try_into().unwrap()), Some(c));
+        assert_eq!(fx.other_tr.key_for_id8(&c[..8].try_into().unwrap()), None, "не держит прав у этого узла");
     }
 
     #[test]

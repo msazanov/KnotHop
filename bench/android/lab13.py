@@ -13,6 +13,9 @@
   lab13.py test NAME                  с клиента: curl «сайта» и whoami через туннель
   lab13.py logs NAME [N]              хвост журнала
   lab13.py down                       убрать контейнеры и сеть (состояние остаётся в ~/.cache/knothop-lab13/lab)
+  lab13.py meshperf [--pairs 3] [--secs 10] [--keep]
+                                      A/B mesh (KNOTHOP_MESH=0/1) в топологии клиент–T–выход: клиент только в сети perf-neta 172.29.102.0/24 вместе с T и хабом, выход (adm) и
+                                      «сайт» только в perf-net, T в обеих; клиент не достаёт до выхода по IP. Ядра: adm=1,cl=2,gen=3,site=4,hub=5,t=6 (PERF_CPUS)
   lab13.py perf [--pairs 3] [--secs 10] [--negative] [--keep]
                                       A/B замер прямого канала данных (KNOTHOP_DIRECT_DATA=0/1): отдельная внутренняя сеть perf-net 172.29.101.0/24,
                                       release-бинарь (~/.cache/knothop-target/fork/release/knothopd), выход и клиент по 1 ядру (PERF_CPUS="adm=1,cl=2,gen=3,site=4,hub=5"),
@@ -32,7 +35,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-if sys.argv[1:2] == ["perf"]:
+if sys.argv[1:2] in (["perf"], ["meshperf"]):
     # Замер идёт в отдельной внутренней сети со своим префиксом, release-бинарём и без подробного журнала (KNOTHOP_DEBUG замедляет путь данных).
     os.environ.setdefault("LAB13_PREFIX", "perf")
     os.environ.setdefault("LAB13_ROOT", str(Path.home() / ".cache/knothop-perf13/lab"))
@@ -82,11 +85,11 @@ def next_ip():
     sys.exit("нет свободных адресов")
 
 
-def run(name, ip, cmd, state, extra=()):
+def run(name, ip, cmd, state, extra=(), net=None):
     sh("docker", "rm", "-f", name, check=False)
     debug = ("-e", "KNOTHOP_DEBUG=1") if os.environ.get("LAB13_DEBUG", "1") != "0" else ()
     cpus = ("--cpuset-cpus", CPUSETS[name]) if name in CPUSETS else ()
-    sh("docker", "run", "-d", "--name", name, "--hostname", name, "--network", NET, "--ip", ip, "--cap-add", "NET_ADMIN", "--device", "/dev/net/tun",
+    sh("docker", "run", "-d", "--name", name, "--hostname", name, "--network", net or NET, "--ip", ip, "--cap-add", "NET_ADMIN", "--device", "/dev/net/tun",
        "--sysctl", "net.ipv4.ip_forward=1", *debug, *cpus, "-e", "KNOTHOP_ALLOW_PRIVATE_DIAL=1", "-e", "KNOTHOP_TCP_BACKOFF_S=30",
        "-v", f"{BIN}:/usr/local/bin/knothopd:ro", "-v", f"{HERE}:/lab:ro", "-v", f"{state}:/state", *extra, "--entrypoint", "sh", IMAGE, "-c", cmd)
 
@@ -364,6 +367,7 @@ def dp_counters(st):
     d = dict(t.get("dataplane") or {})
     d["unauth_drops"] = t.get("unauth_drops")
     d["from_tun_pkts"], d["to_tun_pkts"] = t.get("from_tun_pkts"), t.get("to_tun_pkts")
+    d["mesh"] = t.get("mesh")
     return d
 
 
@@ -384,13 +388,19 @@ def iperf(args):
         return {"error": (r.stdout or r.stderr)[-200:]}
 
 
+MESH_T = False   # в топологии meshperf есть транзит T: его CPU тоже считаем
+
+
 def measured(fn):
-    c0 = (cpu_s(CL_NAME), cpu_s(ADM_NAME))
+    c0 = (cpu_s(CL_NAME), cpu_s(ADM_NAME), cpu_s(T_NAME) if MESH_T else 0.0)
     t0 = time.time()
     res = fn()
     wall = time.time() - t0
-    c1 = (cpu_s(CL_NAME), cpu_s(ADM_NAME))
-    return res, {"wall_s": round(wall, 2), "cl_cpu_s": round(c1[0] - c0[0], 2), "adm_cpu_s": round(c1[1] - c0[1], 2)}
+    c1 = (cpu_s(CL_NAME), cpu_s(ADM_NAME), cpu_s(T_NAME) if MESH_T else 0.0)
+    r = {"wall_s": round(wall, 2), "cl_cpu_s": round(c1[0] - c0[0], 2), "adm_cpu_s": round(c1[1] - c0[1], 2)}
+    if MESH_T:
+        r["t_cpu_s"] = round(c1[2] - c0[2], 2)
+    return res, r
 
 
 def perf_tests(secs):
@@ -534,6 +544,164 @@ def cmd_perf(a):
         print(f"#{r['index']} mode={r['mode']} carrier={r.get('client_carrier')} client={r['dataplane_client']} exit={r['dataplane_exit']} functional={r['tests']['functional']}")
 
 
+# ---------------------------------------------------------------------------------------------------- meshperf: клиент–T–выход
+NET_A, SUBNET_A, T_IPA = f"{PREFIX or 'l13'}-neta", "172.29.102.0/24", "172.29.102.20"
+T_NAME = f"{PREFIX or 'l13'}-t"
+
+
+def mesh_down():
+    for n in (GEN_NAME, CL_NAME, T_NAME, ADM_NAME, HUB_NAME, SITE_NAME):
+        sh("docker", "rm", "-f", n, check=False)
+    sh("docker", "network", "rm", NET_A, check=False)
+    sh("docker", "network", "rm", NET, check=False)
+    if LAB.name == "lab" and "perf" in str(LAB.parent) and LAB.exists():
+        sh("docker", "run", "--rm", "-v", f"{LAB.parent}:/l", "--entrypoint", "rm", IMAGE, "-rf", "/l/lab")
+
+
+def mesh_up(mode):
+    """adm (выход) и сайт в perf-net; T в обеих сетях; клиент и хаб (публичная RNS для обнаружения адресов) достижимы клиентом через perf-neta."""
+    from types import SimpleNamespace
+    global MESH_T
+    MESH_T = True
+    cpus = dict(adm="1", cl="2", gen="3", site="4", hub="5", t="6")
+    cpus.update(dict(x.split("=", 1) for x in os.environ.get("PERF_CPUS", "").split(",") if "=" in x))
+    CPUSETS.update({ADM_NAME: cpus["adm"], CL_NAME: cpus["cl"], SITE_NAME: cpus["site"], HUB_NAME: cpus["hub"], T_NAME: cpus["t"]})
+    mesh_down()
+    LAB.parent.mkdir(parents=True, exist_ok=True)
+    sh("docker", "network", "create", "--internal", "--subnet", SUBNET, "--label", "knothop.perf=1", NET)
+    sh("docker", "network", "create", "--internal", "--subnet", SUBNET_A, "--label", "knothop.perf=1", NET_A)
+    pre = ("printf '%s' '{\"version\":1,\"aliases\":[],\"allow\":[]}' > /state/host-acl.json; chmod 600 /state/host-acl.json; "
+           f"ip route replace {INET}/32 via {SITE_IP}; ")
+    env = f"KNOTHOP_DIRECT_DATA=1 KNOTHOP_MESH={mode} "
+    os.environ["LAB_NODE_ENV"] = pre + env
+    os.environ["LAB_CLIENT_ENV"] = env
+    # identity adm и T создаём заранее, право T (USE+TRANSIT: чистый транзит, не выход) выдаём офлайн ДО старта adm; якорь корня ставим на T (узел сам не вступает)
+    da, dt = state_dir("adm"), state_dir(T_NAME)
+    kn = lambda d: ("docker", "run", "--rm", "-v", f"{BIN}:/usr/local/bin/knothopd:ro", "-v", f"{d}:/state", "--entrypoint", "knothopd", IMAGE)
+    adm_who = json.loads(sh(*kn(da), "whoami", "--state", "/state").stdout)
+    t_who = json.loads(sh(*kn(dt), "whoami", "--state", "/state").stdout)
+    sh(*kn(da), "grant", "--state", "/state", "--holder", t_who["pk"], "--rights", "relay")
+    # запись права T: файл inbox13 админа копируем в inbox13 T (узел принимает его при старте: корень T уже якорь); иначе T «без прав» и сеть его не видит
+    sh("docker", "run", "--rm", "-v", f"{LAB}:/l", "--entrypoint", "sh", IMAGE, "-c", f"mkdir -p /l/{T_NAME}/inbox13 && cp /l/adm/inbox13/* /l/{T_NAME}/inbox13/")
+    write_private(dt / "root.pk", adm_who["pk"])
+    sh(*kn(dt), "trust-anchor", "--state", "/state", "--root-key-file", "/state/root.pk", "--fingerprint", adm_who["hash"])
+    cmd_up(SimpleNamespace(phone=False, no_adm=False))
+    sh("docker", "network", "connect", NET_A, HUB_NAME)
+    hub_a = sh("docker", "inspect", "-f", f"{{{{(index .NetworkSettings.Networks \"{NET_A}\").IPAddress}}}}", HUB_NAME).stdout.strip()
+    dx(SITE_NAME, "ip", "addr", "add", f"{INET}/32", "dev", "lo")
+    sh("docker", "exec", "-d", SITE_NAME, "taskset", "-c", cpus["site"], "iperf3", "-s", "-B", INET)
+    d = dt
+    write_pub(d)
+    ip_b = next_ip()
+    # прямой сосед T -> adm (seed): записи прав (adm -> T) доходят по этой связи; без неё обнаружение идёт только через хаб и не успевает
+    os.environ["LAB_NODE_EXTRA"] = f" --seed {adm_who['pk'][64:]}@{ip_of(ADM_NAME)}:47001"
+    run(T_NAME, ip_b, node_cmd(T_NAME, ip_b, None, False, f",{T_IPA}:47001"), d)
+    os.environ["LAB_NODE_EXTRA"] = ""
+    sh("docker", "network", "connect", "--ip", T_IPA, NET_A, T_NAME)
+    wait_file(T_NAME, "/state/server.json")
+    adm_hash = adm_who["hash"]
+    t_hash = t_who["hash"]
+    # T: носитель клиента (клиент дозванивается только до нод с правом EXIT), но выходом T быть не должна - её политика сужает выдачу до USE+TRANSIT
+    for _ in range(40):
+        if dx(T_NAME, "knothopd", "policy", "--state", "/state", "--root", adm_hash, "--rights", "use+transit", check=False).returncode == 0:
+            break
+        time.sleep(1)
+    # клиент: только perf-neta; хаб ему доступен по адресу в этой сети
+    c = state_dir(CL_NAME)
+    (c / "pub.txt").write_text(f"{hub_a}:4242\n")
+    write_private(c / "invite.txt", make_invite(ADM_NAME, "user", CL_NAME, f"{adm_hash},{t_hash}", ""))
+    run(CL_NAME, "172.29.102.30", client_cmd(""), c, net=NET_A)
+    deadline = time.time() + 300
+    consented = False
+    while time.time() < deadline:
+        if not consented:
+            r = sh("docker", "exec", CL_NAME, "cat", "/state/enrollment.json", check=False)
+            try:
+                offer = json.loads(r.stdout) if r.returncode == 0 else {}
+            except ValueError:
+                offer = {}
+            if offer.get("state") == "offer" and offer.get("request"):
+                body = json.dumps({"request": offer["request"], "accept": True})
+                sh("docker", "exec", CL_NAME, "sh", "-c", f"printf '%s' '{body}' > /state/enroll-consent.json")
+                consented = True
+        if sh("docker", "exec", CL_NAME, "ip", "link", "show", "tun0", check=False).returncode == 0:
+            sh("docker", "exec", CL_NAME, "ip", "route", "replace", f"{INET}/32", "dev", "tun0")
+            if sh("docker", "exec", CL_NAME, "curl", "-s", "-m", "3", f"http://{INET}/", check=False).stdout.strip():
+                break
+        time.sleep(1)
+    else:
+        sys.exit("туннель не поднялся за 300 с")
+    Path(LAB.parent / "cpu.py").write_text(CPU_PY)
+    for n in (CL_NAME, ADM_NAME, T_NAME):
+        sh("docker", "cp", str(LAB.parent / "cpu.py"), f"{n}:/tmp/cpu.py")
+    sh("docker", "run", "-d", "--name", GEN_NAME, "--network", f"container:{CL_NAME}", "--cpuset-cpus", cpus["gen"], "--entrypoint", "sleep", IMAGE, "infinity")
+
+
+def mesh_reach_check():
+    """Клиент не должен доставать до выхода по IP: проверка из сети клиента (UDP/TCP 47001 выхода и ping)."""
+    adm_ip = ip_of(ADM_NAME)
+    r = sh("docker", "exec", CL_NAME, "sh", "-c", f"ping -c1 -W1 {adm_ip} >/dev/null 2>&1 && echo reachable || echo unreachable", check=False)
+    return r.stdout.strip()
+
+
+def mesh_sweep(mode, secs):
+    mesh_up(mode)
+    reach = mesh_reach_check()
+    # прогрев (результаты отбрасываются) и время, за которое mesh успевает подняться (журнал клиента)
+    iperf(["-t", "6"]); iperf(["-t", "6", "-R"])
+    t_start = int(time.time())
+    res = {"mode": mode, "secs": secs, "client_to_exit_ip": reach, "tests": perf_tests(secs)}
+    st = {n: fresh_status(n, time.time()) for n in (CL_NAME, ADM_NAME, T_NAME)}
+    res["dataplane_client"], res["dataplane_exit"], res["dataplane_t"] = (dp_counters(st[CL_NAME]), dp_counters(st[ADM_NAME]), dp_counters(st[T_NAME]))
+    res["client_carrier"] = (st[CL_NAME].get("current") or {}).get("carrier")
+    log = dx(CL_NAME, "sh", "-c", "grep -a 'mesh:\\|выход .* принял' /state/client.log | tail -5", check=False).stdout
+    res["client_log"] = log.strip().splitlines()
+    res["started_unix"] = t_start
+    return res
+
+
+def cmd_meshperf(a):
+    import statistics
+    if not BIN.exists():
+        sys.exit(f"нет {BIN}")
+    res_dir = LAB.parent / "results"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    sweeps = []
+    try:
+        order = [0, 1] * a.pairs
+        for i, mode in enumerate(order):
+            print(f"[meshperf] прогон {i + 1}/{len(order)} KNOTHOP_MESH={mode}", flush=True)
+            r = mesh_sweep(mode, a.secs)
+            r["index"] = i
+            sweeps.append(r)
+            (res_dir / f"mesh-{i}-mode{mode}.json").write_text(json.dumps(r, ensure_ascii=False, indent=1))
+            print(json.dumps({"mode": mode, "reach": r["client_to_exit_ip"], "tcp_up": r["tests"]["tcp_up"].get("mbit"), "tcp_down": r["tests"]["tcp_down"].get("mbit"),
+                              "dp_client": r["dataplane_client"], "dp_exit": r["dataplane_exit"], "dp_t": r["dataplane_t"]}, ensure_ascii=False), flush=True)
+    finally:
+        if not a.keep:
+            mesh_down()
+    rows = [("tcp_up", "mbit"), ("tcp_up", "cl_cpu_s_per_gib"), ("tcp_up", "adm_cpu_s_per_gib"), ("tcp_up", "t_cpu_s"), ("tcp_down", "mbit"), ("tcp_down", "cl_cpu_s_per_gib"),
+            ("tcp_down", "adm_cpu_s_per_gib"), ("tcp_down", "t_cpu_s"), ("tcp_down", "ping_under_load.p50"), ("tcp_down", "ping_under_load.p95"), ("tcp_up", "retransmits"),
+            ("ping_idle", "p50"), ("ping_idle", "p95"), ("udp_up_30M", "lost_pct"), ("udp_down_30M", "lost_pct"),
+            ("pps_up_64B_12M", "pps"), ("pps_up_64B_12M", "lost_pct"), ("pps_down_64B_12M", "pps"), ("pps_down_64B_12M", "lost_pct")]
+
+    def get(r, t, k):
+        v = r["tests"].get(t, {})
+        for part in k.split("."):
+            v = v.get(part) if isinstance(v, dict) else None
+        return v
+
+    print(f"\n{'метрика':36} {'MESH=0 (Link через T) мед [мин..макс]':40} {'MESH=1 (сквозной QUIC)':34}")
+    for t, k in rows:
+        cells = []
+        for m in (0, 1):
+            xs = [x for x in (get(r, t, k) for r in sweeps if r["mode"] == m) if isinstance(x, (int, float))]
+            cells.append(f"{statistics.median(xs):.2f} [{min(xs):.2f}..{max(xs):.2f}] n={len(xs)}" if xs else "-")
+        print(f"{t + '.' + k:36} {cells[0]:40} {cells[1]:34}")
+    for r in sweeps:
+        print(f"#{r['index']} mode={r['mode']} reach={r['client_to_exit_ip']} client={r['dataplane_client']} exit={r['dataplane_exit']} t={r['dataplane_t']} log={r['client_log']} functional={r['tests']['functional']}")
+
+
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 sp = ap.add_subparsers(dest="c", required=True)
 x = sp.add_parser("up"); x.add_argument("--phone", action="store_true", help="опубликовать порт adm на LAN-адресе ноутбука для телефона"); x.add_argument("--no-adm", action="store_true", help="без ноды adm (админом будет клиент: lab13.py admin NAME)"); x.set_defaults(f=cmd_up)
@@ -556,5 +724,10 @@ x.add_argument("--negative", action="store_true", help="вместо A/B: отз
 x.add_argument("--blackhole", action="store_true", help="с --negative: выход не отвечает клиенту (клиент не видит закрытия Link и шлёт дальше)")
 x.add_argument("--keep", action="store_true", help="не убирать стенд после замера")
 x.set_defaults(f=cmd_perf)
+x = sp.add_parser("meshperf", help="A/B KNOTHOP_MESH=0/1 в топологии клиент–T–выход (клиент не достаёт до выхода по IP)")
+x.add_argument("--pairs", type=int, default=3)
+x.add_argument("--secs", type=int, default=10)
+x.add_argument("--keep", action="store_true")
+x.set_defaults(f=cmd_meshperf)
 a = ap.parse_args()
 a.f(a)

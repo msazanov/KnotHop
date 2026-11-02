@@ -205,19 +205,30 @@ impl Plane {
 
     /// Живое QUIC-соединение к ключу, которое мультиплексор выбрал рабочим носителем. Выбран TCP (или ничего) - None: данные идут по Link.
     fn carrier(&self, key: &[u8; 32]) -> Option<Connection> {
+        self.carrier_filtered(key, |_| true)
+    }
+
+    /// Как `carrier`, но среди соединений, подходящих под `ok` (mesh исключает сквозные соединения, которые сами идут по mesh).
+    pub(crate) fn carrier_filtered(&self, key: &[u8; 32], ok: impl Fn(&Connection) -> bool) -> Option<Connection> {
         // Порядок замков: `Mux::remove`/`close` держат `Mux::st` и вызывают `unregister` (`conns.write`). Поэтому под `conns` в мультиплексор не
-        // заходим: копируем кандидатов (не больше MAX_CONNS_PER_PEER) и проверяем выбор носителя уже без замка `conns`.
+        // заходим: копируем кандидатов (не больше MAX_CONNS_PER_PEER) и проверяем выбор носителя уже без замка `conns`. По той же причине `ok`
+        // (он может читать состояние соединения) тоже вызывается без замка `conns`.
         let cands: Vec<(Option<Weak<Mux>>, u64, Connection)> = {
             let m = self.conns.read().unwrap();
             m.get(key)?.iter().filter(|e| e.conn.close_reason().is_none()).map(|e| (e.mux.clone(), e.car, e.conn.clone())).collect()
         };
-        cands.into_iter().find_map(|(mux, car, conn)| {
+        cands.into_iter().filter(|(_, _, conn)| ok(conn)).find_map(|(mux, car, conn)| {
             let selected = match mux {
                 None => true,
                 Some(w) => w.upgrade().is_some_and(|mx| mx.carrier_selected(car)),
             };
             selected.then_some(conn)
         })
+    }
+
+    /// Есть ли выбранный QUIC-носитель к ключу (любой, в том числе сквозной по mesh).
+    pub fn has_carrier(&self, key: &[u8; 32]) -> bool {
+        self.carrier(key).is_some()
     }
 
     // ---------------------------------------------------------------- отправка

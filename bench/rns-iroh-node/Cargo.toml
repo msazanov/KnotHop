@@ -23,7 +23,10 @@ leviculum-std = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "77c4ff
 leviculum-lxmf = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "77c4ff13f59116adaf0190d455b83c286c135066", default-features = false, features = ["pow"] }
 # Штатный встраиваемый PN engine того же форка; AGPL-3.0-or-later, без BLE/serial.
 lnpnd = { git = "https://codeberg.org/Lew_Palm/Leviculum", rev = "77c4ff13f59116adaf0190d455b83c286c135066", default-features = false }
-iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }
+iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring", "unstable-custom-transports"] }
+# CustomAddr и n0_watcher::Direct (тип CustomEndpoint::watch_local_addrs) iroh не реэкспортирует: нужны для mesh-транспорта (src/mesh.rs).
+iroh-base = "=1.3.0"
+n0-watcher = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util", "sync", "net", "signal"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -38,7 +41,7 @@ hmac = "0.12"
 base64 = "0.22"
 rand_core = { version = "0.6", features = ["std", "getrandom"] }
 # только для диагностики (счётчики sendmsg/recvmmsg), нужен локальный patch noq-udp: bench/android/build.sh с KNOTHOP_UDPSTATS=1
-noq-udp = { version = "=1.3.0", optional = true }
+noq-udp = "=1.3.0"
 # Клиентская часть relay: проверка сертификата QAD по пину ключа ноды (CaTlsConfig::custom_server_cert_verifier).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
@@ -49,6 +52,6 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 [features]
 default = ["relay-server"]
 relay-server = ["iroh-relay/server", "dep:rcgen"]
-udp-stats = ["dep:noq-udp"]
+udp-stats = []
 # Лабораторный обход enforce роли `e` (бинарник rns-iroh-node для стендов замеров l3_cell/laptop/lev_cell). Не включать в knothopd и APK.
 lab-exit-no-enforce = []

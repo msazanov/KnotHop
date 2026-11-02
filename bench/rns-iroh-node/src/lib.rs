@@ -46,6 +46,7 @@ mod route;
 mod host_acl;
 mod qprobe;
 mod dataplane;
+mod mesh;
 pub use vpn::{VpnCli, VpnCmd};
 
 /// Fixed non-shell admin CLI bridge used by the Android JNI wrapper.
@@ -757,6 +758,15 @@ impl PacketSource for QuicDgramSource {
                         }
                         continue;
                     }
+                    if b.first() == Some(&mesh::TAG) {
+                        if let Some(m) = mesh::global() {
+                            m.on_datagram(&self.conn, &b);
+                        }
+                        if self.filter.ate() {
+                            return None;
+                        }
+                        continue;
+                    }
                     if self.filter.intercept(&self.conn, &b) {
                         if self.filter.ate() {
                             return None;
@@ -782,6 +792,15 @@ impl PacketSource for QuicDgramSource {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))?;
                 if dataplane::is_tag(&b) {
                     dataplane::plane().on_datagram(self.conn.remote_id().as_bytes(), &b[1..]);
+                    if self.filter.ate() {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
+                if b.first() == Some(&mesh::TAG) {
+                    if let Some(m) = mesh::global() {
+                        m.on_datagram(&self.conn, &b);
+                    }
                     if self.filter.ate() {
                         tokio::task::yield_now().await;
                     }
@@ -893,7 +912,15 @@ static QUIC_CC: std::sync::OnceLock<(String, u64)> = std::sync::OnceLock::new();
 static QUIC_EXTRA: std::sync::OnceLock<(u16, u64, u64, usize, usize)> = std::sync::OnceLock::new();
 
 fn transport(idle_ms: u64, keepalive_ms: u64, conn_idle_ms: u64) -> Option<QuicTransportConfig> {
-    let extra = *QUIC_EXTRA.get().unwrap_or(&(0, 0, 0, 0, 0));
+    transport_mtu(idle_ms, keepalive_ms, conn_idle_ms, None)
+}
+
+/// То же, но с начальным MTU `mtu` (сквозное соединение по mesh: начинает с 1200 и растёт PMTUD, иначе большие пакеты не влезают в соседскую датаграмму).
+fn transport_mtu(idle_ms: u64, keepalive_ms: u64, conn_idle_ms: u64, mtu: Option<u16>) -> Option<QuicTransportConfig> {
+    let mut extra = *QUIC_EXTRA.get().unwrap_or(&(0, 0, 0, 0, 0));
+    if let Some(m) = mtu {
+        extra.0 = m;
+    }
     let cc = QUIC_CC.get().cloned().unwrap_or(("default".into(), 0));
     if idle_ms == 0 && keepalive_ms == 0 && conn_idle_ms == 0 && extra == (0, 0, 0, 0, 0) && cc.0 == "default" {
         return None;
@@ -1028,14 +1055,31 @@ async fn accept_loop(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>) {
             incoming.refuse();
             continue;
         };
-        let (node, sh) = (node.clone(), sh.clone());
+        let (node, sh, ep2) = (node.clone(), sh.clone(), ep.clone());
         n += 1;
         let id = n;
         tokio::spawn(async move {
             let _slot = slot;
-            let Ok(conn) = incoming.await else { return };
+            // сквозное соединение клиента, пришедшее по mesh: у него начальный MTU 1200 (рост - PMTUD по соседскому пути), права ключа проверяются сразу
+            let via_mesh = mesh::incoming_is_mesh(&incoming.remote_addr());
+            let conn = if via_mesh {
+                let Some(m) = mesh::global() else { incoming.refuse(); return };
+                let Some(cfg) = mesh::quic_cfg() else { incoming.refuse(); return };
+                let sc = ep2.create_server_config_builder(vec![ALPN.to_vec()]).set_transport_config(cfg).build();
+                let Ok(acc) = incoming.accept_with(Arc::new(sc)) else { return };
+                // рукопожатие mesh-входящего ограничено по времени: слот (MAX_INCOMING) не должен висеть на молчащем пире
+                let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(10), acc).await else { return };
+                if !m.admit_e2e(conn.remote_id().as_bytes()) || !m.mark_e2e(&conn) {
+                    conn.close(0u32.into(), b"mesh not allowed");
+                    return;
+                }
+                conn
+            } else {
+                let Ok(conn) = incoming.await else { return };
+                conn
+            };
             let peer = conn.remote_id().fmt_short().to_string();
-            sh.note(format!("quic accepted from {peer}"));
+            sh.note(format!("quic accepted from {peer}{}", if via_mesh { " (mesh)" } else { "" }));
             if carrier().0 {
                 // один интерфейс RNS на ключ iroh пира: смена носителя (QUIC <-> TCP) его не пересоздаёт, Link остаётся
                 let key = *conn.remote_id().as_bytes();
@@ -2338,6 +2382,7 @@ impl TunState {
             "send_errors": self.c.send_errors.load(Relaxed), "not_ipv4": self.c.not_ipv4.load(Relaxed), "probes": self.c.probes.load(Relaxed),
             "routes": self.routes.read().unwrap().len(),
             "dataplane": dataplane::plane().stats(),
+            "mesh": mesh::global().map(|m| m.stats()),
             "failovers": self.failovers.lock().unwrap().clone(),
         })
     }

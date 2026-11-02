@@ -1145,7 +1145,15 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
     let events = node.take_event_receiver().context("event receiver")?;
     let node = Arc::new(node);
 
+    // mesh (ADR 0023): сквозное QUIC клиент↔выход через транзит. KNOTHOP_MESH=0 - транспорт на endpoint не ставится вовсе (поведение как до mesh)
+    let mesh_inst = mesh::install(*key.public().as_bytes());
+    if let Some(c) = transport_mtu(cli.path_idle_ms, cli.path_keepalive_ms, cli.conn_idle_ms, Some(1200)) {
+        mesh::set_quic_cfg(c);
+    }
     let mut eb = Endpoint::builder(presets::Minimal).secret_key(key).alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled);
+    if mesh_inst.enabled() {
+        eb = eb.add_custom_transport(mesh_inst.transport()).path_selector(Arc::new(mesh::MeshBackupSelector));
+    }
     if !relays.is_empty() {
         // relay нужен для сигнализации hole punching и QAD; сертификат принимается только от ключа доверенной ноды (relay.rs)
         let _ = RELAY_URLS.set(relays.to_vec());
@@ -1180,6 +1188,54 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
 static RELAY_URLS: std::sync::OnceLock<Vec<RelayUrl>> = std::sync::OnceLock::new();
 /// Права доверенных ключей читаются из Trust процесса; пока он не задан, relay никому не доверяет.
 static RELAY_TRUST: std::sync::OnceLock<Arc<Mutex<trust::Trust>>> = std::sync::OnceLock::new();
+
+/// Политика mesh узла: права из Trust (корень проверяется в `Trust::mesh_forward_root`), путь к назначению - из таблицы путей RNS.
+struct MeshPolicy {
+    node: Arc<Node>,
+    trust: Arc<Mutex<trust::Trust>>,
+    /// клиент (телефон) не транзит
+    client: bool,
+    /// поколение прав Trust (читается без замка Trust)
+    rights_gen: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl mesh::Policy for MeshPolicy {
+    fn may_forward(&self, prev: &[u8; 32], src: &[u8; 32], dst: &[u8; 32]) -> bool {
+        !self.client && self.trust.lock().unwrap().mesh_forward_root(now_ms() as u64, prev, src, dst).is_some()
+    }
+
+    fn holds_rights(&self, key: &[u8; 32]) -> bool {
+        self.trust.lock().unwrap().key_holds_any(key)
+    }
+
+    fn is_transit(&self, key: &[u8; 32]) -> bool {
+        self.trust.lock().unwrap().key_is_transit(key)
+    }
+
+    fn generation(&self) -> u64 {
+        self.rights_gen.load(Relaxed)
+    }
+
+    fn key_for_id(&self, id: &[u8; 8]) -> Option<[u8; 32]> {
+        self.trust.lock().unwrap().key_for_id8(id)
+    }
+
+    /// Сосед по таблице путей RNS: назначение узла (из его публичного ключа) -> интерфейс пути -> мультиплексор -> ключ рабочего QUIC-носителя.
+    fn route(&self, dst: &[u8; 32]) -> Option<[u8; 32]> {
+        let pk = self.trust.lock().unwrap().pk_for_key(dst)?;
+        let dh = DestinationHash::new(dest_from_pub_tag(&pk, T13_TAG));
+        let path = self.node.engine().get_path_clone(&dh)?;
+        let name = self.node.engine().interface_stats().iter().find(|i| i.interface_id.0 == path.interface_index)?.name.clone();
+        mux::by_name(&name)?.quic_peer()
+    }
+}
+
+fn install_mesh_policy(node: &Arc<Node>, trust: &Arc<Mutex<trust::Trust>>, client: bool) {
+    if let Some(m) = mesh::global() {
+        let rights_gen = trust.lock().unwrap().rights_generation();
+        m.set_policy(Arc::new(MeshPolicy { node: node.clone(), trust: trust.clone(), client, rights_gen }));
+    }
+}
 
 /// Есть ли у ключа Ed25519 (он же EndpointId iroh и подпись identity RNS) хоть какое-то право в нашем Trust.
 fn key_has_rights(tr: &trust::Trust, k: &[u8; 32]) -> bool {
@@ -2983,7 +3039,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         Some(T13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), 
             trust_dirty: AtomicBool::new(false),  dir_sent: Mutex::new(HashMap::new()), dir_requested: Mutex::new(HashMap::new()) })
     };
-    if let Some(t) = &t13 { let _ = RELAY_TRUST.set(t.trust.clone()); }
+    if let Some(t) = &t13 { let _ = RELAY_TRUST.set(t.trust.clone()); install_mesh_policy(&b.node, &t.trust, false); }
 
     // Clear stale host-access kernel leases before any ordinary admission.
     // Без TUN (--no-exit) клиентов нет; --no-host-nft - лаборатория без таблицы: наборы пусты, TCP к хосту закрыт.
@@ -6893,6 +6949,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
     let ep_key = iroh_key_from_identity(&identity)?;
     let b = start_base("c", &a.state, false, None, ep_key, Some(identity.clone()), a.quic_cc_mbit, &extra, None, &relays).await?;
     let (node, sh, ep, cli, events, admin_lxmf) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events, b.admin_lxmf);
+    if let Some(c) = &c13 { install_mesh_policy(&node, &c.trust, true); }
     let tun = TunState::open(&cli, false)?;
     let _ = sh.tun.set(tun.clone());
     tokio::spawn(tun_reader(tun.clone(), node.clone(), sh.clone()));
@@ -7941,10 +7998,82 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
         if let Some(ck) = cand.pk {
             if ck[32..64] == cand.key {
                 dataplane::plane().bind(cand.key, id);
+                mesh_carrier(ctx, cand);
             }
         }
     }
     Ok((id, handle))
+}
+
+/// Выходы, к которым сейчас идёт попытка mesh-соединения (не больше `MESH_DIAL_MAX` одновременно).
+static MESH_DIALING: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+const MESH_DIAL_MAX: usize = 2;
+
+/// У выхода нет прямого QUIC-носителя (клиент и выход не соседи): поднять сквозное QUIC-соединение по mesh и подключить его носителем мультиплексора выхода.
+/// Адрес - ТОЛЬКО mesh (с IP выигрывает гонка рукопожатия, и mesh-путь не открывается; прямой путь iroh найдёт сам через NAT traversal поверх mesh).
+/// Дальше Link/dataplane к выходу идут по этому соединению. Повторы с задержкой 2..60 с, пока выход остаётся текущим.
+fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
+    let Some(m) = mesh::global() else { return };
+    if !m.enabled() || mesh::quic_cfg().is_none() {
+        return;
+    }
+    let key = cand.key;
+    if dataplane::plane().has_carrier(&key) {
+        return;
+    }
+    {
+        let mut d = MESH_DIALING.lock().unwrap();
+        if d.contains(&key) || d.len() >= MESH_DIAL_MAX {
+            return;
+        }
+        d.push(key);
+    }
+    let (weak, dest, name) = (Arc::downgrade(ctx), cand.dest, cand.name.clone());
+    tokio::spawn(async move {
+        let mut wait = 2u64;
+        let mut first = true;
+        loop {
+            let Some(ctx) = weak.upgrade() else { break };
+            // при первой попытке `cur` ещё не записан (connect_exit не вернулся)
+            let wanted = std::mem::take(&mut first) || ctx.cur.lock().unwrap().is_some_and(|c| c.0 == dest);
+            if !wanted || dataplane::plane().has_carrier(&key) {
+                break;
+            }
+            let (Some(addr), Some(cfg)) = (mesh::endpoint_addr(&key), mesh::quic_cfg()) else { break };
+            m.prepare(&key);
+            let t0 = Instant::now();
+            let attempt = async {
+                let c = ctx.ep.connect_with_opts(addr, ALPN, iroh::endpoint::ConnectOptions::new().with_transport_config(cfg)).await.ok()?;
+                c.await.ok()
+            };
+            match tokio::time::timeout(Duration::from_secs(12), attempt).await {
+                Ok(Some(conn)) => {
+                    // не удалось пометить сквозным - соединение закрываем: непомеченное могло бы стать «соседом» mesh
+                    if !m.mark_e2e(&conn) {
+                        conn.close(0u32.into(), b"mesh table full");
+                        break;
+                    }
+                    let Ok(mx) = mux::Mux::new(&ctx.node, &ctx.sh, mux::next_name("iroh-dg-out", &format!("mesh-{}", &hex(&key)[..8])), false) else { conn.close(0u32.into(), b"no interface"); break };
+                    if mx.add_quic(conn.clone(), true, key).is_none() {
+                        conn.close(0u32.into(), b"too many carriers");
+                        break;
+                    }
+                    ctx.sh.note(format!("mesh: сквозное QUIC к {name} установлено за {} мс", t0.elapsed().as_millis()));
+                    wait = 2;
+                    drop(ctx);
+                    let _ = conn.closed().await;
+                    mx.close();
+                }
+                _ => {
+                    ctx.sh.note(format!("mesh: к {name} не соединилось, повтор через {wait} с"));
+                    drop(ctx);
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    wait = (wait * 2).min(60);
+                }
+            }
+        }
+        MESH_DIALING.lock().unwrap().retain(|k| k != &key);
+    });
 }
 
 fn candidates(ctx: &Arc<ClientCtx>, banned: &path::ExitBackoff, only: Option<[u8; 16]>) -> Vec<CServer> {
