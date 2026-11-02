@@ -1,12 +1,21 @@
 # NOTICE для Leviculum (зависимость KnotHop)
 
 Первоисточник: https://codeberg.org/Lew_Palm/Leviculum (автор Lew_Palm).
-Используется изменённый форк https://github.com/msazanov/leviculum на коммите `b73cedc3600de37d31ba4167324796e2432d5a27` (см. deploy/leviculum.ref).
+Используется изменённый форк https://github.com/msazanov/leviculum на коммите `145c8ac232051a7774a0eb377a5f5d513904e255` (см. deploy/leviculum.ref).
 База в Cargo.toml: `77c4ff13f59116adaf0190d455b83c286c135066`.
 Лицензия Leviculum и форка: AGPL-3.0-or-later; см. LICENSE.
 
 ## Коммиты форка поверх базы
 
+- 145c8ac2 Isolate ReticulumNodeBuilder cipher methods into driver/ext.rs
+- 02a69d9d Isolate discovery record expiration loop into discovery/ext.rs
+- 39666ff2 Isolate ByteChannelOptions into interfaces/byte_channel/ext.rs
+- a448871e Isolate connect_with_cipher and spawn_byte_channel_with into driver/ext.rs
+- ce7abd9d Isolate facade node builder and connect methods into api/ext.rs
+- 786aefd8 Isolate path expiry cache and its tests into memory_storage/ext
+- eada3c6a Isolate channel pacing/ceiling and HDLC bulk framing into ext modules
+- a91b5bc9 Isolate driver send window registry and datagram dispatch into ext modules
+- 1e67e960 Isolate storage and discovery fork code into ext modules
 - b73cedc3 Merge upstream master e2e4c055
 - 4c9a3efb Move driver fork code into driver/ext.rs
 - 94cf0e1a Move transport and Link fork code into ext modules

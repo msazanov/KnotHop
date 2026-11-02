@@ -1006,16 +1006,33 @@ impl Trust {
     /// Исполняя отказ, нода берёт свою политику (`my_eff`), а чужую не требует: чужие права она проверяет по выдаче. Для выбора выхода и звонка
     /// берут обе, чтобы не стучаться в ноду, которая уже отказалась.
     pub fn common_with(&self, peer: &Pk, mine: u16, theirs: u16, my_eff: bool, their_eff: bool, now: u64) -> bool {
+        self.common_root_with(peer, mine, theirs, my_eff, their_eff, now).is_some()
+    }
+
+    /// Return the actual accepted root supporting both rights. Route and
+    /// endpoint hints are not authorities. If several roots qualify, the
+    /// selected root is unspecified; callers must re-evaluate that exact root.
+    pub fn common_root_with(&self, peer: &Pk, mine: u16, theirs: u16, my_eff: bool, their_eff: bool, now: u64) -> Option<Hash> {
+        let h = hash_of(peer)?;
+        self.anchors.keys().find(|root| self.common_hash_in_with(root, &h, mine, theirs, my_eff, their_eff, now)).copied()
+    }
+
+    /// Recheck both parties in this exact accepted root, never another root.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn common_in_with(&self, root: &Hash, peer: &Pk, mine: u16, theirs: u16, my_eff: bool, their_eff: bool, now: u64) -> bool {
+        if !self.anchors.contains_key(root) { return false; }
         let Some(h) = hash_of(peer) else { return false };
-        self.anchors.keys().any(|root| {
-            // A client presents USE scoped to the exit, NOT USE scoped to itself.
-            let endpoint = if mine == USE && theirs == EXIT { h } else { self.me_hash };
-            let m = if mine == USE { self.rights_at(root, &self.me_hash, &endpoint) } else { self.rights_in(root, &self.me_hash) };
-            let t = self.rights_at(root, &h, &endpoint);
-            let m = if my_eff { m & self.offer_in(root, &self.me_hash, now) } else { m };
-            let t = if their_eff { t & self.offer_in(root, &h, now) } else { t };
-            m & mine != 0 && t & theirs != 0
-        })
+        self.common_hash_in_with(root, &h, mine, theirs, my_eff, their_eff, now)
+    }
+
+    fn common_hash_in_with(&self, root: &Hash, h: &Hash, mine: u16, theirs: u16, my_eff: bool, their_eff: bool, now: u64) -> bool {
+        // A client presents USE scoped to the exit, NOT USE scoped to itself.
+        let endpoint = if mine == USE && theirs == EXIT { *h } else { self.me_hash };
+        let m = if mine == USE { self.rights_at(root, &self.me_hash, &endpoint) } else { self.rights_in(root, &self.me_hash) };
+        let t = self.rights_at(root, h, &endpoint);
+        let m = if my_eff { m & self.offer_in(root, &self.me_hash, now) } else { m };
+        let t = if their_eff { t & self.offer_in(root, h, now) } else { t };
+        m & mine != 0 && t & theirs != 0
     }
 
     /// Мои права в корне (для выдачи).
@@ -1559,6 +1576,112 @@ mod tests {
 
     fn tr(id: &Identity) -> Trust {
         Trust::new(id.clone(), None)
+    }
+
+    #[test]
+    fn direct_vpn_admission_is_mutual_root_and_exit_scoped_and_revocable() {
+        use crate::enroll::{EnRec, Grant, Invite, Proof};
+
+        let (root_id, exit_id, client_id, other_exit, other_root) =
+            (ident(), ident(), ident(), ident(), ident());
+        let root = *root_id.hash();
+        let mut authority = tr(&root_id);
+        authority
+            .issue(root, exit_id.public_key_bytes(), USE | EXIT)
+            .unwrap();
+
+        // Model enrollment's node-scoped USE grant to this specific exit.
+        let invite = Invite::new(vec![*exit_id.hash()]).unwrap();
+        let grant = Grant::create(
+            &root_id,
+            root,
+            &invite,
+            USE,
+            now_ms() as u64 / 1000,
+        )
+        .unwrap();
+        let consent = EnRec::consent(&client_id, &grant, USE).unwrap();
+        let rec = EnRec::create(
+            &exit_id,
+            &grant,
+            client_id.public_key_bytes(),
+            USE,
+            consent,
+            now_ms() as u64,
+        )
+        .unwrap();
+        let proof = Proof {
+            root: root_id.public_key_bytes(),
+            admin: root_id.public_key_bytes(),
+            chain: authority.chain_for(&exit_id.public_key_bytes()),
+            grant,
+            rec,
+        };
+
+        let mut client = tr(&client_id);
+        client.add_anchor(&root_id.public_key_bytes()).unwrap();
+        for record in authority.export_all() {
+            assert_eq!(client.offer(record), Offer::Added);
+        }
+        assert!(client.offer_enrollment(proof.clone()).unwrap());
+
+        let mut exit = tr(&exit_id);
+        exit.add_anchor(&root_id.public_key_bytes()).unwrap();
+        for record in authority.export_all() {
+            assert_eq!(exit.offer(record), Offer::Added);
+        }
+        assert!(exit.offer_enrollment(proof.clone()).unwrap());
+
+        assert!(client.common_with(
+            &exit_id.public_key_bytes(), USE, EXIT, false, true, now_ms() as u64
+        ));
+        assert!(exit.common_with(
+            &client_id.public_key_bytes(), EXIT, USE, true, false, now_ms() as u64
+        ));
+        assert_eq!(client.common_root_with(
+            &exit_id.public_key_bytes(), USE, EXIT, false, true, now_ms() as u64
+        ), Some(root));
+        assert_eq!(exit.common_root_with(
+            &client_id.public_key_bytes(), EXIT, USE, true, false, now_ms() as u64
+        ), Some(root));
+        assert!(exit.common_in_with(&root, &client_id.public_key_bytes(), EXIT, USE, true, false, now_ms() as u64));
+        assert!(!exit.common_in_with(other_root.hash(), &client_id.public_key_bytes(), EXIT, USE, true, false, now_ms() as u64));
+        assert_eq!(
+            client.rights_at(&root, client_id.hash(), exit_id.hash()) & USE,
+            USE
+        );
+        assert_eq!(client.rights_at(&root, client_id.hash(), other_exit.hash()) & USE, 0);
+        assert!(!client.common_with(
+            &other_exit.public_key_bytes(), USE, EXIT, false, true, now_ms() as u64
+        ));
+
+        // An unrelated root does not inherit the exit's authority from `root`.
+        let mut unrelated_client = tr(&client_id);
+        unrelated_client
+            .add_anchor(&other_root.public_key_bytes())
+            .unwrap();
+        assert!(!unrelated_client.common_with(
+            &exit_id.public_key_bytes(), USE, EXIT, false, true, now_ms() as u64
+        ));
+        assert!(unrelated_client.common_root_with(
+            &exit_id.public_key_bytes(), USE, EXIT, false, true, now_ms() as u64
+        ).is_none());
+        assert_eq!(unrelated_client.rights_in(other_root.hash(), exit_id.hash()), 0);
+
+        // A root-signed revoke invalidates the scoped USE on both independent stores.
+        let revoke = authority
+            .issue(root, client_id.public_key_bytes(), 0)
+            .unwrap();
+        assert_eq!(client.offer(revoke.clone()), Offer::Added);
+        assert_eq!(exit.offer(revoke), Offer::Added);
+        assert!(!exit.common_in_with(&root, &client_id.public_key_bytes(), EXIT, USE, true, false, now_ms() as u64));
+        assert_eq!(client.rights_at(&root, client_id.hash(), exit_id.hash()), 0);
+        assert!(!client.common_with(
+            &exit_id.public_key_bytes(), USE, EXIT, false, true, now_ms() as u64
+        ));
+        assert!(!exit.common_with(
+            &client_id.public_key_bytes(), EXIT, USE, true, false, now_ms() as u64
+        ));
     }
 
     #[test]

@@ -45,6 +45,7 @@ mod observations;
 mod route;
 mod host_acl;
 mod qprobe;
+mod dataplane;
 pub use vpn::{VpnCli, VpnCmd};
 
 /// Fixed non-shell admin CLI bridge used by the Android JNI wrapper.
@@ -749,6 +750,13 @@ impl PacketSource for QuicDgramSource {
             let mut fut = std::pin::pin!(self.conn.read_datagram());
             match fut.as_mut().poll(&mut cx) {
                 Poll::Ready(Ok(b)) => {
+                    if dataplane::is_tag(&b) {
+                        dataplane::plane().on_datagram(self.conn.remote_id().as_bytes(), &b[1..]);
+                        if self.filter.ate() {
+                            return None;
+                        }
+                        continue;
+                    }
                     if self.filter.intercept(&self.conn, &b) {
                         if self.filter.ate() {
                             return None;
@@ -772,6 +780,13 @@ impl PacketSource for QuicDgramSource {
                     .read_datagram()
                     .await
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))?;
+                if dataplane::is_tag(&b) {
+                    dataplane::plane().on_datagram(self.conn.remote_id().as_bytes(), &b[1..]);
+                    if self.filter.ate() {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
                 if self.filter.intercept(&self.conn, &b) {
                     // поток magic не должен держать исполнителя и выбор между приёмом, исходящей очередью и остановом интерфейса
                     if self.filter.ate() {
@@ -2208,6 +2223,12 @@ impl TunState {
 
     /// Пакет, пришедший по Link: на выходе запомнить, чей это IP, и положить в TUN.
     fn on_link_packet(&self, node: &Arc<Node>, link_id: leviculum_std::api::LinkId, pkt: &[u8]) {
+        self.on_link_packet_with(&|id| Arc::new(node.engine().link_handle(id)), link_id, pkt);
+    }
+
+    /// Тело `on_link_packet`; `mk_handle` нужен только для обратного маршрута выхода без принудительного режима. Единый обработчик для пакетов
+    /// из Link и из прямого канала `dataplane`: проверки (allowed, source-IP, ACL, HOST_ACCESS) одни и те же.
+    fn on_link_packet_with(&self, mk_handle: &dyn Fn(&leviculum_std::api::LinkId) -> Arc<leviculum_std::LinkHandle>, link_id: leviculum_std::api::LinkId, pkt: &[u8]) {
         use std::sync::atomic::Ordering::Relaxed;
         if !valid_ipv4_packet(pkt) {
             self.c.not_ipv4.fetch_add(1, Relaxed);
@@ -2255,7 +2276,7 @@ impl TunState {
             let src = u32::from_be_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]);
             let known = self.routes.read().unwrap().get(&src).map(|(id, _)| *id == link_id).unwrap_or(false);
             if !known {
-                let handle = Arc::new(node.engine().link_handle(&link_id));
+                let handle = mk_handle(&link_id);
                 self.routes.write().unwrap().insert(src, (link_id, handle));
             }
         }
@@ -2294,6 +2315,8 @@ impl TunState {
     }
 
     pub fn disallow(&self, link_id: &leviculum_std::api::LinkId) {
+        // прямой канал данных живёт ровно столько, сколько допуск Link
+        dataplane::plane().unbind(link_id);
         disallow_link(&self.host_access, &self.allowed, &self.routes, link_id);
     }
 
@@ -2314,6 +2337,7 @@ impl TunState {
             "tun_write_drops": self.c.tun_write_drops.load(Relaxed), "route_miss": self.c.route_miss.load(Relaxed),
             "send_errors": self.c.send_errors.load(Relaxed), "not_ipv4": self.c.not_ipv4.load(Relaxed), "probes": self.c.probes.load(Relaxed),
             "routes": self.routes.read().unwrap().len(),
+            "dataplane": dataplane::plane().stats(),
             "failovers": self.failovers.lock().unwrap().clone(),
         })
     }
@@ -2407,7 +2431,9 @@ async fn tun_reader(tun: Arc<TunState>, _node: Arc<Node>, sh: Arc<Shared>) {
             };
             tun.c.from_tun_pkts.fetch_add(1, Relaxed);
             tun.c.from_tun_bytes.fetch_add(pkt.len() as u64, Relaxed);
-            if link.send_datagram(pkt).await.is_err() {
+            // Прямой канал (QUIC-датаграмма с меткой) при привязанном Link и рабочем QUIC-носителе; иначе Link. В оба пути пакет не идёт.
+            let sent = dataplane::plane().try_send(link.link_id(), pkt) || link.send_datagram(pkt).await.is_ok();
+            if !sent {
                 tun.c.send_errors.fetch_add(1, Relaxed);
             } else if !tun.is_exit && on_main {
                 let t = now_ms() as u64;

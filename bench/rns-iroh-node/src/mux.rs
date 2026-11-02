@@ -126,9 +126,18 @@ impl Mux {
         };
         for c in cars {
             if let Tx::Quic(conn) = c.tx {
+                dataplane::plane().unregister(conn.remote_id().as_bytes(), self as *const Mux as usize, c.id);
                 conn.close(0u32.into(), b"mux closed");
             }
         }
+    }
+
+    /// Этот носитель сейчас рабочий и он QUIC: только по такому соединению идёт прямой канал VPN (`dataplane`). Рабочий TCP или иной - нет.
+    pub(crate) fn carrier_selected(&self, car: u64) -> bool {
+        if self.is_closed() || self.send_on.load(Relaxed) != car {
+            return false;
+        }
+        self.st.lock().unwrap().cars.iter().any(|c| c.id == car && c.kind == Kind::Quic)
     }
 
     /// Закрыть, если носителей всё ещё нет и с момента `epoch` ничего не подключалось. Проверка и закрытие под одним замком: `add` не успеет вклиниться.
@@ -152,6 +161,7 @@ impl Mux {
     /// `owner` - по чему считается частота разрешений на зонд (принимающая сторона: адрес источника, см. `owner_key`).
     pub fn add_quic(self: &Arc<Self>, conn: Connection, select: bool, owner: [u8; 32]) -> Option<u64> {
         let id = self.add(Kind::Quic, Tx::Quic(conn.clone()), select)?;
+        dataplane::plane().register(self, id, &conn);
         let _ = self.cmd.send(Cmd::Quic(id, conn.clone(), owner));
         let (m, c) = (self.clone(), conn);
         tokio::spawn(async move {
@@ -190,6 +200,9 @@ impl Mux {
     pub fn remove(self: &Arc<Self>, id: u64) {
         let mut st = self.st.lock().unwrap();
         let before = st.cars.len();
+        if let Some(Tx::Quic(conn)) = st.cars.iter().find(|c| c.id == id).map(|c| &c.tx) {
+            dataplane::plane().unregister(conn.remote_id().as_bytes(), Arc::as_ptr(self) as usize, id);
+        }
         st.cars.retain(|c| c.id != id);
         if st.cars.len() == before {
             return;
@@ -341,6 +354,15 @@ impl MuxSource {
                             match fut.as_mut().poll(cx) {
                                 Poll::Ready(Some(b)) => {
                                     *fut = read_dg(conn);
+                                    if dataplane::is_tag(&b) {
+                                        // VPN-данные прямого канала: в RNS не идут никогда; ключ пира - только из TLS соединения
+                                        dataplane::plane().on_datagram(conn.remote_id().as_bytes(), &b[1..]);
+                                        if filter.ate() {
+                                            yielded = true;
+                                            break;
+                                        }
+                                        continue;
+                                    }
                                     if is_grant_req(&b) {
                                         answer_grant(&mux, *id, conn, filter, owner, &b);
                                         if filter.ate() {

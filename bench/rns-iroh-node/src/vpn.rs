@@ -3030,6 +3030,15 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         ours_online: Default::default(), listen_port: a.port, public_ids: Mutex::new(HashSet::new()),
         t13,
     });
+    if ctx.tun.is_some() {
+        // Пакеты прямого канала VPN идут тем же обработчиком, что и пакеты Link допущенного клиента (allowed, source-IP, ACL, HOST_ACCESS).
+        let weak = Arc::downgrade(&ctx);
+        dataplane::plane().set_sink(Arc::new(move |link, pkt| {
+            if let Some(ctx) = weak.upgrade() {
+                if let Some(t) = &ctx.tun { t.on_link_packet(&ctx.node, link, pkt); }
+            }
+        }));
+    }
     if let (Some(tun), Some(t), Some(host_nft)) = (&ctx.tun, &ctx.t13, host_nft) {
         let weak = Arc::downgrade(&ctx);
         host_nft.start(tun, t.trust.clone(), move || {
@@ -5087,7 +5096,12 @@ impl NodeCtx {
         let result = promote_client_link(&t.trust, &self.links, link, &pk, |ip, host_ok, replaces| {
             match admission_outcome(tun.allow_replacing_with_handle(link, ip, handle, replaces)) {
                 AdmitOutcome::Refuse { reason, note } => Err(AdmitOutcome::Refuse { reason, note }),
-                AdmitOutcome::SendAuthOk if tun.set_host_access(&link, host_ok) => Ok(()),
+                AdmitOutcome::SendAuthOk if tun.set_host_access(&link, host_ok) => {
+                    // Прямой канал VPN-данных: ключ iroh клиента = ключ подписи его identity (pk[32..64]); привязка только после допуска,
+                    // под теми же guard Trust+links, что и allow. Нет места - клиент просто остаётся на Link.
+                    dataplane::plane().bind(pk[32..64].try_into().expect("32 bytes"), link);
+                    Ok(())
+                }
                 _ => Err(AdmitOutcome::Refuse { reason: b"admission failed", note: "допуск в TUN не завершён" }),
             }
         });
@@ -6873,9 +6887,10 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
     if a.tun_fd < 0 {
         extra.extend(["--tun-ip", &tun_ip]);
     }
-    // с relay EndpointId клиента должен быть связан с identity, иначе relay не отличит допущенного от чужого
+    // EndpointId клиента всегда = ключ подписи identity: по нему выход сопоставляет QUIC-носитель с допущенным Link (dataplane, 0023), и relay
+    // отличает допущенного от чужого. Случайный ключ здесь = датаграммы VPN клиента отбрасываются выходом как непривязанные (ошибка hop alpha 30.10).
     let relays = parse_relay_urls(&a.relay_url);
-    let ep_key = if relays.is_empty() { SecretKey::generate() } else { iroh_key_from_identity(&identity)? };
+    let ep_key = iroh_key_from_identity(&identity)?;
     let b = start_base("c", &a.state, false, None, ep_key, Some(identity.clone()), a.quic_cc_mbit, &extra, None, &relays).await?;
     let (node, sh, ep, cli, events, admin_lxmf) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events, b.admin_lxmf);
     let tun = TunState::open(&cli, false)?;
@@ -6909,6 +6924,12 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
         carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), books: Mutex::new(HashMap::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
         c13, path_gate: path::PathGate::default(), nbrs: Mutex::new(HashMap::new()), admitted_exits: Mutex::new(HashMap::new()), ctrl: Mutex::new(HashMap::new()), lk_fail: Mutex::new(HashMap::new()), vis: Mutex::new(HashMap::new()), qstat: Mutex::new(HashMap::new()),
          rcfg: std::sync::RwLock::new(Arc::new(route::Cfg::default())), rreport: Mutex::new(serde_json::Value::Null), rpending: Mutex::new(HashSet::new()), rback: Mutex::new(HashMap::new()) });
+    {
+        let weak = Arc::downgrade(&ctx);
+        dataplane::plane().set_sink(Arc::new(move |link, pkt| {
+            if let Some(ctx) = weak.upgrade() { client_direct_packet(&ctx, link, pkt); }
+        }));
+    }
     let _enrollment_service = ctx.c13.as_ref().map(|c| enroll_net::register(node.clone(), ctx.identity.clone(), c.trust.clone(), &a.state, Some(Arc::downgrade(&ctx))));
     let _admin_client_guard = if let (Some(runtime), Some(c13)) = (admin_lxmf, ctx.c13.as_ref()) {
         let guard = lxmf_admin::register_client_runtime(&a.state, &runtime);
@@ -7518,6 +7539,7 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                 ctx.sh.established.lock().unwrap().insert(hex(link_id.as_bytes()));
             }
             NodeEvent::LinkClosed { link_id, reason, .. } => {
+                dataplane::plane().unbind(&link_id);
                 ctx.admitted_exits.lock().unwrap().remove(&link_id);
                 ctx.ctrl.lock().unwrap().remove(&link_id);
                 ctx.data_wait.lock().unwrap().remove(&link_id);
@@ -7592,6 +7614,22 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// IP-пакет из прямого канала (`dataplane`) от выхода, к ключу которого привязан `link_id`: тот же разбор, что у пакета из этого Link
+/// (`NodeEvent::LinkDataReceived` выше). Пакеты Link, не являющегося ни текущим, ни дополнительным выходом, отбрасываются.
+fn client_direct_packet(ctx: &ClientCtx, link_id: LinkId, data: &[u8]) {
+    let cur = ctx.cur.lock().unwrap().map(|c| c.1);
+    if cur == Some(link_id) {
+        ctx.last_pong.store(now_ms() as u64, Relaxed);
+        ctx.tun.on_link_packet(&ctx.node, link_id, data);
+    } else if ctx.tun.routing.load(Relaxed) {
+        let x = ctx.tun.extra.read().unwrap().values().find(|x| x.id == link_id).cloned();
+        if let Some(x) = x {
+            x.last_rx_ms.store(now_ms() as u64, Relaxed);
+            ctx.tun.on_extra_packet(data);
         }
     }
 }
@@ -7896,6 +7934,16 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     ctx.sh.note(format!("выход {} принял клиента за {} мс (хопов {:?})", cand.name, t0.elapsed().as_millis(), ctx.node.hops_to(&dest)));
     ctx.node.engine().with_link_mut(&id, |l| l.set_keepalive_override(Some(CLIENT_KEEPALIVE_S)));
     ctx.remember_rns_rtt(cand.dest, &id);
+    // Прямой канал VPN-данных к этому выходу: после AUTH_OK и проверки EXIT. Ключ - `cand.key`: именно им Link проверил подпись ответчика
+    // (`connect_with_key_cipher`), то есть это ключ подписи пира Link и ключ iroh выхода; он обязан совпасть с ключом проверенного кандидата.
+    // (`get_remote_identity` здесь не годится: у инициатора Link он пуст, пока пир не вызвал identify.) Нет совпадения или нет c13 - данные идут по Link.
+    if ctx.c13.is_some() {
+        if let Some(ck) = cand.pk {
+            if ck[32..64] == cand.key {
+                dataplane::plane().bind(cand.key, id);
+            }
+        }
+    }
     Ok((id, handle))
 }
 
@@ -8031,6 +8079,7 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
             let why = if !wanted.contains(d) { Some("не нужен") } else if closed { Some("закрыт") } else if step.silent_ms >= ctx.fail_ms.max(3000) + SILENCE_GRACE.as_millis() as u64 { Some("нет ответа") } else { None };
             if let Some(why) = why {
                 ctx.tun.extra.write().unwrap().remove(d);
+                dataplane::plane().unbind(&x.id);
                 pacers.remove(&x.id);
                 recovering.remove(&x.id);
                 let _ = ctx.node.engine().close_link(&x.id).await;

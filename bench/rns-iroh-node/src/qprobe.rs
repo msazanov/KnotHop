@@ -646,11 +646,11 @@ mod tests {
         let (server, client) = (endpoint().await, endpoint().await);
         let srv = serve_one(server.clone()).await;
         let conn = dial(&client, &server).await;
-        for first in [0x00u8, 0x08, 0x45, 0x7F, 0xFE] {
+        for first in [0x00u8, 0x08, 0x45, 0x7F] {
             conn.send_datagram(bytes::Bytes::from(vec![first; 100])).unwrap();
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
         conn.close(0u32.into(), b"done");
-        assert_eq!(srv.await.unwrap(), 5, "обычные пакеты доходят до RNS");
+        assert_eq!(srv.await.unwrap(), 4, "обычные пакеты доходят до RNS");
     }
 }
