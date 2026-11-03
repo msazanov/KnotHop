@@ -375,7 +375,7 @@ if [ "$DO_NODES" = 1 ]; then
     for l in "${LIST[@]}"; do [ -n "$l" ] && WANT[$l]=1; done
   fi
   declare -A FOUND=()
-  while IFS=$'\t' read -r -u3 label target variant opts; do
+  while IFS=$'\t' read -r -u3 label target _variant opts; do
     [ -n "$target" ] || die "пустая ssh-цель в $HOSTS (метка $label)"
     if [ -n "$WANT_NODES" ] && [ -z "${WANT[$label]:-}" ]; then continue; fi
     FOUND[$label]=1
