@@ -94,6 +94,8 @@ def should_exclude(rel: Path) -> bool:
         return True
     if name.startswith(("docs/reviews/", "docs/decisions/", "docs/archive/")):
         return True
+    if name in {"bench/vendor/iroh/PATCH.md", "bench/vendor/noq-proto/PATCH.md"}:
+        return False
     if rel.parts[:1] == ("bench",) and rel.suffix.lower() in {".md", ".rst"}:
         return True
     if name.startswith("deploy-0013/") and ".env." in rel.name:

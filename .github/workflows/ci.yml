@@ -56,7 +56,14 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/test
         run: bash bench/cargo_fork.sh rns-iroh-node test --locked --lib
       - name: Python-тесты
-        run: python3 -m unittest deploy/test_push.py deploy/test_sanitize_public.py
+        env:
+          LEVICULUM_FORK: ${{ github.workspace }}/leviculum
+        run: python3 -m unittest deploy/test_push.py deploy/test_sanitize_public.py deploy/test_live_tools.py
+      - name: Тесты локального noq-proto (MTU, очередь, replay)
+        env:
+          LEVICULUM_FORK: ${{ github.workspace }}/leviculum
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target/test
+        run: bash bench/cargo_fork.sh rns-iroh-node test --manifest-path "$GITHUB_WORKSPACE/bench/vendor/noq-proto/Cargo.toml" --locked --lib
       - name: Проверка Bash и ShellCheck
         run: |
           sudo apt-get update

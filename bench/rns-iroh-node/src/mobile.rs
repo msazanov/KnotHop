@@ -29,7 +29,7 @@ pub fn ui_visible() -> bool {
 }
 
 pub fn status_interval(visible: bool) -> Duration {
-    if visible { STATUS_FOREGROUND } else { STATUS_BACKGROUND }
+    if visible || crate::debug() { STATUS_FOREGROUND } else { STATUS_BACKGROUND }
 }
 
 pub async fn next_status(visibility: &mut watch::Receiver<bool>) {

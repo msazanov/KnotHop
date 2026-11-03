@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-if sys.argv[1:2] in (["perf"], ["meshperf"]):
+if sys.argv[1:2] in (["perf"], ["meshperf"], ["meshfail"]):
     # Замер идёт в отдельной внутренней сети со своим префиксом, release-бинарём и без подробного журнала (KNOTHOP_DEBUG замедляет путь данных).
     os.environ.setdefault("LAB13_PREFIX", "perf")
     os.environ.setdefault("LAB13_ROOT", str(Path.home() / ".cache/knothop-perf13/lab"))
@@ -558,7 +558,7 @@ def mesh_down():
         sh("docker", "run", "--rm", "-v", f"{LAB.parent}:/l", "--entrypoint", "rm", IMAGE, "-rf", "/l/lab")
 
 
-def mesh_up(mode):
+def mesh_up(mode, direct=False):
     """adm (выход) и сайт в perf-net; T в обеих сетях; клиент и хаб (публичная RNS для обнаружения адресов) достижимы клиентом через perf-neta."""
     from types import SimpleNamespace
     global MESH_T
@@ -572,7 +572,7 @@ def mesh_up(mode):
     sh("docker", "network", "create", "--internal", "--subnet", SUBNET_A, "--label", "knothop.perf=1", NET_A)
     pre = ("printf '%s' '{\"version\":1,\"aliases\":[],\"allow\":[]}' > /state/host-acl.json; chmod 600 /state/host-acl.json; "
            f"ip route replace {INET}/32 via {SITE_IP}; ")
-    env = f"KNOTHOP_DIRECT_DATA=1 KNOTHOP_MESH={mode} "
+    env = f"KNOTHOP_DIRECT_DATA=1 KNOTHOP_MESH={mode} " + os.environ.get("MESH_EXTRA_ENV", "")
     os.environ["LAB_NODE_ENV"] = pre + env
     os.environ["LAB_CLIENT_ENV"] = env
     # identity adm и T создаём заранее, право T (USE+TRANSIT: чистый транзит, не выход) выдаём офлайн ДО старта adm; якорь корня ставим на T (узел сам не вступает)
@@ -610,7 +610,12 @@ def mesh_up(mode):
     c = state_dir(CL_NAME)
     (c / "pub.txt").write_text(f"{hub_a}:4242\n")
     write_private(c / "invite.txt", make_invite(ADM_NAME, "user", CL_NAME, f"{adm_hash},{t_hash}", ""))
-    run(CL_NAME, "172.29.102.30", client_cmd(""), c, net=NET_A)
+    if direct:
+        # клиент достаёт выход напрямую (perf-net) И через транзит T: прямой носитель + тёплый запасной mesh-путь
+        run(CL_NAME, "172.29.101.30", client_cmd(""), c, net=NET)
+        sh("docker", "network", "connect", "--ip", "172.29.102.30", NET_A, CL_NAME)
+    else:
+        run(CL_NAME, "172.29.102.30", client_cmd(""), c, net=NET_A)
     deadline = time.time() + 300
     consented = False
     while time.time() < deadline:
@@ -702,6 +707,126 @@ def cmd_meshperf(a):
         print(f"#{r['index']} mode={r['mode']} reach={r['client_to_exit_ip']} client={r['dataplane_client']} exit={r['dataplane_exit']} t={r['dataplane_t']} log={r['client_log']} functional={r['tests']['functional']}")
 
 
+
+# ---------------------------------------------------------------------------------------------------- meshfail: переключение прямой -> тёплый mesh-путь
+def client_path():
+    r = sh("docker", "exec", CL_NAME, "cat", "/state/status.json", check=False)
+    try:
+        status = json.loads(r.stdout)
+        current = status.get("current") or {}
+        q = dict(current.get("quic") or {})
+        q.update(ts_ms=status.get("ts_ms"), exit=current.get("d"),
+                 dataplane=(status.get("tun") or {}).get("dataplane"),
+                 mesh=(status.get("tun") or {}).get("mesh"))
+        return q
+    except ValueError:
+        return {}
+
+
+def ping_gaps(out, t_from, t_to):
+    from failover_metrics import ping_window
+    return ping_window(out, t_from, t_to)
+
+
+def fail_scenario(kind, secs=40):
+    """kind: 'block' - клиент перестаёт видеть выход (iptables DROP на адрес выхода), T достижим; 'blackhole' - клиент теряет всю сеть на 5 с."""
+    adm_ip = sh("docker", "inspect", "-f", f"{{{{(index .NetworkSettings.Networks \"{NET}\").IPAddress}}}}", ADM_NAME).stdout.strip()
+    t0 = time.time()
+    while time.time() - t0 < 180:
+        q = client_path()
+        if q.get("kind") == "direct" and "mesh" in (q.get("backup") or []):
+            break
+        time.sleep(2)
+    else:
+        return {"error": f"тёплый запасной путь не открылся: {client_path()}"}
+    pre = client_path()
+    pinned = pre.get("exit", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", pinned):
+        return {"error": "cannot-pin-exit"}
+    sh("docker", "exec", CL_NAME, "sh", "-c", f"printf '%s' '{pinned}' > /state/select")
+    p = subprocess.Popen(["docker", "exec", GEN_NAME, "ping", "-n", "-D", "-i", "0.1", "-c", str(secs * 10), "-W", "1", INET], stdout=subprocess.PIPE, text=True)
+    ip_p = subprocess.Popen(["docker", "exec", GEN_NAME, "iperf3", "-c", INET, "-J", "-t", str(secs - 4), "-i", "1"], stdout=subprocess.PIPE, text=True)
+    time.sleep(10)
+    t_block_start = time.time()
+    if kind == "block":
+        rules_add = [["-I", "OUTPUT", "-d", adm_ip, "-j", "DROP"], ["-I", "INPUT", "-s", adm_ip, "-j", "DROP"]]
+        rules_del = [["-D", "OUTPUT", "-d", adm_ip, "-j", "DROP"], ["-D", "INPUT", "-s", adm_ip, "-j", "DROP"]]
+    else:
+        rules_add = [["-I", "OUTPUT", "!", "-o", "lo", "-j", "DROP"], ["-I", "INPUT", "!", "-i", "lo", "-j", "DROP"]]
+        rules_del = [["-D", "OUTPUT", "!", "-o", "lo", "-j", "DROP"], ["-D", "INPUT", "!", "-i", "lo", "-j", "DROP"]]
+    applied = []
+    trace = []
+    cleanup_ok = True
+    try:
+        for add, delete in zip(rules_add, rules_del):
+            sh("docker", "exec", CL_NAME, "iptables", *add)
+            applied.append(delete)
+        t_block = time.time()
+        deadline = t_block + (5 if kind == "blackhole" else 15)
+        while time.time() < deadline:
+            sample = client_path()
+            trace.append({"observed_at": time.time(), **sample})
+            time.sleep(0.25)
+    finally:
+        t_unblock_start = time.time()
+        for delete in reversed(applied):
+            cleanup_ok &= sh("docker", "exec", CL_NAME, "iptables", *delete, check=False).returncode == 0
+        t_unblock = time.time()
+    during = trace[-1] if trace else {}
+    if kind == "blackhole":
+        sh("docker", "exec", CL_NAME, "touch", "/state/netchange", check=False)
+    back = None
+    for _ in range(60):
+        q = client_path()
+        if q.get("kind") == "direct" and q.get("exit") == pinned and q.get("ts_ms", 0) >= t_unblock * 1000:
+            back = round(time.time() - t_unblock, 1)
+            break
+        time.sleep(0.5)
+    out = p.communicate()[0]
+    iout = ip_p.communicate()[0]
+    try:
+        ij = json.loads(iout)
+        ints = [round(x["sum"]["bits_per_second"] / 1e6) for x in ij["intervals"]]
+        iperf_min = min(ints[8:20]) if len(ints) > 20 else None
+        iperf_ints = ints[6:22]
+    except Exception:
+        iperf_min, iperf_ints = None, None
+    run_dir = LAB.parent / "results" / f"meshfail-{kind}-{time.time_ns()}"
+    run_dir.mkdir(parents=True)
+    (run_dir / "ping.log").write_text(out)
+    (run_dir / "iperf.json").write_text(iout)
+    fresh = [q for q in trace if t_block * 1000 <= q.get("ts_ms", 0) <= t_unblock * 1000 and q.get("exit") == pinned]
+    return {"kind": kind, "before": pre, "during": during, "path_trace": trace,
+            "mesh_observed_during_block": any(q.get("kind") == "mesh" for q in fresh),
+            "exit_stayed_pinned": bool(fresh) and all(q.get("exit") == pinned for q in trace),
+            "cleanup_ok": cleanup_ok,
+            "timing": {"block_started": t_block_start, "block_applied": t_block, "unblock_started": t_unblock_start, "unblock_done": t_unblock},
+            "ping_block": ping_gaps(out, t_block, min(t_block + 8, t_unblock)),
+            "ping_unblock": ping_gaps(out, t_unblock, t_unblock + 8),
+            "back_to_direct_status_s": back, "iperf_mbit_6_22": iperf_ints, "raw_results": str(run_dir)}
+
+
+def cmd_meshfail(a):
+    res_dir = LAB.parent / "results"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    allr = []
+    try:
+        mesh_up(1, direct=True)
+        for i in range(a.repeats):
+            for kind in ("block", "blackhole"):
+                r = fail_scenario(kind)
+                r["i"] = i
+                allr.append(r)
+                print(json.dumps(r, ensure_ascii=False), flush=True)
+                time.sleep(15)
+        st = fresh_status(CL_NAME, time.time())
+        print("mesh client:", json.dumps({k: v for k, v in (st.get("tun", {}).get("mesh") or {}).items() if v}, ensure_ascii=False))
+    finally:
+        (res_dir / "meshfail.json").write_text(json.dumps(allr, ensure_ascii=False, indent=1))
+        if not a.keep:
+            mesh_down()
+
+
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 sp = ap.add_subparsers(dest="c", required=True)
 x = sp.add_parser("up"); x.add_argument("--phone", action="store_true", help="опубликовать порт adm на LAN-адресе ноутбука для телефона"); x.add_argument("--no-adm", action="store_true", help="без ноды adm (админом будет клиент: lab13.py admin NAME)"); x.set_defaults(f=cmd_up)
@@ -724,6 +849,10 @@ x.add_argument("--negative", action="store_true", help="вместо A/B: отз
 x.add_argument("--blackhole", action="store_true", help="с --negative: выход не отвечает клиенту (клиент не видит закрытия Link и шлёт дальше)")
 x.add_argument("--keep", action="store_true", help="не убирать стенд после замера")
 x.set_defaults(f=cmd_perf)
+x = sp.add_parser("meshfail", help="переключение прямой -> тёплый mesh при блоке выхода и при потере сети клиентом")
+x.add_argument("--repeats", type=int, default=3)
+x.add_argument("--keep", action="store_true")
+x.set_defaults(f=cmd_meshfail)
 x = sp.add_parser("meshperf", help="A/B KNOTHOP_MESH=0/1 в топологии клиент–T–выход (клиент не достаёт до выхода по IP)")
 x.add_argument("--pairs", type=int, default=3)
 x.add_argument("--secs", type=int, default=10)

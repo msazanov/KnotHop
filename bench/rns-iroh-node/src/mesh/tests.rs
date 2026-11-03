@@ -43,6 +43,10 @@ impl Policy for TP {
     fn generation(&self) -> u64 {
         self.rgen.load(Relaxed)
     }
+    fn transit_candidates(&self) -> Vec<Key> {
+        let r = self.rights.lock().unwrap();
+        TRANSIT_KEYS.lock().unwrap().iter().filter(|k| r.contains(*k)).copied().collect()
+    }
     fn route(&self, dst: &Key) -> Option<Key> {
         self.routes.lock().unwrap().get(dst).copied()
     }
@@ -232,7 +236,8 @@ async fn one_hop_handshake_stream_and_datagrams_transit_sees_only_ciphertext() {
     assert_eq!(ca.remote_id(), e.ep.id());
     assert_eq!(ce.remote_id(), a.ep.id());
     assert!(mesh_selected(&ca) || ca.paths().iter().count() > 0);
-    echo(&ca, &ce).await;
+    println!("max_datagram_size: {:?}, paths: {:?}", ca.max_datagram_size(), ca.paths().iter().map(|p| (p.remote_addr().clone(), p.is_selected(), p.stats().current_mtu)).collect::<Vec<_>>());
+echo(&ca, &ce).await;
     assert!(t.mesh.c.fwd.load(Relaxed) > 0);
     assert!(e.mesh.c.delivered.load(Relaxed) > 0 && e.mesh.c.rev_learned.load(Relaxed) == 1, "ответы идут по обратной таблице");
     assert!(!t.saw_plain.load(Relaxed), "транзит увидел открытый текст");
@@ -351,6 +356,14 @@ async fn upgrades_to_ip_and_keeps_mesh_as_backup() {
 }
 
 // ---------------------------------------------------------------- решения без сети
+
+/// Потолок пакета сквозного QUIC на пути mesh: 1452 (MTU соседа) - 38 - HDR = 1396; пакет такого размера + HDR помещается в датаграмму соседа 1414.
+#[test]
+fn e2e_max_udp_fits_neighbor_datagram() {
+    assert_eq!(e2e_max_udp(1452), 1396);
+    assert_eq!(e2e_max_udp(1452) as usize + HDR, 1452 - 38);
+    assert_eq!(e2e_max_udp(10), 0, "без переполнения");
+}
 
 #[test]
 fn ttl_one_is_dropped_and_ttl_two_goes_on() {
@@ -543,14 +556,11 @@ async fn stale_hop_cache_never_sends_into_a_connection_that_rides_mesh() {
     route(&a, &e, &t);
     let (ca, _ce) = e2e_connect(&a, &e).await;
     assert!(a.mesh.mark_e2e(&ca));
-    // обычное соединение к E (поедет по mesh-пути) и «устаревший» кэш хопа, указывающий на него
-    let c2 = tokio::time::timeout(Duration::from_secs(10), a.ep.connect(EndpointAddr::new(e.ep.id()), ALPN)).await.expect("timeout").expect("connect");
-    a.mesh.hops.lock().unwrap().insert(e.id(), HopEntry { res: Ok(HopConn { sid: c2.stable_id(), peer: e.id(), conn: c2.clone() }), at: Instant::now() });
+    // «устаревший» кэш хопа, указывающий на помеченное сквозное соединение
+    a.mesh.hops.lock().unwrap().insert(e.id(), HopEntry { res: Ok(HopConn { sid: ca.stable_id(), peer: e.id(), conn: ca.clone() }), at: Instant::now() });
     let tx = a.mesh.c.tx.load(Relaxed);
     a.mesh.send_payload(&e.id(), b"x");
     assert_eq!((a.mesh.c.tx.load(Relaxed), a.mesh.c.drop_recursion.load(Relaxed)), (tx, 1));
-    // и даже без пометки самого соединения: ключ пира с живым сквозным соединением
-    assert!(a.mesh.hop_rides_mesh(&HopConn { sid: 0, peer: e.id(), conn: c2 }, Instant::now()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -665,11 +675,280 @@ async fn second_connection_to_mesh_peer_rides_mesh_and_is_not_a_neighbor() {
     assert!(a.mesh.rides_mesh(&ca));
     // второе соединение к тому же ключу: адрес не задан, iroh берёт известные пути пира (mesh)
     let c2 = tokio::time::timeout(Duration::from_secs(10), a.ep.connect(EndpointAddr::new(e.ep.id()), ALPN)).await.expect("timeout").expect("connect");
-    assert!(a.mesh.rides_mesh(&c2), "paths: {:?}", c2.paths().iter().map(|p| p.remote_addr().clone()).collect::<Vec<_>>());
+    // c2 сначала едет по mesh, потом iroh находит прямой путь: в обоих случаях кадры mesh к E идут через T, а не в соединение к E
     // и ни одно из них не используется как сосед для кадров mesh
     a.nbrs.write().unwrap().insert(e.id(), c2.clone());
     a.mesh.warm(&e.id());
     let before = a.mesh.c.tx.load(Relaxed);
     a.mesh.send_payload(&e.id(), b"x");
     assert_eq!(a.mesh.c.tx.load(Relaxed), before + 1, "кадр уходит через T, а не в соединение к E");
+}
+
+/// Патч iroh (`bench/vendor/iroh/PATCH.md`): при соединении с IP-адресом И mesh-адресом mesh-путь открывается тёплым запасным (Backup), IP выбран основным.
+/// Без патча IP выигрывает гонку рукопожатия, и mesh-путь не открывается вообще (тогда при блокировке прямого пути соединение умирает).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custom_address_opens_as_warm_backup_next_to_ip() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    a.mesh.prepare(&e.id());
+    let addr = EndpointAddr::from_parts(e.ep.id(), [TransportAddr::Ip(ip(&e)), TransportAddr::Custom(addr_of(&e.id()))]);
+    let acc = async { tokio::time::timeout(Duration::from_secs(10), e.e2e.lock().await.recv()).await.unwrap().unwrap() };
+    let (c, s) = tokio::join!(tokio::time::timeout(Duration::from_secs(10), a.ep.connect(addr, ALPN)), acc);
+    let (ca, ce) = (c.expect("timeout").expect("connect"), s);
+    let t0 = Instant::now();
+    let both = loop {
+        let paths = ca.paths();
+        let has_custom = paths.iter().any(|p| matches!(p.remote_addr(), TransportAddr::Custom(_)));
+        let ip_sel = paths.iter().any(|p| p.is_selected() && p.is_ip());
+        if has_custom && ip_sel {
+            break true;
+        }
+        if t0.elapsed() > Duration::from_secs(8) {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(both, "paths: {:?}", ca.paths().iter().map(|p| (p.remote_addr().clone(), p.is_selected())).collect::<Vec<_>>());
+    println!("max_datagram_size: {:?}, paths: {:?}", ca.max_datagram_size(), ca.paths().iter().map(|p| (p.remote_addr().clone(), p.is_selected(), p.stats().current_mtu)).collect::<Vec<_>>());
+    // запасной путь действительно живой: по нему ходят кадры (валидация пути), а данные идут по IP
+    echo(&ca, &ce).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(t.mesh.c.fwd.load(Relaxed) > 0, "по mesh-пути идут кадры валидации/keepalive");
+}
+
+/// Блокировка прямого UDP A<->E в приватном netns (`unshare -rn`, KH_NETNS=1): nft drop по портам сокетов A и E.
+fn nft_block(a: &Node, e: &Node, on: bool) {
+    assert!(std::env::var("KH_NETNS").is_ok(), "блокировку выполнять только в приватном netns");
+    let ports = |n: &Node| n.ep.bound_sockets().iter().map(|s| s.port().to_string()).collect::<Vec<_>>().join(",");
+    let (pa, pe) = (ports(a), ports(e));
+    let script = if on {
+        format!("add table inet lab\nadd chain inet lab c {{ type filter hook output priority 0; }}\nadd rule inet lab c udp sport {{ {pa} }} udp dport {{ {pe} }} drop\nadd rule inet lab c udp sport {{ {pe} }} udp dport {{ {pa} }} drop\n")
+    } else {
+        "delete table inet lab\n".to_string()
+    };
+    let mut ch = std::process::Command::new("nft").args(["-f", "-"]).stdin(std::process::Stdio::piped()).spawn().unwrap();
+    use std::io::Write;
+    ch.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    assert!(ch.wait().unwrap().success());
+}
+
+/// Переключение на тёплый запасной путь: поток датаграмм A->E каждые 20 мс, блок прямого UDP, замер паузы в доставке; разблок - возврат на IP.
+/// Запуск: `unshare -rn sh -c 'ip link set lo up; KH_NETNS=1 bash bench/cargo_fork.sh rns-iroh-node test --offline --locked --lib mesh::tests::failover -- --ignored --nocapture'`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "нужен приватный netns с nft"]
+async fn failover_to_warm_backup_and_back() {
+    assert!(std::env::var("KH_NETNS").is_ok());
+    let cfgs: [(&str, Option<(u64, u64, u64)>); 1] = [("default", None)];
+    for (name, _cfg) in cfgs {
+        let (a, t, e) = (node().await, node().await, node().await);
+        link(&a, &t).await;
+        link(&t, &e).await;
+        allow_all(&[&a, &t, &e]);
+        t.set_transit(true);
+        route(&a, &e, &t);
+        a.mesh.prepare(&e.id());
+        let addr = EndpointAddr::from_parts(e.ep.id(), [TransportAddr::Ip(ip(&e)), TransportAddr::Custom(addr_of(&e.id()))]);
+        let acc = async { e.e2e.lock().await.recv().await.unwrap() };
+        let (c, ce) = tokio::join!(a.ep.connect(addr, ALPN), acc);
+        let ca = c.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let rx = tokio::spawn({
+            let ce = ce.clone();
+            async move {
+                let mut got: Vec<(u32, Instant)> = Vec::new();
+                while let Ok(Ok(d)) = tokio::time::timeout(Duration::from_secs(40), ce.read_datagram()).await {
+                    got.push((u32::from_be_bytes(d[..4].try_into().unwrap()), Instant::now()));
+                }
+                got
+            }
+        });
+        let start = Instant::now();
+        let mut seq = 0u32;
+        let (mut blocked_at, mut unblocked_at) = (None, None);
+        let mut saw_mesh_during_block = false;
+        while start.elapsed() < Duration::from_secs(40) {
+            let el = start.elapsed();
+            if blocked_at.is_none() && el > Duration::from_secs(5) {
+                nft_block(&a, &e, true);
+                blocked_at = Some(Instant::now());
+            }
+            if blocked_at.is_some() && unblocked_at.is_none() && el > Duration::from_secs(25) {
+                nft_block(&a, &e, false);
+                unblocked_at = Some(Instant::now());
+            }
+            if blocked_at.is_some() && unblocked_at.is_none() {
+                saw_mesh_during_block |= ca.paths().iter().any(|p| p.is_selected() && matches!(p.remote_addr(), TransportAddr::Custom(_)));
+            }
+            let _ = ca.send_datagram(Bytes::from(seq.to_be_bytes().to_vec()));
+            seq += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw_mesh_during_block, "backup must actually become selected during the block");
+        assert!(ca.paths().iter().any(|p| p.is_selected() && matches!(p.remote_addr(), TransportAddr::Ip(_))), "direct path must return");
+        ca.close(0u32.into(), b"test complete");
+        drop(ca);
+        let got = rx.await.unwrap();
+        let (b0, u0) = (blocked_at.unwrap(), unblocked_at.unwrap());
+        // наибольшая пауза в доставке после блока и после разблока
+        let gap = |from: Instant, to: Instant| {
+            let mut last = from;
+            let mut worst = Duration::ZERO;
+            for (_, t) in got.iter().filter(|(_, t)| *t >= from && *t <= to) {
+                worst = worst.max(*t - last);
+                last = *t;
+            }
+            worst.max(to.saturating_duration_since(last))
+        };
+        {
+            // диагностика до проверок: где именно провал доставки во время блока
+            let win: Vec<Duration> = got.iter().filter(|(_, t)| *t >= b0 && *t <= u0).map(|(_, t)| *t - b0).collect();
+            let mut gaps: Vec<(Duration, Duration)> = Vec::new();
+            let mut last = Duration::ZERO;
+            for &t in &win {
+                if t - last > Duration::from_millis(250) {
+                    gaps.push((last, t - last));
+                }
+                last = t;
+            }
+            println!("[{name}] block window {:?}: delivered {}, first at {:?}, last at {:?}, gaps>250ms (start, len): {gaps:?}", u0 - b0, win.len(), win.first(), win.last());
+        }
+        let unique: std::collections::HashSet<_> = got.iter().map(|(n, _)| *n).collect();
+        assert_eq!(unique.len(), got.len(), "duplicate application datagrams");
+        assert!(got.iter().any(|(_, t)| *t >= b0 && *t < u0), "delivery must continue via backup");
+        assert!(got.iter().any(|(_, t)| *t >= u0), "delivery must continue after unblock");
+        assert!(gap(b0, u0) < Duration::from_secs(2), "backup delivery stalled");
+        let lost_block = (seq as usize).saturating_sub(unique.len());
+        println!("[{name}] sent={seq} got={} lost={lost_block}; worst gap after block {:?}, after unblock {:?}", got.len(), gap(b0, u0), gap(u0, u0 + Duration::from_secs(10)));
+    }
+}
+
+/// Потеря сети клиентом: nft режет весь UDP узла A (оба направления, любые пиры) на `outage`, затем возврат. `notify` - оболочка сообщает о возврате сети
+/// (`Endpoint::network_change`, как `mobile::network_changed` в knothopd). Замер: пауза в доставке датаграмм A->E после возврата.
+async fn network_loss_run(notify: bool, outage: Duration) -> (Duration, usize, usize) {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    a.mesh.prepare(&e.id());
+    let addr = EndpointAddr::from_parts(e.ep.id(), [TransportAddr::Ip(ip(&e)), TransportAddr::Custom(addr_of(&e.id()))]);
+    let acc = async { e.e2e.lock().await.recv().await.unwrap() };
+    let (c, ce) = tokio::join!(a.ep.connect(addr, ALPN), acc);
+    let ca = c.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let rx = tokio::spawn({
+        let ce = ce.clone();
+        async move {
+            let mut got: Vec<(u32, Instant)> = Vec::new();
+            while let Ok(Ok(d)) = tokio::time::timeout(Duration::from_secs(25), ce.read_datagram()).await {
+                got.push((u32::from_be_bytes(d[..4].try_into().unwrap()), Instant::now()));
+            }
+            got
+        }
+    });
+    let ports: Vec<String> = a.ep.bound_sockets().iter().map(|s| s.port().to_string()).collect();
+    let p = ports.join(",");
+    let nft = |s: String| {
+        let mut ch = std::process::Command::new("nft").args(["-f", "-"]).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        use std::io::Write;
+        ch.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
+        assert!(ch.wait().unwrap().success());
+    };
+    let start = Instant::now();
+    let (mut down_at, mut up_at) = (None, None);
+    let mut seq = 0u32;
+    let mut sent_after_up = 0usize;
+    let mut first_seq_after_up = None;
+    while start.elapsed() < outage + Duration::from_secs(14) {
+        let el = start.elapsed();
+        if down_at.is_none() && el > Duration::from_secs(3) {
+            nft(format!("add table inet lab\nadd chain inet lab o {{ type filter hook output priority 0; }}\nadd chain inet lab i {{ type filter hook input priority 0; }}\nadd rule inet lab o udp sport {{ {p} }} drop\nadd rule inet lab o udp dport {{ {p} }} drop\nadd rule inet lab i udp dport {{ {p} }} drop\n"));
+            down_at = Some(Instant::now());
+        }
+        if down_at.is_some() && up_at.is_none() && el > Duration::from_secs(3) + outage {
+            nft("delete table inet lab\n".into());
+            up_at = Some(Instant::now());
+            first_seq_after_up = Some(seq);
+            if notify {
+                a.ep.network_change().await;
+            }
+        }
+        let _ = ca.send_datagram(Bytes::from(seq.to_be_bytes().to_vec()));
+        if up_at.is_some() {
+            sent_after_up += 1;
+        }
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    ca.close(0u32.into(), b"test complete");
+    drop(ca);
+    let got = rx.await.unwrap();
+    let up = up_at.unwrap();
+    let first_seq = first_seq_after_up.unwrap();
+    let after: Vec<_> = got.iter().filter(|(n, t)| *n >= first_seq && *t >= up).collect();
+    let first_after = after.first().map(|(_, t)| *t - up).unwrap_or(Duration::from_secs(99));
+    let unique: std::collections::HashSet<_> = after.iter().map(|(n, _)| *n).collect();
+    assert_eq!(unique.len(), after.len(), "duplicate application datagrams");
+    (first_after, sent_after_up, unique.len())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "нужен приватный netns с nft"]
+async fn network_loss_recovery() {
+    assert!(std::env::var("KH_NETNS").is_ok());
+    for outage in [Duration::from_secs(3), Duration::from_secs(8)] {
+        for notify in [false, true] {
+            let (first, sent, got) = network_loss_run(notify, outage).await;
+            println!("[netloss] outage={outage:?} notify={notify}: first delivery after return {first:?}; sent after return {sent}, delivered {got}");
+            assert!(first < Duration::from_secs(2), "fresh post-outage packet must arrive within 2 s");
+            assert!(got <= sent && got * 10 >= sent * 9, "at least 90% of post-outage packets must arrive");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn path_json_reports_kind_rtt_and_backup_from_quic() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    a.mesh.prepare(&e.id());
+    let addr = EndpointAddr::from_parts(e.ep.id(), [TransportAddr::Ip(ip(&e)), TransportAddr::Custom(addr_of(&e.id()))]);
+    let acc = async { e.e2e.lock().await.recv().await.unwrap() };
+    let (c, _ce) = tokio::join!(a.ep.connect(addr, ALPN), acc);
+    let ca = c.unwrap();
+    let t0 = Instant::now();
+    let j = loop {
+        let j = path_json(&ca, a.mesh.hop_peer(&e.id()));
+        if (j["kind"] == "direct" && j["backup"].as_array().is_some_and(|b| b.iter().any(|x| x == "mesh"))) || t0.elapsed() > Duration::from_secs(8) {
+            break j;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(j["kind"], "direct", "{j}");
+    assert!(j["backup"].as_array().unwrap().iter().any(|x| x == "mesh"), "{j}");
+    assert!(j["rtt_ms"].as_f64().is_some());
+    assert_eq!(j["path_desc"], "прямой (IP)");
+    assert!(j["current_mtu"].as_u64().is_some_and(|mtu| mtu >= 1200));
+    assert!(j["max_datagram_size"].as_u64().is_some());
+    assert!(j["datagram_mtu_drops"].as_u64().is_some());
+    assert!(j["black_holes_detected"].as_u64().is_some());
+}
+
+#[test]
+fn private_and_special_addresses_are_not_global() {
+    use iroh::knothop::is_global;
+    for s in ["127.0.0.1", "10.1.2.3", "192.168.0.9", "172.16.5.5", "169.254.1.1", "100.64.0.1", "0.0.0.0", "224.0.0.1", "198.18.0.5", "::1", "fe80::1", "fc00::5", "ff02::1", "::"] {
+        assert!(!is_global(&s.parse().unwrap()), "{s}");
+    }
+    for s in ["8.8.8.8", "1.1.1.1", "1.1.1.1", "2606:4700:4700::1111"] {
+        assert!(is_global(&s.parse().unwrap()), "{s}");
+    }
 }

@@ -1145,8 +1145,14 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
     let events = node.take_event_receiver().context("event receiver")?;
     let node = Arc::new(node);
 
+    // фильтр исходящих адресов IP-транспорта (правка iroh): QNT-зонды выхода идут на адреса, которые называет пир; частные/loopback закрыты, лаборатория включает KNOTHOP_ALLOW_PRIVATE_DIAL=1
+    iroh::knothop::set_block_private_egress(std::env::var("KNOTHOP_ALLOW_PRIVATE_DIAL").is_err());
     // mesh (ADR 0023): сквозное QUIC клиент↔выход через транзит. KNOTHOP_MESH=0 - транспорт на endpoint не ставится вовсе (поведение как до mesh)
     let mesh_inst = mesh::install(*key.public().as_bytes());
+    // потолок UDP-пакета на путях mesh: соседский QUIC того же MTU; KNOTHOP_MESH_E2E_CAP=0 отключает (A/B в lab13)
+    if cli.quic_initial_mtu > 0 && std::env::var("KNOTHOP_MESH_E2E_CAP").map(|v| v.trim() != "0").unwrap_or(true) {
+        iroh::knothop::set_custom_path_max_udp(mesh::e2e_max_udp(cli.quic_initial_mtu));
+    }
     if let Some(c) = transport_mtu(cli.path_idle_ms, cli.path_keepalive_ms, cli.conn_idle_ms, Some(1200)) {
         mesh::set_quic_cfg(c);
     }
@@ -1214,6 +1220,11 @@ impl mesh::Policy for MeshPolicy {
 
     fn generation(&self) -> u64 {
         self.rights_gen.load(Relaxed)
+    }
+
+    fn transit_candidates(&self) -> Vec<[u8; 32]> {
+        let tr = self.trust.lock().unwrap();
+        tr.holders_with(trust::TRANSIT).into_iter().map(|pk| <[u8; 32]>::try_from(&pk[32..64]).unwrap()).filter(|k| tr.key_is_transit(k)).collect()
     }
 
     fn key_for_id(&self, id: &[u8; 8]) -> Option<[u8; 32]> {
@@ -1864,7 +1875,13 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
             for a in &resolved {
                 addr = addr.with_ip_addr(*a);
             }
-            let addr = with_relays(addr);
+            let mut addr = with_relays(addr);
+            // тёплый запасной путь: mesh-адрес пира (правка iroh открывает его запасным рядом с IP); мимо прямого носителя кадры идут через альтернативный транзит
+            if let Some(m) = mesh::global().filter(|m| m.enabled()) {
+                let key = *d.id.as_bytes();
+                addr = addr.with_addrs([iroh::TransportAddr::Custom(mesh::addr_of(&key))]);
+                m.prepare(&key);
+            }
             match tokio::time::timeout(Duration::from_secs(if resolved.is_empty() { 15 } else { 6 }), d.ep.connect(addr, ALPN)).await {
                 Ok(Ok(conn)) => {
                     quic_fail = 0;
@@ -2130,8 +2147,9 @@ impl Dialer {
                 Cur::Tcp { .. } => {
                     let quic_bad = sh.health.is_bad(peer, health::Kind::Quic);
                     let from = *st.tcp_since.get_or_insert(since);
+                    let force_try = !ctl.prefer_tcp.load(Relaxed);
                     // срок проверяется вместе с памятью о QUIC: помеченный неработающим QUIC не повод пробовать
-                    if !tcp_release_due(from.elapsed(), st.back_off, quic_bad) {
+                    if !force_try && !tcp_release_due(from.elapsed(), st.back_off, quic_bad) {
                         continue;
                     }
                     match self.try_return(&m).await {
@@ -2141,6 +2159,7 @@ impl Dialer {
                             ctl.prefer_tcp.store(false, Relaxed);
                             old.close();
                             st.tcp_since = None;
+                            st.back_off = st.first_back;
                             since = Instant::now();
                             proven = false;
                             sh.note(format!("{label}: возврат на QUIC без разрыва Link"));
@@ -2204,6 +2223,11 @@ impl Dialer {
         let mut addr = EndpointAddr::new(self.id);
         for a in &resolved {
             addr = addr.with_ip_addr(*a);
+        }
+        if let Some(m) = mesh::global().filter(|m| m.enabled()) {
+            let key = *self.id.as_bytes();
+            addr = addr.with_addrs([iroh::TransportAddr::Custom(mesh::addr_of(&key))]);
+            m.prepare(&key);
         }
         let conn = match tokio::time::timeout(Duration::from_secs(6), self.ep.connect(addr, ALPN)).await {
             Ok(Ok(c)) => c,
@@ -6887,17 +6911,43 @@ impl ClientCtx {
             .collect();
         // Маршрут до текущего выхода: Link идёт через интерфейс, на который телефон набрал узел (его имя в названии интерфейса). Если это не сам выход -
         // выход достигается через транзитный узел (первая пересылка); дальше цепочка клиенту неизвестна.
-        let via: Option<String> = cur.and_then(|c| {
-            let ifc = self.node.engine().with_link(&c.1, |l| l.attached_interface())??;
-            let name = self.node.engine().interface_stats().iter().find(|i| i.interface_id.0 == ifc)?.name.clone();
-            let label = name.strip_prefix("iroh-dg-out-").or_else(|| name.strip_prefix("tcp-out-"))?.rsplit_once('-')?.0.to_string();
-            let dest_of = self.carriers.lock().unwrap().iter().find(|(_, x)| *x.label.lock().unwrap() == label).map(|(d, _)| *d)?;
-            if dest_of == c.0 { None } else { Some(hex(&dest_of)) }
+        let mut quic_via_dest = None;
+        let quic_info = cur.and_then(|c| {
+            servers.iter().find(|e| e.dest == c.0).and_then(|e| {
+                dataplane::plane().carrier_conn(&e.key).map(|conn| {
+                    let hop = mesh::global().and_then(|m| m.hop_peer(&e.key));
+                    let info = mesh::path_json(&conn, hop);
+                    if info["kind"] == "mesh" {
+                        // UI indexes nodes by full RNS destination, not a prefix of the QUIC key.
+                        quic_via_dest = hop.and_then(|key| servers.iter().find(|s| s.key == key).map(|s| hex(&s.dest)));
+                    }
+                    info
+                })
+            })
         });
+        let via: Option<String> = if quic_info.is_some() {
+            quic_via_dest
+        } else {
+            cur.and_then(|c| {
+                let ifc = self.node.engine().with_link(&c.1, |l| l.attached_interface())??;
+                let name = self.node.engine().interface_stats().iter().find(|i| i.interface_id.0 == ifc)?.name.clone();
+                let label = name.strip_prefix("iroh-dg-out-").or_else(|| name.strip_prefix("tcp-out-"))?.rsplit_once('-')?.0.to_string();
+                let dest_of = self.carriers.lock().unwrap().iter().find(|(_, x)| *x.label.lock().unwrap() == label).map(|(d, _)| *d)?;
+                if dest_of == c.0 { None } else { Some(hex(&dest_of)) }
+            })
+        };
+        let rtt = if let Some(ref q) = quic_info {
+            q["rtt_ms"].as_f64().or(*self.rtt_ms.lock().unwrap())
+        } else {
+            *self.rtt_ms.lock().unwrap()
+        };
+        let path_desc = quic_info.as_ref().and_then(|q| q["path_desc"].as_str().map(String::from));
         let j = serde_json::json!({"state": state, "ip": self.ip, "up_s": up_since.elapsed().as_secs(),
             "current": cur.map(|c| serde_json::json!({"d": hex(&c.0), "n": servers.iter().find(|e| e.dest == c.0).map(|e| e.name.clone()), "since_s": c.2.elapsed().as_secs(),
-                "rtt_ms": *self.rtt_ms.lock().unwrap(), "hops": self.node.hops_to(&DestinationHash::new(c.0)),
-                "carrier": self.carriers.lock().unwrap().get(&c.0).map(|x| *x.mode.lock().unwrap()), "via": via})),
+                "rtt_ms": rtt, "hops": self.node.hops_to(&DestinationHash::new(c.0)),
+                "carrier": self.carriers.lock().unwrap().get(&c.0).map(|x| *x.mode.lock().unwrap()), "via": via,
+                "path_desc": path_desc,
+                "quic": quic_info})),
             "log_tail": self.sh.log.lock().unwrap().iter().rev().take(25).map(|(t, m)| format!("{} {}", *t as u64, m)).collect::<Vec<_>>(),
             "selected": std::fs::read_to_string(self.state.join("select")).unwrap_or_default().trim().to_string(),
             "routing": self.routing_json(&servers),
@@ -7109,20 +7159,26 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
     }
     // Android sends the existing ConnectivityManager event through JNI. CLI retains its file hook.
     {
-        let (ep2, f) = (ep.clone(), a.state.join("netchange"));
+        let (ep2, f, c_net) = (ep.clone(), a.state.join("netchange"), ctx.clone());
         tokio::spawn(async move {
             let mut changes = crate::mobile::network_changes();
             loop {
                 let event = if cfg!(target_os = "android") {
                     changes.changed().await.is_ok()
                 } else {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    f.exists()
+                    tokio::select! {
+                        _ = changes.changed() => true,
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => f.exists(),
+                    }
                 };
                 if event {
                     changes.borrow_and_update();
                     if !cfg!(target_os = "android") {
-                    let _ = std::fs::remove_file(&f);
+                        let _ = std::fs::remove_file(&f);
+                    }
+                    sh.health.reset_all();
+                    for ctl in c_net.carriers.lock().unwrap().values() {
+                        ctl.prefer_tcp.store(false, Relaxed);
                     }
                     ep2.network_change().await;
                 }
@@ -8421,6 +8477,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
 
         // обслуживание: пинг раз в секунду, смена по просьбе пользователя, отказ -> следующий выход
         let mut pacer = Pacer { last_pkts: ctx.tun.traffic_pkts(), ..Default::default() };
+        let mut quic_tracker = (0usize, 0u64); // (conn_id, last_rx_count)
         let mut sil_grace: Option<Instant> = None;
         let mut better_since: Option<Instant> = None;
         let mut last_eval = Instant::now();
@@ -8472,6 +8529,34 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             }
             let (acked, ka_rtt) = ctx.node.engine().with_link(&id, |l| (l.keepalives_acked(), l.keepalive_rtt_ms())).unwrap_or((0, None));
             let now = now_ms() as u64;
+
+            // Телеметрия и живость выхода через сквозной QUIC (Задача Б):
+            let quic_carrier = dataplane::plane().carrier_conn(&cand.key);
+            if let Some(ref quic_conn) = quic_carrier {
+                let st = quic_conn.stats();
+                // Only authenticated, non-replayed frames are contact. Raw UDP
+                // includes garbage/replays addressed to the connection ID.
+                let rx_count = st.frame_rx.authenticated_progress();
+                let cid = quic_conn.stable_id();
+                let mut fresh = false;
+                if quic_tracker.0 != cid {
+                    quic_tracker = (cid, rx_count);
+                    *ctx.rtt_ms.lock().unwrap() = None;
+                } else if rx_count > quic_tracker.1 {
+                    quic_tracker.1 = rx_count;
+                    ctx.last_pong.store(now, Relaxed);
+                    fresh = true;
+                }
+                if let Some(sel) = quic_conn.paths().iter().find(|p| p.is_selected()).filter(|_| fresh) {
+                    let rtt = (sel.rtt().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+                    *ctx.rtt_ms.lock().unwrap() = Some(rtt);
+                    ctx.rtt_pong.store(now, Relaxed);
+                }
+            } else {
+                // carrier_conn omits closed/unselected QUIC. Let the existing
+                // Link/TCP recovery run; a closed carrier does not prove a dead exit.
+                quic_tracker = (0, 0);
+            }
             let step = pacer.step(now, ctx.tun.traffic_pkts(), ctx.last_pong.load(Relaxed), acked, CLIENT_KEEPALIVE_S * 1000, ctx.fail_ms);
             if step.keepalive_ack {
                 ctx.remember_rns_rtt(cand.dest, &id);
@@ -8491,7 +8576,11 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                 let car = ctx.carriers.lock().unwrap().get(&cand.dest).cloned();
                 let car = car.map(|c| format!("{} смен {}", if c.is_quic() { "QUIC" } else { "TCP" }, c.switches.load(Relaxed))).unwrap_or_else(|| "?".into());
                 let rtt = ctx.rtt_ms.lock().unwrap().map(|r| format!("{r:.0} мс")).unwrap_or_else(|| "?".into());
-                let loss = ctx.loss.lock().unwrap().loss(Duration::from_secs(10), 1).map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "?".into());
+                let loss = if let Some(ref conn) = quic_carrier {
+                    format!("QUIC lost_packets={} (за соединение)", conn.stats().lost_packets)
+                } else {
+                    ctx.loss.lock().unwrap().loss(Duration::from_secs(10), 1).map(|x| format!("RGP {:.0}%", x * 100.0)).unwrap_or_else(|| "?".into())
+                };
                 ctx.sh.note(format!("снимок: выход {}, живёт {} с, носитель {car}, rtt {rtt}, потери {loss}, тишина {} мс, keepalive ack {acked}, пакетов TUN {}",
                     cand.name, connected_at.elapsed().as_secs(), step.silent_ms, ctx.tun.traffic_pkts()));
             }
@@ -8520,18 +8609,23 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                 }
             }
             if step.ping {
-                seq = seq.wrapping_add(1);
-                spawn_dgram(&ctx.node, id, dgram_ping(seq, now_us(), b'P'));
-                ctx.loss.lock().unwrap().sent(seq);
-                // монитор качества: на QUIC потери пингов >= 30% при >= 8 созревших -> запасной TCP для этого выхода
-                let cc = ctx.carriers.lock().unwrap().get(&cand.dest).cloned();
-                if let Some(cc) = cc {
-                    if cc.is_quic() && !cc.prefer_tcp.load(Relaxed) {
-                        if let Some(l) = ctx.loss.lock().unwrap().loss(Duration::from_secs(3), 8) {
-                            if l >= 0.30 {
-                                ctx.sh.note(format!("{}: потери UDP {:.0}% по пингам, переключаю носитель на TCP", cand.name, l * 100.0));
-                                cc.prefer_tcp.store(true, Relaxed);
-                                cc.switches.fetch_add(1, Relaxed);
+                if let Some(ref quic_conn) = quic_carrier {
+                    // Проба запрашивает ACK; живость обновляет только приём, не сам вызов ping().
+                    quic_conn.ping();
+                } else {
+                    seq = seq.wrapping_add(1);
+                    spawn_dgram(&ctx.node, id, dgram_ping(seq, now_us(), b'P'));
+                    ctx.loss.lock().unwrap().sent(seq);
+                    // монитор качества: на QUIC потери пингов >= 30% при >= 8 созревших -> запасной TCP для этого выхода
+                    let cc = ctx.carriers.lock().unwrap().get(&cand.dest).cloned();
+                    if let Some(cc) = cc {
+                        if cc.is_quic() && !cc.prefer_tcp.load(Relaxed) {
+                            if let Some(l) = ctx.loss.lock().unwrap().loss(Duration::from_secs(3), 8) {
+                                if l >= 0.30 {
+                                    ctx.sh.note(format!("{}: потери UDP {:.0}% по пингам, переключаю носитель на TCP", cand.name, l * 100.0));
+                                    cc.prefer_tcp.store(true, Relaxed);
+                                    cc.switches.fetch_add(1, Relaxed);
+                                }
                             }
                         }
                     }

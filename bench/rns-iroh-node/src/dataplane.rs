@@ -226,6 +226,11 @@ impl Plane {
         })
     }
 
+    /// Выбранный QUIC-носитель к ключу (для статуса: путь и RTT берутся из его статистики).
+    pub fn carrier_conn(&self, key: &[u8; 32]) -> Option<Connection> {
+        self.carrier(key)
+    }
+
     /// Есть ли выбранный QUIC-носитель к ключу (любой, в том числе сквозной по mesh).
     pub fn has_carrier(&self, key: &[u8; 32]) -> bool {
         self.carrier(key).is_some()
@@ -281,11 +286,32 @@ impl Plane {
     }
 
     pub fn stats(&self) -> serde_json::Value {
+        let (min_mds, total_bh, mtu_drops) = {
+            let m = self.conns.read().unwrap();
+            let mut mds: Option<usize> = None;
+            let mut bh = 0u64;
+            let mut mtu_drops = 0u64;
+            for v in m.values() {
+                for e in v.iter().filter(|e| e.conn.close_reason().is_none()) {
+                    mtu_drops = mtu_drops.saturating_add(e.conn.stats().datagram_mtu_drops);
+                    if let Some(sz) = e.conn.max_datagram_size() {
+                        mds = Some(mds.map_or(sz, |m| m.min(sz)));
+                    }
+                    for p in e.conn.paths().iter() {
+                        bh += p.stats().black_holes_detected;
+                    }
+                }
+            }
+            (mds, bh, mtu_drops)
+        };
         serde_json::json!({
             "tx": self.c.tx.load(Relaxed), "rx": self.c.rx.load(Relaxed), "fallback": self.c.fallback.load(Relaxed),
             "unbound_drops": self.c.unbound_drops.load(Relaxed), "too_large": self.c.too_large.load(Relaxed),
             "table_full": self.c.table_full.load(Relaxed),
             "bindings": self.bindings(), "tx_enabled": self.tx_enabled.load(Relaxed),
+            "max_datagram_size": min_mds,
+            "black_holes_detected": total_bh,
+            "datagram_mtu_drops": mtu_drops,
         })
     }
 }

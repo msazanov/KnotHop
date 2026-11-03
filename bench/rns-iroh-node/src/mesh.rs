@@ -50,6 +50,17 @@ pub fn id_of(k: &Key) -> Id {
 pub const MAX_TTL: u8 = 8;
 /// Наименьший допустимый UDP-пакет QUIC (Initial) - соседская датаграмма должна вмещать его вместе с заголовком.
 const QUIC_MIN_UDP: usize = 1200;
+/// Накладные расходы QUIC на одну датаграмму соседа: `MTU - max_datagram_size` (1452 - 1414 по замерам lab13 `meshfail`).
+const NBR_DGRAM_OVERHEAD: usize = 38;
+
+/// Наибольший UDP-пакет сквозного QUIC, который заведомо влезает в датаграмму соседа с MTU `nbr_mtu`: `nbr_mtu - накладные - HDR`.
+/// Custom-транспорт не сообщает QUIC MTU, поэтому потолок задаёт приложение (`iroh::knothop::set_custom_path_max_udp`): иначе
+/// тёплый путь mesh стартует с `initial_mtu` соединения, пакеты больше потолка теряются сериями, детектор чёрной дыры noq
+/// сбрасывает MTU пути в 1200 на 60 с, и IP-пакет TUN (1328 Б с меткой) уходит в fallback Link.
+pub fn e2e_max_udp(nbr_mtu: u16) -> u16 {
+    (nbr_mtu as usize).saturating_sub(NBR_DGRAM_OVERHEAD + HDR) as u16
+}
+
 /// Сколько сегментов GSO принимает наш sender. Не меньше, чем у IP-транспорта (Linux: 64): iroh берёт минимум по всем транспортам
 /// (`socket/transports.rs: max_transmit_segments`), и меньшее значение отключило бы GSO прямому IP-пути.
 pub const MAX_SEGMENTS: usize = 64;
@@ -69,8 +80,6 @@ const HOP_MAX_AGE: Duration = Duration::from_secs(5);
 const HOP_MAX: usize = 256;
 /// Сколько сквозных соединений и пиров с ними помечаем (больше - соединение закрывается: непомеченное могло бы стать «соседом» mesh).
 const E2E_MAX: usize = 256;
-/// Пока iroh помнит mesh-адрес пира после закрытия последнего сквозного соединения, новые обычные соединения к нему тоже идут по mesh.
-const PEER_GRACE: Duration = Duration::from_secs(300);
 const BUCKET_MAX_NBR: usize = 256;
 const BUCKET_MAX_PAIR: usize = 1024;
 
@@ -85,6 +94,8 @@ pub trait Policy: Send + Sync {
     fn holds_rights(&self, key: &Key) -> bool;
     /// Держит ли ключ право TRANSIT в принятом корне применительно к этому узлу (только такой сосед вправе вести за собой чужого источника).
     fn is_transit(&self, key: &Key) -> bool;
+    /// Ключи узлов с правом TRANSIT применительно к этому узлу: из них выбирается альтернативный транзит для тёплого запасного пути.
+    fn transit_candidates(&self) -> Vec<Key>;
     /// Поколение прав: меняется при любом изменении записей, зачислений, якорей и политик. Кэши решений mesh сбрасываются при смене - отзыв действует сразу.
     fn generation(&self) -> u64;
     /// Сосед, через которого таблица путей RNS ведёт к назначению узла с ключом `dst`. Только подсказка маршрута, не полномочие.
@@ -127,6 +138,10 @@ pub struct Counters {
     pub drop_recursion: AtomicU64,
     /// не удалось пометить сквозное соединение (таблица заполнена): соединение закрывается
     pub e2e_overflow: AtomicU64,
+    /// очередь отправки кадров полна (кадр потерян)
+    pub drop_queue_full: AtomicU64,
+    /// путь mesh тёплого запасного пути: кадров через альтернативный транзит
+    pub alt_hops: AtomicU64,
     /// сколько раз кэши решений сброшены сменой поколения прав
     pub gen_resets: AtomicU64,
 }
@@ -189,6 +204,9 @@ pub struct Mesh {
     ride_cache: Mutex<HashMap<usize, (bool, Instant)>>,
     hop_pending: Mutex<std::collections::HashSet<Key>>,
     hop_req: Mutex<std::sync::mpsc::Sender<Key>>,
+    /// очередь исходящих кадров: poll_send работает под замком QUIC-соединения, а `send_datagram` хопа берёт замок ДРУГОГО соединения; чтобы вложенные замки
+    /// (и циклы между соединениями с mesh-путём) были невозможны, кадры отправляет отдельный поток
+    txq: std::sync::mpsc::SyncSender<(Connection, Bytes)>,
     /// stable_id соединений, которые сами идут по mesh (сквозные): они не соседи и кадры mesh не несут
     e2e: Mutex<E2e>,
     e2e_max: AtomicU64,
@@ -233,6 +251,7 @@ impl Mesh {
     fn build(me: Key, enabled: bool, carriers: Carriers) -> Arc<Self> {
         let (rx_tx, rx) = mpsc::channel(DELIVER_QUEUE);
         let (hop_tx, hop_rx) = std::sync::mpsc::channel::<Key>();
+        let (txq, txq_rx) = std::sync::mpsc::sync_channel::<(Connection, Bytes)>(8192);
         let mesh = Arc::new(Mesh {
             me,
             enabled: AtomicBool::new(enabled),
@@ -249,6 +268,7 @@ impl Mesh {
             ride_cache: Default::default(),
             hop_pending: Default::default(),
             hop_req: Mutex::new(hop_tx),
+            txq,
             e2e: Default::default(),
             e2e_max: AtomicU64::new(E2E_MAX as u64),
             seen_gen: AtomicU64::new(0),
@@ -257,6 +277,22 @@ impl Mesh {
             rx_tx,
             rx: Mutex::new(Some(rx)),
             local: n0_watcher::Watchable::new(vec![addr_of(&me)]),
+        });
+        let w2 = Arc::downgrade(&mesh);
+        let _ = std::thread::Builder::new().name("knothop-mesh-tx".into()).spawn(move || {
+            while let Ok((conn, b)) = txq_rx.recv() {
+                let Some(m) = w2.upgrade() else { break };
+                match conn.send_datagram(b) {
+                    Ok(()) => {}
+                    // пакет сквозного QUIC + заголовок не влезает в датаграмму соседа: QUIC видит потерю (см. `e2e_max_udp`)
+                    Err(iroh::endpoint::SendDatagramError::TooLarge) => {
+                        m.c.drop_mtu.fetch_add(1, Relaxed);
+                    }
+                    Err(_) => {
+                        m.c.drop_send_err.fetch_add(1, Relaxed);
+                    }
+                }
+            }
         });
         // поток-разрешитель следующих хопов: заменяет вычисление в poll_send (см. `hops`)
         let w = Arc::downgrade(&mesh);
@@ -314,38 +350,26 @@ impl Mesh {
         Arc::new(MeshTransport(self.clone()))
     }
 
-    /// Пометить соединение как сквозное (идёт по mesh). Оно не может быть соседом: кадры mesh по нему не шлём и не принимаем; то же для любого другого
-    /// соединения к ключу его пира. false - таблица заполнена: вызывающий ОБЯЗАН закрыть соединение (непомеченное могло бы стать «соседом»).
+    /// Пометить соединение как сквозное (начато по mesh). Оно не может быть соседом: кадры mesh по нему не шлём и не принимаем.
+    /// false - таблица заполнена: вызывающий ОБЯЗАН закрыть соединение (непомеченное могло бы стать «соседом»).
     pub fn mark_e2e(self: &Arc<Self>, conn: &Connection) -> bool {
-        let (id, peer, now) = (conn.stable_id(), *conn.remote_id().as_bytes(), Instant::now());
+        let id = conn.stable_id();
         let max = self.e2e_max.load(Relaxed) as usize;
         {
             let mut e = self.e2e.lock().unwrap();
             if !e.ids.contains(&id) {
-                if e.peers.len() >= max {
-                    e.peers.retain(|_, (n, t)| *n > 0 || now.saturating_duration_since(*t) < PEER_GRACE);
-                }
-                if e.ids.len() >= max || (!e.peers.contains_key(&peer) && e.peers.len() >= max) {
+                if e.ids.len() >= max {
                     drop(e);
                     self.c.e2e_overflow.fetch_add(1, Relaxed);
                     return false;
                 }
                 e.ids.insert(id);
-                let p = e.peers.entry(peer).or_insert((0, now));
-                p.0 += 1;
-                p.1 = now;
             }
         }
         let (m, c) = (self.clone(), conn.clone());
         tokio::spawn(async move {
             let _ = c.closed().await;
-            let mut e = m.e2e.lock().unwrap();
-            if e.ids.remove(&id) {
-                if let Some(p) = e.peers.get_mut(&peer) {
-                    p.0 = p.0.saturating_sub(1);
-                    p.1 = Instant::now();
-                }
-            }
+            m.e2e.lock().unwrap().ids.remove(&id);
         });
         true
     }
@@ -354,25 +378,22 @@ impl Mesh {
         self.e2e.lock().unwrap().ids.contains(&conn.stable_id())
     }
 
-    /// Проверка при отправке: без обращения к соединению (стабильный id и ключ пира записаны в запись хопа).
-    fn hop_rides_mesh(&self, h: &HopConn, now: Instant) -> bool {
-        let e = self.e2e.lock().unwrap();
-        e.ids.contains(&h.sid) || e.peers.get(&h.peer).is_some_and(|(n, t)| *n > 0 || now.saturating_duration_since(*t) < PEER_GRACE)
+    /// Проверка при отправке: без обращения к соединению (стабильный id записан в запись хопа).
+    fn hop_rides_mesh(&self, h: &HopConn, _now: Instant) -> bool {
+        self.e2e.lock().unwrap().ids.contains(&h.sid)
     }
 
     pub fn set_e2e_max(&self, n: usize) {
         self.e2e_max.store(n as u64, Relaxed);
     }
 
-    /// Соединение идёт (или может идти) по mesh: помечено сквозным, это соединение к ключу пира, с которым есть сквозное, либо у него есть путь `Custom`.
-    /// iroh держит пути пира общими для всех соединений к его ключу, поэтому обычное соединение к выходу, открытое после mesh-соединения, тоже получает
-    /// mesh-путь: оно не сосед, кадры mesh в него класть нельзя (кадр mesh внутри соединения, идущего по mesh, - рекурсия под замком этого же соединения).
+    /// Соединение сейчас едет по mesh: помечено сквозным либо выбранный путь у него `Custom`. Соединение с тёплым запасным mesh-путём (основной - IP) соседом
+    /// быть может, пока основной путь прямой; в сквозное, идущее по mesh, класть кадры mesh нельзя (вложенность и петли). Решение по путям держим 1 с.
     pub fn rides_mesh(&self, conn: &Connection) -> bool {
-        let (id, peer, now) = (conn.stable_id(), *conn.remote_id().as_bytes(), Instant::now());
-        if self.hop_rides_mesh(&HopConn { conn: conn.clone(), sid: id, peer }, now) {
+        if self.is_e2e(conn) {
             return true;
         }
-        // проверка путей дорога (вызывается на каждый кадр): решение держим по соединению 1 с
+        let (id, now) = (conn.stable_id(), Instant::now());
         {
             let c = self.ride_cache.lock().unwrap();
             if let Some((v, t)) = c.get(&id) {
@@ -381,7 +402,7 @@ impl Mesh {
                 }
             }
         }
-        let v = conn.paths().iter().any(|p| matches!(p.remote_addr(), iroh::TransportAddr::Custom(_)));
+        let v = conn.paths().iter().any(|p| p.is_selected() && matches!(p.remote_addr(), iroh::TransportAddr::Custom(_)));
         let mut c = self.ride_cache.lock().unwrap();
         if c.len() >= 256 {
             c.retain(|_, (_, t)| now.saturating_duration_since(*t) < Duration::from_secs(1));
@@ -417,8 +438,8 @@ impl Mesh {
             "drop_no_route": c.drop_no_route.load(Relaxed), "drop_no_quic": c.drop_no_quic.load(Relaxed), "drop_mtu": c.drop_mtu.load(Relaxed),
             "drop_send_err": c.drop_send_err.load(Relaxed), "rev_learned": c.rev_learned.load(Relaxed),
             "rev_conflict": c.rev_conflict.load(Relaxed), "drop_id_ambiguous": c.drop_id_ambiguous.load(Relaxed), "drop_recursion": c.drop_recursion.load(Relaxed),
-            "e2e_overflow": c.e2e_overflow.load(Relaxed), "gen_resets": c.gen_resets.load(Relaxed),
-            "rev_size": self.rev.lock().unwrap().len(), "e2e_conns": self.e2e.lock().unwrap().ids.len(),
+            "e2e_overflow": c.e2e_overflow.load(Relaxed), "drop_queue_full": c.drop_queue_full.load(Relaxed), "alt_hops": c.alt_hops.load(Relaxed), "gen_resets": c.gen_resets.load(Relaxed),
+            "egress_blocked": iroh::knothop::blocked_egress(), "rev_size": self.rev.lock().unwrap().len(), "e2e_conns": self.e2e.lock().unwrap().ids.len(),
         })
     }
 
@@ -548,6 +569,11 @@ impl Mesh {
         if self.carrier(dst).is_some() {
             return Some(*dst);
         }
+        self.next_hop_via(now, dst, policy)
+    }
+
+    /// Путь RNS (главнее выученного) и обратная таблица; хоп, равный `dst`, пропускается.
+    fn next_hop_via(&self, now: Instant, dst: &Key, policy: &dyn Policy) -> Option<Key> {
         let routed = {
             let cached = {
                 let r = self.routes.lock().unwrap();
@@ -578,6 +604,33 @@ impl Mesh {
             }
         }
         None
+    }
+
+    /// Следующий хоп для СВОИХ кадров (poll_send). Если до `dst` есть прямой носитель (путь IP), mesh - запасной путь и обязан идти МИМО него: через
+    /// альтернативный транзит (`alt_transit`). Иначе - путь RNS или обратная таблица, как при пересылке.
+    fn next_hop_origin(&self, now: Instant, dst: &Key, policy: &dyn Policy) -> Option<Key> {
+        if self.carrier(dst).is_some() {
+            let k = self.alt_transit(dst, policy)?;
+            self.c.alt_hops.fetch_add(1, Relaxed);
+            return Some(k);
+        }
+        self.next_hop_via(now, dst, policy)
+    }
+
+    /// Альтернативный транзит к `dst`: узел с правом TRANSIT, не `dst`, с живым QUIC-носителем вне mesh; выбор стабилен (меньший `k xor dst`).
+    /// Знания о том, видит ли транзит само `dst`, нет: если он `dst` не достаёт, он кадры отбросит, и путь не подтвердится (запасным он не станет).
+    fn alt_transit(&self, dst: &Key, policy: &dyn Policy) -> Option<Key> {
+        policy
+            .transit_candidates()
+            .into_iter()
+            .filter(|k| k != dst && k != &self.me && self.carrier(k).is_some())
+            .min_by_key(|k| {
+                let mut x = [0u8; 8];
+                for i in 0..8 {
+                    x[i] = k[i] ^ dst[i];
+                }
+                u64::from_be_bytes(x)
+            })
     }
 
     fn count_nbr_err(&self, e: NbrErr) {
@@ -722,7 +775,7 @@ impl Mesh {
         let Some(policy) = self.policy() else { return };
         self.sync_gen(policy.as_ref());
         let now = Instant::now();
-        let res = match self.next_hop(now, dst, policy.as_ref()) {
+        let res = match self.next_hop_origin(now, dst, policy.as_ref()) {
             None => Err(HopErr::NoRoute),
             Some(next) => self
                 .neighbor(&next)
@@ -750,6 +803,11 @@ impl Mesh {
     }
 
     /// Заранее разрешить хоп к `dst` (перед первым пакетом сквозного соединения).
+    /// Сосед, через которого сейчас идут кадры mesh к `dst` (по кэшу хопов).
+    pub fn hop_peer(&self, dst: &Key) -> Option<Key> {
+        self.hops.lock().unwrap().get(dst).and_then(|e| e.res.as_ref().ok().map(|h| h.peer))
+    }
+
     pub fn prepare(&self, dst: &Key) {
         self.warm(dst);
     }
@@ -810,9 +868,9 @@ impl Mesh {
         b.extend_from_slice(&id_of(dst));
         b.extend_from_slice(&id_of(&self.me));
         b.extend_from_slice(payload);
-        match conn.send_datagram(b.freeze()) {
+        match self.txq.try_send((conn, b.freeze())) {
             Ok(()) => c.tx.fetch_add(1, Relaxed),
-            Err(_) => c.drop_send_err.fetch_add(1, Relaxed),
+            Err(_) => c.drop_queue_full.fetch_add(1, Relaxed),
         };
     }
 }
@@ -837,12 +895,10 @@ struct HopEntry {
     at: Instant,
 }
 
-/// Сквозные соединения (идущие по mesh) и ключи пиров, к которым они есть: любое соединение к такому ключу считается едущим по mesh.
+/// Сквозные соединения, начатые по mesh (помечены `mark_e2e`): они не соседи.
 #[derive(Default)]
 struct E2e {
     ids: std::collections::HashSet<usize>,
-    /// ключ пира -> (сколько сквозных соединений живо, когда последнее изменение)
-    peers: HashMap<Key, (usize, Instant)>,
 }
 
 enum NbrErr {
@@ -973,6 +1029,63 @@ impl PathSelector for MeshBackupSelector {
         }
         sel
     }
+}
+
+/// Состояние пути соединения для статуса: источник RTT и «как идёт» - сам QUIC (путь, статистика), а не пинги Link. `kind`: direct (IP) / mesh / relay;
+/// `via` - диагностический префикс ключа транзита (4 байта hex, не destination RNS), `backup` - открытые запасные пути.
+pub fn path_json(conn: &Connection, via: Option<Key>) -> serde_json::Value {
+    use iroh::TransportAddr as T;
+    let paths = conn.paths();
+    let sel = paths.iter().find(|p| p.is_selected());
+    let kind = match sel.as_ref().map(|p| p.remote_addr().clone()) {
+        Some(T::Ip(_)) => "direct",
+        Some(T::Custom(_)) => "mesh",
+        Some(T::Relay(_)) => "relay",
+        _ => "none",
+    };
+    let backups: Vec<&str> = paths
+        .iter()
+        .filter(|p| !p.is_selected())
+        .map(|p| match p.remote_addr() {
+            T::Ip(_) => "direct",
+            T::Custom(_) => "mesh",
+            T::Relay(_) => "relay",
+            _ => "other",
+        })
+        .collect();
+    let st = conn.stats();
+    let via = if kind == "mesh" { via.map(|k| k[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()) } else { None };
+    let path_desc = match kind {
+        "direct" => "прямой (IP)".to_string(),
+        "mesh" => via.as_ref().map(|v| format!("mesh через {v}")).unwrap_or_else(|| "mesh".to_string()),
+        "relay" => "relay".to_string(),
+        _ => "путь не выбран".to_string(),
+    };
+    let black_holes_detected: u64 = paths.iter().map(|p| p.stats().black_holes_detected).sum();
+    // по каждому открытому пути: тип, выбран ли, MTU и счётчики MTUD (диагностика PMTU запасных путей)
+    let paths_detail: Vec<serde_json::Value> = paths
+        .iter()
+        .map(|p| {
+            let s = p.stats();
+            serde_json::json!({
+                "kind": match p.remote_addr() { T::Ip(_) => "direct", T::Custom(_) => "mesh", T::Relay(_) => "relay", _ => "other" },
+                "selected": p.is_selected(), "mtu": s.current_mtu,
+                "probes_sent": s.sent_plpmtud_probes, "probes_lost": s.lost_plpmtud_probes, "black_holes": s.black_holes_detected,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "paths_detail": paths_detail,
+        "kind": kind,
+        "connection_id": conn.stable_id(),
+        "via": via, "path_desc": path_desc,
+        "rtt_ms": sel.as_ref().map(|p| (p.rtt().as_secs_f64() * 1000.0 * 100.0).round() / 100.0),
+        "backup": backups, "lost_packets": st.lost_packets, "paths": paths.len(),
+        "max_datagram_size": conn.max_datagram_size(),
+        "current_mtu": sel.as_ref().map(|p| p.stats().current_mtu),
+        "black_holes_detected": black_holes_detected,
+        "datagram_mtu_drops": st.datagram_mtu_drops,
+    })
 }
 
 /// Конфигурация QUIC сквозных соединений по mesh (начальный MTU 1200); узел задаёт её при запуске.

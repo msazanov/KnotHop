@@ -41,6 +41,18 @@ def make_fork(root: Path) -> str:
 
 
 class SanitizeTests(unittest.TestCase):
+    def test_vendor_patch_provenance_and_sources_survive_public_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "src", Path(tmp) / "dst"
+            make_source(src)
+            for crate in ("iroh", "noq-proto"):
+                for file, content in (("PATCH.md", "Local changes\n"), ("src/lib.rs", "// source\n"), ("LICENSE-MIT", "MIT\n")):
+                    write(src, f"bench/vendor/{crate}/{file}", content)
+            sp.sanitize(src, dst, None)
+            for crate in ("iroh", "noq-proto"):
+                for file in ("PATCH.md", "src/lib.rs", "LICENSE-MIT"):
+                    self.assertTrue((dst / "bench/vendor" / crate / file).is_file())
+
     def test_async_invite_secrets_are_excluded_even_outside_named_state_dir(self):
         self.assertTrue(sp.should_exclude(Path("bench/custom-node/enroll-outbox/0123.json")))
         self.assertTrue(sp.should_exclude(Path("bench/custom-node/enroll-join.json")))

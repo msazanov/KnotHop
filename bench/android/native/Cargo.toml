@@ -26,3 +26,8 @@ opt-level = 3
 debug = false
 strip = true
 panic = "unwind"
+
+# см. bench/vendor/iroh/PATCH.md
+[patch.crates-io]
+iroh = { path = "../../vendor/iroh" }
+noq-proto = { path = "../../vendor/noq-proto" }

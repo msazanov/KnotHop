@@ -134,6 +134,13 @@ impl Health {
         self.save(&m);
     }
 
+    /// Сбросить память о неработающих носителях (смена/возврат сети).
+    pub fn reset_all(&self) {
+        let mut m = self.m.lock().unwrap();
+        m.clear();
+        self.save(&m);
+    }
+
     /// Пока оба носителя помечены, меньший остаток: через сколько стоит проверить пару снова.
     pub fn blocked_for(&self, peer: &str) -> Option<Duration> {
         let (t, q) = (self.remaining(peer, Kind::Tcp)?, self.remaining(peer, Kind::Quic)?);

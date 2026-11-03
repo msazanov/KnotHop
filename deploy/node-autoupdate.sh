@@ -44,7 +44,11 @@ cmd_run() {
   fetch "$BASE/SHA256SUMS" "$sums" 4096 30 || { log "SHA256SUMS недоступен, повтор позже"; return 1; }
   want=$(want_from_sums "$sums" "$KH_VARIANT") || { log "в SHA256SUMS нет единственной строки для $KH_VARIANT"; return 1; }
   have=$(sha "$BIN")
-  if [[ $want == "$have" ]]; then return 0; fi
+  if [[ $want == "$have" ]]; then
+    # ручной запуск печатает одну строку; запуск таймером/юнитом (systemd задаёт INVOCATION_ID) молчит
+    [[ -n ${INVOCATION_ID:-} ]] || log "актуально: ${want:0:12}"
+    return 0
+  fi
   log "установлен ${have:0:12}, в релизе ${want:0:12}: обновляю $KH_VARIANT"
   rm -f "$TMP"
   fetch "$BASE/$KH_VARIANT" "$TMP" "$MAX_BIN" 900 || { log "скачивание не удалось"; return 1; }
