@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+use crate::Instant;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, trace};
 
@@ -15,6 +17,134 @@ use crate::{
     connection::spaces::PendingReachOutFrames,
     frame::{AddAddress, ReachOut, RemoveAddress},
 };
+
+/// KnotHop: minimum interval between two accepted new REACH_OUT rounds on one connection.
+///
+/// A peer that can open a QUIC connection may otherwise send REACH_OUT with an ever-growing
+/// `round`; each new round resets the attempt counters and makes us probe attacker-chosen
+/// (possibly third-party) addresses again. Frames for a newer round arriving earlier than this
+/// after the previously accepted new round are ignored (the connection is not closed).
+pub(crate) const MIN_NAT_ROUND_INTERVAL: Duration = Duration::from_secs(5);
+
+/// KnotHop: NAT traversal probe (off-path PATH_CHALLENGE) budget per connection: bucket
+/// capacity. One full round of 32 addresses is 288 probes, so such a round is trimmed; typical
+/// rounds (a handful of addresses) fit entirely.
+pub(crate) const NAT_PROBE_BURST: f64 = 256.0;
+
+/// KnotHop: NAT probe budget refill period (the bucket refills fully over this time),
+/// i.e. a sustained rate of at most `NAT_PROBE_BURST / NAT_PROBE_REFILL` probes per second.
+pub(crate) const NAT_PROBE_REFILL: Duration = Duration::from_secs(60);
+
+/// KnotHop: sustained rate of accepted remote-address changes (ADD_ADDRESS that inserts a new
+/// entry or replaces the address of a known `seq_no`; each resets the probe attempt counter).
+pub(crate) const NAT_ADDR_CHANGES_PER_MIN: f64 = 16.0;
+
+/// KnotHop: extra burst on top of the negotiated address limit, so the initial advertisement of
+/// all addresses right after the handshake is never throttled.
+pub(crate) const NAT_ADDR_CHANGE_BURST_SLACK: f64 = 16.0;
+
+/// Token bucket with lazy initialisation (starts full).
+#[derive(Debug)]
+struct Bucket {
+    capacity: f64,
+    /// Tokens per second.
+    rate: f64,
+    tokens: f64,
+    last: Option<Instant>,
+}
+
+impl Bucket {
+    fn new(capacity: f64, per: Duration) -> Self {
+        Self {
+            capacity,
+            rate: capacity / per.as_secs_f64(),
+            tokens: capacity,
+            last: None,
+        }
+    }
+
+    fn take(&mut self, now: Instant) -> bool {
+        if let Some(last) = self.last {
+            let dt = now.saturating_duration_since(last).as_secs_f64();
+            self.tokens = (self.tokens + dt * self.rate).min(self.capacity);
+        }
+        self.last = Some(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// KnotHop: per-connection limiter for NAT traversal activity that a (possibly hostile) peer can
+/// trigger: new rounds, off-path probes and remote address changes. Exhaustion is silent (the
+/// frame/probe is dropped) and counted in [`Self::suppressed`], exported as
+/// `ConnectionStats::nat_probes_suppressed`.
+#[derive(Debug)]
+pub(crate) struct Guard {
+    last_round: Option<Instant>,
+    probes: Bucket,
+    addr_changes: Option<Bucket>,
+    /// Number of suppressed rounds, probes and address changes.
+    pub(crate) suppressed: u64,
+}
+
+impl Default for Guard {
+    fn default() -> Self {
+        Self {
+            last_round: None,
+            probes: Bucket::new(NAT_PROBE_BURST, NAT_PROBE_REFILL),
+            addr_changes: None,
+            suppressed: 0,
+        }
+    }
+}
+
+impl Guard {
+    /// Whether a REACH_OUT starting a new (higher) round may be accepted now.
+    pub(crate) fn allow_round(&mut self, now: Instant) -> bool {
+        if let Some(last) = self.last_round
+            && now.saturating_duration_since(last) < MIN_NAT_ROUND_INTERVAL
+        {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return false;
+        }
+        self.last_round = Some(now);
+        true
+    }
+
+    /// Whether one more off-path NAT probe may be sent now.
+    pub(crate) fn allow_probe(&mut self, now: Instant) -> bool {
+        if self.probes.take(now) {
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            false
+        }
+    }
+
+    /// Whether a remote address insert/replacement may be applied now.
+    pub(crate) fn allow_addr_change(&mut self, now: Instant, max_addresses: usize) -> bool {
+        let bucket = self.addr_changes.get_or_insert_with(|| {
+            Bucket::new(
+                max_addresses as f64 + NAT_ADDR_CHANGE_BURST_SLACK,
+                // capacity / period = NAT_ADDR_CHANGES_PER_MIN per minute
+                Duration::from_secs_f64(
+                    (max_addresses as f64 + NAT_ADDR_CHANGE_BURST_SLACK) * 60.0
+                        / NAT_ADDR_CHANGES_PER_MIN,
+                ),
+            )
+        });
+        if bucket.take(now) {
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            false
+        }
+    }
+}
 
 /// Maximum number of times we send a NAT probe to the same remote address in a round.
 ///
@@ -261,6 +391,19 @@ impl State {
             Self::NotNegotiated => None,
             Self::ClientSide(state) => state.next_probe_addr(),
             Self::ServerSide(state) => state.next_probe_addr(),
+        }
+    }
+
+    /// KnotHop: drops a queued probe without sending it (budget exhausted).
+    pub(crate) fn drop_pending_probe(&mut self, remote: IpPort) {
+        match self {
+            Self::NotNegotiated => (),
+            Self::ClientSide(state) => {
+                state.pending_probes.remove(&remote);
+            }
+            Self::ServerSide(state) => {
+                state.pending_probes.remove(&remote);
+            }
         }
     }
 
@@ -593,6 +736,19 @@ impl ClientState {
     /// Checks that a received remote address is valid.
     ///
     /// An address is valid as long as it does not change the value of a known address id.
+    pub(crate) fn max_remote_addresses(&self) -> usize {
+        self.max_remote_addresses
+    }
+
+    /// Whether applying this ADD_ADDRESS would insert a new entry or replace an address
+    /// (i.e. reset a probe attempt counter), as opposed to repeating a known one.
+    pub(crate) fn would_change(&self, add_addr: &AddAddress) -> bool {
+        match self.remote_addresses.get(&add_addr.seq_no) {
+            None => true,
+            Some((existing, _)) => *existing != CanonicalIpPort::from(add_addr.ip_port()),
+        }
+    }
+
     pub(crate) fn check_remote_address(&self, add_addr: &AddAddress) -> bool {
         match self.remote_addresses.get(&add_addr.seq_no) {
             None => true,

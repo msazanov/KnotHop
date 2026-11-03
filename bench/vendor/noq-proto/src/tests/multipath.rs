@@ -2321,3 +2321,136 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
 
     Ok(())
 }
+
+/// KnotHop: public addresses a hostile peer may name as probe targets (documentation range).
+fn victim_addr(n: u16) -> SocketAddr {
+    format!("[2001:db8::{n:x}]:9").parse().unwrap()
+}
+
+fn server_nat_probes(pair: &mut ConnPair) -> u64 {
+    pair.stats(Server).frame_tx.path_challenge
+}
+
+/// A peer sending REACH_OUT with a growing round faster than the round limit cannot make us
+/// probe its (third-party) addresses more than the per-connection budget allows.
+#[test]
+fn nat_reach_out_round_flood_is_limited() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .enable_nat_traversal()
+        .with_routes(SimpleFirewallRouting::new())
+        .connect();
+    pair.add_nat_traversal_address(Server, SimpleFirewallRouting::SERVER_FW_ADDR)?;
+    for n in 1..=8 {
+        pair.add_nat_traversal_address(Client, victim_addr(n))?;
+    }
+    pair.drive();
+    let base = server_nat_probes(&mut pair);
+
+    // 200 rounds, 100 ms apart (20 s total): far above one round per 5 s.
+    for _ in 0..200 {
+        pair.initiate_nat_traversal_round(Client)?;
+        pair.time += Duration::from_millis(100);
+        pair.drive_bounded(4);
+    }
+    let sent = server_nat_probes(&mut pair) - base;
+    // 20 s => at most 4-5 accepted rounds, each 8 addresses; each address at most 9 times, and
+    // the sub-second retry windows leave far fewer. Without the limit this is >1500.
+    assert!(sent <= 5 * 8 * 9, "server sent {sent} NAT probes");
+    assert!(pair.stats(Server).nat_probes_suppressed >= 190);
+    Ok(())
+}
+
+/// Rounds spaced just above the round limit are accepted, but the probe budget still caps the
+/// sustained rate (<= 256 per 60 s plus the initial burst).
+#[test]
+fn nat_probe_budget_caps_sustained_rate() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .enable_nat_traversal()
+        .with_routes(SimpleFirewallRouting::new())
+        .connect();
+    pair.add_nat_traversal_address(Server, SimpleFirewallRouting::SERVER_FW_ADDR)?;
+    for n in 1..=8 {
+        pair.add_nat_traversal_address(Client, victim_addr(n))?;
+    }
+    pair.drive();
+    let base = server_nat_probes(&mut pair);
+    let start = pair.time;
+
+    for _ in 0..60 {
+        pair.initiate_nat_traversal_round(Client)?;
+        pair.drive(); // lets all 9 attempts of the round run (~6 s)
+        pair.time += Duration::from_secs(6);
+        pair.drive_bounded(1);
+    }
+    let elapsed = (pair.time - start).as_secs_f64();
+    let sent = server_nat_probes(&mut pair) - base;
+    let allowed = 256.0 + 256.0 * elapsed / 60.0 + 8.0;
+    assert!(
+        (sent as f64) <= allowed,
+        "sent {sent} probes in {elapsed:.0}s, allowed {allowed:.0}"
+    );
+    assert!(pair.stats(Server).nat_probes_suppressed > 0);
+    Ok(())
+}
+
+/// A server that keeps replacing advertised addresses (REMOVE + ADD with new ids resets the
+/// probe attempt counter each time) is rate limited on the client.
+#[test]
+fn nat_add_address_flood_is_limited() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .enable_nat_traversal()
+        .with_routes(SimpleFirewallRouting::new())
+        .connect();
+    pair.add_nat_traversal_address(Client, SimpleFirewallRouting::CLIENT_FW_ADDR)?;
+    let mut prev: Option<SocketAddr> = None;
+    let mut added = 0;
+    for n in 1..=100u16 {
+        if let Some(p) = prev.take() {
+            pair.remove_nat_traversal_address(Server, p)?;
+        }
+        let a = victim_addr(n);
+        pair.add_nat_traversal_address(Server, a)?;
+        prev = Some(a);
+        pair.drive_bounded(4);
+        while let Some(ev) = pair.poll(Client) {
+            if matches!(ev, Event::NatTraversal(n0_nat_traversal::Event::AddressAdded(_))) {
+                added += 1;
+            }
+        }
+    }
+    // capacity = 8 (test limit) + 16 slack, no time passes in this loop.
+    assert!(added <= 8 + 16, "client accepted {added} address changes");
+    assert!(pair.stats(Client).nat_probes_suppressed > 0);
+    Ok(())
+}
+
+/// Legitimate rounds more than the limit apart keep working and open the path.
+#[test]
+fn nat_second_round_after_interval_still_opens_path() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .enable_nat_traversal()
+        .with_routes(SimpleFirewallRouting::new())
+        .connect();
+    pair.add_nat_traversal_address(Server, SimpleFirewallRouting::SERVER_FW_ADDR)?;
+    pair.add_nat_traversal_address(Client, SimpleFirewallRouting::CLIENT_FW_ADDR)?;
+    pair.drive();
+    pair.initiate_nat_traversal_round(Client)?;
+    pair.time += Duration::from_secs(6);
+    pair.initiate_nat_traversal_round(Client)?;
+    pair.drive();
+    let mut established = false;
+    while let Some(ev) = pair.poll(Client) {
+        established |= matches!(ev, Event::Path(PathEvent::Established { .. }));
+    }
+    assert!(established);
+    assert_eq!(pair.stats(Server).nat_probes_suppressed, 0);
+    Ok(())
+}

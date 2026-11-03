@@ -1085,6 +1085,7 @@ pub fn path_json(conn: &Connection, via: Option<Key>) -> serde_json::Value {
         "current_mtu": sel.as_ref().map(|p| p.stats().current_mtu),
         "black_holes_detected": black_holes_detected,
         "datagram_mtu_drops": st.datagram_mtu_drops,
+        "nat_probes_suppressed": st.nat_probes_suppressed,
     })
 }
 

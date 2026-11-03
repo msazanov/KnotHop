@@ -286,14 +286,17 @@ impl Plane {
     }
 
     pub fn stats(&self) -> serde_json::Value {
-        let (min_mds, total_bh, mtu_drops) = {
+        let (min_mds, total_bh, mtu_drops, nat_suppressed) = {
             let m = self.conns.read().unwrap();
             let mut mds: Option<usize> = None;
             let mut bh = 0u64;
             let mut mtu_drops = 0u64;
+            let mut nat_suppressed = 0u64;
             for v in m.values() {
                 for e in v.iter().filter(|e| e.conn.close_reason().is_none()) {
-                    mtu_drops = mtu_drops.saturating_add(e.conn.stats().datagram_mtu_drops);
+                    let cs = e.conn.stats();
+                    mtu_drops = mtu_drops.saturating_add(cs.datagram_mtu_drops);
+                    nat_suppressed = nat_suppressed.saturating_add(cs.nat_probes_suppressed);
                     if let Some(sz) = e.conn.max_datagram_size() {
                         mds = Some(mds.map_or(sz, |m| m.min(sz)));
                     }
@@ -302,7 +305,7 @@ impl Plane {
                     }
                 }
             }
-            (mds, bh, mtu_drops)
+            (mds, bh, mtu_drops, nat_suppressed)
         };
         serde_json::json!({
             "tx": self.c.tx.load(Relaxed), "rx": self.c.rx.load(Relaxed), "fallback": self.c.fallback.load(Relaxed),
@@ -312,6 +315,7 @@ impl Plane {
             "max_datagram_size": min_mds,
             "black_holes_detected": total_bh,
             "datagram_mtu_drops": mtu_drops,
+            "nat_probes_suppressed": nat_suppressed,
         })
     }
 }

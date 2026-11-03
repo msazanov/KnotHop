@@ -304,6 +304,8 @@ pub struct Connection {
 
     /// State for n0's (<https://n0.computer>) nat traversal protocol.
     n0_nat_traversal: n0_nat_traversal::State,
+    /// KnotHop: limits on peer-triggerable NAT traversal activity.
+    nat_guard: n0_nat_traversal::Guard,
     qlog: QlogSink,
 }
 
@@ -428,6 +430,7 @@ impl Connection {
             abandoned_paths: Default::default(),
 
             n0_nat_traversal: Default::default(),
+            nat_guard: Default::default(),
             qlog,
         };
         if path_validated {
@@ -2151,6 +2154,13 @@ impl Connection {
             return None;
         }
 
+        // KnotHop: per-connection probe budget; an over-budget probe is dropped (its address
+        // may be retried by the regular retry schedule, which draws from the same budget).
+        if !self.nat_guard.allow_probe(now) {
+            self.n0_nat_traversal.drop_pending_probe(remote);
+            return None;
+        }
+
         // TODO: Using the active CID here makes the paths linkable. This is a violation of
         //    RFC9000 but something we want to accept in the short term. Eventually we aim
         //    to fix up the supply of CIDs sufficiently so that we can keep paths unlinkable
@@ -2681,6 +2691,7 @@ impl Connection {
     pub fn stats(&mut self) -> ConnectionStats {
         let mut stats = self.partial_stats.clone();
         stats.datagram_mtu_drops = self.datagrams.mtu_drops;
+        stats.nat_probes_suppressed = self.nat_guard.suppressed;
 
         for path_stats in self.path_stats.iter_stats() {
             // Self::path_stats() computes the path rtt, cwnd and current_mtu on access
@@ -5488,16 +5499,24 @@ impl Connection {
                         warn!(?addr, "server sent illegal ADD_ADDRESS frame");
                     }
 
-                    match client_state.add_remote_address(addr) {
-                        Ok(maybe_added) => {
-                            if let Some(added) = maybe_added {
-                                self.events.push_back(Event::NatTraversal(
-                                    n0_nat_traversal::Event::AddressAdded(added),
-                                ));
+                    // KnotHop: inserts/replacements reset the probe attempt counter; rate limit them.
+                    let max_remote = client_state.max_remote_addresses();
+                    if client_state.would_change(&addr)
+                        && !self.nat_guard.allow_addr_change(now, max_remote)
+                    {
+                        debug!("ignoring ADD_ADDRESS: address change rate limit");
+                    } else {
+                        match client_state.add_remote_address(addr) {
+                            Ok(maybe_added) => {
+                                if let Some(added) = maybe_added {
+                                    self.events.push_back(Event::NatTraversal(
+                                        n0_nat_traversal::Event::AddressAdded(added),
+                                    ));
+                                }
                             }
-                        }
-                        Err(e) => {
-                            warn!(%e, "failed to add remote address")
+                            Err(e) => {
+                                warn!(%e, "failed to add remote address")
+                            }
                         }
                     }
                 }
@@ -5529,7 +5548,11 @@ impl Connection {
 
                     let round_before = server_state.current_round();
 
-                    if let Err(err) = server_state.handle_reach_out(reach_out, ipv6) {
+                    // KnotHop: a frame opening a newer round is ignored if the previous new
+                    // round was accepted less than MIN_NAT_ROUND_INTERVAL ago.
+                    if reach_out.round > round_before && !self.nat_guard.allow_round(now) {
+                        debug!("ignoring REACH_OUT: round rate limit");
+                    } else if let Err(err) = server_state.handle_reach_out(reach_out, ipv6) {
                         return Err(TransportError::PROTOCOL_VIOLATION(format!(
                             "Nat traversal(REACH_OUT): {err}"
                         )));

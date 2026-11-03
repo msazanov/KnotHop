@@ -1007,6 +1007,7 @@ async fn path_json_reports_kind_rtt_and_backup_from_quic() {
     assert!(j["current_mtu"].as_u64().is_some_and(|mtu| mtu >= 1200));
     assert!(j["max_datagram_size"].as_u64().is_some());
     assert!(j["datagram_mtu_drops"].as_u64().is_some());
+    assert!(j["nat_probes_suppressed"].as_u64().is_some());
     assert!(j["black_holes_detected"].as_u64().is_some());
 }
 

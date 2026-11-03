@@ -280,6 +280,9 @@ pub struct PathStats {
 pub struct ConnectionStats {
     /// Queued outgoing DATAGRAMs discarded after the usable path MTU shrank.
     pub datagram_mtu_drops: u64,
+    /// KnotHop: NAT traversal rounds, probes and address changes silently dropped by the
+    /// per-connection limiter (see `n0_nat_traversal::Guard`).
+    pub nat_probes_suppressed: u64,
     /// Statistics about UDP datagrams transmitted on the connection.
     pub udp_tx: UdpStats,
     /// Statistics about UDP datagrams received on the connection.
@@ -322,6 +325,7 @@ impl std::ops::Add<PathStats> for ConnectionStats {
         } = rhs;
         Self {
             datagram_mtu_drops: self.datagram_mtu_drops,
+            nat_probes_suppressed: self.nat_probes_suppressed,
             udp_tx: self.udp_tx + udp_tx,
             udp_rx: self.udp_rx + udp_rx,
             frame_tx: self.frame_tx + frame_tx,
@@ -356,6 +360,7 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
         } = rhs;
         let Self {
             datagram_mtu_drops: _,
+            nat_probes_suppressed: _,
             udp_tx,
             udp_rx,
             frame_tx,
