@@ -82,6 +82,8 @@ pub struct Counters {
     pub frag_out: AtomicU64,
     /// пакетов, потерянных на границе MTU (не режутся/не отправились фрагменты); по Link они не идут
     pub pmtu_dropped: AtomicU64,
+    /// выход снял DF и порезал пакет (`df_fragment`)
+    pub df_cleared: AtomicU64,
 }
 
 /// Итог `Plane::try_send`.
@@ -104,6 +106,8 @@ pub struct Plane {
     tx_enabled: AtomicBool,
     /// `KNOTHOP_TOO_LARGE_LINK=1`: слишком большой пакет по-старому уходит в Link (резерв/откат); по умолчанию выключено
     link_oversize: AtomicBool,
+    /// выход: пакет больше пути режется на фрагменты и при DF=1 (DF снимается) - ICMP интернет-хостам через NAT не доходит/игнорируется (v0.1.39, ru1)
+    df_fragment: AtomicBool,
     icmp: std::sync::Mutex<pmtu::IcmpLimiter>,
     pub c: Counters,
 }
@@ -132,6 +136,7 @@ impl Plane {
             sink: RwLock::new(None),
             tx_enabled: AtomicBool::new(tx_enabled),
             link_oversize: AtomicBool::new(false),
+            df_fragment: AtomicBool::new(false),
             icmp: std::sync::Mutex::new(pmtu::IcmpLimiter::new(std::time::Instant::now())),
             c: Counters::default(),
         }
@@ -140,6 +145,11 @@ impl Plane {
     #[cfg(test)]
     pub fn set_tx_enabled(&self, on: bool) {
         self.tx_enabled.store(on, Relaxed);
+    }
+
+    /// Выход: фрагментировать и пакеты с DF (поведение VPN-шлюза на своей стороне туннеля; клиент учит PMTU по ICMP в своём TUN).
+    pub fn set_df_fragment(&self, on: bool) {
+        self.df_fragment.store(on, Relaxed);
     }
 
     #[cfg(test)]
@@ -348,6 +358,17 @@ impl Plane {
             self.c.fallback.fetch_add(1, Relaxed);
             return Tx::Link;
         }
+        let cleared;
+        let pkt = if pkt[6] & 0x40 != 0 && self.df_fragment.load(Relaxed) {
+            // выход: DF снимаем, фрагменты получают новые контрольные суммы в `pmtu::fragment`
+            let mut v = pkt.to_vec();
+            v[6] &= !0x40;
+            self.c.df_cleared.fetch_add(1, Relaxed);
+            cleared = v;
+            &cleared[..]
+        } else {
+            pkt
+        };
         if pkt[6] & 0x40 != 0 {
             // UDP с DF при пределе ниже минимального пакета QUIC (1200 + 28): ICMP не поможет - QUIC внутри VPN встал бы совсем.
             // До фрагментации на уровне туннеля такие пакеты везёт Link (редкий случай: путь сжат до минимума QUIC).
@@ -452,7 +473,7 @@ impl Plane {
             "pmtu_icmp_sent": self.c.pmtu_icmp_sent.load(Relaxed), "pmtu_icmp_limited": self.c.pmtu_icmp_limited.load(Relaxed),
             "pmtu_icmp_skipped": self.c.pmtu_icmp_skipped.load(Relaxed),
             "frag_pkts": self.c.frag_pkts.load(Relaxed), "frag_out": self.c.frag_out.load(Relaxed),
-            "pmtu_dropped": self.c.pmtu_dropped.load(Relaxed), "too_large_link": self.link_oversize.load(Relaxed),
+            "pmtu_dropped": self.c.pmtu_dropped.load(Relaxed), "df_cleared": self.c.df_cleared.load(Relaxed), "too_large_link": self.link_oversize.load(Relaxed),
         })
     }
 }
@@ -783,6 +804,22 @@ mod tests {
         let ok = (0..30).filter(|_| p.frag_needed(&df, mtu, [10, 99, 0, 1]).is_some()).count();
         assert!((9..=10).contains(&ok), "один токен уже потрачен выше (+ возможное пополнение): {ok}");
         assert_eq!(p.c.pmtu_icmp_limited.load(Relaxed), 30 - ok as u64);
+
+        // выход (`df_fragment`): DF=1 тоже режется, DF в кусках снят, собирается в оригинал
+        p.set_df_fragment(true);
+        let out0 = p.c.frag_out.load(Relaxed) as usize;
+        assert_eq!(p.try_send(&lid(1), &df), Tx::Sent);
+        assert_eq!(p.c.df_cleared.load(Relaxed), 1);
+        let n = p.c.frag_out.load(Relaxed) as usize - out0;
+        let mut back = Vec::new();
+        for _ in 0..n {
+            let d = tokio::time::timeout(Duration::from_secs(2), sconn.read_datagram()).await.unwrap().unwrap();
+            let f = &d[1..];
+            assert_eq!(pmtu::csum(&f[..20]), 0);
+            assert_eq!(f[6] & 0x40, 0, "DF снят");
+            back.extend_from_slice(&f[20..]);
+        }
+        assert_eq!(back, df[20..]);
     }
 
     /// Ядро Linux принимает построенный ICMP: после доставки локальному адресу `ip route get` показывает `mtu` из ICMP.

@@ -2168,6 +2168,9 @@ impl TunState {
     }
 
     fn build(is_exit: bool, dev: Option<tokio::io::unix::AsyncFd<TunFd>>) -> Arc<Self> {
+        if is_exit {
+            dataplane::plane().set_df_fragment(true);
+        }
         Arc::new(TunState {
             dev: std::sync::RwLock::new(dev.map(Arc::new)),
             dev_gen: tokio::sync::watch::channel(0).0,
