@@ -46,6 +46,7 @@ mod route;
 mod host_acl;
 mod qprobe;
 mod dataplane;
+mod pmtu;
 mod mesh;
 pub use vpn::{VpnCli, VpnCmd};
 
@@ -1923,6 +1924,8 @@ pub struct TunState {
     rt: RouteCounters,
     /// клиент: выход основного Link (для счётчиков)
     main_dest: std::sync::RwLock<[u8; 16]>,
+    /// клиент: адрес выхода в туннеле (`exit_tun_ip`) - источник ICMP «Fragmentation Needed» в сторону локальных приложений (0 - не задан, ICMP не строится)
+    pmtu_gw: std::sync::atomic::AtomicU32,
 }
 
 /// Дополнительный Link к выходу для раздельного туннелирования.
@@ -2188,6 +2191,8 @@ impl TunState {
             extra: std::sync::RwLock::new(HashMap::new()),
             rt: RouteCounters::default(),
             main_dest: std::sync::RwLock::new([0; 16]),
+            // клиент: адрес выхода по умолчанию (`--exit-tun-ip`); lib-клиент уточняет его из CLI, мобильный/vpn.rs клиент использует умолчание
+            pmtu_gw: std::sync::atomic::AtomicU32::new(if is_exit { 0 } else { u32::from_be_bytes([10, 99, 0, 1]) }),
         })
     }
 
@@ -2477,7 +2482,17 @@ async fn tun_reader(tun: Arc<TunState>, _node: Arc<Node>, sh: Arc<Shared>) {
             tun.c.from_tun_pkts.fetch_add(1, Relaxed);
             tun.c.from_tun_bytes.fetch_add(pkt.len() as u64, Relaxed);
             // Прямой канал (QUIC-датаграмма с меткой) при привязанном Link и рабочем QUIC-носителе; иначе Link. В оба пути пакет не идёт.
-            let sent = dataplane::plane().try_send(link.link_id(), pkt) || link.send_datagram(pkt).await.is_ok();
+            let sent = match dataplane::plane().try_send(link.link_id(), pkt) {
+                dataplane::Tx::Sent => true,
+                dataplane::Tx::Link => link.send_datagram(pkt).await.is_ok(),
+                // потеря на границе MTU (учтена в dataplane.pmtu_dropped): по Link не дублируем, send_errors не трогаем
+                dataplane::Tx::Dropped => continue,
+                // DF=1 и пакет не влез: отправителю уходит ICMP «Fragmentation Needed»; сам пакет не отправлен
+                dataplane::Tx::TooBig(mtu) => {
+                    tun.pmtu_reply(&link, pkt, mtu);
+                    continue;
+                }
+            };
             if !sent {
                 tun.c.send_errors.fetch_add(1, Relaxed);
             } else if !tun.is_exit && on_main {
@@ -2490,6 +2505,31 @@ async fn tun_reader(tun: Arc<TunState>, _node: Arc<Node>, sh: Arc<Shared>) {
 }
 
 impl TunState {
+    /// ICMP «Fragmentation Needed» отправителю пакета `pkt`, не влезшего в путь туннеля (`mtu` - наибольший IP-пакет пути).
+    /// Клиент: источник - адрес выхода в туннеле (`exit_tun_ip`), ответ пишется в локальный TUN (локальным приложениям; доверие не пересекается).
+    /// Выход: источник - адрес клиента (получатель `pkt`), ответ идёт через `on_link_packet_with` как пакет этого клиента: те же `allowed[link]`,
+    /// source-IP, ACL и HOST_ACCESS, что у любого пакета клиента, а дальше ядро (nft: forward/NAT/conntrack related). Обхода проверок нет.
+    fn pmtu_reply(&self, link: &Arc<leviculum_std::LinkHandle>, pkt: &[u8], mtu: u16) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let src = if self.is_exit {
+            [pkt[16], pkt[17], pkt[18], pkt[19]]
+        } else {
+            let gw = self.pmtu_gw.load(Relaxed);
+            if gw == 0 {
+                dataplane::plane().c.pmtu_dropped.fetch_add(1, Relaxed);
+                return;
+            }
+            gw.to_be_bytes()
+        };
+        let Some(icmp) = dataplane::plane().frag_needed(pkt, mtu, src) else { return };
+        if self.is_exit {
+            let l = link.clone();
+            self.on_link_packet_with(&move |_| l.clone(), *link.link_id(), &icmp);
+        } else {
+            self.write_tun(&icmp);
+        }
+    }
+
     /// Validate an exit-side host response against the client Link selected by dst.
     fn response_allowed(&self, pkt: &[u8]) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2711,6 +2751,9 @@ async fn client_tun(cli: &Cli, node: Arc<Node>, sh: Arc<Shared>, dest: &Destinat
     *tun.client_link.write().unwrap() = Some(Arc::new(handle));
     tun.last_rx_ms.store(now_ms() as u64, std::sync::atomic::Ordering::Relaxed);
     let _ = sh.tun.set(tun.clone());
+    // источник ICMP «Fragmentation Needed» для локальных приложений - адрес выхода в туннеле
+    let gw = cli.exit_tun_ip.split('/').next().and_then(|a| a.parse::<std::net::Ipv4Addr>().ok()).map_or(u32::from_be_bytes([10, 99, 0, 1]), u32::from);
+    tun.pmtu_gw.store(gw, std::sync::atomic::Ordering::Relaxed);
     tokio::spawn(tun_reader(tun.clone(), node.clone(), sh.clone()));
     if cli.fail_ms > 0 {
         let (cli2, node2, sh2, tun2, dest2, key2) = (cli.clone(), node.clone(), sh.clone(), tun.clone(), *dest, *key);
@@ -3150,6 +3193,86 @@ mod tests {
         let non_v4 = vec![0x60; 40];
         assert!(!valid_ipv4_packet(&non_v4));
         assert!(!response_host_access_allowed(&reply, false, &host_acl::Inventory::default(), true));
+    }
+
+    /// ICMP «Fragmentation Needed» выхода идёт через тот же `on_link_packet_with`, что любой пакет клиента: допуск Link, source-IP клиента, ACL назначения.
+    #[test]
+    fn exit_pmtu_icmp_goes_through_client_checks() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let link = leviculum_std::api::LinkId::new([7; 16]);
+        let other = leviculum_std::api::LinkId::new([8; 16]);
+        let client = u32::from(std::net::Ipv4Addr::new(198, 18, 1, 7));
+        let tun = TunState::build(true, None);
+        tun.enforce.store(true, Relaxed);
+        tun.host_acl_ready.store(true, Relaxed);
+        let owned = u32::from(std::net::Ipv4Addr::new(203, 0, 113, 9));
+        let mut inv = host_acl::Inventory::default();
+        inv.owned.insert(owned);
+        *tun.host_inventory.write().unwrap() = Some(Arc::new(inv));
+        tun.allowed.write().unwrap().insert(link, client);
+        let plane = dataplane::Plane::new(true);
+        let deny = |_: &leviculum_std::api::LinkId| -> Arc<leviculum_std::LinkHandle> { panic!("в принудительном режиме обратный маршрут не строится") };
+        // ответ хосту из интернета на большой пакет (src хоста -> клиент): ICMP от клиента к хосту
+        let big = acl_packet("1.1.1.1", "198.18.1.7", 6, 1300, None);
+        let icmp = plane.frag_needed(&big, 1161, [198, 18, 1, 7]).unwrap();
+        assert_eq!(&icmp[12..16], &[198, 18, 1, 7]);
+        tun.on_link_packet_with(&deny, link, &icmp);
+        assert_eq!((tun.c.unauth_drops.load(Relaxed), tun.c.tun_write_drops.load(Relaxed)), (0, 1), "допущенный клиент: дошло до записи в TUN");
+        // тот же ICMP по чужому Link: адрес источника не его
+        tun.on_link_packet_with(&deny, other, &icmp);
+        assert_eq!(tun.c.unauth_drops.load(Relaxed), 1);
+        // получатель - адрес самого выхода без права HOST_ACCESS: ICMP-ошибка не проходит
+        let to_host = acl_packet("203.0.113.9", "198.18.1.7", 6, 1300, None);
+        let icmp = plane.frag_needed(&to_host, 1161, [198, 18, 1, 7]).unwrap();
+        tun.on_link_packet_with(&deny, link, &icmp);
+        assert_eq!(tun.c.unauth_drops.load(Relaxed), 2);
+        // получатель - внутренняя сеть: отказ ACL
+        let internal = acl_packet("10.1.2.3", "198.18.1.7", 6, 1300, None);
+        let icmp = plane.frag_needed(&internal, 1161, [198, 18, 1, 7]).unwrap();
+        tun.on_link_packet_with(&deny, link, &icmp);
+        assert_eq!(tun.c.unauth_drops.load(Relaxed), 3);
+        // ACL не готов: fail-closed
+        tun.host_acl_ready.store(false, Relaxed);
+        let icmp = plane.frag_needed(&big, 1161, [198, 18, 1, 7]).unwrap();
+        tun.on_link_packet_with(&deny, link, &icmp);
+        assert_eq!(tun.c.unauth_drops.load(Relaxed), 4);
+    }
+
+    /// Фрагменты клиента (offset != 0, MF) проходят те же адресные проверки; к службам хоста фрагменты не допускаются ни при каких правах.
+    #[test]
+    fn fragments_do_not_bypass_host_access_and_acl() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let link = leviculum_std::api::LinkId::new([7; 16]);
+        let client = u32::from(std::net::Ipv4Addr::new(198, 18, 1, 7));
+        let tun = TunState::build(true, None);
+        tun.enforce.store(true, Relaxed);
+        tun.host_acl_ready.store(true, Relaxed);
+        let host = u32::from(std::net::Ipv4Addr::new(203, 0, 113, 9));
+        let mut inv = host_acl::Inventory::default();
+        inv.owned.insert(host);
+        inv.host_allow.insert(host);
+        *tun.host_inventory.write().unwrap() = Some(Arc::new(inv));
+        tun.allowed.write().unwrap().insert(link, client);
+        tun.host_access.write().unwrap().insert(link);
+        let deny = |_: &leviculum_std::api::LinkId| -> Arc<leviculum_std::LinkHandle> { panic!("не строится") };
+        // целый пакет к хосту с правом - проходит; первый фрагмент, не первый фрагмент - отказ
+        let whole = acl_packet("198.18.1.7", "203.0.113.9", 6, 60, None);
+        tun.on_link_packet_with(&deny, link, &whole);
+        assert_eq!(tun.c.unauth_drops.load(Relaxed), 0);
+        for (flags, plen) in [(0x2000u16, 40usize), (0x0005, 40)] {
+            let mut f = acl_packet("198.18.1.7", "203.0.113.9", 6, 20 + plen, None);
+            f[6..8].copy_from_slice(&flags.to_be_bytes());
+            tun.on_link_packet_with(&deny, link, &f);
+        }
+        assert_eq!(tun.c.unauth_drops.load(Relaxed), 2, "оба фрагмента к хосту отброшены");
+        // фрагмент во внутреннюю сеть и с чужим источником: те же отказы, что у целого пакета
+        let mut f = acl_packet("198.18.1.7", "10.9.9.9", 6, 60, None);
+        f[6..8].copy_from_slice(&0x0005u16.to_be_bytes());
+        tun.on_link_packet_with(&deny, link, &f);
+        let mut f = acl_packet("198.18.1.99", "8.8.8.8", 6, 60, None);
+        f[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        tun.on_link_packet_with(&deny, link, &f);
+        assert_eq!(tun.c.unauth_drops.load(Relaxed), 4);
     }
 
     #[test]
