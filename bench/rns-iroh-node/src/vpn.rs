@@ -1433,6 +1433,8 @@ pub struct CarrierCtl {
     pub prefer_tcp: AtomicBool,
     /// "quic" | "tcp": чем сейчас соединены
     pub mode: Mutex<&'static str>,
+    /// сосед не отвечает `DEAD_AFTER` наборов подряд и не анонсировался: не набираем (dial_direct, Liveness)
+    pub dead: AtomicBool,
     pub switches: std::sync::atomic::AtomicU32,
     /// растёт при каждом подключении/отключении носителя: Link, созданный на прежнем носителе, больше не годится и закрывается сразу
     pub generation: std::sync::atomic::AtomicU32,
@@ -1452,7 +1454,7 @@ pub struct CarrierCtl {
 
 impl CarrierCtl {
     fn new() -> Arc<Self> {
-        Arc::new(Self { prefer_tcp: AtomicBool::new(false), mode: Mutex::new("none"), switches: Default::default(), generation: Default::default(), fails: Default::default(), rtt_us: Default::default(), label: Mutex::new(String::new()), peer: Mutex::new(String::new()), silence: Mutex::new(None), joint_fail: Mutex::new(None) })
+        Arc::new(Self { prefer_tcp: AtomicBool::new(false), mode: Mutex::new("none"), dead: AtomicBool::new(false), switches: Default::default(), generation: Default::default(), fails: Default::default(), rtt_us: Default::default(), label: Mutex::new(String::new()), peer: Mutex::new(String::new()), silence: Mutex::new(None), joint_fail: Mutex::new(None) })
     }
     fn set_mode(&self, m: &'static str) {
         // `generation` тут не растёт: смена носителя интерфейс пира (`mux.rs`) не пересоздаёт и Link не рвёт; растёт `Dialer::mux_for`
@@ -1601,6 +1603,60 @@ fn record_tcp_blackhole(health: &health::Health, cc: &CarrierCtl, peer: &str, qu
 }
 
 /// Этап 0 make-before-break (docs/reviews/quic-return-make-before-break-2026-10-25.md): детерминированные регрессии без сети и часов.
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    #[test]
+    fn miss_pause_is_quadratic_and_bounded() {
+        let s: Vec<u64> = (1..=DEAD_AFTER).map(|k| miss_pause(k).as_secs()).collect();
+        assert_eq!(s, vec![2, 8, 18, 32, 50, 72, 98, 128]);
+        assert_eq!(miss_pause(0), miss_pause(1));
+        assert_eq!(miss_pause(1000), miss_pause(DEAD_AFTER));
+    }
+
+    #[test]
+    fn neighbor_dies_after_n_misses_and_announce_revives() {
+        let sh = Shared::new();
+        let cc = CarrierCtl::new();
+        let book = Addrs::new(vec!["a".into()]);
+        let mut l = Liveness { may_die: true, miss: 0, dead: false, seen_gen: book.epoch() };
+        for k in 1..DEAD_AFTER {
+            assert_eq!(l.missed(&sh, &cc, "n"), miss_pause(k));
+            assert!(!cc.dead.load(Relaxed));
+        }
+        assert_eq!(l.missed(&sh, &cc, "n"), DEAD_RECHECK);
+        assert!(l.dead && cc.dead.load(Relaxed));
+        // повторный промах у мёртвого: снова ждём анонса
+        assert_eq!(l.missed(&sh, &cc, "n"), DEAD_RECHECK);
+        assert!(!l.woken(&cc, book.epoch()), "без анонса не оживает");
+        book.wake();
+        assert!(l.woken(&cc, book.epoch()) && !l.dead && !cc.dead.load(Relaxed) && l.miss == 0);
+        assert_eq!(l.missed(&sh, &cc, "n"), miss_pause(1), "после анонса счёт заново");
+        // новые адреса тоже будят; одинаковые - нет
+        let g = book.epoch();
+        assert!(!book.set(vec!["a".into()]) && book.epoch() == g);
+        assert!(book.set(vec!["b".into()]) && book.epoch() > g);
+    }
+
+    #[test]
+    fn reached_clears_and_client_never_dies() {
+        let sh = Shared::new();
+        let cc = CarrierCtl::new();
+        let mut l = Liveness { may_die: true, miss: 0, dead: false, seen_gen: 0 };
+        for _ in 0..DEAD_AFTER {
+            l.missed(&sh, &cc, "n");
+        }
+        l.reached(&sh, &cc, "n");
+        assert!(!l.dead && !cc.dead.load(Relaxed) && l.miss == 0);
+        let mut c = Liveness { may_die: false, miss: 0, dead: false, seen_gen: 0 };
+        for _ in 0..DEAD_AFTER * 3 {
+            assert_eq!(c.missed(&sh, &cc, "x"), Duration::from_secs(2));
+        }
+        assert!(!c.dead && !cc.dead.load(Relaxed));
+    }
+}
+
 #[cfg(test)]
 mod carrier_return_tests {
     use super::*;
@@ -1959,13 +2015,23 @@ impl QuicMon {
 /// Адреса одного пира, общие для диалера и приёма анонсов: диалер берёт их на каждой попытке, анонс обновляет (0014 R4).
 struct Addrs {
     v: Mutex<Vec<String>>,
-    /// будит паузу диалера, если адреса сменились
+    /// будит паузу диалера, если адреса сменились или пир объявился
     changed: tokio::sync::Notify,
+    /// растёт при смене адресов и свежем анонсе: диалер по нему снимает статус «мёртв»
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 impl Addrs {
     fn new(v: Vec<String>) -> Arc<Self> {
-        Arc::new(Self { v: Mutex::new(v), changed: Default::default() })
+        Arc::new(Self { v: Mutex::new(v), changed: Default::default(), epoch: Default::default() })
+    }
+    /// Пир объявился сам (свежий анонс): разбудить диалер, даже если адреса прежние.
+    fn wake(&self) {
+        self.epoch.fetch_add(1, Relaxed);
+        self.changed.notify_one();
+    }
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Relaxed)
     }
     fn get(&self) -> Vec<String> {
         self.v.lock().unwrap().clone()
@@ -1980,7 +2046,8 @@ impl Addrs {
             return false;
         }
         *cur = v;
-        self.changed.notify_one();
+        drop(cur);
+        self.wake();
         true
     }
     /// Пауза диалера: до `d`, но не дольше, чем до смены адресов.
@@ -2032,8 +2099,67 @@ async fn resolve_addrs(addrs: &[String]) -> Vec<SocketAddr> {
 /// Носитель: QUIC (датаграммы), а если он не соединяется или монитор качества нашёл потери UDP - TCP. Link привязан к интерфейсу, а не к носителю,
 /// поэтому смена носителя в обе стороны идёт «сначала подключить новый, потом закрыть старый» и Link не рвёт. Из TCP пытаемся вернуться на QUIC, когда
 /// прошла пауза `back_off` (120 с, удваивается до 30 мин) от перехода на TCP: кандидатный QUIC проходит зонд (`qprobe`) и только потом берёт данные.
+/// Подряд неудачных наборов (хост не ответил ни по QUIC, ни по TCP/relay), после которых сосед считается мёртвым и не набирается до
+/// свежего анонса или новых адресов. Пауза после k-го промаха - `MISS_BASE_MS`·k² (2, 8, 18 … 98 с): до признания ≈5 мин пауз плюс время попыток.
+const DEAD_AFTER: u32 = 8;
+const MISS_BASE_MS: u64 = 2_000;
+/// Страховка от потерянного анонса: мёртвого соседа раз в час проверяем одной попыткой.
+const DEAD_RECHECK: Duration = Duration::from_secs(3600);
+
+fn miss_pause(miss: u32) -> Duration {
+    let k = u64::from(miss.clamp(1, DEAD_AFTER));
+    Duration::from_millis(MISS_BASE_MS * k * k)
+}
+
+/// Учёт недозвона до соседа: квадратичная пауза и статус «мёртв» (`may_die`, только соседи-узлы; у клиента своя логика смены сети).
+struct Liveness {
+    may_die: bool,
+    miss: u32,
+    dead: bool,
+    seen_gen: u64,
+}
+
+impl Liveness {
+    /// Хост ответил (носитель поднялся или TCP соединился): промахи забыть.
+    fn reached(&mut self, sh: &Shared, ctl: &CarrierCtl, label: &str) {
+        self.miss = 0;
+        if self.dead {
+            self.dead = false;
+            ctl.dead.store(false, Relaxed);
+            sh.note(format!("{label}: снова на связи"));
+        }
+    }
+    /// Свежий анонс или новые адреса: сразу набирать, счёт заново. true - статус «мёртв» снят.
+    fn woken(&mut self, ctl: &CarrierCtl, epoch: u64) -> bool {
+        if epoch == self.seen_gen {
+            return false;
+        }
+        self.seen_gen = epoch;
+        self.miss = 0;
+        ctl.dead.store(false, Relaxed);
+        std::mem::take(&mut self.dead)
+    }
+    /// Промах; пауза до следующей попытки (у мёртвого - до анонса или часовой перепроверки).
+    fn missed(&mut self, sh: &Shared, ctl: &CarrierCtl, label: &str) -> Duration {
+        self.miss = self.miss.saturating_add(1);
+        if !self.may_die {
+            // клиент и seed: прежний ровный темп, телефон после смены сети не должен ждать минутами
+            return Duration::from_secs(2);
+        }
+        if self.miss >= DEAD_AFTER {
+            if !self.dead {
+                self.dead = true;
+                ctl.dead.store(true, Relaxed);
+                sh.note(format!("{label}: не отвечает {} попыток подряд, считаю мёртвым до анонса (перепроверка раз в {} мин)", self.miss, DEAD_RECHECK.as_secs() / 60));
+            }
+            return DEAD_RECHECK;
+        }
+        miss_pause(self.miss)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: String, id: EndpointId, book: Arc<Addrs>, alive: Arc<AtomicBool>, ctl: Arc<CarrierCtl>) {
+async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: String, id: EndpointId, book: Arc<Addrs>, alive: Arc<AtomicBool>, ctl: Arc<CarrierCtl>, may_die: bool) {
     // память о неработающих носителях к этому пиру (health.rs): ключ - EndpointId, не имя и не адрес
     let peer = id.to_string();
     *ctl.peer.lock().unwrap() = peer.clone();
@@ -2044,7 +2170,11 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
     let mut quic_fail = 0u32;
     let mut tcp_fail = 0u32;
     let mut announced_block = false;
+    let mut live = Liveness { may_die, miss: 0, dead: false, seen_gen: d.book.epoch() };
     while d.alive.load(Relaxed) {
+        if live.woken(ctl, d.book.epoch()) {
+            sh.note(format!("{label}: объявился, набираю снова"));
+        }
         if st.mux.as_ref().is_some_and(|m| m.is_closed()) {
             st.mux = None;
         }
@@ -2099,6 +2229,7 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
             match tokio::time::timeout(Duration::from_secs(if resolved.is_empty() { 15 } else { 6 }), d.ep.connect(addr, ALPN)).await {
                 Ok(Ok(conn)) => {
                     quic_fail = 0;
+                    live.reached(sh, ctl, label);
                     st.quic_suspect = false;
                     sh.note(format!("quic connected to {label}"));
                     let Some(m) = d.mux_for(&mut st) else {
@@ -2116,7 +2247,8 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                 }
                 _ if relay_only => {
                     sh.note(format!("{label}: через relay не соединилось, повторю"));
-                    d.book.pause(Duration::from_secs(10)).await;
+                    let p = live.missed(sh, ctl, label);
+                    d.book.pause(p.max(Duration::from_secs(10))).await;
                 }
                 _ => {
                     quic_fail += 1;
@@ -2135,13 +2267,17 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                             st.quic_suspect = true;
                         }
                     }
-                    d.book.pause(Duration::from_secs(2)).await;
+                    let p = live.missed(sh, ctl, label);
+                    // переход на TCP не откладываем: «лучше в обход, чем разрыв»; у мёртвого соседа - ждём анонса
+                    let p = if ctl.prefer_tcp.load(Relaxed) && p < DEAD_RECHECK { Duration::from_secs(2) } else { p };
+                    d.book.pause(p).await;
                 }
             }
         } else {
             match tcpc::connect(&resolved, d.ep.secret_key(), &d.id).await {
                 tcpc::Dial::Up(stream) => {
                     tcp_fail = 0;
+                    live.reached(sh, ctl, label);
                     d.tcp_confirmed(&mut st);
                     let Some(m) = d.mux_for(&mut st) else {
                         d.book.pause(Duration::from_secs(2)).await;
@@ -2157,6 +2293,8 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                     d.session(&mut st, cur, m).await;
                 }
                 tcpc::Dial::Blackhole => {
+                    // хост ответил (TCP соединился): это блокировка, не смерть
+                    live.reached(sh, ctl, label);
                     d.tcp_blackholed(&mut st);
                     ctl.prefer_tcp.store(false, Relaxed);
                     st.tcp_since = None;
@@ -2171,7 +2309,8 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                         ctl.prefer_tcp.store(false, Relaxed);
                         tcp_fail = 0;
                     }
-                    d.book.pause(Duration::from_secs(2)).await;
+                    let p = live.missed(sh, ctl, label);
+                    d.book.pause(p).await;
                 }
             }
         }
@@ -2969,7 +3108,7 @@ impl NodeCtx {
             let up = nb.link.is_some() && now.duration_since(nb.last_heard) < self.dead;
             let hops = self.node.hops_to(&DestinationHash::new(nb.dest));
             ex.push(serde_json::json!({"n": nb.name, "d": hex(&nb.dest), "k": hex(&nb.key), "e": nb.ep, "a": nb.addrs.get(), "h": hops, "r": nb.rtt_ms,
-                "c": *nb.ctl.mode.lock().unwrap(), "sw": nb.ctl.switches.load(Relaxed), "s": if up { "up" } else { "seen" }, "age_s": now.duration_since(nb.last_announce).as_secs(), "heard_s": now.duration_since(nb.last_heard).as_secs()}));
+                "c": *nb.ctl.mode.lock().unwrap(), "dead": nb.ctl.dead.load(Relaxed), "sw": nb.ctl.switches.load(Relaxed), "s": if up { "up" } else { "seen" }, "age_s": now.duration_since(nb.last_announce).as_secs(), "heard_s": now.duration_since(nb.last_heard).as_secs()}));
         }
         serde_json::json!({"exits": ex, "ts": now_ms() as u64})
     }
@@ -3355,7 +3494,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     tokio::spawn(tcpc::listen(node.clone(), sh.clone(), a.port, ep.secret_key().clone(), relay_host));
     for s in a.seed.split(',').filter(|s| !s.is_empty()) {
         if let Some((id, addrs)) = parse_peer(s) {
-            tokio::spawn(dial_direct(ep.clone(), node.clone(), sh.clone(), format!("seed-{}", id.fmt_short()), id, Addrs::new(addrs), Arc::new(AtomicBool::new(true)), CarrierCtl::new()));
+            tokio::spawn(dial_direct(ep.clone(), node.clone(), sh.clone(), format!("seed-{}", id.fmt_short()), id, Addrs::new(addrs), Arc::new(AtomicBool::new(true)), CarrierCtl::new(), false));
         } else {
             sh.note(format!("bad --seed entry {s:?} (want id@ip:port)"));
         }
@@ -3509,6 +3648,10 @@ fn on_announce(ctx: &Arc<NodeCtx>, ann: &leviculum_std::ReceivedAnnounce) {
         e.tags = tags;
         e.accepts_links = accepts_links;
         e.last_announce = Instant::now();
+        // свежий анонс (не ответ на запрос пути из чужого кэша) - узел жив: снять «мёртв» и набрать сразу
+        if !ann.is_path_response() {
+            e.addrs.wake();
+        }
     }
     // lc=false is an opt-out from being selected as a server neighbor, not a grant or
     // revocation of rights. If a delayed announce arrives after promotion, remove only
@@ -3554,7 +3697,7 @@ fn maybe_dial(ctx: &Arc<NodeCtx>, dest: [u8; 16]) {
         let sa: Vec<String> = nb.addrs.get();
         tokio::spawn({
             let (ep, node, sh, label, cc, book) = (ctx.ep.clone(), ctx.node.clone(), ctx.sh.clone(), nb.name.clone(), nb.ctl.clone(), nb.addrs.clone());
-            async move { dial_direct(ep, node, sh, label, id, book, alive, cc).await }
+            async move { dial_direct(ep, node, sh, label, id, book, alive, cc, true).await }
         });
         (id, sa, nb.name.clone())
     };
@@ -7839,7 +7982,7 @@ fn start_dialer(ctx: &Arc<ClientCtx>, s: &CServer) {
     let cc = CarrierCtl::new();
     *cc.label.lock().unwrap() = s.name.clone();
     ctx.carriers.lock().unwrap().insert(s.dest, cc.clone());
-    tokio::spawn(dial_direct(ctx.ep.clone(), ctx.node.clone(), ctx.sh.clone(), s.name.clone(), id, book, alive, cc));
+    tokio::spawn(dial_direct(ctx.ep.clone(), ctx.node.clone(), ctx.sh.clone(), s.name.clone(), id, book, alive, cc, false));
 }
 
 /// Запустить диалеры выходов, у которых появился адрес: после пересборки списка по записям (новая запись работает без перезапуска клиента).
