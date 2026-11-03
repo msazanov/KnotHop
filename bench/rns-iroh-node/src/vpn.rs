@@ -509,6 +509,11 @@ const T_OBSERVE: u8 = 21; // admitted client -> exit: UI visible (one byte 0/1),
 /// сосед-сервер -> сосед-сервер: клиенты-узлы (якорь/TRANSIT/EXIT) с их именем {"c":[{"k","n"}]};
 /// получатель проверяет права ключа по своим записям, держит не дольше CINFO_TTL; только для отображения
 const T_CINFO: u8 = 22;
+/// Живость и RTT по Channel (0024; заменили RGP-датаграммы Link): T_PING [nonce u64 LE] -> T_PONG [тот же nonce].
+/// Отвечает только допущенный Link (Server/Client, не `enroll_only`); ответ принимает лишь тот, кто послал именно этот nonce именно на этом Link.
+const T_PING: u8 = 23;
+const T_PONG: u8 = 24;
+const PING_BODY_LEN: usize = 8;
 const CINFO_TTL: Duration = Duration::from_secs(60);
 const CINFO_MAX: usize = 64;
 /// Каталог нод: не более DIR_MAX записей в одном LXMF-сообщении
@@ -698,14 +703,153 @@ mod tests {
     }
 
     #[test]
-    fn exit_datagram_probe_requires_exact_echo_not_control_or_foreign_nonce() {
-        let reply = dgram_ping(42, 1234, b'R');
-        assert!(data_probe_matches(42, 1234, &reply));
-        assert!(!data_probe_matches(41, 1234, &reply));
-        assert!(!data_probe_matches(42, 1235, &reply));
-        assert!(!data_probe_matches(42, 1234, &dgram_ping(42, 1234, b'P')));
-        assert!(!data_probe_matches(42, 1234, &reply[..15]));
-        assert!(!data_probe_matches(42, 1234, &[T_AUTH_OK]));
+    fn ping_nonce_wire_is_exactly_eight_bytes() {
+        let n = 0x0102_0304_0506_0708u64;
+        assert_eq!(parse_ping_nonce(&n.to_le_bytes()), Some(n));
+        assert_eq!(parse_ping_nonce(&n.to_le_bytes()[..7]), None);
+        assert_eq!(parse_ping_nonce(&[n.to_le_bytes().as_slice(), &[0]].concat()), None);
+        assert_eq!(parse_ping_nonce(&[]), None);
+        assert_ne!(new_ping_nonce(), new_ping_nonce(), "nonce случайный");
+        assert!(T_PING != T_PONG && ![T_AUTH_OK, T_AUTH_FAIL, T_USE, T_NBRS, T_OBSERVE, T_CINFO].contains(&T_PING)
+            && ![T_AUTH_OK, T_AUTH_FAIL, T_USE, T_NBRS, T_OBSERVE, T_CINFO].contains(&T_PONG));
+    }
+
+    #[test]
+    fn pong_is_accepted_once_for_the_sent_nonce_on_the_sent_link() {
+        let (a, b) = (LinkId::new([1; 16]), LinkId::new([2; 16]));
+        let mut book = PingBook::default();
+        book.sent(a, 111);
+        book.sent(a, 222);
+        assert_eq!(book.ack(b, 111), None, "тот же nonce на чужом Link");
+        assert_eq!(book.ack(a, 333), None, "nonce, которого не отправляли");
+        assert!(book.ack(a, 111).is_some(), "ответ на отправленный nonce");
+        assert_eq!(book.ack(a, 111), None, "повтор старого pong отвергается");
+        assert!(book.ack(a, 222).is_some(), "второй nonce жив независимо");
+    }
+
+    #[test]
+    fn neighbor_pong_requires_current_link_of_that_neighbor() {
+        let (cur, other) = (LinkId::new([1; 16]), LinkId::new([2; 16]));
+        let mut book = PingBook::default();
+        book.sent(cur, 7);
+        book.sent(other, 8);
+        assert_eq!(accept_pong(&mut book, Some(cur), other, 8), None, "Link не текущий для соседа");
+        assert_eq!(accept_pong(&mut book, None, cur, 7), None, "у соседа нет Link");
+        assert_eq!(accept_pong(&mut book, Some(cur), cur, 8), None, "nonce другого Link");
+        assert!(accept_pong(&mut book, Some(cur), cur, 7).is_some());
+        assert_eq!(accept_pong(&mut book, Some(cur), cur, 7), None, "повтор");
+    }
+
+    #[test]
+    fn ping_book_is_bounded_and_counts_unanswered_as_loss() {
+        let l = LinkId::new([3; 16]);
+        let mut book = PingBook::default();
+        for n in 0..40u64 {
+            book.sent(l, n);
+        }
+        assert_eq!(book.v.len(), 16, "окно ограничено");
+        assert_eq!(book.ack(l, 0), None, "вытесненный nonce не принимается");
+        assert!(book.ack(l, 39).is_some());
+        assert_eq!(book.loss(Some(l), Duration::ZERO, 8), Some(15.0 / 16.0));
+        assert_eq!(book.loss(Some(LinkId::new([4; 16])), Duration::ZERO, 1), None);
+        assert_eq!(book.loss(None, Duration::from_secs(3600), 1), None, "никто не созрел");
+    }
+
+    #[test]
+    fn quic_monitor_flags_silence_and_counter_loss_but_not_a_healthy_link() {
+        // здоровый носитель: прогресс растёт каждый тик, потерь нет
+        let mut m = QuicMon::default();
+        assert!(!m.tick(5, 100, 0, 1000), "первый тик соединения - не контакт");
+        for i in 1..=QMON_TICKS as u64 {
+            assert!(m.tick(5, 100 + i * 4, 0, 1000 + i * 10));
+        }
+        assert_eq!(m.loss(), Some(0.0));
+        // окно набирается не раньше QMON_TICKS тиков
+        let mut m = QuicMon::default();
+        m.tick(5, 0, 0, 0);
+        for _ in 0..QMON_TICKS - 1 {
+            m.tick(5, 0, 0, 0);
+        }
+        assert_eq!(m.loss(), None);
+        m.tick(5, 0, 0, 0);
+        assert_eq!(m.loss(), Some(1.0), "полная тишина: каждая проба потеряна");
+        // 3 тихих из 8 = 37 % >= порога; 2 из 8 = 25 % < порога
+        let mut m = QuicMon::default();
+        m.tick(5, 0, 0, 0);
+        let mut p = 0;
+        for i in 0..QMON_TICKS {
+            if i >= 3 { p += 1; }
+            m.tick(5, p, 0, 0);
+        }
+        assert!(m.loss().unwrap() >= QMON_LOSS_LIMIT, "{:?}", m.loss());
+        let mut m = QuicMon::default();
+        m.tick(5, 0, 0, 0);
+        let mut p = 0;
+        for i in 0..QMON_TICKS {
+            if i >= 2 { p += 1; }
+            m.tick(5, p, 0, 0);
+        }
+        assert!(m.loss().unwrap() < QMON_LOSS_LIMIT);
+        // под трафиком прогресс идёт, но QUIC считает потерянные пакеты: 40 % от отправленных
+        let mut m = QuicMon::default();
+        m.tick(5, 0, 0, 0);
+        for i in 1..=QMON_TICKS as u64 {
+            m.tick(5, i * 10, i * 20, i * 50);
+        }
+        assert!((m.loss().unwrap() - 0.4).abs() < 1e-9);
+        // мало отправленного (< QMON_MIN_TX): доля потерь не значима
+        let mut m = QuicMon::default();
+        m.tick(5, 0, 0, 0);
+        for i in 1..=QMON_TICKS as u64 {
+            m.tick(5, i, i, i * 4);
+        }
+        assert_eq!(m.loss(), Some(0.0));
+    }
+
+    /// Источник статистики настоящий: после `ping()` растёт `frame_rx.authenticated_progress`, у закрытого пиром соединения - нет.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_monitor_sees_real_ping_progress_on_loopback() {
+        use iroh::endpoint::presets;
+        let mk = || async {
+            iroh::Endpoint::builder(presets::Minimal).secret_key(iroh::SecretKey::generate()).alpns(vec![b"rns/0".to_vec()])
+                .relay_mode(iroh::RelayMode::Disabled).bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).unwrap().bind().await.unwrap()
+        };
+        let (server, client) = (mk().await, mk().await);
+        let addr = iroh::EndpointAddr::new(server.id()).with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], server.bound_sockets()[0].port())));
+        let incoming = async { server.accept().await.unwrap().await.unwrap() };
+        let (c, s) = tokio::join!(client.connect(addr, b"rns/0"), incoming);
+        let (c, s) = (c.unwrap(), s);
+        let mut m = QuicMon::default();
+        let sample = |m: &mut QuicMon| {
+            let st = c.stats();
+            m.tick(c.stable_id(), st.frame_rx.authenticated_progress(), st.lost_packets, st.udp_tx.datagrams)
+        };
+        sample(&mut m);
+        for _ in 0..QMON_TICKS + 2 {
+            assert!(c.ping(), "соединение живо");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(sample(&mut m), "ACK на QUIC PING - аутентифицированный контакт");
+        }
+        assert_eq!(m.loss(), Some(0.0));
+        assert!(c.paths().iter().any(|p| p.is_selected() && p.rtt() < Duration::from_secs(1)));
+        // пир закрыл соединение: контакта нет
+        s.close(0u32.into(), b"bye");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(c.close_reason().is_some(), "закрытое пиром соединение: carrier_conn его не отдаст");
+    }
+
+    #[test]
+    fn quic_monitor_resets_on_new_connection() {
+        let mut m = QuicMon::default();
+        m.tick(5, 0, 0, 0);
+        for _ in 0..QMON_TICKS {
+            m.tick(5, 0, 0, 0);
+        }
+        assert_eq!(m.loss(), Some(1.0));
+        assert!(!m.tick(6, 500, 0, 0), "новое соединение - окно с нуля, контакта нет");
+        assert_eq!(m.loss(), None);
+        m.reset();
+        assert!(!m.tick(6, 501, 0, 0));
     }
 
     #[test]
@@ -1711,34 +1855,104 @@ mod carrier_return_tests {
     }
 }
 
-/// Окно последних пингов: доля не вернувшихся среди «созревших» (старше `age`).
-#[derive(Default)]
-struct LossWin {
-    v: std::collections::VecDeque<(u32, Instant, bool)>,
+/// Окно отправленных Channel-пингов (T_PING/T_PONG): Link, случайный nonce, время отправки. Ответ засчитывается один раз и только
+/// с тем nonce и на том Link, на котором пинг ушёл; повтор, чужой nonce и ответ на другом Link отвергаются. RTT считается по локальным часам.
+struct PingBook {
+    v: std::collections::VecDeque<(LinkId, u64, Instant, bool)>,
+    cap: usize,
 }
 
-impl LossWin {
-    fn sent(&mut self, seq: u32) {
-        self.v.push_back((seq, Instant::now(), false));
-        while self.v.len() > 16 {
+impl Default for PingBook {
+    fn default() -> Self {
+        Self::with_cap(16)
+    }
+}
+
+impl PingBook {
+    fn with_cap(cap: usize) -> Self {
+        Self { v: Default::default(), cap }
+    }
+    fn sent(&mut self, link: LinkId, nonce: u64) {
+        self.v.push_back((link, nonce, Instant::now(), false));
+        while self.v.len() > self.cap {
             self.v.pop_front();
         }
     }
-    fn ack(&mut self, seq: u32) {
-        if let Some(e) = self.v.iter_mut().find(|e| e.0 == seq) {
-            e.2 = true;
-        }
+    /// Засчитать ответ: `Some(RTT)` только при первом ответе на отправленный на этом Link nonce.
+    fn ack(&mut self, link: LinkId, nonce: u64) -> Option<Duration> {
+        let e = self.v.iter_mut().find(|e| e.0 == link && e.1 == nonce && !e.3)?;
+        e.3 = true;
+        Some(e.2.elapsed())
     }
     fn clear(&mut self) {
         self.v.clear();
     }
-    /// Доля потерь, если набралось не меньше `min_n` созревших пингов.
-    fn loss(&self, age: Duration, min_n: usize) -> Option<f64> {
-        let m: Vec<_> = self.v.iter().filter(|e| e.1.elapsed() >= age).collect();
+    /// Доля не вернувшихся среди «созревших» (старше `age`) пингов, если их не меньше `min_n`; `link` - только этого Link.
+    /// Channel надёжен: потеря здесь означает, что даже повторы Channel не дошли, а не потерю отдельной датаграммы.
+    fn loss(&self, link: Option<LinkId>, age: Duration, min_n: usize) -> Option<f64> {
+        let m: Vec<_> = self.v.iter().filter(|e| link.map_or(true, |l| l == e.0) && e.2.elapsed() >= age).collect();
         if m.len() < min_n {
             return None;
         }
-        Some(m.iter().filter(|e| !e.2).count() as f64 / m.len() as f64)
+        Some(m.iter().filter(|e| !e.3).count() as f64 / m.len() as f64)
+    }
+}
+
+fn new_ping_nonce() -> u64 {
+    rand_core::OsRng.next_u64()
+}
+
+/// Тело T_PING/T_PONG: ровно 8 байт nonce.
+fn parse_ping_nonce(body: &[u8]) -> Option<u64> {
+    <[u8; PING_BODY_LEN]>::try_from(body).ok().map(u64::from_le_bytes)
+}
+
+/// Окно монитора QUIC-носителя соседа и порог потерь (как у прежнего монитора пингов-датаграмм: >= 8 проб, >= 30 %).
+const QMON_TICKS: usize = 8;
+/// Минимум датаграмм за окно, при котором доля потерянных пакетов по счётчикам QUIC считается значимой.
+const QMON_MIN_TX: u64 = 40;
+const QMON_LOSS_LIMIT: f64 = 0.30;
+
+/// Монитор качества QUIC-носителя по его статистике: замена потерь пингов-датаграмм выхода. Один шаг на тик (2 с), перед ним выход шлёт
+/// QUIC PING. «Тихий» тик - ни одного аутентифицированного кадра от пира (`frame_rx.authenticated_progress`): проба потеряна. При трафике
+/// потери видны и по счётчикам QUIC (`lost_packets` / отправленные датаграммы). Потеря окна = max из двух долей.
+#[derive(Default)]
+struct QuicMon {
+    cid: usize,
+    last: Option<(u64, u64, u64)>,
+    ticks: std::collections::VecDeque<(bool, u64, u64)>,
+}
+
+impl QuicMon {
+    fn reset(&mut self) {
+        self.cid = 0;
+        self.last = None;
+        self.ticks.clear();
+    }
+    /// Учесть счётчики; true - от пира пришёл аутентифицированный кадр с прошлого тика (контакт). Первый тик нового соединения контактом не считается.
+    fn tick(&mut self, cid: usize, progress: u64, lost: u64, tx: u64) -> bool {
+        let prev = if self.cid == cid { self.last } else { None };
+        if prev.is_none() {
+            self.ticks.clear();
+        }
+        self.cid = cid;
+        self.last = Some((progress, lost, tx));
+        let Some((p, l, t)) = prev else { return false };
+        let moved = progress > p;
+        self.ticks.push_back((!moved, lost.saturating_sub(l), tx.saturating_sub(t)));
+        while self.ticks.len() > QMON_TICKS {
+            self.ticks.pop_front();
+        }
+        moved
+    }
+    fn loss(&self) -> Option<f64> {
+        if self.ticks.len() < QMON_TICKS {
+            return None;
+        }
+        let quiet = self.ticks.iter().filter(|t| t.0).count() as f64 / self.ticks.len() as f64;
+        let tx: u64 = self.ticks.iter().map(|t| t.2).sum();
+        let stat = if tx >= QMON_MIN_TX { self.ticks.iter().map(|t| t.1).sum::<u64>() as f64 / tx as f64 } else { 0.0 };
+        Some(quiet.max(stat))
     }
 }
 
@@ -2308,31 +2522,16 @@ async fn send_ctl(node: &Arc<Node>, link: LinkId, ty: u8, body: &[u8]) {
     let _ = h.send(&m).await;
 }
 
-/// Пинг/понг датаграммой Link (ненадёжно, без Channel): потеря пинга остаётся потерей и видна монитору качества носителя.
-/// Формат 16 байт: `RGP` + 'P'|'R' + seq(u32 LE) + время отправителя (мкс, u64 LE).
-fn dgram_ping(seq: u32, ts: u64, kind: u8) -> Vec<u8> {
-    let mut b = vec![0u8; 16];
-    b[..3].copy_from_slice(b"RGP");
-    b[3] = kind;
-    b[4..8].copy_from_slice(&seq.to_le_bytes());
-    b[8..16].copy_from_slice(&ts.to_le_bytes());
-    b
-}
-
-fn is_rgp(d: &[u8]) -> bool {
-    d.len() == 16 && &d[..3] == b"RGP" && (d[3] == b'P' || d[3] == b'R')
-}
-
 /// Keepalive RNS клиентских Link в секундах (ADR 0019 §11): ставят оба конца, клиент при подключении, сервер при допуске.
 /// Одинаковое значение обязательно: ответчик с коротким окном stale закрыл бы Link клиента, молчащего между keepalive.
 const CLIENT_KEEPALIVE_S: u64 = 25;
 /// Запас сверх keepalive на задержку ответа, прежде чем пропуск считается потерей контакта.
 const KEEPALIVE_SLACK_MS: u64 = 3_000;
-/// Сколько после последнего IP-пакета выход считается занятым: пока занят, пингуем RGP раз в секунду.
+/// Сколько после последнего IP-пакета выход считается занятым: пока занят, пингуем (QUIC PING или Channel T_PING) раз в секунду.
 const PING_ACTIVE_HOLD_MS: u64 = 10_000;
 
 /// Решение клиента о живости выхода (ADR 0019 §11): без трафика телефон не будится пингами и полагается на keepalive RNS
-/// (каждые `CLIENT_KEEPALIVE_S`). При трафике, а также после пропущенного keepalive, идут RGP-пинги раз в секунду;
+/// (каждые `CLIENT_KEEPALIVE_S`). При трафике, а также после пропущенного keepalive, идут пинги раз в секунду;
 /// `fail_ms` без любого ответа - выход мёртв. Для пропуска keepalive это три проверки по секунде.
 /// Чистое состояние: время и счётчики приходят аргументами.
 #[derive(Default)]
@@ -2346,7 +2545,7 @@ struct Pacer {
 }
 
 struct PaceStep {
-    /// отправить RGP-пинг сейчас
+    /// отправить пинг сейчас
     ping: bool,
     /// молчание выхода в мс; 0, пока ответа никто не ждёт
     silent_ms: u64,
@@ -2397,7 +2596,7 @@ mod keepalive_pacer_tests {
         let mut p = Pacer::default();
         for now in (1_000..=28_000).step_by(250) {
             let s = p.step(now, 0, 1_000, 0, 25_000, 3_000);
-            assert!(!s.ping && s.silent_ms == 0, "no RGP wakeup while idle");
+            assert!(!s.ping && s.silent_ms == 0, "no ping wakeup while idle");
         }
         for now in [29_250, 30_250, 31_250] {
             let s = p.step(now, 0, 1_000, 0, 25_000, 3_000);
@@ -2417,13 +2616,6 @@ mod keepalive_pacer_tests {
         assert_eq!(p.step(31_000, 1, 30_900, 1, 25_000, 3_000).silent_ms, 100);
         assert!(!p.step(41_000, 1, 40_500, 1, 25_000, 3_000).ping, "return to idle");
     }
-}
-
-fn spawn_dgram(node: &Arc<Node>, link: LinkId, data: Vec<u8>) {
-    let h = node.engine().link_handle(&link);
-    tokio::spawn(async move {
-        let _ = h.send_datagram(&data).await;
-    });
 }
 
 fn spawn_ctl(node: &Arc<Node>, link: LinkId, ty: u8, body: Vec<u8>) {
@@ -2598,8 +2790,10 @@ struct Neighbor {
     first_seen: Instant,
     last_try: Instant,
     ctl: Arc<CarrierCtl>,
-    loss: LossWin,
-    ping_seq: u32,
+    /// Channel-пинги (носитель не QUIC или нет прямого соединения)
+    loss: PingBook,
+    /// монитор QUIC-носителя по статистике соединения (вместо пингов по датаграммам)
+    qmon: QuicMon,
     /// когда текущий Link допущен: потери считаются только по пингам этого Link (старый Link на отключённом интерфейсе даёт ложные потери)
     admitted_at: Instant,
     seen_gen: u32,
@@ -3263,9 +3457,7 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
             NodeEvent::LinkDataReceived { link_id, .. } if rrc::is_hub_link(&link_id) => {}
             NodeEvent::LinkDataReceived { link_id, .. } if ctx.link_is_cbc(&link_id) => {}
             NodeEvent::LinkDataReceived { link_id, data, .. } => {
-                if is_rgp(&data) {
-                    on_rgp(&ctx, link_id, &data);
-                } else if let Some(t) = &ctx.tun {
+                if let Some(t) = &ctx.tun {
                     t.on_link_packet(&ctx.node, link_id, &data);
                 }
             }
@@ -3305,7 +3497,7 @@ fn on_announce(ctx: &Arc<NodeCtx>, ann: &leviculum_std::ReceivedAnnounce) {
         let mut n = ctx.neigh.lock().unwrap();
         let e = n.entry(dest).or_insert_with(|| Neighbor { dest, key, pk, name: name.clone().unwrap_or_else(|| "?".into()), ep: ep.clone(), addrs: Addrs::new(addrs.clone()), tags: tags.clone(), accepts_links, last_announce: Instant::now(),
             link: None, last_heard: Instant::now() - Duration::from_secs(3600), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(),
-            last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: LossWin::default(), ping_seq: 0, admitted_at: Instant::now(), seen_gen: 0 });
+            last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0 });
         if let Some(n) = name.clone() {
             e.name = n;
         }
@@ -3462,35 +3654,47 @@ fn on_identified(ctx: &Arc<NodeCtx>, link: LinkId, idh: [u8; 16]) {
     }
 }
 
-fn on_rgp(ctx: &Arc<NodeCtx>, link: LinkId, d: &[u8]) {
-    let role_srv = {
-        let mut l = ctx.links.lock().unwrap();
-        match l.get_mut(&link) {
-            Some(info) => {
-                info.last_heard = Instant::now();
-                match info.role {
-                    Role::Server { dest } => Some(Some(dest)),
-                    Role::Client { .. } => Some(None),
-                    _ => None,
-                }
-            }
-            None => None,
-        }
-    };
-    let Some(srv) = role_srv else { return }; // пинг от неавторизованного Link не обслуживаем
-    if d[3] == b'P' {
-        let mut r = d.to_vec();
-        r[3] = b'R';
-        spawn_dgram(&ctx.node, link, r);
-    } else if let Some(dest) = srv {
-        let seq = u32::from_le_bytes(d[4..8].try_into().unwrap());
-        let ts = u64::from_le_bytes(d[8..16].try_into().unwrap());
-        if let Some(nb) = ctx.neigh.lock().unwrap().get_mut(&dest) {
-            nb.rtt_ms = Some(now_us().saturating_sub(ts) as f64 / 1000.0);
-            nb.last_heard = Instant::now();
-            nb.loss.ack(seq);
-        }
+/// Допущенный (Server/Client) Link не для зачисления? Только такой отвечает на T_PING и принимает T_PONG.
+/// `Some(Some(dest))` - сосед, `Some(None)` - клиент.
+fn admitted_ping_role(ctx: &Arc<NodeCtx>, link: LinkId) -> Option<Option<[u8; 16]>> {
+    let l = ctx.links.lock().unwrap();
+    let info = l.get(&link)?;
+    if info.enroll_only {
+        return None;
     }
+    match info.role {
+        Role::Server { dest } => Some(Some(dest)),
+        Role::Client { .. } => Some(None),
+        Role::Unknown => None,
+    }
+}
+
+/// T_PING от допущенного Link: эхо nonce тем же Link. Размер ответа равен запросу (усиления нет); частоту ограничивает `ctrl_pass`.
+fn on_ping(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
+    if parse_ping_nonce(body).is_none() || admitted_ping_role(ctx, link).is_none() {
+        return;
+    }
+    spawn_ctl(&ctx.node, link, T_PONG, body.to_vec());
+}
+
+/// T_PONG на выходе: только от соседа (Server) и только на nonce, отправленный на этот же Link. RTT и «слышали» берутся отсюда.
+fn on_pong(ctx: &Arc<NodeCtx>, link: LinkId, body: &[u8]) {
+    let Some(nonce) = parse_ping_nonce(body) else { return };
+    let Some(Some(dest)) = admitted_ping_role(ctx, link) else { return };
+    let mut n = ctx.neigh.lock().unwrap();
+    let Some(nb) = n.get_mut(&dest) else { return };
+    if let Some(rtt) = accept_pong(&mut nb.loss, nb.link, link, nonce) {
+        nb.rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
+        nb.last_heard = Instant::now();
+    }
+}
+
+/// Засчитывать ли T_PONG соседа: Link должен быть текущим Link соседа, а nonce - отправленным на него и ещё не отвеченным.
+fn accept_pong(book: &mut PingBook, current: Option<LinkId>, link: LinkId, nonce: u64) -> Option<Duration> {
+    if current != Some(link) {
+        return None;
+    }
+    book.ack(link, nonce)
 }
 
 fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
@@ -3507,6 +3711,8 @@ fn on_control(ctx: &Arc<NodeCtx>, link: LinkId, data: &[u8]) {
     }
     match ty {
         T_CINFO => on_cinfo(ctx, link, body),
+        T_PING => on_ping(ctx, link, body),
+        T_PONG => on_pong(ctx, link, body),
         T_OBSERVE if matches!(body, [0] | [1]) => {
             {
                 let mut links = ctx.links.lock().unwrap();
@@ -3774,7 +3980,7 @@ fn admit_neighbor_state(n: &mut HashMap<[u8; 16], Neighbor>, link: LinkId, dest:
     let mut key = [0u8; 32];
     key.copy_from_slice(&pk[32..64]);
     let e = n.entry(dest).or_insert_with(|| Neighbor { dest, key, pk: *pk, name: "?".into(), ep: String::new(), addrs: Addrs::new(vec![]), tags: vec![], accepts_links: true, last_announce: Instant::now(),
-        link: None, last_heard: Instant::now(), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(), last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: LossWin::default(), ping_seq: 0, admitted_at: Instant::now(), seen_gen: 0 });
+        link: None, last_heard: Instant::now(), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(), last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0 });
     if let Some(old) = e.link {
         if old != link {
             let keep_new = link.as_bytes() < old.as_bytes();
@@ -3789,6 +3995,7 @@ fn admit_neighbor_state(n: &mut HashMap<[u8; 16], Neighbor>, link: LinkId, dest:
     e.last_heard = Instant::now();
     e.admitted_at = Instant::now();
     e.loss.clear();
+    e.qmon.reset();
     None
 }
 
@@ -5140,7 +5347,7 @@ impl NodeCtx {
             let key: [u8; 32] = e.pk[32..64].try_into().unwrap();
             n.insert(e.dest, Neighbor { dest: e.dest, key, pk: e.pk, name: e.name, ep: e.ep, addrs: Addrs::new(e.addrs), tags: vec![], accepts_links: true, last_announce: Instant::now(),
                 link: None, last_heard: Instant::now() - Duration::from_secs(3600), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(),
-                last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: LossWin::default(), ping_seq: 0, admitted_at: Instant::now(), seen_gen: 0 });
+                last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0 });
         }
     }
 
@@ -5442,7 +5649,7 @@ fn on_dir_node(ctx: &Arc<NodeCtx>, sender: trust::Pk, dir: &[serde_json::Value])
         // соседство решают записи (neighbor_policy/evaluate), не этот каталог; tags пусты до анонса; срок забывания - от now
         n.insert(e.dest, Neighbor { dest: e.dest, key, pk: e.pk, name: e.name, ep: e.ep, addrs: Addrs::new(e.addrs), tags: vec![], accepts_links: true, last_announce: Instant::now(),
             link: None, last_heard: Instant::now() - Duration::from_secs(3600), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(),
-            last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: LossWin::default(), ping_seq: 0, admitted_at: Instant::now(), seen_gen: 0 });
+            last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0 });
     }
     true
 }
@@ -5588,6 +5795,7 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
                 if g != nb.seen_gen {
                     nb.seen_gen = g;
                     nb.loss.clear();
+                    nb.qmon.reset();
                     if let Some(l) = nb.link.take() {
                         nb.rtt_ms = None;
                         nb.last_try = Instant::now() - Duration::from_secs(3600);
@@ -5687,27 +5895,64 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
         // пинги соседям и клиентам-проверка живости
         if now.duration_since(last_ping) >= Duration::from_secs(2) {
             last_ping = now;
+            // 0024: на QUIC-носителе живость, RTT и потери берутся из статистики соединения (QUIC PING + аутентифицированный приём),
+            // без сообщений Link; без QUIC (TCP-носитель, транзит RNS) - Channel-пинг T_PING/T_PONG раз в 2 с.
             let links: Vec<(LinkId, [u8; 16])> = ctx.links.lock().unwrap().iter().filter_map(|(k, l)| match l.role { Role::Server { dest } => Some((*k, dest)), _ => None }).collect();
             for (l, dest) in links {
-                let seq = {
+                let Some(key) = ctx.neigh.lock().unwrap().get(&dest).filter(|nb| nb.link == Some(l)).map(|nb| nb.key) else { continue };
+                // выбор носителя берёт замки мультиплексора: вне замка `neigh`
+                let conn = dataplane::plane().carrier_conn(&key);
+                let snap = conn.as_ref().map(|c| {
+                    let st = c.stats();
+                    let rtt = c.paths().iter().find(|p| p.is_selected()).map(|p| (p.rtt().as_secs_f64() * 1000.0 * 100.0).round() / 100.0);
+                    (c.stable_id(), st.frame_rx.authenticated_progress(), st.lost_packets, st.udp_tx.datagrams, rtt)
+                });
+                let mut ping: Option<u64> = None;
+                let mut contact = false;
+                {
                     let mut n = ctx.neigh.lock().unwrap();
                     let Some(nb) = n.get_mut(&dest) else { continue };
-                    nb.ping_seq = nb.ping_seq.wrapping_add(1);
-                    nb.loss.sent(nb.ping_seq);
-                    // монитор качества: потери пингов >= 30% при >= 8 созревших на QUIC -> TCP (набирает дозвон этого пира; принимающая сторона следует за ним)
-                    if nb.ctl.is_quic() && !nb.ctl.prefer_tcp.load(Relaxed) && nb.admitted_at.elapsed() > Duration::from_secs(6) {
-                        if let Some(lo) = nb.loss.loss(Duration::from_secs(4), 8) {
-                            if lo >= 0.30 {
-                                ctx.sh.note(format!("{}: потери UDP {:.0}% по пингам, переключаю носитель на TCP", nb.name, lo * 100.0));
-                                nb.ctl.prefer_tcp.store(true, Relaxed);
-                                nb.ctl.switches.fetch_add(1, Relaxed);
-                                nb.loss.clear();
+                    match snap {
+                        Some((cid, progress, lost, tx, rtt)) => {
+                            nb.loss.clear();
+                            contact = nb.qmon.tick(cid, progress, lost, tx);
+                            if contact {
+                                nb.last_heard = Instant::now();
+                            }
+                            if rtt.is_some() {
+                                nb.rtt_ms = rtt;
+                            }
+                            // монитор качества: потери >= 30% (тихие тики или доля потерянных пакетов QUIC) по окну из 8 тиков (16 с) на QUIC
+                            // -> TCP (набирает дозвон этого пира; принимающая сторона следует за ним)
+                            if nb.ctl.is_quic() && !nb.ctl.prefer_tcp.load(Relaxed) && nb.admitted_at.elapsed() > Duration::from_secs(6) {
+                                if let Some(lo) = nb.qmon.loss() {
+                                    if lo >= QMON_LOSS_LIMIT {
+                                        ctx.sh.note(format!("{}: потери UDP {:.0}% по статистике QUIC, переключаю носитель на TCP", nb.name, lo * 100.0));
+                                        nb.ctl.prefer_tcp.store(true, Relaxed);
+                                        nb.ctl.switches.fetch_add(1, Relaxed);
+                                        nb.qmon.reset();
+                                    }
+                                }
                             }
                         }
+                        None => {
+                            nb.qmon.reset();
+                            let nonce = new_ping_nonce();
+                            nb.loss.sent(l, nonce);
+                            ping = Some(nonce);
+                        }
                     }
-                    nb.ping_seq
-                };
-                spawn_dgram(&ctx.node, l, dgram_ping(seq, now_us(), b'P'));
+                }
+                if contact {
+                    if let Some(info) = ctx.links.lock().unwrap().get_mut(&l) {
+                        info.last_heard = Instant::now();
+                    }
+                }
+                match (&conn, ping) {
+                    (Some(c), _) => { c.ping(); } // проба запрашивает ACK; контакт засчитывает только приём
+                    (None, Some(nonce)) => spawn_ctl(&ctx.node, l, T_PING, nonce.to_le_bytes().to_vec()),
+                    _ => {}
+                }
             }
         }
 
@@ -5726,7 +5971,7 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
                         let silent = heard.get(&l).map(|t| now.duration_since(*t).as_millis()).unwrap_or(0);
                         let detail = format!("тишина {silent} мс, носитель {}, смен носителя {}, потери пингов {}, rtt {}, допущен {} с назад",
                             if nb.ctl.is_quic() { "QUIC" } else { "TCP" }, nb.ctl.switches.load(Relaxed),
-                            nb.loss.loss(Duration::from_secs(10), 1).map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "?".into()),
+                            nb.qmon.loss().or_else(|| nb.loss.loss(None, Duration::from_secs(10), 1)).map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "?".into()),
                             nb.rtt_ms.map(|r| format!("{r:.0} мс")).unwrap_or_else(|| "?".into()), nb.admitted_at.elapsed().as_secs());
                         to_close.push((l, nb.name.clone(), detail));
                     }
@@ -6574,8 +6819,8 @@ struct ClientCtx {
     servers: Mutex<Vec<CServer>>,
     tun: Arc<TunState>,
     auth_wait: Mutex<HashMap<LinkId, tokio::sync::oneshot::Sender<std::result::Result<serde_json::Value, String>>>>,
-    /// Пробы датаграмм только после AUTH_OK и проверки EXIT: Link -> случайный seq, метка времени, ответ.
-    data_wait: Mutex<HashMap<LinkId, (u32, u64, tokio::sync::oneshot::Sender<()>)>>,
+    /// Проба выхода (гейт допуска) только после AUTH_OK и проверки EXIT: Link -> случайный nonce T_PING и ответ.
+    data_wait: Mutex<HashMap<LinkId, (u64, tokio::sync::oneshot::Sender<()>)>>,
     cur: Mutex<Option<([u8; 16], LinkId, Instant)>>,
     last_pong: std::sync::atomic::AtomicU64,
     /// Окно свежести контакта для индикации: `fail_ms` при трафике, keepalive с запасом в простое (выставляет `Pacer`).
@@ -6593,7 +6838,8 @@ struct ClientCtx {
     names: Mutex<HashMap<[u8; 16], String>>,
     /// адреса выходов для диалеров (dest -> общее хранилище): анонс обновляет, диалер читает на каждой попытке (0014 R4)
     books: Mutex<HashMap<[u8; 16], Arc<Addrs>>>,
-    loss: Mutex<LossWin>,
+    /// отправленные Channel-пинги текущего и дополнительных выходов (Link в записи)
+    loss: Mutex<PingBook>,
     fail_ms: u64,
     path_gate: path::PathGate,
     /// состояние прав 0013 (создаётся при каждом запуске клиента)
@@ -7028,7 +7274,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
     let ctx = Arc::new(ClientCtx { node: node.clone(), sh: sh.clone(), ep: ep.clone(), identity, ip: client_addr, servers: Mutex::new(servers.clone()), tun,
         auth_wait: Mutex::new(HashMap::new()), data_wait: Mutex::new(HashMap::new()), cur: Mutex::new(None), last_pong: Default::default(), contact_window_ms: Default::default(), rtt_pong: Default::default(), rtt_ms: Mutex::new(None), failovers: Mutex::new(Vec::new()),
         state: a.state.clone(), status: Mutex::new("подключаюсь".into()), dialers: Mutex::new(HashMap::new()),
-        carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), books: Mutex::new(HashMap::new()), loss: Mutex::new(LossWin::default()), fail_ms: a.fail_ms,
+        carriers: Mutex::new(HashMap::new()), public_ids: Mutex::new(Vec::new()), names: Mutex::new(load_names(&a.state)), books: Mutex::new(HashMap::new()), loss: Mutex::new(PingBook::with_cap(64)), fail_ms: a.fail_ms,
         c13, path_gate: path::PathGate::default(), nbrs: Mutex::new(HashMap::new()), admitted_exits: Mutex::new(HashMap::new()), ctrl: Mutex::new(HashMap::new()), lk_fail: Mutex::new(HashMap::new()), vis: Mutex::new(HashMap::new()), qstat: Mutex::new(HashMap::new()),
          rcfg: std::sync::RwLock::new(Arc::new(route::Cfg::default())), rreport: Mutex::new(serde_json::Value::Null), rpending: Mutex::new(HashSet::new()), rback: Mutex::new(HashMap::new()) });
     {
@@ -7690,43 +7936,51 @@ async fn client_events(ctx: Arc<ClientCtx>, mut events: leviculum_std::driver::E
                             on_nbrs_client(&ctx, link_id, body);
                         }
                     }
+                    T_PONG => on_pong_client(&ctx, link_id, body),
                     _ => {}
                 }
             }
             NodeEvent::LinkDataReceived { link_id, data, .. } => {
-                // IP-пакеты не берут дополнительный мьютекс таблицы проб.
-                if is_rgp(&data) && data[3] == b'R' {
-                    let probe = {
-                        let mut pending = ctx.data_wait.lock().unwrap();
-                        if pending.get(&link_id).map(|(seq, ts, _)| data_probe_matches(*seq, *ts, &data)).unwrap_or(false) {
-                            pending.remove(&link_id)
-                        } else { None }
-                    };
-                    if let Some((_, _, tx)) = probe { let _ = tx.send(()); }
-                }
                 let cur = ctx.cur.lock().unwrap().map(|c| c.1);
                 if cur == Some(link_id) {
                     ctx.last_pong.store(now_ms() as u64, Relaxed); // любой пакет от выхода - признак жизни
-                    if is_rgp(&data) {
-                        if data[3] == b'R' {
-                            ctx.loss.lock().unwrap().ack(u32::from_le_bytes(data[4..8].try_into().unwrap()));
-                            *ctx.rtt_ms.lock().unwrap() = Some(now_us().saturating_sub(u64::from_le_bytes(data[8..16].try_into().unwrap())) as f64 / 1000.0);
-                            ctx.rtt_pong.store(now_ms() as u64, Relaxed);
-                        }
-                    } else {
-                        ctx.tun.on_link_packet(&ctx.node, link_id, &data);
-                    }
+                    ctx.tun.on_link_packet(&ctx.node, link_id, &data);
                 } else if ctx.tun.routing.load(Relaxed) {
                     let x = ctx.tun.extra.read().unwrap().values().find(|x| x.id == link_id).cloned();
                     if let Some(x) = x {
                         x.last_rx_ms.store(now_ms() as u64, Relaxed);
-                        if !is_rgp(&data) {
-                            ctx.tun.on_extra_packet(&data);
-                        }
+                        ctx.tun.on_extra_packet(&data);
                     }
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// T_PONG выхода (клиент). Принимается только ответ с nonce, отправленным именно на этот Link: гейт допуска (`connect_exit`) либо Channel-пинг
+/// пейсера (текущий или дополнительный выход). Повтор, чужой nonce и ответ другого Link отвергаются.
+fn on_pong_client(ctx: &ClientCtx, link: LinkId, body: &[u8]) {
+    let Some(nonce) = parse_ping_nonce(body) else { return };
+    {
+        let mut pending = ctx.data_wait.lock().unwrap();
+        if pending.get(&link).is_some_and(|(n, _)| *n == nonce) {
+            if let Some((_, tx)) = pending.remove(&link) {
+                let _ = tx.send(());
+            }
+            return;
+        }
+    }
+    let Some(rtt) = ctx.loss.lock().unwrap().ack(link, nonce) else { return };
+    let cur = ctx.cur.lock().unwrap().map(|c| c.1);
+    if cur == Some(link) {
+        ctx.last_pong.store(now_ms() as u64, Relaxed);
+        *ctx.rtt_ms.lock().unwrap() = Some(rtt.as_secs_f64() * 1000.0);
+        ctx.rtt_pong.store(now_ms() as u64, Relaxed);
+    } else if ctx.tun.routing.load(Relaxed) {
+        let x = ctx.tun.extra.read().unwrap().values().find(|x| x.id == link).cloned();
+        if let Some(x) = x {
+            x.last_rx_ms.store(now_ms() as u64, Relaxed);
         }
     }
 }
@@ -7923,11 +8177,6 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
     Ok((id, Arc::new(handle)))
 }
 
-fn data_probe_matches(seq: u32, ts: u64, data: &[u8]) -> bool {
-    is_rgp(data) && data[3] == b'R'
-        && data[4..8] == seq.to_le_bytes() && data[8..16] == ts.to_le_bytes()
-}
-
 struct ExitProbeGuard<'a> {
     ctx: &'a ClientCtx,
     id: LinkId,
@@ -7984,6 +8233,21 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
             bail!("{} не ответил на авторизацию", cand.name);
         }
     };
+    // Гейт допуска (0024): T_PING с новым случайным nonce на ЭТОТ Link, ответ принимается только с тем же nonce (`on_pong_client`).
+    // Проба уходит до T_OBSERVE и отправки хранилища прав, чтобы Channel не ждал за ними; ответ ждём ниже.
+    let nonce = new_ping_nonce();
+    let (ptx, mut prx) = tokio::sync::oneshot::channel();
+    let room = {
+        let mut pending = ctx.data_wait.lock().unwrap();
+        if pending.len() >= 32 { false } else { pending.insert(id, (nonce, ptx)); true }
+    };
+    if !room {
+        let _ = ctx.node.engine().close_link(&id).await;
+        bail!("слишком много проверок выхода");
+    }
+    let mut probe = ExitProbeGuard { ctx, id, ready: false };
+    let probe_at = tokio::time::Instant::now();
+    send_ctl(&ctx.node, id, T_PING, &nonce.to_le_bytes()).await;
     if let Some(c) = &ctx.c13 {
         // цепочка сервера пришла раньше AUTH_OK (события клиента обрабатываются по порядку): сверяем его право EXIT в общем корне
         let ok = authorized_exit(&c.trust.lock().unwrap(), cand.pk.as_ref(), now_ms() as u64);
@@ -8013,32 +8277,18 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
             ctx.sync_to(id, recs, vec![]);
         }
     }
-    // Управляющий Channel может отвечать, пока ненадёжные датаграммы по тому же
-    // пути не проходят. Такой Link не должен вытеснять рабочий запасной выход.
-    let (seq, ts) = (rand_core::OsRng.next_u32(), now_us());
-    let (tx, mut rx) = tokio::sync::oneshot::channel();
-    let room = {
-        let mut pending = ctx.data_wait.lock().unwrap();
-        if pending.len() >= 32 { false } else { pending.insert(id, (seq, ts, tx)); true }
-    };
-    if !room {
-        let _ = ctx.node.engine().close_link(&id).await;
-        bail!("слишком много проверок датаграмм выхода");
-    }
-    let mut probe = ExitProbeGuard { ctx, id, ready: false };
-    for _ in 0..3 {
-        spawn_dgram(&ctx.node, id, dgram_ping(seq, ts, b'P'));
-        match tokio::time::timeout(Duration::from_secs(1), &mut rx).await {
-            Ok(Ok(())) => { probe.ready = true; break; }
-            Ok(Err(_)) => break,
-            Err(_) => {}
-        }
+    // Выход обязан ответить эхом nonce по этому Link за 3 с с отправки пробы (как прежние 3 x 1 с). Ответ с чужим nonce, повтор старого
+    // и ответ другого Link отвергает `on_pong_client`. Channel надёжен: датаграммы Link пробой больше не проверяются, качество QUIC-носителя
+    // дальше смотрят статистика QUIC и пейсер.
+    match tokio::time::timeout_at(probe_at + Duration::from_secs(3), &mut prx).await {
+        Ok(Ok(())) => probe.ready = true,
+        _ => {}
     }
     ctx.data_wait.lock().unwrap().remove(&id);
     if !probe.ready {
         let iface = ctx.node.engine().with_link(&id, |s| s.attached_interface()).flatten();
         let _ = ctx.node.engine().close_link(&id).await;
-        let why = format!("{}: нет ответа на датаграммы выхода", cand.name);
+        let why = format!("{}: нет ответа на проверку выхода", cand.name);
         return Err(match iface {
             Some(iface) => anyhow::Error::new(path::FailedPath { iface, why }),
             None => anyhow::anyhow!(why),
@@ -8271,7 +8521,6 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
     let mut stamp = Vec::new();
     let mut pacers: HashMap<LinkId, Pacer> = HashMap::new();
     let mut recovering = HashSet::new();
-    let mut seq = 0u32;
     while !fin.exists() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let st = stamp_of();
@@ -8325,8 +8574,10 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
                     ctx.rback.lock().unwrap().insert(*d, Instant::now() + Duration::from_secs(10));
                 }
             } else if step.ping {
-                seq = seq.wrapping_add(1);
-                spawn_dgram(&ctx.node, x.id, dgram_ping(seq, now_us(), b'P'));
+                // Channel-пинг доп. выхода (0024): ответ T_PONG с тем же nonce обновит `last_rx_ms` (`on_pong_client`)
+                let nonce = new_ping_nonce();
+                ctx.loss.lock().unwrap().sent(x.id, nonce);
+                spawn_ctl(&ctx.node, x.id, T_PING, nonce.to_le_bytes().to_vec());
             }
         }
         // недостающие Link
@@ -8399,7 +8650,6 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
     let mut active: Option<(CServer, LinkId, Arc<leviculum_std::LinkHandle>)> = None;
     let mut primary: Option<[u8;16]> = None;
     let mut pending_reason: Option<String> = None;
-    let mut seq = 0u32;
     let mut keep_trying: HashMap<[u8; 16], Instant> = HashMap::new();
     // QAB-M2: перенос на QUIC не удался, а прежний Link мог быть вытеснен сервером; когда начался перенос; восстановленный выход и время
     let mut pair_delay = 2u64;
@@ -8612,7 +8862,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             let step = pacer.step(now, ctx.tun.traffic_pkts(), ctx.last_pong.load(Relaxed), acked, CLIENT_KEEPALIVE_S * 1000, ctx.fail_ms);
             if step.keepalive_ack {
                 ctx.remember_rns_rtt(cand.dest, &id);
-                // ответ keepalive RNS - контакт; его RTT нужен индикации, если свежих RGP нет
+                // ответ keepalive RNS - контакт; его RTT нужен индикации, если свежих замеров QUIC/T_PONG нет
                 ctx.last_pong.store(now, Relaxed);
                 if now.saturating_sub(ctx.rtt_pong.load(Relaxed)) >= 5_000 {
                     if let Some(r) = ka_rtt {
@@ -8631,7 +8881,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                 let loss = if let Some(ref conn) = quic_carrier {
                     format!("QUIC lost_packets={} (за соединение)", conn.stats().lost_packets)
                 } else {
-                    ctx.loss.lock().unwrap().loss(Duration::from_secs(10), 1).map(|x| format!("RGP {:.0}%", x * 100.0)).unwrap_or_else(|| "?".into())
+                    ctx.loss.lock().unwrap().loss(Some(id), Duration::from_secs(10), 1).map(|x| format!("T_PING {:.0}%", x * 100.0)).unwrap_or_else(|| "?".into())
                 };
                 ctx.sh.note(format!("снимок: выход {}, живёт {} с, носитель {car}, rtt {rtt}, потери {loss}, тишина {} мс, keepalive ack {acked}, пакетов TUN {}",
                     cand.name, connected_at.elapsed().as_secs(), step.silent_ms, ctx.tun.traffic_pkts()));
@@ -8665,14 +8915,16 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                     // Проба запрашивает ACK; живость обновляет только приём, не сам вызов ping().
                     quic_conn.ping();
                 } else {
-                    seq = seq.wrapping_add(1);
-                    spawn_dgram(&ctx.node, id, dgram_ping(seq, now_us(), b'P'));
-                    ctx.loss.lock().unwrap().sent(seq);
-                    // монитор качества: на QUIC потери пингов >= 30% при >= 8 созревших -> запасной TCP для этого выхода
+                    // Нет выбранного QUIC-носителя (TCP или Link): Channel-пинг T_PING вместо датаграммы Link (0024)
+                    let nonce = new_ping_nonce();
+                    ctx.loss.lock().unwrap().sent(id, nonce);
+                    spawn_ctl(&ctx.node, id, T_PING, nonce.to_le_bytes().to_vec());
+                    // монитор качества: режим QUIC, но выбранного соединения нет, а Channel-пинги не возвращаются (>= 30% при >= 8 созревших)
+                    // -> запасной TCP для этого выхода. Channel надёжен, поэтому срабатывает лишь при реальной потере связи
                     let cc = ctx.carriers.lock().unwrap().get(&cand.dest).cloned();
                     if let Some(cc) = cc {
                         if cc.is_quic() && !cc.prefer_tcp.load(Relaxed) {
-                            if let Some(l) = ctx.loss.lock().unwrap().loss(Duration::from_secs(3), 8) {
+                            if let Some(l) = ctx.loss.lock().unwrap().loss(Some(id), Duration::from_secs(3), 8) {
                                 if l >= 0.30 {
                                     ctx.sh.note(format!("{}: потери UDP {:.0}% по пингам, переключаю носитель на TCP", cand.name, l * 100.0));
                                     cc.prefer_tcp.store(true, Relaxed);

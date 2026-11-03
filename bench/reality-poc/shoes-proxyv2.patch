@@ -1,0 +1,32 @@
+diff --git a/src/tcp/tcp_server.rs b/src/tcp/tcp_server.rs
+index 5312ac0..0a6b733 100644
+--- a/src/tcp/tcp_server.rs
++++ b/src/tcp/tcp_server.rs
+@@ -83,6 +83,27 @@ async fn run_tcp_server(
+         let cloned_handler = server_handler.clone();
+         tasks.spawn(async move {
+             let _permit = permit;
++            // PoC-патч: PROXY protocol v2 от Traefik (env SHOES_PROXY_V2=1)
++            let mut stream = stream;
++            let mut addr = addr;
++            if std::env::var("SHOES_PROXY_V2").is_ok() {
++                use tokio::io::AsyncReadExt;
++                let mut h = [0u8; 16];
++                if stream.read_exact(&mut h).await.is_err() || h[..12] != *b"\r\n\r\n\x00\r\nQUIT\n" {
++                    error!("{addr}: no PROXY v2 header");
++                    return;
++                }
++                let len = u16::from_be_bytes([h[14], h[15]]) as usize;
++                if len > 536 { return; }
++                let mut body = vec![0u8; len];
++                if stream.read_exact(&mut body).await.is_err() { return; }
++                if h[12] == 0x21 && h[13] == 0x11 && len >= 12 {
++                    let ip = std::net::Ipv4Addr::new(body[0], body[1], body[2], body[3]);
++                    let port = u16::from_be_bytes([body[8], body[9]]);
++                    addr = std::net::SocketAddr::new(ip.into(), port);
++                    error!("PROXYv2 real client addr: {addr}");
++                }
++            }
+             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
+                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+             } else {

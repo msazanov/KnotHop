@@ -1,0 +1,16 @@
+tcp:
+  routers:
+    reality:
+      rule: "HostSNI(`cover.lab`)"
+      entryPoints: [websecure]
+      tls: {passthrough: true}
+      service: reality-svc
+  services:
+    reality-svc:
+      loadBalancer:
+        serversTransport: pp2
+        servers:
+          - address: "srv:8444"
+  serversTransports:
+    pp2:
+      proxyProtocol: {version: 2}
