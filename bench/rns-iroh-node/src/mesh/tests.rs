@@ -92,6 +92,10 @@ async fn node() -> Node {
 }
 
 async fn node_with(selector: bool) -> Node {
+    node_bound(selector, std::net::IpAddr::from([127, 0, 0, 1])).await
+}
+
+async fn node_bound(selector: bool, bind: std::net::IpAddr) -> Node {
     let sk = SecretKey::generate();
     let me = *sk.public().as_bytes();
     let nbrs: Nbrs = Default::default();
@@ -103,7 +107,7 @@ async fn node_with(selector: bool) -> Node {
         .secret_key(sk)
         .alpns(vec![ALPN.to_vec(), NBR.to_vec()])
         .relay_mode(RelayMode::Disabled)
-        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .bind_addr(SocketAddr::new(bind, 0))
         .unwrap();
     if selector {
         b = b.add_custom_transport(mesh.transport()).path_selector(Arc::new(MeshBackupSelector));
@@ -353,6 +357,70 @@ async fn upgrades_to_ip_and_keeps_mesh_as_backup() {
     let custom = ca.paths().iter().filter(|p| matches!(p.remote_addr(), TransportAddr::Custom(_))).count();
     assert_eq!(custom, 1, "mesh-путь остаётся открытым как запасной");
     echo(&ca, &ce).await;
+}
+
+/// Живой пилот 03.11 (v0.1.34): соединение, начатое по mesh, под потоком данных не должно раскачиваться между IP и mesh.
+/// В multipath подтверждения пакетов пути X могут идти по пути Y; сторожок не должен принимать это за застой X.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mesh_started_connection_stays_on_ip_under_traffic() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    echo(&ca, &ce).await;
+    let t0 = Instant::now();
+    while mesh_selected(&ca) && t0.elapsed() < Duration::from_secs(15) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!mesh_selected(&ca), "сначала переход на IP");
+    // поток в обе стороны: A->E датаграммы, E отвечает эхом (как TCP: данные + обратный трафик)
+    let echo_task = tokio::spawn({
+        let ce = ce.clone();
+        async move {
+            while let Ok(Ok(d)) = tokio::time::timeout(Duration::from_secs(3), ce.read_datagram()).await {
+                let _ = ce.send_datagram(d);
+            }
+        }
+    });
+    let rx = tokio::spawn({
+        let ca = ca.clone();
+        async move {
+            let mut got = Vec::new();
+            while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(3), ca.read_datagram()).await {
+                got.push(Instant::now());
+            }
+            got
+        }
+    });
+    let (start, mut switches, mut last_mesh, mut mesh_samples, mut samples) = (Instant::now(), 0, false, 0, 0);
+    let mut seq = 0u32;
+    while start.elapsed() < Duration::from_secs(20) {
+        let _ = ca.send_datagram(Bytes::from(seq.to_be_bytes().to_vec()));
+        seq += 1;
+        let m = mesh_selected(&ca);
+        samples += 1;
+        mesh_samples += m as u32;
+        if m != last_mesh {
+            switches += 1;
+            last_mesh = m;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let end = Instant::now();
+    let got = rx.await.unwrap();
+    echo_task.abort();
+    let mut worst = Duration::ZERO;
+    let mut last = start;
+    for t in got.iter().filter(|t| **t <= end) {
+        worst = worst.max(*t - last);
+        last = *t;
+    }
+    println!("[mesh-start] sent={seq} echoed={} switches={switches} mesh_samples={mesh_samples}/{samples} worst_gap={worst:?}", got.len());
+    assert!(switches <= 1 && mesh_samples * 20 <= samples, "раскачка IP<->mesh: switches={switches}, на mesh {mesh_samples}/{samples}");
+    assert!(worst < Duration::from_millis(500), "провал доставки {worst:?}");
 }
 
 // ---------------------------------------------------------------- решения без сети
@@ -951,4 +1019,205 @@ fn private_and_special_addresses_are_not_global() {
     for s in ["8.8.8.8", "1.1.1.1", "1.1.1.1", "2606:4700:4700::1111"] {
         assert!(is_global(&s.parse().unwrap()), "{s}");
     }
+}
+
+// ---------------------------------------------------------------- клиент за NAT
+
+fn sh_ok(cmd: &str) {
+    let o = std::process::Command::new("sh").args(["-c", cmd]).output().unwrap();
+    assert!(o.status.success(), "{cmd}: {}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// Дочерний процесс-держатель netns (`unshare -n sleep`); убивается при drop.
+struct NetNs(std::process::Child);
+
+impl NetNs {
+    fn new() -> NetNs {
+        NetNs(std::process::Command::new("unshare").args(["-n", "sleep", "600"]).spawn().unwrap())
+    }
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+    /// Команда внутри netns (ждём, пока unshare выполнит exec sleep: у процесса появится свой netns).
+    fn sh(&self, cmd: &str) {
+        sh_ok(&format!("nsenter -t {} -n sh -c '{}'", self.pid(), cmd));
+    }
+}
+
+impl Drop for NetNs {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Tokio-рантайм, все потоки которого находятся в netns процесса `pid` (потоки наследуют netns создателя).
+fn runtime_in_netns(pid: u32) -> tokio::runtime::Runtime {
+    std::thread::spawn(move || {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::File::open(format!("/proc/{pid}/ns/net")).unwrap();
+        assert_eq!(unsafe { libc::setns(f.as_raw_fd(), libc::CLONE_NEWNET) }, 0, "setns");
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
+    })
+    .join()
+    .unwrap()
+}
+
+/// Стенд NAT: клиент C (192.168.50.2) - роутер R (masquerade) - "публичная" сеть 93.184.216.0/24 (этот netns): T = .11, E = .10.
+/// `one_to_one`: E стоит за 1:1 NAT (облачная ВМ: у интерфейса только частный адрес 10.99.0.10, публичный .10 проброшен на роутере) в своём netns.
+struct NatLab {
+    _r: NetNs,
+    _c: NetNs,
+    _s: Option<NetNs>,
+    c_rt: Option<tokio::runtime::Runtime>,
+    s_rt: Option<tokio::runtime::Runtime>,
+}
+
+fn nat_lab(one_to_one: bool) -> NatLab {
+    assert!(std::env::var("KH_NETNS").is_ok(), "только в приватном netns");
+    let (r, c) = (NetNs::new(), NetNs::new());
+    let s = one_to_one.then(NetNs::new);
+    std::thread::sleep(Duration::from_millis(300));
+    sh_ok("ip link set lo up");
+    sh_ok("ip link add name kp type veth peer name kr1");
+    sh_ok(&format!("ip link set kr1 netns {}", r.pid()));
+    sh_ok("ip addr add 93.184.216.11/24 dev kp; ip link set kp up");
+    if !one_to_one {
+        sh_ok("ip addr add 93.184.216.10/24 dev kp");
+    }
+    sh_ok("ip link add name kc type veth peer name kc1");
+    sh_ok(&format!("ip link set kc netns {}", r.pid()));
+    sh_ok(&format!("ip link set kc1 netns {}", c.pid()));
+    r.sh("ip link set lo up; ip addr add 93.184.216.1/24 dev kr1; ip link set kr1 up; ip addr add 192.168.50.1/24 dev kc; ip link set kc up; sysctl -qw net.ipv4.ip_forward=1");
+    r.sh("nft add table ip nat; nft add chain ip nat post { type nat hook postrouting priority 100 \\; }; nft add rule ip nat post ip saddr 192.168.50.0/24 snat to 93.184.216.1");
+    c.sh("ip link set lo up; ip addr add 192.168.50.2/24 dev kc1; ip link set kc1 up; ip route add default via 192.168.50.1");
+    if let Some(s) = &s {
+        sh_ok("ip link add name ks type veth peer name ks1");
+        sh_ok(&format!("ip link set ks netns {}", r.pid()));
+        sh_ok(&format!("ip link set ks1 netns {}", s.pid()));
+        r.sh("ip addr add 10.99.0.1/24 dev ks; ip link set ks up; ip addr add 93.184.216.10/32 dev kr1");
+        s.sh("ip link set lo up; ip addr add 10.99.0.10/24 dev ks1; ip link set ks1 up; ip route add default via 10.99.0.1");
+        // 1:1 NAT как у облачных ВМ: входящие на публичный адрес идут на частный, исходящие с частного получают публичный
+        r.sh("nft add table ip one; nft add chain ip one pre { type nat hook prerouting priority -100 \\; }; nft add rule ip one pre ip daddr 93.184.216.10 dnat to 10.99.0.10; nft add chain ip one post { type nat hook postrouting priority 90 \\; }; nft add rule ip one post ip saddr 10.99.0.10 oifname kr1 snat to 93.184.216.10");
+    }
+    let c_rt = runtime_in_netns(c.pid());
+    let s_rt = s.as_ref().map(|s| runtime_in_netns(s.pid()));
+    NatLab { _r: r, _c: c, _s: s, c_rt: Some(c_rt), s_rt }
+}
+
+/// Клиент за NAT начинает соединение с выходом по mesh (транзит T). Возвращает время до ухода с mesh на IP (None - не ушёл за 45 с).
+/// `hint`: к адресу добавлен проверенный публичный IP выхода (как в `dial_direct`), иначе только mesh (как делал `mesh_carrier`).
+async fn nat_run(one_to_one: bool, hint: bool, late_hint: bool) -> Option<Duration> {
+    let mut lab = nat_lab(one_to_one);
+    iroh::knothop::set_block_private_egress(true);
+    struct Off;
+    impl Drop for Off {
+        fn drop(&mut self) {
+            iroh::knothop::set_block_private_egress(false);
+        }
+    }
+    let _off = Off;
+    let t = node_bound(true, "93.184.216.11".parse().unwrap()).await;
+    let e = match &lab.s_rt {
+        Some(rt) => rt.spawn(node_bound(true, "10.99.0.10".parse().unwrap())).await.unwrap(),
+        None => node_bound(true, "93.184.216.10".parse().unwrap()).await,
+    };
+    let a = lab.c_rt.as_ref().unwrap().spawn(node_bound(true, "192.168.50.2".parse().unwrap())).await.unwrap();
+    let pub_addr = |n: &Node, ipa: &str| SocketAddr::new(ipa.parse().unwrap(), n.ep.bound_sockets()[0].port());
+    let e_pub = pub_addr(&e, "93.184.216.10");
+    // соседские связи по IP: A -> T (через NAT), T -> E (публично)
+    let conn = a.ep.connect(EndpointAddr::new(t.ep.id()).with_ip_addr(pub_addr(&t, "93.184.216.11")), NBR).await.unwrap();
+    add_nbr(&a.nbrs, &a.mesh, conn, a.saw_plain.clone());
+    let conn = t.ep.connect(EndpointAddr::new(e.ep.id()).with_ip_addr(e_pub), NBR).await.unwrap();
+    add_nbr(&t.nbrs, &t.mesh, conn, t.saw_plain.clone());
+    let w = Instant::now();
+    while !(t.nbrs.read().unwrap().contains_key(&a.id()) && e.nbrs.read().unwrap().contains_key(&t.id())) {
+        assert!(w.elapsed() < Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    a.mesh.prepare(&e.id());
+    let addr = if hint { endpoint_addr_with(&e.id(), &[e_pub]).unwrap() } else { endpoint_addr(&e.id()).unwrap() };
+    let acc = async { tokio::time::timeout(Duration::from_secs(10), e.e2e.lock().await.recv()).await.unwrap().unwrap() };
+    let tc = Instant::now();
+    let conn_fut = async {
+        let r = tokio::time::timeout(Duration::from_secs(10), a.ep.connect(addr, ALPN)).await;
+        println!("[nat] connect result after {:?}: ok={}", tc.elapsed(), matches!(r, Ok(Ok(_))));
+        r
+    };
+    let (c, ce) = tokio::join!(conn_fut, acc);
+    let ca = c.expect("connect timed out").expect("connect failed");
+    echo(&ca, &ce).await;
+    let t0 = Instant::now();
+    let mut upgraded = None;
+    let mut probe_done = !late_hint;
+    while t0.elapsed() < Duration::from_secs(45) {
+        if !probe_done && t0.elapsed() > Duration::from_secs(5) {
+            probe_done = true;
+            // подсказка IP позже: отдельное короткое соединение с IP-адресом выхода (как проба достижимости)
+            let r = tokio::time::timeout(Duration::from_secs(6), a.ep.connect(EndpointAddr::new(e.ep.id()).with_ip_addr(e_pub), ALPN)).await;
+            println!("[nat] late hint probe: ok={}", matches!(r, Ok(Ok(_))));
+            if let Ok(Ok(c2)) = r {
+                c2.close(0u32.into(), b"probe");
+            }
+        }
+        if !mesh_selected(&ca) {
+            upgraded = Some(t0.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!(
+        "[nat one_to_one={one_to_one} hint={hint} late={late_hint}] upgraded_after={upgraded:?} paths={:?} blocked_egress={}",
+        ca.paths().iter().map(|p| (p.remote_addr().clone(), p.is_selected())).collect::<Vec<_>>(),
+        iroh::knothop::blocked_egress()
+    );
+    if upgraded.is_some() {
+        echo(&ca, &ce).await;
+    }
+    ca.close(0u32.into(), b"done");
+    a.ep.close().await;
+    e.ep.close().await;
+    t.ep.close().await;
+    // рантаймы с сокетами в чужих netns не гасим синхронно внутри async-контекста
+    if let Some(rt) = lab.s_rt.take() {
+        rt.shutdown_background();
+    }
+    lab.c_rt.take().unwrap().shutdown_background();
+    upgraded
+}
+
+/// Дефект живого пилота 03.11: клиент за NAT начал соединение с выходом только по mesh; выход с публичным адресом на интерфейсе (NAT traversal работает).
+/// Запуск: `unshare -rn sh -c 'ip link set lo up; KH_NETNS=1 bash bench/cargo_fork.sh rns-iroh-node test --offline --locked --lib mesh::tests::nat_ -- --ignored --nocapture --test-threads=1'`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "нужен приватный netns (unshare -rn), ip, nft, nsenter"]
+async fn nat_client_mesh_start_public_exit_upgrades_to_ip() {
+    let up = nat_run(false, false, false).await;
+    assert!(up.is_some(), "клиент за NAT остался на mesh при публичном выходе");
+}
+
+/// Выход за 1:1 NAT (облако: на интерфейсе только частный адрес, публичный iroh не знает - нет relay/QAD). Только mesh: NAT traversal нечем.
+/// Диагностика дефекта живого пилота: результат печатается, без утверждения (апгрейда нет - известное ограничение iroh без relay/QAD).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "нужен приватный netns (unshare -rn), ip, nft, nsenter"]
+async fn nat_exit_behind_1to1_nat_mesh_only_has_no_upgrade() {
+    let r = nat_run(true, false, false).await;
+    println!("[nat] 1:1 NAT выход, только mesh: {r:?}");
+}
+
+/// То же, но с проверенной подсказкой публичного IP выхода в адресе соединения (как в `dial_direct`): прямой путь обязан быть.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "нужен приватный netns (unshare -rn), ip, nft, nsenter"]
+async fn nat_exit_behind_1to1_nat_with_ip_hint_goes_direct() {
+    let r = nat_run(true, true, false).await;
+    assert!(r.is_some(), "с подсказкой IP клиент остался на mesh");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "нужен приватный netns (unshare -rn), ip, nft, nsenter"]
+async fn nat_public_exit_with_ip_hint_goes_direct() {
+    let r = nat_run(false, true, false).await;
+    assert!(r.is_some(), "с подсказкой IP клиент остался на mesh");
 }

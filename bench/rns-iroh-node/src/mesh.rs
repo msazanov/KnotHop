@@ -1111,10 +1111,25 @@ pub fn incoming_is_mesh(a: &iroh::endpoint::IncomingAddr) -> bool {
     matches!(a, iroh::endpoint::IncomingAddr::Custom(c) if c.id() == MESH_ID)
 }
 
-/// Адрес выхода только по mesh (без IP: иначе IP выиграет гонку рукопожатия и mesh-путь не откроется, а iroh сам найдёт прямой через NAT traversal).
+/// Адрес выхода только по mesh, без подсказок IP (проверки; в узле используется `endpoint_addr_with`).
+#[cfg(test)]
 pub fn endpoint_addr(key: &Key) -> Option<iroh::EndpointAddr> {
     let id = iroh::EndpointId::from_bytes(key).ok()?;
     Some(iroh::EndpointAddr::from_parts(id, [iroh::TransportAddr::Custom(addr_of(key))]))
+}
+
+/// Адрес выхода: mesh плюс проверенные подсказки IP (прошедшие фильтр носителя). С IP-подсказкой соединение сразу идёт прямым путём, если он достижим;
+/// mesh остаётся тёплым запасным путём (правка iroh `open_custom_backups`). Подсказки нужны за NAT: iroh без relay/QAD не знает собственного публичного адреса.
+pub fn endpoint_addr_with(key: &Key, ips: &[std::net::SocketAddr]) -> Option<iroh::EndpointAddr> {
+    let id = iroh::EndpointId::from_bytes(key).ok()?;
+    let mut addrs: Vec<iroh::TransportAddr> = ips.iter().map(|a| iroh::TransportAddr::Ip(*a)).collect();
+    addrs.push(iroh::TransportAddr::Custom(addr_of(key)));
+    Some(iroh::EndpointAddr::from_parts(id, addrs))
+}
+
+/// Выбранный путь соединения идёт через mesh (custom-транспорт), а не по IP.
+pub fn selected_is_mesh(conn: &Connection) -> bool {
+    conn.paths().iter().find(|p| p.is_selected()).is_some_and(|p| matches!(p.remote_addr(), iroh::TransportAddr::Custom(_)))
 }
 
 #[cfg(test)]

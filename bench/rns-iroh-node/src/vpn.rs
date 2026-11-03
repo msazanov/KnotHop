@@ -8066,7 +8066,10 @@ static MESH_DIALING: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
 const MESH_DIAL_MAX: usize = 2;
 
 /// У выхода нет прямого QUIC-носителя (клиент и выход не соседи): поднять сквозное QUIC-соединение по mesh и подключить его носителем мультиплексора выхода.
-/// Адрес - ТОЛЬКО mesh (с IP выигрывает гонка рукопожатия, и mesh-путь не открывается; прямой путь iroh найдёт сам через NAT traversal поверх mesh).
+/// Адрес выхода - mesh плюс проверенные подсказки IP выхода (книга адресов, прошедшая фильтр `resolve_addrs`): IP достижим - соединение сразу идёт прямым
+/// путём, mesh остаётся тёплым запасным (правка iroh 1); недостижим - рукопожатие идёт по mesh. Только mesh было нельзя: без relay/QAD iroh не знает публичного
+/// адреса выхода за NAT (облачная ВМ с частным адресом на интерфейсе), NAT traversal поверх mesh нечем и апгрейд на IP не происходит (W138, `nat_exit_behind_1to1_*`).
+/// Если соединение осталось на mesh, а прямой путь стал достижим (проба IP), оно закрывается и набирается заново с подсказками (бэкофф 30..300 с).
 /// Дальше Link/dataplane к выходу идут по этому соединению. Повторы с задержкой 2..60 с, пока выход остаётся текущим.
 fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
     let Some(m) = mesh::global() else { return };
@@ -8084,7 +8087,7 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
         }
         d.push(key);
     }
-    let (weak, dest, name) = (Arc::downgrade(ctx), cand.dest, cand.name.clone());
+    let (weak, dest, name, fallback) = (Arc::downgrade(ctx), cand.dest, cand.name.clone(), cand.addrs.clone());
     tokio::spawn(async move {
         let mut wait = 2u64;
         let mut first = true;
@@ -8095,7 +8098,8 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
             if !wanted || dataplane::plane().has_carrier(&key) {
                 break;
             }
-            let (Some(addr), Some(cfg)) = (mesh::endpoint_addr(&key), mesh::quic_cfg()) else { break };
+            let hints = mesh_hints(&ctx, &dest, &fallback).await;
+            let (Some(addr), Some(cfg)) = (mesh::endpoint_addr_with(&key, &hints), mesh::quic_cfg()) else { break };
             m.prepare(&key);
             let t0 = Instant::now();
             let attempt = async {
@@ -8117,7 +8121,43 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
                     ctx.sh.note(format!("mesh: сквозное QUIC к {name} установлено за {} мс", t0.elapsed().as_millis()));
                     wait = 2;
                     drop(ctx);
-                    let _ = conn.closed().await;
+                    // соединение на mesh, а прямой путь достижим: переподключиться с подсказками IP
+                    let (mut gap, mut mesh_since) = (30u64, Instant::now());
+                    loop {
+                        tokio::select! {
+                            _ = conn.closed() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                        }
+                        if !mesh::selected_is_mesh(&conn) {
+                            (gap, mesh_since) = (30, Instant::now());
+                            continue;
+                        }
+                        if mesh_since.elapsed() < Duration::from_secs(gap) {
+                            continue;
+                        }
+                        let Some(ctx) = weak.upgrade() else { break };
+                        let hints = mesh_hints(&ctx, &dest, &fallback).await;
+                        let mut reachable = false;
+                        if !hints.is_empty() {
+                            if let Ok(id) = iroh::EndpointId::from_bytes(&key) {
+                                let mut probe = EndpointAddr::new(id);
+                                for a in &hints {
+                                    probe = probe.with_ip_addr(*a);
+                                }
+                                if let Ok(Ok(pc)) = tokio::time::timeout(Duration::from_secs(6), ctx.ep.connect(probe, ALPN)).await {
+                                    pc.close(0u32.into(), b"probe");
+                                    reachable = true;
+                                }
+                            }
+                        }
+                        if reachable && mesh::selected_is_mesh(&conn) {
+                            ctx.sh.note(format!("mesh: к {name} прямой путь достижим, соединение осталось на mesh - переподключаюсь с подсказками IP"));
+                            conn.close(0u32.into(), b"mesh to direct");
+                            break;
+                        }
+                        gap = (gap * 2).min(300);
+                        mesh_since = Instant::now();
+                    }
                     mx.close();
                 }
                 _ => {
@@ -8130,6 +8170,18 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
         }
         MESH_DIALING.lock().unwrap().retain(|k| k != &key);
     });
+}
+
+/// Проверенные подсказки IP выхода для mesh-соединения: книга адресов (обновляется анонсом, `dial_direct` читает её же) либо адреса кандидата;
+/// фильтр `resolve_addrs` (частные/служебные сети отбрасываются, кроме лаборатории). Не больше 3.
+async fn mesh_hints(ctx: &Arc<ClientCtx>, dest: &[u8; 16], fallback: &[String]) -> Vec<SocketAddr> {
+    let mut cur = ctx.book_for(dest).get();
+    if cur.is_empty() {
+        cur = fallback.to_vec();
+    }
+    let mut v = resolve_addrs(&cur).await;
+    v.truncate(3);
+    v
 }
 
 fn candidates(ctx: &Arc<ClientCtx>, banned: &path::ExitBackoff, only: Option<[u8; 16]>) -> Vec<CServer> {
