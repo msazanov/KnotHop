@@ -1,6 +1,6 @@
 //! Профиль ClientHello браузера (данные) и построитель ClientHello по профилю.
 //!
-//! Профиль - текстовый файл (`profiles/*.txt`, вшит через `include_str!`, можно подгрузить свой из строки):
+//! Профиль - текстовый файл (`hello-profiles/*.txt`, вшит через `include_str!`, можно подгрузить свой из строки):
 //! ```text
 //! name chrome155 | record_version 0301 | legacy_version 0303 | session_id_len 32 | compression 00 | shuffle 1
 //! ciphers G:cipher 1301 1302 ...            # G:<слот> - значение GREASE (новое на каждое хелло; слот одинаков внутри хелло)
@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::kx::{self, GROUP_HYBRID, GROUP_X25519};
 use crate::util::{self, put_u16, put_u24, put_vec16, put_vec8};
 
-pub const CHROME155: &str = include_str!("../profiles/chrome155.txt");
+pub const CHROME155: &str = include_str!("../hello-profiles/chrome155.txt");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Slot {

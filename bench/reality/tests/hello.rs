@@ -50,7 +50,7 @@ fn shape(msg: &[u8]) -> (Vec<u16>, BTreeSet<(u16, Vec<u8>)>, usize) {
 }
 
 fn captures() -> Vec<Vec<u8>> {
-    include_str!("../profiles/chrome155-captures.hex").lines().filter(|l| !l.trim().is_empty()).map(|l| util::unhex(l).unwrap()).collect()
+    include_str!("../hello-profiles/chrome155-captures.hex").lines().filter(|l| !l.trim().is_empty()).map(|l| util::unhex(l).unwrap()).collect()
 }
 
 #[test]

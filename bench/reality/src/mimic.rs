@@ -1,7 +1,7 @@
 //! Начальный обмен «как h2 браузера» внутри записей application_data сразу после рукопожатия, до начала туннельных данных,
 //! и форма первых записей туннеля. Содержимое записей - случайные байты (шифртекст); совпадают длины, порядок и RTT-зависимость.
 //!
-//! Обмен (по эталону Chromium 155 -> nginx, `profiles/chrome155-h2.txt`):
+//! Обмен (по эталону Chromium 155 -> nginx, `hello-profiles/chrome155-h2.txt`):
 //! ```text
 //! клиент: Finished | [B1 = preface+SETTINGS+WU: 87] [B2 = HEADERS: 465..]       (сразу, как браузер)
 //! сервер: (билеты) | [S0 = SETTINGS+WU: 57] ... после B1,B2: [ответы: 26, 118 / 104, 40 ...]    (из наблюдений сайта)
@@ -18,7 +18,7 @@ use crate::stream::Shape;
 use crate::tls13::*;
 use crate::util;
 
-pub const H2_PROFILE: &str = include_str!("../profiles/chrome155-h2.txt");
+pub const H2_PROFILE: &str = include_str!("../hello-profiles/chrome155-h2.txt");
 
 /// Верхний предел числа записей пачки клиента/ответа сервера, принимаемых от пира.
 const MAX_RECORDS: usize = 16;

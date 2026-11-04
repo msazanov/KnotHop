@@ -1,0 +1,32 @@
+# Профиль ClientHello: Chromium 155.0.8059.84 (Arch Linux), снят 04.11.2026 локальным слушателем (tools/capture_ch.py),
+# 52 рукопожатия, 8 запусков браузера, SNI по имени. Всё ниже постоянно во всех 52 хелло, кроме:
+#  - значений GREASE (случайный полубайт, пара одинаковых байт; G:group одинаков в supported_groups и key_share;
+#    два GREASE-расширения различны), порядка расширений (перемешивание, как в Chrome >= 110: первое и последнее GREASE, остальное случайно),
+#  - длины полезной нагрузки ECH GREASE: 144/176/208/240 (ext 186/218/250/282 байт).
+# Эталон JA4: t13d1517h2_8daaf6152771_cb7bf5808d99. Формат: см. src/profile.rs. Обновление под новую версию: снять хелло, сверить, поправить строки.
+name chrome155
+record_version 0301
+legacy_version 0303
+session_id_len 32
+compression 00
+shuffle 1
+ciphers G:cipher 1301 1302 1303 c02b c02f c02c c030 cca9 cca8 c013 c014 009c 009d 002f 0035
+ext G:ext1 first raw
+ext 18 any raw
+ext 51764 any raw 00b80582df1302010582df1302060582df13020d0582df13020e0582df13020f0582df1302120582df1302130582df13021408839a648c9b2d010708839a648c9b2d010808839a648c9b2d010908839a648c9b2d010a08839a648c9b2d010b08839a648c9b2d010c08839a648c9b2d010d08839a648c9b2d011208839a648c9b2d011304d679090104d679090404d679090504d679090604d679090704d679090804d679090a04d679090b04d679090c04d679090d04d679090f
+ext 16 any raw 000c02683208687474702f312e31
+ext 35 any raw
+ext 11 any raw 0100
+ext 17613 any raw 0003026832
+ext 51 any keyshare G:group mlkem768x25519 x25519
+ext 43 any versions G:version 0304 0303
+ext 23 any raw
+ext 13 any sigalgs G:sigalg 0904 0905 0906 0403 0804 0401 0503 0805 0501 0806 0601
+ext 65037 any ech 144 176 208 240
+ext 27 any raw 020002
+ext 10 any groups G:group 11ec 001d 0017 0018
+ext 5 any raw 0100000000
+ext 0 any sni
+ext 45 any raw 0101
+ext 65281 any raw 00
+ext G:ext2 last raw 00
