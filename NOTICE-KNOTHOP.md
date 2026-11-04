@@ -1,12 +1,13 @@
 # NOTICE для Leviculum (зависимость KnotHop)
 
 Первоисточник: https://codeberg.org/Lew_Palm/Leviculum (автор Lew_Palm).
-Используется изменённый форк https://github.com/msazanov/leviculum на коммите `145c8ac232051a7774a0eb377a5f5d513904e255` (см. deploy/leviculum.ref).
+Используется изменённый форк https://github.com/msazanov/leviculum на коммите `bb6b6e1fe469fb6cc617a259de87784e3083e975` (см. deploy/leviculum.ref).
 База в Cargo.toml: `77c4ff13f59116adaf0190d455b83c286c135066`.
 Лицензия Leviculum и форка: AGPL-3.0-or-later; см. LICENSE.
 
 ## Коммиты форка поверх базы
 
+- bb6b6e1f lxmf: optional standard-CBC direct links per destination (stock transports)
 - 145c8ac2 Isolate ReticulumNodeBuilder cipher methods into driver/ext.rs
 - 02a69d9d Isolate discovery record expiration loop into discovery/ext.rs
 - 39666ff2 Isolate ByteChannelOptions into interfaces/byte_channel/ext.rs

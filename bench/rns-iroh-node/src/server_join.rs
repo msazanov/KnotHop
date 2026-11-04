@@ -179,12 +179,19 @@ fn msg(op: &str, code: &Hash) -> Msg {
     Msg { v: 1, op: op.into(), code: hex(code), server: String::new(), name: String::new(), mac: String::new(), rec: String::new(), peers: vec![], reason: String::new() }
 }
 
+/// Журнал шагов вступления (редкие события; только короткие префиксы хешей, без pin/кода/ключей).
+pub fn jlog(msg: impl AsRef<str>) { eprintln!("[{}] вступление: {}", now_ms(), msg.as_ref()); }
+fn short(h: &[u8]) -> String { hex(&h[..h.len().min(4)]) }
+
 fn send(state: &Path, pk: Pk, m: &Msg) -> bool {
     let Ok(content) = serde_json::to_vec(m) else { return false };
     if content.len() > lxmf_admin::MAX_ADMIN_CONTENT { return false; }
-    lxmf_sync::submit(state, lxmf_sync::Command::Send(lxmf_sync::Outbound {
+    let ok = lxmf_sync::submit(state, lxmf_sync::Command::Send(lxmf_sync::Outbound {
         title: TITLE.to_vec(), pk, content, gate: Arc::new(|| Some(true)), exp: now_s() + lxmf_sync::TTL, ack: false,
-    }))
+    }));
+    let to = trust::hash_of(&pk).map(|h| short(&h)).unwrap_or_default();
+    jlog(format!("{} -> {}: {}", m.op, to, if ok { "передано в очередь LXMF" } else { "очередь LXMF недоступна (нет воркера или переполнена)" }));
+    ok
 }
 
 fn parse_msg(message: &Message, me: &Hash, max: usize) -> Option<Msg> {
@@ -309,7 +316,8 @@ fn own_chain_record(tr: &Trust, holder: &Pk, root: &Hash) -> Option<Record> {
 /// Запрос сервера. Возвращает истину, если trust админа изменился.
 fn on_join(state: &Path, identity: &Identity, trust: &Arc<Mutex<Trust>>, message: &Message, m: Msg) -> bool {
     if m.op != "join" || !is_hex(&m.server, 128) || !is_hex(&m.mac, 64) || m.name.len() > 160 || m.name.chars().count() > 40 { return false; }
-    if !rate_ok(message.source_hash) { return false; }
+    jlog(format!("получен запрос join от {}", short(&message.source_hash)));
+    if !rate_ok(message.source_hash) { jlog("запрос отброшен: лимит частоты"); return false; }
     let Ok(server) = raw(&m.server).and_then(|b| <Pk>::try_from(b).map_err(|_| anyhow::anyhow!("pk"))) else { return false };
     let Some(server_hash) = trust::hash_of(&server) else { return false };
     if !lxmf_admin::signed_by_trusted_source(message, &server) { return false; }
@@ -320,9 +328,9 @@ fn on_join(state: &Path, identity: &Identity, trust: &Arc<Mutex<Trust>>, message
     let Ok(code) = Code::parse(&file.code) else { return false };
     let Some(mac) = raw(&m.mac).ok() else { return false };
     // неверный pin: молчим (ни оракула, ни ответа тому, кто pin не знает)
-    if code.id() != id || code.root != identity.public_key_bytes() || !code.mac_ok(&server, &m.name, &mac) { return false; }
+    if code.id() != id || code.root != identity.public_key_bytes() || !code.mac_ok(&server, &m.name, &mac) { jlog("запрос отброшен: код/HMAC не сошлись"); return false; }
     let reply_to = |reply: Msg| { send(state, server, &reply); lxmf_sync::acknowledge(state, message, server); };
-    let deny = |why: &str| { let mut r = msg("deny", &id); r.reason = why.into(); reply_to(r); };
+    let deny = |why: &str| { jlog(format!("отказ серверу {}: {why}", short(&server_hash))); let mut r = msg("deny", &id); r.reason = why.into(); reply_to(r); };
     let root = code.root_hash();
     if code.expires <= now_s() { deny("expired"); return false; }
     if file.revoked { deny("revoked"); return false; }
@@ -356,6 +364,7 @@ fn on_join(state: &Path, identity: &Identity, trust: &Arc<Mutex<Trust>>, message
         }
     }
     while serde_json::to_vec(&reply).map_or(0, |b| b.len()) > MAX_REPLY && reply.peers.pop().is_some() {}
+    jlog(format!("сервер {} принят ({}), отправляю grant", short(&server_hash), if changed { "права выданы" } else { "права уже были" }));
     reply_to(reply);
     // уже вступившие серверы узнают нового сами: иначе они не увидят его TRANSIT и не откроют соседство
     if changed || !in_roster {
@@ -419,6 +428,7 @@ pub fn spawn_join(state: PathBuf, identity: Identity, trust: Arc<Mutex<Trust>>, 
         let name = clean_name(&name);
         let mut wait = 5u64;
         let mut announced = false;
+        let mut attempt = 1u32;
         loop {
             let has = trust.lock().unwrap_or_else(|e| e.into_inner()).rights_in(&root, &me_hash) & code.rights == code.rights;
             if has {
@@ -439,7 +449,9 @@ pub fn spawn_join(state: PathBuf, identity: Identity, trust: Arc<Mutex<Trust>>, 
             m.server = hex(&me_pk);
             m.name = name.clone();
             m.mac = hex(&code.mac(&me_pk, &name));
-            send(&state, code.root, &m);
+            let queued = send(&state, code.root, &m);
+            note(format!("вступление: запрос join #{attempt} к админу {} {}; следующий через {wait} с", &hex(&root)[..8], if queued { "в очереди LXMF" } else { "НЕ поставлен в очередь" }));
+            attempt += 1;
             tokio::time::sleep(Duration::from_secs(wait)).await;
             wait = (wait * 2).min(300);
         }
@@ -449,11 +461,12 @@ pub fn spawn_join(state: PathBuf, identity: Identity, trust: Arc<Mutex<Trust>>, 
 /// Ответ админа. Истина — trust сервера изменился (нужно пересчитать роли Link).
 fn on_reply(state: &Path, identity: &Identity, trust: &Arc<Mutex<Trust>>, message: &Message, m: Msg) -> bool {
     if !matches!(m.op.as_str(), "grant" | "deny") { return false; }
+    jlog(format!("получен ответ {} от {}", m.op, short(&message.source_hash)));
     let Some(st) = read_join_state(state) else { return false };
-    if st.state != "pending" || st.code != m.code { return false; }
+    if st.state != "pending" || st.code != m.code { jlog("ответ проигнорирован: нет ожидающего вступления с этим кодом"); return false; }
     let Some(root_pk) = raw(&st.root).ok().and_then(|b| Pk::try_from(b).ok()) else { return false };
     let Some(root) = trust::hash_of(&root_pk) else { return false };
-    if !rate_ok(message.source_hash) || !lxmf_admin::signed_by_trusted_source(message, &root_pk) { return false; }
+    if !rate_ok(message.source_hash) || !lxmf_admin::signed_by_trusted_source(message, &root_pk) { jlog("ответ отброшен: лимит или подпись не корня из кода"); return false; }
     let ack = || lxmf_sync::acknowledge(state, message, root_pk);
     if m.op == "deny" {
         let reason: String = m.reason.chars().filter(|c| c.is_ascii_alphanumeric()).take(16).collect();
@@ -477,7 +490,8 @@ fn on_reply(state: &Path, identity: &Identity, trust: &Arc<Mutex<Trust>>, messag
         }
         tr.rights_in(&root, identity.hash()) & st.rights == st.rights && tr.save().is_ok()
     };
-    if !ok { return false; }
+    if !ok { jlog("grant отклонён проверкой записи (holder/права/подпись/якорь)"); return false; }
+    jlog("grant принят, права получены");
     let s = JoinState { state: "joined".into(), reason: String::new(), ..st };
     if let Ok(b) = serde_json::to_vec(&s) { let _ = write(&join_state_path(state), &b); }
     ack();

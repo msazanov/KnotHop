@@ -187,6 +187,9 @@ pub struct AdminProcessor {
     resource_jobs: SyncSender<PendingResourceBuild>,
     resource_results: Receiver<ResourceBuildResult>,
     last_announce_ms: u64,
+    /// Момент регистрации и число прогревочных повторов анонса (см. `ANNOUNCE_WARMUP_MS`).
+    registered_ms: u64,
+    warmup_done: usize,
     state: ProcessorState,
     sync: Receiver<super::lxmf_sync::Command>,
     sync_pending: HashMap<String, PendingSync>,
@@ -218,11 +221,13 @@ struct PendingSync {
     pn_copies: u8,
     /// не раньше этого времени (с): новая копия или повтор принятой, но не подтверждённой адресатом
     pn_retry_at: u64,
+    /// последний диагностический вывод по доставке join (с)
+    diag_at: u64,
 }
 
 impl PendingSync {
     fn new(request: super::lxmf_sync::Outbound) -> Self {
-        Self { request, last_try: None, first_try: None, transport: None, pn_copy: None, pn_node: None, pn_since: 0, pn_held: false, pn_copies: 0, pn_retry_at: 0 }
+        Self { request, last_try: None, first_try: None, transport: None, pn_copy: None, pn_node: None, pn_since: 0, pn_held: false, pn_copies: 0, pn_retry_at: 0, diag_at: 0 }
     }
 }
 
@@ -311,6 +316,8 @@ impl AdminProcessor {
             resource_jobs:jobs_tx,
             resource_results:result_rx,
             last_announce_ms: 0,
+            registered_ms: 0,
+            warmup_done: 0,
             state: ProcessorState::Unregistered,
             sync: sync_rx,
             sync_pending: HashMap::new(),
@@ -366,6 +373,7 @@ impl AdminProcessor {
         }
         self.ready.store(true, Ordering::Release);
         self.last_announce_ms = core.now_ms();
+        self.registered_ms = self.last_announce_ms;
         Ok(ProcessorState::Ready { router, outbound_ids: HashMap::new() })
     }
 
@@ -393,6 +401,9 @@ impl AdminProcessor {
                     }
                     RouterEvent::MessageState { message_id, state } => {
                         use leviculum_lxmf::router::MessageState as S;
+                        if self.sync_pending.values().any(|p| p.transport == Some(message_id) && p.request.title == super::server_join::TITLE) {
+                            super::server_join::jlog(format!("LXMF join: состояние доставки {state:?}"));
+                        }
                         if matches!(state, S::AwaitingCollection | S::Failed | S::Rejected | S::Cancelled) && self.pn_outcomes.len() < 64 {
                             self.pn_outcomes.push((message_id, state));
                         }
@@ -486,7 +497,12 @@ impl AdminProcessor {
                         let _ = self.transport_events.try_send(TransportEvent::Expired { requestid:delivery.requestid });
                     }
                 }
-                if core.now_ms().saturating_sub(self.last_announce_ms) >= 600_000 {
+                // Первый анонс уходит на первом тике, когда публичные интерфейсы RNS ещё не подключены, и дальше молчание
+                // 600 с: адресат (админ, ждущий вступления сервера) недостижим. Поэтому в начале работы — несколько повторов.
+                let now_ms = core.now_ms();
+                let warm = ANNOUNCE_WARMUP_MS.get(self.warmup_done).is_some_and(|d| now_ms.saturating_sub(self.registered_ms) >= *d);
+                if warm { self.warmup_done += 1; }
+                if warm || now_ms.saturating_sub(self.last_announce_ms) >= 600_000 {
                     let data=announce::DeliveryAnnounce::new(None,None).map(|a|a.encode()).unwrap_or_default();
                     let dest=router.node().delivery_destination_hash();
                     if let Ok(output)=core.announce_destination(&dest,Some(&data)) { out.merge(output); }
@@ -645,13 +661,27 @@ impl AdminProcessor {
             if permission.is_none() || enqueued || pending.last_try.is_some_and(|t| now.saturating_sub(t) < 5) { continue; }
             // Повторы и бюджет незавершённой доставки принадлежат LXMF/RNS.
             // Прикладной retry не обрывает ещё идущий Resource/поиск пути.
-            if pending.transport.is_some_and(|id| router.outbound().contains_key(&id)) { continue; }
+            if let Some(entry) = pending.transport.and_then(|id| router.outbound().get(&id)) {
+                if pending.request.title == super::server_join::TITLE && now.saturating_sub(pending.diag_at) >= 10 {
+                    pending.diag_at = now;
+                    let dest = DestinationHash::new(entry.message().destination_hash);
+                    super::server_join::jlog(format!("LXMF join в доставке: попыток {}, путь {}", entry.attempts,
+                        if core.has_path(&dest) { "есть" } else { "нет" }));
+                }
+                continue;
+            }
             if let Some(transport) = pending.transport.take() {
                 if let Ok(output) = router.cancel(core, &transport) { out.merge(output.core); }
             }
             let Some(identity) = lxmf_sync::public_identity(&pending.request.pk) else { remove.push(id.clone()); continue };
             let destination = lxmf_destination(identity.hash());
             core.remember_identity(DestinationHash::new(destination), identity);
+            if pending.request.title == super::server_join::TITLE {
+                // join идёт через публичную RNS (чужие транспорты пропускают только стандартный CBC); тело зашифровано LXMF на получателя
+                router.node_mut().use_cbc_links_to(DestinationHash::new(destination));
+                super::server_join::jlog(format!("LXMF {} -> {}: попытка доставки, путь {}", "join", &super::hex(&destination)[..8],
+                    if core.has_path(&DestinationHash::new(destination)) { "известен" } else { "неизвестен (роутер запросит путь)" }));
+            }
             if let Ok(message) = router.create_message(core, destination, pending.request.title.clone(), pending.request.content.clone(), Vec::new(), DeliveryMethod::Direct) {
                 let transport = message.message_id;
                 let bytes = message.pack().len() as u64;
@@ -921,6 +951,9 @@ fn spawn_runtime_worker(
         operation();
     })
 }
+
+/// Повторы анонса `lxmf.delivery` после старта (мс от регистрации); дальше обычный период 600 с (AGENTS п.9).
+const ANNOUNCE_WARMUP_MS: [u64; 3] = [15_000, 45_000, 120_000];
 
 pub fn spawn_node_worker(runtime: AdminRuntime, ctx: Arc<super::NodeCtx>) {
     let state = ctx.state.clone();
