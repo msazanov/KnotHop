@@ -9,8 +9,9 @@ import android.widget.Toast;
 import java.io.File;
 
 /**
- * «Забыть профиль» (R-2, R-3): профиль, приглашение, зачисление и чужие корни доверия. Идентичность телефона и записи его
- * собственной сети остаются. Чужие якоря стирает нативная часть (`forget-network`) после остановки службы.
+ * «Забыть профиль» (решение владельца 04.11): стирается ВСЁ состояние телефона — ключ (identity), собственный корень и его записи,
+ * чужие якоря, профиль, приглашения, коды серверов, очереди LXMF. Остаётся только имя телефона. Следующий запуск создаёт новую identity:
+ * телефон начинает с чистого листа, прежняя сеть (в том числе серверы, вступившие по кодам этого корня) остаётся без админа.
  * Кнопка живёт в настройках своей ноды (долгое нажатие на свой телефон на графе).
  */
 final class ProfileReset {
@@ -20,10 +21,33 @@ final class ProfileReset {
     /** Подтверждение; после сброса настройки ноды закрываются и показывается главный экран. */
     static void confirm(Activity a) {
         new AlertDialog.Builder(a).setTitle("Забыть профиль?")
-                .setMessage("Профиль, приглашение и чужие сети будут стёрты, VPN остановится. Ключ телефона и ваша собственная сеть сохранятся.")
+                .setMessage("Будет стёрто всё: ключ телефона, ваша собственная сеть и её записи, приглашения и коды серверов, чужие сети. VPN остановится, "
+                        + "при следующем запуске телефон получит новый ключ.\n\nЕсли этот телефон — админ сети, серверы, вступившие по его кодам, "
+                        + "останутся без админа: их придётся развернуть заново новым кодом. Отменить нельзя.")
                 .setNegativeButton("Отмена", null)
                 .setPositiveButton("Забыть", (d, w) -> run(a))
                 .show();
+    }
+
+    /** Удалить всё в каталоге состояния, кроме имени телефона. Ссылки не разыменовываются (удаляется сама ссылка). */
+    private static void wipe(File st) throws java.io.IOException {
+        File[] fs = st.listFiles();
+        if (fs == null) return;
+        for (File f : fs) {
+            if ("node-name.txt".equals(f.getName())) continue;
+            del(f.toPath());
+        }
+        String[] left = st.list();
+        if (left != null && left.length > (new File(st, "node-name.txt").exists() ? 1 : 0)) throw new java.io.IOException("не всё состояние удалось стереть");
+    }
+
+    private static void del(java.nio.file.Path p) throws java.io.IOException {
+        if (java.nio.file.Files.isDirectory(p, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            try (java.nio.file.DirectoryStream<java.nio.file.Path> ds = java.nio.file.Files.newDirectoryStream(p)) {
+                for (java.nio.file.Path c : ds) del(c);
+            }
+        }
+        java.nio.file.Files.deleteIfExists(p);
     }
 
     private static void run(Activity a) {
@@ -38,11 +62,7 @@ final class ProfileReset {
                 for (int i = 0; i < 100 && (!"idle".equals(KnotHopVpnService.phase) || KnotHopVpnService.tunHeld); i++) Thread.sleep(100);
                 if (!"idle".equals(KnotHopVpnService.phase) || KnotHopVpnService.tunHeld) throw new IllegalStateException("Узел ещё останавливается; повторите позже");
                 new File(st, "status.json").delete(); // только после остановки: CLI проверяет свежесть статуса
-                if (new File(st, "identity.key").exists()) {
-                    String sd = st.getAbsolutePath();
-                    if (Native.runVpn("forget-network --state " + sd, sd) != 0) throw new IllegalStateException("Не удалось забыть чужие сети: " + Util.read(new File(st, "error.txt")));
-                }
-                for (String n : new String[]{"profile.txt", "enrollment.json", "enroll-consent.json", "enroll-consented.json", "enroll-join.json"}) new File(st, n).delete();
+                wipe(st);
                 app.getSharedPreferences("p", Context.MODE_PRIVATE).edit().remove("profile").apply();
             } catch (Exception ex) {
                 err = ex.getMessage();
