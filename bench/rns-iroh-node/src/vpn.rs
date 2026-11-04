@@ -2330,7 +2330,8 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
             // оба носителя проверены и не работают: прямой интерфейс не поднимаем, путь к пиру найдёт RNS через другие узлы; позже проверим снова
             if !announced_block {
                 announced_block = true;
-                sh.note(format!("{label}: прямой путь заблокирован (QUIC и TCP не проходят), не подключаюсь, повторная проверка через {} мин", rem.as_secs() / 60 + 1));
+                sh.note(format!("{label}: прямой путь заблокирован (QUIC и TCP не проходят), не подключаюсь, повторная проверка через {} мин; REALITY: {}", rem.as_secs() / 60 + 1,
+                    if reality_carrier::global().is_none() { "выключен" } else if d.book.rl().is_none() { "нет подсказки rl у этого выхода" } else { "подсказка есть" }));
             }
             d.book.pause(rem.min(Duration::from_secs(60))).await;
             continue;
@@ -7597,6 +7598,14 @@ impl ClientCtx {
         }
     }
 
+    /// Подсказка REALITY из записи третьих рук (приглашение, расписки зачисления): запомнить и отдать диалеру, если своей ещё нет.
+    fn learn_rl(&self, e: &DirEnt) {
+        if e.rl.is_none() { return; }
+        self.remember_rl(&e.dest, &e.rl, false);
+        let book = self.book_for(&e.dest);
+        book.rl_fill(&e.rl);
+    }
+
     /// Запомнить подсказку REALITY выхода (`own` - пришла от самого узла: заменяет и стирает; иначе только если своей нет).
     fn remember_rl(&self, dest: &[u8; 16], rl: &Option<reality_carrier::RealityHint>, own: bool) {
         let Some(c) = &self.c13 else { return };
@@ -8121,7 +8130,7 @@ async fn pair_client(ctx: &Arc<ClientCtx>) -> Result<()> {
     let service = enroll_net::find(&ctx.state).context("enrollment runtime")?;
     *ctx.status.lock().unwrap() = "Связываюсь с нодами приглашения".into();
     let hints = enroll_net::join(&service, &inv).await?;
-    for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.set_name(e.dest, &e.name); }
+    for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.set_name(e.dest, &e.name); ctx.learn_rl(&e); }
     *c.invite.lock().unwrap() = None;
     ctx.refresh_servers13(); start_dialers(ctx); Ok(())
 }
@@ -8208,7 +8217,7 @@ async fn client_enroll_refresh(ctx: Arc<ClientCtx>) {
         let summary = format!("Расписок нод: {received} из {expected}");
         match res {
             Ok(Some(hints)) => {
-                for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.set_name(e.dest, &e.name); }
+                for e in parse_dir_values(&hints, T13_TAG, DIR_MAX) { ctx.remember_addrs(&e.dest, &e.addrs); ctx.set_name(e.dest, &e.name); ctx.learn_rl(&e); }
                 if after > before { ctx.sh.note(format!("зачисление: дополучены расписки, {received} из {expected}")); }
                 ctx.refresh_servers13(); start_dialers(&ctx);
                 if manual { report(format!("{summary} (новых {}). {}", after.saturating_sub(before), if received < expected { "Остальные подтверждения ещё не доставлены" } else { "Все подтверждения получены" })); }
@@ -9084,6 +9093,11 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
                             continue;
                         }
                         let Some(ctx) = weak.upgrade() else { break };
+                        // прямой путь уже помечен заблокированным (QUIC и TCP): повторная проверка IP только рвала бы рабочий mesh
+                        if endpoint_peer_id(&key).is_some_and(|p| ctx.sh.health.blocked_for(&p).is_some()) {
+                            mesh_since = Instant::now();
+                            continue;
+                        }
                         let hints = mesh_hints(&ctx, &dest, &fallback).await;
                         let mut reachable = false;
                         if !hints.is_empty() {
@@ -9093,8 +9107,16 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
                                     probe = probe.with_ip_addr(*a);
                                 }
                                 if let Ok(Ok(pc)) = tokio::time::timeout(Duration::from_secs(6), ctx.ep.connect(probe, ALPN)).await {
+                                    // iroh подмешивает известные пути пира, в том числе mesh: рукопожатие могло пройти по mesh, а не по IP.
+                                    // «Достижим» - только если IP-путь реально выбран (IP первичен в MeshBackupSelector, когда у него есть RTT).
+                                    for _ in 0..8 {
+                                        if pc.paths().iter().any(|p| p.is_selected() && matches!(p.remote_addr(), iroh::TransportAddr::Ip(_))) {
+                                            reachable = true;
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                    }
                                     pc.close(0u32.into(), b"probe");
-                                    reachable = true;
                                 }
                             }
                         }
@@ -9109,6 +9131,8 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
                     mx.close();
                 }
                 _ => {
+                    // следующая попытка идёт через другой транзит: выбранный мог не видеть выход
+                    m.rotate_alt(&key);
                     ctx.sh.note(format!("mesh: к {name} не соединилось, повтор через {wait} с"));
                     drop(ctx);
                     tokio::time::sleep(Duration::from_secs(wait)).await;

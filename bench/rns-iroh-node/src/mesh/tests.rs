@@ -267,6 +267,46 @@ async fn two_hops() {
     assert_eq!(e.mesh.c.rev_learned.load(Relaxed), 1);
 }
 
+/// Прямой путь закрыт, маршрута RNS через наш QUIC-носитель нет (путь идёт через TCP хаба): первым хопом берётся транзит с живым QUIC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_rns_route_first_hop_is_alt_transit() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    // маршрута a -> e нет вовсе; у t прямой сосед e
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    echo(&ca, &ce).await;
+    assert!(a.mesh.c.alt_hops.load(Relaxed) > 0, "первый хоп выбран как альтернативный транзит");
+    assert!(t.mesh.c.fwd.load(Relaxed) > 0);
+    assert!(!t.saw_plain.load(Relaxed));
+}
+
+/// Выбранный транзит не видит выход: после неудачи следующая попытка идёт через другого кандидата.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_attempt_rotates_alt_transit() {
+    let (a, t1, t2, e) = (node().await, node().await, node().await, node().await);
+    link(&a, &t1).await;
+    link(&a, &t2).await;
+    link(&t2, &e).await;
+    allow_all(&[&a, &t1, &t2, &e]);
+    t1.set_transit(true);
+    t2.set_transit(true);
+    let mut ok = None;
+    for _ in 0..3 {
+        a.mesh.prepare(&e.id());
+        let r = tokio::time::timeout(Duration::from_millis(2500), a.ep.connect(endpoint_addr(&e.id()).unwrap(), ALPN)).await;
+        if let Ok(Ok(c)) = r {
+            ok = Some(c);
+            break;
+        }
+        a.mesh.rotate_alt(&e.id());
+    }
+    assert!(ok.is_some(), "после ротации соединение поднялось через транзит, который видит выход");
+    assert!(t2.mesh.c.fwd.load(Relaxed) > 0);
+}
+
 async fn denied(setup: impl FnOnce(&Node, &Node, &Node)) -> (Node, Node, Node) {
     let (a, t, e) = (node().await, node().await, node().await);
     link(&a, &t).await;

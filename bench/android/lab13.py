@@ -44,7 +44,7 @@ if sys.argv[1:2] in (["realityfail"],):
     os.environ.setdefault("LAB13_ROOT", str(Path.home() / ".cache/knothop-rl13/lab"))
     os.environ.setdefault("LAB13_SUBNET", "172.29.103.0/24")
     os.environ.setdefault("KNOTHOP_BIN", str(Path.home() / ".cache/knothop-target/check-rns-iroh-node/debug/knothopd"))
-if sys.argv[1:2] in (["perf"], ["meshperf"], ["meshfail"]):
+if sys.argv[1:2] in (["perf"], ["meshperf"], ["meshfail"], ["blockfail"]):
     # Замер идёт в отдельной внутренней сети со своим префиксом, release-бинарём и без подробного журнала (KNOTHOP_DEBUG замедляет путь данных).
     os.environ.setdefault("LAB13_PREFIX", "perf")
     os.environ.setdefault("LAB13_ROOT", str(Path.home() / ".cache/knothop-perf13/lab"))
@@ -567,7 +567,7 @@ def mesh_down():
         sh("docker", "run", "--rm", "-v", f"{LAB.parent}:/l", "--entrypoint", "rm", IMAGE, "-rf", "/l/lab")
 
 
-def mesh_up(mode, direct=False):
+def mesh_up(mode, direct=False, pre_client=None):
     """adm (выход) и сайт в perf-net; T в обеих сетях; клиент и хаб (публичная RNS для обнаружения адресов) достижимы клиентом через perf-neta."""
     from types import SimpleNamespace
     global MESH_T
@@ -619,6 +619,8 @@ def mesh_up(mode, direct=False):
     c = state_dir(CL_NAME)
     (c / "pub.txt").write_text(f"{hub_a}:4242\n")
     write_private(c / "invite.txt", make_invite(ADM_NAME, "user", CL_NAME, f"{adm_hash},{t_hash}", ""))
+    if pre_client:
+        pre_client()
     if direct:
         # клиент достаёт выход напрямую (perf-net) И через транзит T: прямой носитель + тёплый запасной mesh-путь
         run(CL_NAME, "172.29.101.30", client_cmd(""), c, net=NET)
@@ -987,6 +989,75 @@ def cmd_realityfail(a):
             perf_down()
 
 
+
+# ---------------------------------------------------------------------------------------------------- blockfail: прямой путь к выходу закрыт с самого начала
+def cmd_blockfail(a):
+    """Клиент стартует, когда прямой путь к выходу уже заблокирован (как телефон на пилоте). --kind dpi: UDP 47001 drop, TCP 47001 соединяется, данные нет;
+    drop: оба молча drop; asym: клиент->выход UDP проходит, выход->клиент UDP режется. --reality: на выходе REALITY (:8443), --rl-block: порт REALITY тоже закрыт.
+    Меряет: время до первого ответа через туннель, число допусков/закрытий Link на выходе, ping 0,5 с за --secs."""
+    res = {"scenario": "blockfail", "kind": a.kind, "reality": a.reality, "rl_block": a.rl_block}
+    res_dir = LAB.parent / "results"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    t_start = [0.0]
+
+    def block():
+        if a.reality:
+            sh("docker", "exec", "-d", SITE_NAME, "python3", "/lab/lab_web.py", "cover")
+        rules = []
+        if a.kind in ("dpi", "drop", "sym"):
+            rules.append(("-p", "udp", "--dport", "47001"))
+            rules.append(("-p", "tcp", "--dport", "47001", "!", "--syn") if a.kind == "dpi" else ("-p", "tcp", "--dport", "47001"))
+        elif a.kind == "asym":
+            rules.append(("-p", "udp", "--sport", "47001"))
+        if a.rl_block:
+            rules.append(("-p", "tcp", "--dport", str(RL_PORT)))
+        for r in rules:
+            chain = "OUTPUT" if a.kind == "asym" and r[2] == "--sport" else "INPUT"
+            peer = ("-d" if chain == "OUTPUT" else "-s", "172.29.101.30")   # блок только для клиента: T и остальные ноды выхода видят
+            dx(ADM_NAME, "iptables", "-I", chain, *peer, *r, "-j", "DROP")
+        t_start[0] = time.time()
+
+    extra = f" --reality-listen 0.0.0.0:{RL_PORT} --reality-dest {SITE_IP}:443 --reality-sni {RL_SNI} --reality-public-port {RL_PORT}" if a.reality else ""
+    os.environ["LAB_NODE_EXTRA_ADM"] = extra
+    try:
+        os.environ["LAB_NODE_EXTRA"] = extra
+        # mesh_up сам выставляет LAB_NODE_EXTRA для T и сбрасывает; для adm она берётся здесь, до cmd_up
+        mesh_up_blk(block)
+        res["tunnel_up_s"] = round(time.time() - t_start[0], 1)
+        sh("docker", "exec", "-d", CL_NAME, "sh", "-c", f"ping -D -i 0.5 -W 1 {INET} > /tmp/pingblk.txt 2>&1")
+        t0 = time.time()
+        time.sleep(a.secs)
+        res["ping"] = rl_ping_outage(t0)
+        nl = dx(ADM_NAME, "sh", "-c", "grep -a -c 'admitted on' /state/node.log; grep -a -c 'close link' /state/node.log; grep -a 'quic accepted' /state/node.log | wc -l", check=False).stdout.split()
+        res["exit_admitted_closed_quic_accepted"] = nl
+        res["exit_log"] = dx(ADM_NAME, "sh", "-c", "grep -a 'admitted on\\|close link\\|quic accepted\\|packet interface\\|reality' /state/node.log | cut -c1-170 | tail -40", check=False).stdout.splitlines()
+        res["client_log"] = dx(CL_NAME, "sh", "-c", "grep -a -v 'снимок' /state/client.log | grep -a 'mesh\\|REALITY\\|reality\\|заблокирован\\|выход .* принял\\|Link\\|TCP\\|QUIC' | cut -c1-200 | tail -40", check=False).stdout.splitlines()
+        res["client_path"] = client_path()
+        if a.restart:
+            # зачисленный клиент (как телефон) перезапускается при том же блоке: время до первого ответа через туннель и шторм Link за 120 с
+            sh("docker", "restart", "-t", "1", CL_NAME)
+            t1 = time.time()
+            def after():
+                sh("docker", "exec", CL_NAME, "ip", "route", "replace", f"{INET}/32", "dev", "tun0", check=False)
+                return rl_curl(2)
+            res["restart_to_traffic_s"] = round(time.time() - t1, 1) if rl_wait(after, 240, "restart") else None
+            time.sleep(120)
+            res["after_restart_admitted_closed"] = dx(ADM_NAME, "sh", "-c", "grep -a -c 'admitted on' /state/node.log; grep -a -c 'close link' /state/node.log", check=False).stdout.split()
+            res["after_restart_ping_curl"] = rl_curl(3)
+        st = fresh_status(CL_NAME, time.time())
+        res["client_mesh"] = {k: v for k, v in (st.get("tun", {}).get("mesh") or {}).items() if v}
+        res["exit_mesh"] = {k: v for k, v in (fresh_status(ADM_NAME, time.time()).get("tun", {}).get("mesh") or {}).items() if v}
+    finally:
+        print(json.dumps(res, ensure_ascii=False, indent=1))
+        (res_dir / f"blockfail-{a.kind}-{int(a.reality)}{int(a.rl_block)}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1))
+        if not a.keep:
+            mesh_down()
+
+
+def mesh_up_blk(block):
+    mesh_up(1, direct=True, pre_client=block)
+
+
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 sp = ap.add_subparsers(dest="c", required=True)
 x = sp.add_parser("up"); x.add_argument("--phone", action="store_true", help="опубликовать порт adm на LAN-адресе ноутбука для телефона"); x.add_argument("--no-adm", action="store_true", help="без ноды adm (админом будет клиент: lab13.py admin NAME)"); x.set_defaults(f=cmd_up)
@@ -1018,6 +1089,9 @@ x.add_argument("--pairs", type=int, default=3)
 x.add_argument("--secs", type=int, default=10)
 x.add_argument("--keep", action="store_true")
 x.set_defaults(f=cmd_meshperf)
+x = sp.add_parser("blockfail", help="клиент стартует при уже закрытом прямом пути к выходу (dpi|drop|asym), выход достижим через T; --reality/--rl-block")
+x.add_argument("--kind", default="dpi", choices=["none", "dpi", "drop", "asym"]); x.add_argument("--reality", action="store_true"); x.add_argument("--rl-block", action="store_true")
+x.add_argument("--secs", type=int, default=300); x.add_argument("--restart", action="store_true"); x.add_argument("--keep", action="store_true"); x.set_defaults(f=cmd_blockfail)
 x = sp.add_parser("realityfail", help="REALITY: UDP и TCP:47001 к выходу закрыты, открыт только TCP на порт REALITY (без Traefik); клиент переходит на REALITY")
 x.add_argument("--keep", action="store_true")
 x.add_argument("--control", action="store_true", help="без REALITY, закрыт только UDP (эталон: TCP-носитель)")

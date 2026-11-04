@@ -202,6 +202,8 @@ pub struct Mesh {
     hops: Mutex<HashMap<Key, HopEntry>>,
     ids: Mutex<HashMap<Id, (Option<Key>, Instant)>>,
     ride_cache: Mutex<HashMap<usize, (bool, Instant)>>,
+    /// сдвиг выбора альтернативного транзита по назначению (растёт после неудачной попытки соединения)
+    alt_rot: Mutex<HashMap<Key, u32>>,
     hop_pending: Mutex<std::collections::HashSet<Key>>,
     hop_req: Mutex<std::sync::mpsc::Sender<Key>>,
     /// очередь исходящих кадров: poll_send работает под замком QUIC-соединения, а `send_datagram` хопа берёт замок ДРУГОГО соединения; чтобы вложенные замки
@@ -266,6 +268,7 @@ impl Mesh {
             hops: Default::default(),
             ids: Default::default(),
             ride_cache: Default::default(),
+            alt_rot: Default::default(),
             hop_pending: Default::default(),
             hop_req: Mutex::new(hop_tx),
             txq,
@@ -615,23 +618,47 @@ impl Mesh {
             self.c.alt_hops.fetch_add(1, Relaxed);
             return Some(k);
         }
-        self.next_hop_via(now, dst, policy)
+        // Нет ни прямого носителя, ни маршрута RNS через наш QUIC-носитель, ни обратной записи (прямой путь к выходу закрыт, путь RNS идёт через TCP
+        // публичного хаба): первым хопом берём транзит с живым QUIC. Это подсказка, не право: пересылку разрешает сам транзит (`may_forward`).
+        match self.next_hop_via(now, dst, policy) {
+            Some(k) => Some(k),
+            None => {
+                let k = self.alt_transit(dst, policy)?;
+                self.c.alt_hops.fetch_add(1, Relaxed);
+                Some(k)
+            }
+        }
+    }
+
+    /// Следующая попытка соединения с `dst` идёт через другой транзит (после неудачи; сдвиг в списке кандидатов `alt_transit`).
+    pub fn rotate_alt(&self, dst: &Key) {
+        let mut r = self.alt_rot.lock().unwrap();
+        if r.len() >= 64 && !r.contains_key(dst) {
+            r.clear();
+        }
+        let e = r.entry(*dst).or_insert(0);
+        *e = e.wrapping_add(1);
+        drop(r);
+        self.hops.lock().unwrap().remove(dst);
     }
 
     /// Альтернативный транзит к `dst`: узел с правом TRANSIT, не `dst`, с живым QUIC-носителем вне mesh; выбор стабилен (меньший `k xor dst`).
     /// Знания о том, видит ли транзит само `dst`, нет: если он `dst` не достаёт, он кадры отбросит, и путь не подтвердится (запасным он не станет).
     fn alt_transit(&self, dst: &Key, policy: &dyn Policy) -> Option<Key> {
-        policy
-            .transit_candidates()
-            .into_iter()
-            .filter(|k| k != dst && k != &self.me && self.carrier(k).is_some())
-            .min_by_key(|k| {
-                let mut x = [0u8; 8];
-                for i in 0..8 {
-                    x[i] = k[i] ^ dst[i];
-                }
-                u64::from_be_bytes(x)
-            })
+        let mut c: Vec<Key> = policy.transit_candidates().into_iter().filter(|k| k != dst && k != &self.me && self.carrier(k).is_some()).collect();
+        c.sort_by_key(|k| {
+            let mut x = [0u8; 8];
+            for i in 0..8 {
+                x[i] = k[i] ^ dst[i];
+            }
+            u64::from_be_bytes(x)
+        });
+        c.dedup();
+        if c.is_empty() {
+            return None;
+        }
+        let rot = self.alt_rot.lock().unwrap().get(dst).copied().unwrap_or(0) as usize;
+        Some(c[rot % c.len()])
     }
 
     fn count_nbr_err(&self, e: NbrErr) {
