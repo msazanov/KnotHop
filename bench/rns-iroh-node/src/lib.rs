@@ -48,6 +48,7 @@ mod qprobe;
 mod dataplane;
 mod pmtu;
 mod mesh;
+mod reality_carrier;
 pub use vpn::{VpnCli, VpnCmd};
 
 /// Fixed non-shell admin CLI bridge used by the Android JNI wrapper.
@@ -1062,7 +1063,8 @@ async fn accept_loop(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>) {
         tokio::spawn(async move {
             let _slot = slot;
             // сквозное соединение клиента, пришедшее по mesh: у него начальный MTU 1200 (рост - PMTUD по соседскому пути), права ключа проверяются сразу
-            let via_mesh = mesh::incoming_is_mesh(&incoming.remote_addr());
+            let conn_addr_kind = incoming.remote_addr();
+            let via_mesh = mesh::incoming_is_mesh(&conn_addr_kind);
             let conn = if via_mesh {
                 let Some(m) = mesh::global() else { incoming.refuse(); return };
                 let Some(cfg) = mesh::quic_cfg() else { incoming.refuse(); return };
@@ -1080,7 +1082,11 @@ async fn accept_loop(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>) {
                 conn
             };
             let peer = conn.remote_id().fmt_short().to_string();
-            sh.note(format!("quic accepted from {peer}{}", if via_mesh { " (mesh)" } else { "" }));
+            let via_reality = reality_carrier::incoming_is_reality(&conn_addr_kind);
+            sh.note(format!("quic accepted from {peer}{}", if via_mesh { " (mesh)" } else if via_reality { " (reality)" } else { "" }));
+            if via_reality {
+                reality_carrier::close_conn_with_tunnel(conn.clone());
+            }
             if carrier().0 {
                 // один интерфейс RNS на ключ iroh пира: смена носителя (QUIC <-> TCP) его не пересоздаёт, Link остаётся
                 let key = *conn.remote_id().as_bytes();
@@ -2391,6 +2397,7 @@ impl TunState {
             "routes": self.routes.read().unwrap().len(),
             "dataplane": dataplane::plane().stats(),
             "mesh": mesh::global().map(|m| m.stats()),
+            "reality": reality_carrier::global().map(|r| r.stats()),
             "failovers": self.failovers.lock().unwrap().clone(),
         })
     }

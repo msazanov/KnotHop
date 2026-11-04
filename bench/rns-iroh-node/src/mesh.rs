@@ -387,7 +387,7 @@ impl Mesh {
         self.e2e_max.store(n as u64, Relaxed);
     }
 
-    /// Соединение сейчас едет по mesh: помечено сквозным либо выбранный путь у него `Custom`. Соединение с тёплым запасным mesh-путём (основной - IP) соседом
+    /// Соединение сейчас едет по mesh: помечено сквозным либо выбранный путь у него `Custom` с `MESH_ID` (не REALITY). Соединение с тёплым запасным mesh-путём (основной - IP) соседом
     /// быть может, пока основной путь прямой; в сквозное, идущее по mesh, класть кадры mesh нельзя (вложенность и петли). Решение по путям держим 1 с.
     pub fn rides_mesh(&self, conn: &Connection) -> bool {
         if self.is_e2e(conn) {
@@ -402,7 +402,8 @@ impl Mesh {
                 }
             }
         }
-        let v = conn.paths().iter().any(|p| p.is_selected() && matches!(p.remote_addr(), iroh::TransportAddr::Custom(_)));
+        // только mesh: туннель REALITY (другой custom-путь, `reality_carrier::REALITY_ID`) - обычный TCP-носитель к соседу, кадры mesh по нему ходят как по IP
+        let v = conn.paths().iter().any(|p| p.is_selected() && is_mesh_addr(p.remote_addr()));
         let mut c = self.ride_cache.lock().unwrap();
         if c.len() >= 256 {
             c.retain(|_, (_, t)| now.saturating_duration_since(*t) < Duration::from_secs(1));
@@ -1031,6 +1032,11 @@ impl PathSelector for MeshBackupSelector {
     }
 }
 
+/// Custom-путь: туннель REALITY или mesh (других custom-транспортов нет).
+fn custom_kind(c: &CustomAddr) -> &'static str {
+    if c.id() == crate::reality_carrier::REALITY_ID { "reality" } else { "mesh" }
+}
+
 /// Состояние пути соединения для статуса: источник RTT и «как идёт» - сам QUIC (путь, статистика), а не пинги Link. `kind`: direct (IP) / mesh / relay;
 /// `via` - диагностический префикс ключа транзита (4 байта hex, не destination RNS), `backup` - открытые запасные пути.
 pub fn path_json(conn: &Connection, via: Option<Key>) -> serde_json::Value {
@@ -1039,7 +1045,7 @@ pub fn path_json(conn: &Connection, via: Option<Key>) -> serde_json::Value {
     let sel = paths.iter().find(|p| p.is_selected());
     let kind = match sel.as_ref().map(|p| p.remote_addr().clone()) {
         Some(T::Ip(_)) => "direct",
-        Some(T::Custom(_)) => "mesh",
+        Some(T::Custom(c)) => custom_kind(&c),
         Some(T::Relay(_)) => "relay",
         _ => "none",
     };
@@ -1048,7 +1054,7 @@ pub fn path_json(conn: &Connection, via: Option<Key>) -> serde_json::Value {
         .filter(|p| !p.is_selected())
         .map(|p| match p.remote_addr() {
             T::Ip(_) => "direct",
-            T::Custom(_) => "mesh",
+            T::Custom(c) => custom_kind(c),
             T::Relay(_) => "relay",
             _ => "other",
         })
@@ -1059,6 +1065,7 @@ pub fn path_json(conn: &Connection, via: Option<Key>) -> serde_json::Value {
         "direct" => "прямой (IP)".to_string(),
         "mesh" => via.as_ref().map(|v| format!("mesh через {v}")).unwrap_or_else(|| "mesh".to_string()),
         "relay" => "relay".to_string(),
+        "reality" => "REALITY (TCP, маскировка под TLS)".to_string(),
         _ => "путь не выбран".to_string(),
     };
     let black_holes_detected: u64 = paths.iter().map(|p| p.stats().black_holes_detected).sum();
@@ -1068,7 +1075,7 @@ pub fn path_json(conn: &Connection, via: Option<Key>) -> serde_json::Value {
         .map(|p| {
             let s = p.stats();
             serde_json::json!({
-                "kind": match p.remote_addr() { T::Ip(_) => "direct", T::Custom(_) => "mesh", T::Relay(_) => "relay", _ => "other" },
+                "kind": match p.remote_addr() { T::Ip(_) => "direct", T::Custom(c) => custom_kind(c), T::Relay(_) => "relay", _ => "other" },
                 "selected": p.is_selected(), "mtu": s.current_mtu,
                 "probes_sent": s.sent_plpmtud_probes, "probes_lost": s.lost_plpmtud_probes, "black_holes": s.black_holes_detected,
             })
@@ -1128,9 +1135,14 @@ pub fn endpoint_addr_with(key: &Key, ips: &[std::net::SocketAddr]) -> Option<iro
     Some(iroh::EndpointAddr::from_parts(id, addrs))
 }
 
+/// Адрес пути - mesh (custom `MESH_ID`). Туннель REALITY (другой id custom-транспорта) и IP - нет.
+pub(crate) fn is_mesh_addr(a: &iroh::TransportAddr) -> bool {
+    matches!(a, iroh::TransportAddr::Custom(c) if c.id() == MESH_ID)
+}
+
 /// Выбранный путь соединения идёт через mesh (custom-транспорт), а не по IP.
 pub fn selected_is_mesh(conn: &Connection) -> bool {
-    conn.paths().iter().find(|p| p.is_selected()).is_some_and(|p| matches!(p.remote_addr(), iroh::TransportAddr::Custom(_)))
+    conn.paths().iter().find(|p| p.is_selected()).is_some_and(|p| is_mesh_addr(p.remote_addr()))
 }
 
 #[cfg(test)]

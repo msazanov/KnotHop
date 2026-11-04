@@ -1,0 +1,39 @@
+[package]
+name = "knothop-reality"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+description = "Собственная реализация маскировки уровня REALITY: ClientHello как у Chrome, аутентификация в session_id, прозрачный relay на сайт-прикрытие."
+
+[workspace]
+
+[features]
+default = []
+# лабораторный мост reality-bridge (многопоточный runtime)
+bin = ["tokio/rt-multi-thread"]
+
+[[bin]]
+name = "reality-bridge"
+path = "src/bin/reality-bridge.rs"
+required-features = ["bin"]
+
+[dependencies]
+ring = "0.17.14"
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "reusable_secrets"] }
+ml-kem = { version = "0.3.3", default-features = false }
+tokio = { version = "1", features = ["rt", "io-util", "net", "time", "sync", "macros"] }
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net", "sync"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

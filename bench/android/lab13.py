@@ -16,6 +16,9 @@
   lab13.py meshperf [--pairs 3] [--secs 10] [--keep]
                                       A/B mesh (KNOTHOP_MESH=0/1) в топологии клиент–T–выход: клиент только в сети perf-neta 172.29.102.0/24 вместе с T и хабом, выход (adm) и
                                       «сайт» только в perf-net, T в обеих; клиент не достаёт до выхода по IP. Ядра: adm=1,cl=2,gen=3,site=4,hub=5,t=6 (PERF_CPUS)
+  lab13.py realityfail [--keep] [--unblock N]
+                                      REALITY: выход слушает TCP-порт REALITY (сайт-прикрытие - TLS 1.3 на «сайте»), на выходе режутся UDP и TCP 47001, клиент переходит на REALITY;
+                                      проверки: curl/ping через туннель, зонд без ключа, рестарт клиента при блоке. Сеть rl-net 172.29.103.0/24
   lab13.py perf [--pairs 3] [--secs 10] [--negative] [--keep]
                                       A/B замер прямого канала данных (KNOTHOP_DIRECT_DATA=0/1): отдельная внутренняя сеть perf-net 172.29.101.0/24,
                                       release-бинарь (~/.cache/knothop-target/fork/release/knothopd), выход и клиент по 1 ядру (PERF_CPUS="adm=1,cl=2,gen=3,site=4,hub=5"),
@@ -35,6 +38,12 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if sys.argv[1:2] in (["realityfail"],):
+    # REALITY-сценарий: свой префикс и подсеть (172.29.103.0/24), внутренняя сеть, бинарь - отладочная сборка knothopd из ~/.cache/knothop-target/check-rns-iroh-node
+    os.environ.setdefault("LAB13_PREFIX", "rl")
+    os.environ.setdefault("LAB13_ROOT", str(Path.home() / ".cache/knothop-rl13/lab"))
+    os.environ.setdefault("LAB13_SUBNET", "172.29.103.0/24")
+    os.environ.setdefault("KNOTHOP_BIN", str(Path.home() / ".cache/knothop-target/check-rns-iroh-node/debug/knothopd"))
 if sys.argv[1:2] in (["perf"], ["meshperf"], ["meshfail"]):
     # Замер идёт в отдельной внутренней сети со своим префиксом, release-бинарём и без подробного журнала (KNOTHOP_DEBUG замедляет путь данных).
     os.environ.setdefault("LAB13_PREFIX", "perf")
@@ -826,6 +835,157 @@ def cmd_meshfail(a):
         if not a.keep:
             mesh_down()
 
+# ---------------------------------------------------------------------------------------------------- REALITY: UDP и TCP:47001 к выходу закрыты
+RL_PORT = 8443          # порт REALITY на выходе (в проде Traefik :443 -> 127.0.0.1:порт; здесь прямое соединение без PROXY v2)
+RL_SNI = "cover.lab.example"
+
+
+def rl_client_view(secs=0):
+    """Что клиент сообщает о носителе выхода: status.json -> carrier (quic|tcp|reality|none)."""
+    st = fresh_status(CL_NAME, time.time() - 1, secs or 30)
+    return {"servers": [{"name": s.get("name"), "carrier": s.get("carrier"), "state": s.get("state")} for s in (st.get("servers") or st.get("exits") or [])] or None,
+            "raw_keys": sorted(st.keys())[:12] if not st.get("servers") and not st.get("exits") else None}
+
+
+def rl_curl(secs=5):
+    return sh("docker", "exec", CL_NAME, "curl", "-s", "-m", str(secs), f"http://{INET}/", check=False).stdout.strip()
+
+
+def rl_ping_outage(t_from):
+    """По /tmp/pingblk.txt клиента (ping -D): ответов до t_from, самый длинный перерыв после t_from и время от t_from до первого ответа после этого перерыва."""
+    out = sh("docker", "exec", CL_NAME, "sh", "-c", "pkill -x ping; cat /tmp/pingblk.txt", check=False).stdout
+    ts = [float(m) for m in re.findall(r"^\[(\d+\.\d+)\] \d+ bytes from", out, re.M)]
+    after = [t for t in ts if t >= t_from]
+    if not after:
+        return {"replies_total": len(ts), "recovered": False}
+    pts = [max(t for t in ts if t < t_from) if any(t < t_from for t in ts) else t_from] + after
+    gaps = [(pts[i + 1] - pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+    g, t_end = max(gaps)
+    return {"replies_total": len(ts), "replies_after": len(after), "longest_gap_s": round(g, 1), "first_reply_after_s": round(after[0] - t_from, 1),
+            "restored_after_s": round(t_end - t_from, 1) if g > 2 else round(after[0] - t_from, 1), "last_reply_after_s": round(after[-1] - t_from, 1)}
+
+
+def rl_wait(pred, secs, what):
+    end = time.time() + secs
+    while time.time() < end:
+        v = pred()
+        if v:
+            return v
+        time.sleep(2)
+    return None
+
+
+def cmd_realityfail(a):
+    """Клиент подключается к выходу обычным путём (QUIC/UDP), узнаёт подсказку `rl`; затем на выходе закрываются UDP и TCP 47001 (открыт только TCP REALITY-порт):
+    клиент обязан перейти на REALITY, трафик идёт через туннель; рестарт клиента при том же блоке поднимает туннель по сохранённой подсказке."""
+    from types import SimpleNamespace
+    res = {"scenario": "realityfail"}
+    # state этого сценария создан им же (владелец root внутри контейнера): чистим только каталог lab внутри rl13, иначе журналы прошлых прогонов портят счёт
+    if LAB.name == "lab" and "rl13" in str(LAB.parent) and LAB.exists():
+        sh("docker", "run", "--rm", "-v", f"{LAB.parent}:/l", "--entrypoint", "rm", IMAGE, "-rf", "/l/lab")
+    try:
+        # --control: тот же сценарий без REALITY и с закрытым только UDP (TCP:47001 открыт): эталон поведения прежнего TCP-носителя при блоке
+        os.environ["LAB_NODE_EXTRA"] = "" if a.control else f" --reality-listen 0.0.0.0:{RL_PORT} --reality-dest {SITE_IP}:443 --reality-sni {RL_SNI} --reality-public-port {RL_PORT}"
+        perf_up("1")
+        os.environ["LAB_NODE_EXTRA"] = ""
+        adm_ip = ip_of(ADM_NAME)
+        sh("docker", "exec", "-d", SITE_NAME, "python3", "/lab/lab_web.py", "cover")
+        time.sleep(2)
+        res["cover_direct"] = sh("docker", "exec", CL_NAME, "curl", "-sk", "--http1.1", "-m", "5", "--resolve", f"{RL_SNI}:443:{SITE_IP}", f"https://{RL_SNI}/", check=False).stdout.strip()
+        res["curl_before_block"] = rl_curl()
+        # клиент выучил подсказку (каталог по LXMF приходит не сразу)
+        hint = rl_wait(lambda: sh("docker", "exec", CL_NAME, "cat", "/state/hints-rl.json", check=False).stdout.strip(), 120, "hints-rl.json")
+        res["client_hints_rl_present"] = bool(hint)
+        if hint:
+            h = json.loads(hint)
+            res["client_hint_fields"] = sorted(next(iter(h.values())).keys()) if h else []   # поля (p,s,k,i); значения ключей в отчёт не попадают
+        st = fresh_status(ADM_NAME, time.time() - 1, 30)
+        res["exit_reality_before"] = (st.get("tun") or {}).get("reality") or st.get("reality")
+        # фоновый ping выхода в туннеле (0,5 с, метки времени): по нему считаются перерыв и время восстановления трафика от блока (и от снятия блока)
+        if not a.idle:
+            sh("docker", "exec", "-d", CL_NAME, "sh", "-c", f"ping -D -i 0.5 -W 1 {INET} > /tmp/pingblk.txt 2>&1")
+            time.sleep(3)
+        # блок: UDP и TCP 47001 к выходу закрыты (молча, как DPI); открыт TCP REALITY-порт
+        for r in (("-p", "udp", "--dport", "47001"),) if a.control else (("-p", "udp", "--dport", "47001"), ("-p", "tcp", "--dport", "47001")):
+            dx(ADM_NAME, "iptables", "-I", "INPUT", *r, "-j", "DROP")
+        res["blocked_at"] = int(time.time())
+        t_block_f = time.time()
+        if a.idle:
+            # блок посреди простоя: трафика нет, пока не прошло `idle` секунд (Link и QUIC никто не проверяет, кроме keepalive RNS и таймаута QUIC)
+            time.sleep(a.idle)
+            t_block_f = time.time()
+            sh("docker", "exec", "-d", CL_NAME, "sh", "-c", f"ping -D -i 0.5 -W 1 {INET} > /tmp/pingblk.txt 2>&1")
+        t0 = time.time()
+        sw = rl_wait(lambda: sh("docker", "exec", ADM_NAME, "sh", "-c", "grep -c 'quic accepted from.*(reality)' /state/node.log; true", check=False).stdout.strip() not in ("", "0"), 40 if a.control else 240, "reality")
+        res["switch_to_reality_s"] = round(time.time() - t0, 1) if sw else None
+        ok = rl_wait(lambda: rl_curl(3), 240, "curl")
+        res["curl_after_block"] = ok
+        res["curl_after_block_s"] = round(time.time() - t0, 1) if ok else None
+        res["ping_outage_after_block"] = rl_ping_outage(t_block_f)
+        res["client_log_block"] = sh("docker", "exec", CL_NAME, "sh", "-c", f"awk -F'[][]' '$2 >= {res['blocked_at'] * 1000}' /state/client.log | grep -v 'снимок' | cut -c1-200 | head -40", check=False).stdout.splitlines()
+        pg = sh("docker", "exec", CL_NAME, "ping", "-c", "10", "-i", "0.3", "-W", "2", INET, check=False).stdout
+        res["ping_exit_tun"] = ping_stats(pg)
+        res["client_log_reality"] = [l for l in sh("docker", "exec", CL_NAME, "sh", "-c", "grep -i 'reality' /state/client.log | tail -8", check=False).stdout.splitlines()]
+        st = fresh_status(ADM_NAME, time.time() - 1, 30)
+        res["exit_reality_after"] = (st.get("tun") or {}).get("reality") or st.get("reality")
+        res["exit_log_reality"] = sh("docker", "exec", ADM_NAME, "sh", "-c", "grep -i 'reality' /state/node.log | tail -6", check=False).stdout.splitlines()
+        if a.unblock:
+            sh("docker", "exec", "-d", CL_NAME, "sh", "-c", f"ping -D -i 0.5 -W 1 {INET} > /tmp/pingblk.txt 2>&1")
+            time.sleep(3)
+            t_unb = time.time()
+            for r in (("-p", "udp", "--dport", "47001"),) if a.control else (("-p", "udp", "--dport", "47001"), ("-p", "tcp", "--dport", "47001")):
+                dx(ADM_NAME, "iptables", "-D", "INPUT", *r, "-j", "DROP", check=False)
+            res["unblock_wait_s"] = a.unblock
+            res["unblocked_at_ms"] = int(t_unb * 1000)
+            time.sleep(a.unblock)
+            res["ping_outage_after_unblock"] = rl_ping_outage(t_unb)
+            res["client_log_return"] = sh("docker", "exec", CL_NAME, "sh", "-c", "grep -i 'возврат\\|reality' /state/client.log | tail -6", check=False).stdout.splitlines()
+        # зонд без ключа на порт REALITY получает сайт-прикрытие (сертификат и ответ)
+        res["probe_cert_subject"] = sh("docker", "exec", CL_NAME, "sh", "-c", f"echo | openssl s_client -connect {adm_ip}:{RL_PORT} -servername {RL_SNI} -tls1_3 2>/dev/null | openssl x509 -noout -subject", check=False).stdout.strip()
+        res["probe_body"] = sh("docker", "exec", CL_NAME, "curl", "-sk", "--http1.1", "-m", "8", "--resolve", f"{RL_SNI}:{RL_PORT}:{adm_ip}", f"https://{RL_SNI}:{RL_PORT}/", check=False).stdout.strip()
+        # рестарт клиента при том же блоке: туннель по сохранённой подсказке (при --unblock блок снят, этот шаг пропускается)
+        if a.unblock:
+            return
+        sh("docker", "restart", "-t", "1", CL_NAME)
+        time.sleep(3)
+        sh("docker", "exec", CL_NAME, "ip", "route", "replace", f"{INET}/32", "dev", "tun0", check=False)
+        t1 = time.time()
+        def after_restart():
+            sh("docker", "exec", CL_NAME, "ip", "route", "replace", f"{INET}/32", "dev", "tun0", check=False)
+            return rl_curl(3)
+        res["curl_after_restart"] = rl_wait(after_restart, 180, "restart")
+        res["restart_recover_s"] = round(time.time() - t1, 1) if res["curl_after_restart"] else None
+        if res["curl_after_restart"]:
+            # трафик через туннель REALITY при закрытых UDP и TCP:47001: ping выхода в туннеле, HTTP, загрузка 16 МиБ (скорость лабораторная, на выводы о пропускной способности не годится)
+            pg = sh("docker", "exec", CL_NAME, "ping", "-c", "20", "-i", "0.2", "-W", "2", INET, check=False).stdout
+            res["ping_after_restart"] = ping_stats(pg)
+            dl = sh("docker", "exec", CL_NAME, "curl", "-s", "-m", "60", "-o", "/dev/null", "-w", "%{size_download} B %{speed_download} B/s %{time_total} s", f"http://{INET}/big", check=False).stdout
+            res["download_16MiB_after_restart"] = dl
+            cst = fresh_status(CL_NAME, time.time() - 1, 30)
+
+            def find(o, key, out):
+                if isinstance(o, dict):
+                    if key in o:
+                        out.append({k: o.get(k) for k in ("kind", "path_desc", "max_datagram_size", "current_mtu", "black_holes_detected", "datagram_mtu_drops", "paths_detail")})
+                    for v in o.values():
+                        find(v, key, out)
+                elif isinstance(o, list):
+                    for v in o:
+                        find(v, key, out)
+            pj = []
+            find(cst, "path_desc", pj)
+            res["client_path_after_restart"] = pj[:2]
+            res["client_carrier_after_restart"] = [(x.get("name"), x.get("carrier")) for x in (cst.get("servers") or cst.get("exits") or []) if isinstance(x, dict)]
+            st = fresh_status(ADM_NAME, time.time() - 1, 30)
+            res["exit_reality_after_restart"] = {k: v for k, v in ((st.get("tun") or {}).get("reality") or st.get("reality") or {}).items() if k != "server"}
+            res["exit_reality_server_after_restart"] = ((st.get("tun") or {}).get("reality") or st.get("reality") or {}).get("server")
+        res["client_log_after_restart"] = sh("docker", "exec", CL_NAME, "sh", "-c", "grep -i 'reality' /state/client.log | tail -4", check=False).stdout.splitlines()
+    finally:
+        print(json.dumps(res, ensure_ascii=False, indent=1))
+        (LAB.parent / "realityfail.json").write_text(json.dumps(res, ensure_ascii=False, indent=1))
+        if not a.keep:
+            perf_down()
+
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 sp = ap.add_subparsers(dest="c", required=True)
@@ -858,5 +1018,11 @@ x.add_argument("--pairs", type=int, default=3)
 x.add_argument("--secs", type=int, default=10)
 x.add_argument("--keep", action="store_true")
 x.set_defaults(f=cmd_meshperf)
+x = sp.add_parser("realityfail", help="REALITY: UDP и TCP:47001 к выходу закрыты, открыт только TCP на порт REALITY (без Traefik); клиент переходит на REALITY")
+x.add_argument("--keep", action="store_true")
+x.add_argument("--control", action="store_true", help="без REALITY, закрыт только UDP (эталон: TCP-носитель)")
+x.add_argument("--idle", type=int, default=0, help="после блока N секунд без трафика, затем ping выхода; время восстановления считается от начала ping")
+x.add_argument("--unblock", type=int, default=0, help="после проверок снять блок и ждать N секунд (возврат на QUIC)")
+x.set_defaults(f=cmd_realityfail)
 a = ap.parse_args()
 a.f(a)

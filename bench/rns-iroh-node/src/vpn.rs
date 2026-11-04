@@ -182,6 +182,21 @@ pub struct NodeArgs {
     /// iroh-relay для hole punching, `host:порт` (TLS на TCP-порту ноды с `--iroh-relay`), через запятую: ключ relay должен быть ключом доверенной ноды
     #[arg(long, default_value = "")]
     pub relay_url: String,
+    /// REALITY (последний уровень запасного пути): TCP-слушатель `ip:порт`, обычно 127.0.0.1:порт за Traefik (HostSNI passthrough + PROXY v2). По умолчанию выключено
+    #[arg(long)]
+    pub reality_listen: Option<String>,
+    /// сайт-прикрытие `host:порт`: чужой настоящий сайт с TLS 1.3 и h2, не на этом узле (обязателен с --reality-listen)
+    #[arg(long)]
+    pub reality_dest: Option<String>,
+    /// допустимые SNI через запятую (по умолчанию имя из --reality-dest)
+    #[arg(long, default_value = "")]
+    pub reality_sni: String,
+    /// сети, от которых принимается PROXY v2 (адреса Traefik), через запятую; пусто - PROXY не ждём
+    #[arg(long, default_value = "")]
+    pub reality_proxy_trusted: String,
+    /// внешний порт REALITY для клиентов (Traefik :443), по умолчанию 443
+    #[arg(long)]
+    pub reality_public_port: Option<u16>,
 }
 
 /// Файл настроек узла: всё по умолчанию.
@@ -216,6 +231,12 @@ struct NodeConf {
     iroh_relay: bool,
     relay_quic_port: Option<u16>,
     relay_urls: Vec<String>,
+    /// REALITY: см. одноимённые флаги `--reality-*`
+    reality_listen: Option<String>,
+    reality_dest: Option<String>,
+    reality_sni: Vec<String>,
+    reality_proxy_trusted: Vec<String>,
+    reality_public_port: Option<u16>,
 }
 
 /// Символ допустим в отображаемом имени от пира: без управляющих и без невидимых/меняющих направление текста (подмена имени в UI).
@@ -1201,6 +1222,39 @@ mod tests {
     }
 
     #[test]
+    fn reality_hint_travels_in_directory_and_is_validated() {
+        let id = leviculum_std::api::generate_identity();
+        let pk = id.public_key_bytes();
+        let dest = dest_from_pub_tag(&pk, T13_TAG);
+        let h = reality_carrier::RealityHint { port: 443, sni: "cover.example.org".into(), key: [5; 32], sid: [6; 8] };
+        let row = with_rl(serde_json::json!({"d": hex(&dest), "k": hex(&pk), "e": "", "a": ["203.0.113.7:47001"], "n": "x"}), Some(&h));
+        assert_eq!(row["rl"]["p"], 443);
+        let parsed = parse_dir(&serde_json::json!({"n": [row.clone()]}).to_string().into_bytes(), T13_TAG);
+        assert_eq!(parsed[0].rl.as_ref(), Some(&h));
+        // без подсказки поле не добавляется; кривая подсказка отбрасывается, запись с адресами остаётся
+        assert!(with_rl(serde_json::json!({"a": []}), None).get("rl").is_none());
+        let mut bad = row;
+        bad["rl"]["k"] = serde_json::json!("00");
+        let parsed = parse_dir(&serde_json::json!({"n": [bad]}).to_string().into_bytes(), T13_TAG);
+        assert!(parsed.len() == 1 && parsed[0].rl.is_none());
+    }
+
+    #[test]
+    fn reality_hint_in_addrs_own_replaces_third_party_only_fills() {
+        let (h1, h2) = (reality_carrier::RealityHint { port: 443, sni: "a.example.org".into(), key: [1; 32], sid: [1; 8] }, reality_carrier::RealityHint { port: 8443, sni: "b.example.org".into(), key: [2; 32], sid: [2; 8] });
+        let a = Addrs::new(vec!["203.0.113.7:47001".into()]);
+        let e0 = a.epoch();
+        a.rl_fill(&Some(h1.clone()));
+        assert_eq!(a.rl(), Some(h1.clone()));
+        assert!(a.epoch() > e0, "новая подсказка будит диалер");
+        a.rl_fill(&Some(h2.clone()));
+        assert_eq!(a.rl(), Some(h1.clone()), "третье лицо не затирает");
+        assert!(a.set_rl(Some(h2.clone())) && a.rl() == Some(h2));
+        assert!(!a.set_rl(a.rl()), "без изменений диалер не будится");
+        assert!(a.set_rl(None) && a.rl().is_none(), "узел отключил REALITY");
+    }
+
+    #[test]
     fn dest_from_pub_tag_matches_ancillary_dst() {
         let id = leviculum_std::api::generate_identity();
         let pk = id.public_key_bytes();
@@ -1303,6 +1357,10 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
     let mut eb = Endpoint::builder(presets::Minimal).secret_key(key).alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled);
     if mesh_inst.enabled() {
         eb = eb.add_custom_transport(mesh_inst.transport()).path_selector(Arc::new(mesh::MeshBackupSelector));
+    }
+    // REALITY - последний уровень запасного пути (reality_carrier.rs). KNOTHOP_REALITY=0: транспорт на endpoint не ставится, дозвона и сервера нет
+    if std::env::var("KNOTHOP_REALITY").map(|v| v.trim() != "0").unwrap_or(true) {
+        eb = eb.add_custom_transport(reality_carrier::install().transport());
     }
     if !relays.is_empty() {
         // relay нужен для сигнализации hole punching и QAD; сертификат принимается только от ключа доверенной ноды (relay.rs)
@@ -1450,18 +1508,32 @@ pub struct CarrierCtl {
     pub silence: Mutex<Option<Instant>>,
     /// когда в последний раз тишина по QUIC совпала со сбоем TCP-дозвона (общий сбой пути, а не блокировка носителя)
     pub joint_fail: Mutex<Option<Instant>>,
+    /// растёт, когда у пира появляется носитель после перерыва без носителя ("none" -> quic/tcp/reality): отступ выхода после неудачных попыток Link на это время
+    /// не нужен (клиент сбрасывает его в `client_supervisor`)
+    pub up_epoch: std::sync::atomic::AtomicU32,
 }
 
 impl CarrierCtl {
     fn new() -> Arc<Self> {
-        Arc::new(Self { prefer_tcp: AtomicBool::new(false), mode: Mutex::new("none"), dead: AtomicBool::new(false), switches: Default::default(), generation: Default::default(), fails: Default::default(), rtt_us: Default::default(), label: Mutex::new(String::new()), peer: Mutex::new(String::new()), silence: Mutex::new(None), joint_fail: Mutex::new(None) })
+        Arc::new(Self { prefer_tcp: AtomicBool::new(false), mode: Mutex::new("none"), dead: AtomicBool::new(false), switches: Default::default(), generation: Default::default(), fails: Default::default(), rtt_us: Default::default(), label: Mutex::new(String::new()), peer: Mutex::new(String::new()), silence: Mutex::new(None), joint_fail: Mutex::new(None), up_epoch: Default::default() })
     }
     fn set_mode(&self, m: &'static str) {
         // `generation` тут не растёт: смена носителя интерфейс пира (`mux.rs`) не пересоздаёт и Link не рвёт; растёт `Dialer::mux_for`
-        *self.mode.lock().unwrap() = m;
+        let prev = std::mem::replace(&mut *self.mode.lock().unwrap(), m);
+        if prev == "none" && m != "none" {
+            self.up_epoch.fetch_add(1, Relaxed);
+        }
     }
     fn is_quic(&self) -> bool {
         *self.mode.lock().unwrap() == "quic"
+    }
+    /// Название носителя для журнала и статуса.
+    fn mode_label(&self) -> &'static str {
+        match *self.mode.lock().unwrap() {
+            "quic" => "QUIC",
+            "reality" => "REALITY",
+            _ => "TCP",
+        }
     }
 }
 
@@ -1500,6 +1572,13 @@ fn settle_quic_health(health: &health::Health, peer: &str, up: Duration) -> bool
         health.ok(peer, health::Kind::Quic);
     }
     proven
+}
+
+/// Долго жившего Link закрыл сам RNS (Stale и др.): новый Link поднимается сразу, без отступа выхода (см. `client_supervisor`). Короткоживущий - нет.
+const SOFT_CLOSE_MIN_LIFE: Duration = Duration::from_secs(30);
+
+fn is_soft_link_close(reason: &str, lived: Duration) -> bool {
+    reason.starts_with("link закрыт") && lived >= SOFT_CLOSE_MIN_LIFE
 }
 
 /// Смена носителя этого пира после создания Link (в том числе нами: дозвон сам снял TCP по `back_off`, или QUIC пересоединён после рестарта пира).
@@ -2019,11 +2098,38 @@ struct Addrs {
     changed: tokio::sync::Notify,
     /// растёт при смене адресов и свежем анонсе: диалер по нему снимает статус «мёртв»
     epoch: std::sync::atomic::AtomicU64,
+    /// подсказка REALITY (`rl`): последний уровень запасного пути; хоста не несёт - берутся адреса из `v`
+    rl: Mutex<Option<reality_carrier::RealityHint>>,
 }
 
 impl Addrs {
     fn new(v: Vec<String>) -> Arc<Self> {
-        Arc::new(Self { v: Mutex::new(v), changed: Default::default(), epoch: Default::default() })
+        Arc::new(Self { v: Mutex::new(v), changed: Default::default(), epoch: Default::default(), rl: Mutex::new(None) })
+    }
+    fn new_rl(v: Vec<String>, rl: Option<reality_carrier::RealityHint>) -> Arc<Self> {
+        let a = Self::new(v);
+        *a.rl.lock().unwrap() = rl;
+        a
+    }
+    fn rl(&self) -> Option<reality_carrier::RealityHint> {
+        self.rl.lock().unwrap().clone()
+    }
+    /// Заменить подсказку REALITY; true - изменилась (диалер просыпается: возможно, она открывает единственный путь).
+    fn set_rl(&self, h: Option<reality_carrier::RealityHint>) -> bool {
+        let mut cur = self.rl.lock().unwrap();
+        if *cur == h {
+            return false;
+        }
+        *cur = h;
+        drop(cur);
+        self.wake();
+        true
+    }
+    /// Подсказка из третьих рук: только если своей ещё нет.
+    fn rl_fill(&self, h: &Option<reality_carrier::RealityHint>) {
+        if h.is_some() && self.rl.lock().unwrap().is_none() {
+            self.set_rl(h.clone());
+        }
     }
     /// Пир объявился сам (свежий анонс): разбудить диалер, даже если адреса прежние.
     fn wake(&self) {
@@ -2181,6 +2287,10 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
         let quic_bad = sh.health.is_bad(peer, health::Kind::Quic);
         let tcp_bad = sh.health.is_bad(peer, health::Kind::Tcp);
         if let Some(rem) = sh.health.blocked_for(peer) {
+            // последний уровень: REALITY (TCP на 443, снаружи обычный TLS к сайту). Удачный набор = сессия, по её окончании снова с начала
+            if d.try_reality(&mut st, &mut live).await {
+                continue;
+            }
             // оба носителя проверены и не работают: прямой интерфейс не поднимаем, путь к пиру найдёт RNS через другие узлы; позже проверим снова
             if !announced_block {
                 announced_block = true;
@@ -2244,6 +2354,13 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                     }
                     ctl.set_mode("quic");
                     d.session(&mut st, Cur::Quic(conn), m).await;
+                    if std::mem::take(&mut st.quic_timed_out) && !relay_only && !tcp_bad && !ctl.prefer_tcp.load(Relaxed) {
+                        // QUIC молчал до таймаута простоя: Link ещё держится на интерфейсе пира, а повторы QUIC (до 12 с) съедают окно stale. «Лучше в обход, чем
+                        // разрыв»: TCP сразу; QUIC не объявляется неработающим (это мог быть и handover) - вернёмся зондом через `back_off`.
+                        sh.note(format!("{label}: QUIC закрылся по таймауту простоя, подключаю TCP сразу"));
+                        ctl.prefer_tcp.store(true, Relaxed);
+                        ctl.switches.fetch_add(1, Relaxed);
+                    }
                 }
                 _ if relay_only => {
                     sh.note(format!("{label}: через relay не соединилось, повторю"));
@@ -2298,6 +2415,9 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                     d.tcp_blackholed(&mut st);
                     ctl.prefer_tcp.store(false, Relaxed);
                     st.tcp_since = None;
+                    if d.try_reality(&mut st, &mut live).await {
+                        continue;
+                    }
                 }
                 tcpc::Dial::Unreachable => {
                     // хост не отвечает: это не признак блокировки, ничего не запоминаем (в том числе подозрение на тишину по QUIC: сети нет)
@@ -2308,6 +2428,9 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                         // TCP тоже не идёт: не застреваем, пробуем QUIC
                         ctl.prefer_tcp.store(false, Relaxed);
                         tcp_fail = 0;
+                    }
+                    if d.try_reality(&mut st, &mut live).await {
+                        continue;
                     }
                     let p = live.missed(sh, ctl, label);
                     d.book.pause(p).await;
@@ -2327,14 +2450,13 @@ enum Cur {
 }
 
 impl Cur {
-    /// Ждать, пока носитель не закончится сам.
-    async fn ended(&mut self) {
+    /// Ждать, пока носитель не закончится сам. true - QUIC закрылся по таймауту простоя (пир молчит: UDP режется или сети нет), а не по воле одной из сторон.
+    async fn ended(&mut self) -> bool {
         match self {
-            Cur::Quic(c) => {
-                let _ = c.closed().await;
-            }
+            Cur::Quic(c) => matches!(c.closed().await, iroh::endpoint::ConnectionError::TimedOut),
             Cur::Tcp { done, .. } => {
                 let _ = done.await;
+                false
             }
         }
     }
@@ -2362,6 +2484,11 @@ struct DialState {
     quic_suspect: bool,
     /// подряд TCP-сессий, закрытых за секунды после подключения
     short_tcp: u32,
+    /// последний QUIC закрылся по таймауту простоя: следующий набор идёт сразу на TCP, не тратя 2 x 6 с на повторы QUIC (интерфейс пира живёт `mux::GRACE`)
+    quic_timed_out: bool,
+    /// REALITY: подряд неудач набора и не раньше какого момента пробовать снова (в памяти, как и всё о носителях клиента)
+    rl_fail: u32,
+    rl_next: Option<Instant>,
 }
 
 struct Dialer {
@@ -2419,6 +2546,123 @@ impl Dialer {
         }
     }
 
+    /// Последний уровень запасного пути: туннель REALITY до порта подсказки `rl` (тот же хост, что у QUIC/TCP) и обычный QUIC iroh поверх него.
+    /// Доверия не выводится: ключ пира берёт TLS этого QUIC (`ep.connect(self.id)`), допуск - как у любого QUIC-носителя. true - носитель держался и закончился.
+    async fn try_reality(&self, st: &mut DialState, live: &mut Liveness) -> bool {
+        let (sh, ctl, label) = (&self.sh, &self.ctl, self.label.as_str());
+        let Some(rc) = reality_carrier::global() else { return false };
+        let Some(hint) = self.book.rl() else { return false };
+        if st.rl_next.is_some_and(|t| Instant::now() < t) {
+            return false;
+        }
+        // адреса те же, что для QUIC/TCP, и прошли тот же фильтр (глобальные, кроме KNOTHOP_ALLOW_PRIVATE_DIAL); подсказка хоста не несёт
+        let resolved = resolve_addrs(&self.book.get()).await;
+        if resolved.is_empty() {
+            return false;
+        }
+        let fail = |st: &mut DialState| {
+            st.rl_fail = st.rl_fail.saturating_add(1);
+            st.rl_next = Some(Instant::now() + Duration::from_secs((15u64 << (st.rl_fail - 1).min(5)).min(300)));
+        };
+        let mut tun = match rc.dial(&resolved, &hint).await {
+            reality_carrier::Dial::Up(t) => {
+                live.reached(sh, ctl, label);
+                t
+            }
+            reality_carrier::Dial::Unreachable => {
+                fail(st);
+                return false;
+            }
+            reality_carrier::Dial::Rejected(why) => {
+                // TCP соединился: хост жив, туннель не принят (подмена, нет доверия к ключу, перегрузка)
+                live.reached(sh, ctl, label);
+                sh.note(format!("{label}: REALITY: туннель не поднят ({why})"));
+                fail(st);
+                return false;
+            }
+        };
+        let addr = EndpointAddr::from_parts(self.id, [iroh::TransportAddr::Custom(tun.addr())]);
+        let conn = match tokio::time::timeout(Duration::from_secs(12), self.ep.connect(addr, ALPN)).await {
+            Ok(Ok(c)) => c,
+            _ => {
+                tun.close();
+                sh.note(format!("{label}: REALITY: туннель есть, QUIC поверх него не соединился"));
+                fail(st);
+                return false;
+            }
+        };
+        let Some(m) = self.mux_for(st) else {
+            conn.close(0u32.into(), b"no interface");
+            tun.close();
+            return false;
+        };
+        if m.add_quic(conn.clone(), true, *conn.remote_id().as_bytes()).is_none() {
+            conn.close(0u32.into(), b"too many carriers");
+            tun.close();
+            return false;
+        }
+        st.rl_fail = 0;
+        st.rl_next = None;
+        ctl.set_mode("reality");
+        sh.note(format!("reality connected to {label} (носитель REALITY, возврат на QUIC через {} с)", st.back_off));
+        let t0 = Instant::now();
+        self.reality_session(st, conn, &mut tun, m).await;
+        tun.close();
+        if t0.elapsed() < Duration::from_secs(15) {
+            // туннель рвётся сразу после подключения: пауза растёт, как у коротких TCP-сессий
+            fail(st);
+        }
+        true
+    }
+
+    /// Сессия на туннеле REALITY: ждём конца носителя; по `back_off` пробуем вернуться на прямой QUIC (зонд `qprobe` в `try_return`), как с TCP.
+    async fn reality_session(&self, st: &mut DialState, conn: Connection, tun: &mut reality_carrier::TunnelHandle, m: Arc<mux::Mux>) {
+        let (sh, ctl, label) = (&self.sh, &self.ctl, self.label.as_str());
+        let mut next_return = Instant::now() + Duration::from_secs(st.back_off);
+        loop {
+            tokio::select! {
+                _ = conn.closed() => break,
+                _ = tun.closed() => {
+                    // туннель умер раньше, чем QUIC заметил: не ждём таймаута
+                    conn.close(0u32.into(), b"reality tunnel closed");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+            if !self.alive.load(Relaxed) || m.is_closed() {
+                conn.close(0u32.into(), b"switch carrier");
+                break;
+            }
+            if let Some(p) = conn.paths().iter().find(|p| p.is_selected()) {
+                ctl.rtt_us.store(p.rtt().as_micros().min(u32::MAX as u128) as u32, Relaxed);
+            }
+            if Instant::now() < next_return || sh.health.is_bad(&self.peer, health::Kind::Quic) {
+                continue;
+            }
+            match self.try_return(&m).await {
+                Ok(c2) => {
+                    ctl.set_mode("quic");
+                    ctl.prefer_tcp.store(false, Relaxed);
+                    conn.close(0u32.into(), b"switch carrier");
+                    tun.close();
+                    st.back_off = st.first_back;
+                    sh.note(format!("{label}: возврат с REALITY на QUIC без разрыва Link"));
+                    self.session(st, Cur::Quic(c2), m).await;
+                    return;
+                }
+                Err(grow) => {
+                    if grow {
+                        st.back_off = grown_back_off(st.back_off);
+                    }
+                    next_return = Instant::now() + Duration::from_secs(st.back_off);
+                }
+            }
+        }
+        ctl.set_mode("none");
+        ctl.rtt_us.store(0, Relaxed);
+        sh.note(format!("reality to {label} ended"));
+    }
+
     /// Подключить TCP-поток носителем и дождаться, пока интерфейс его примет (только после этого прежний носитель можно закрывать).
     async fn start_tcp(&self, m: &Arc<mux::Mux>, stream: tokio::net::TcpStream) -> Option<Cur> {
         let _ = stream.set_nodelay(true);
@@ -2444,7 +2688,10 @@ impl Dialer {
         let mut proven = false;
         loop {
             tokio::select! {
-                _ = cur.ended() => break,
+                timed_out = cur.ended() => {
+                    st.quic_timed_out = timed_out;
+                    break;
+                }
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
             if !self.alive.load(Relaxed) || m.is_closed() {
@@ -2590,6 +2837,20 @@ impl Dialer {
                 return Err(true);
             }
         };
+        // iroh помнит custom-адрес пира: пока у пира открыт туннель REALITY, новое соединение может открыться ПО НЕМУ - это не возврат на UDP, и закрыть
+        // потом «старый» носитель значит убить собственный путь. IP-пути даём до 2 с, чтобы стать выбранным.
+        if reality_carrier::global().is_some() && reality_carrier::selected_is_reality(&conn) {
+            for _ in 0..8 {
+                if !reality_carrier::selected_is_reality(&conn) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if reality_carrier::selected_is_reality(&conn) {
+                conn.close(0u32.into(), b"still on reality");
+                return Err(true);
+            }
+        }
         let nonce = rand_core::OsRng.next_u64();
         match qprobe::request_grant(&conn, nonce).await {
             Ok(()) => {}
@@ -2952,6 +3213,8 @@ struct NodeCtx {
     my_dest: [u8; 16],
     my_key: [u8; 32],
     ep_id: String,
+    /// подсказка REALITY этого узла (`--reality-listen`): публикуется рядом с адресами в приватном каталоге
+    rl_pub: Option<reality_carrier::RealityHint>,
     /// объявляемые адреса (без явного advertise меняются вслед за интерфейсами: см. adv_auto)
     advertise: Mutex<Vec<String>>,
     /// адреса взяты с интерфейсов (нет явного advertise): (частные разрешены, свой туннель) для перепроверки раз в 60 с; None - адрес задан явно
@@ -3084,7 +3347,7 @@ impl NodeCtx {
         let now = Instant::now();
         let nb: Vec<String> = self.neigh.lock().unwrap().values().map(|n| {
             let st = if n.link.is_some() {
-                format!("up {} rtt {} смен {}", if n.ctl.is_quic() { "QUIC" } else { "TCP" },
+                format!("up {} rtt {} смен {}", n.ctl.mode_label(),
                     n.rtt_ms.map(|r| format!("{r:.0}")).unwrap_or_else(|| "?".into()), n.ctl.switches.load(Relaxed))
             } else {
                 format!("seen {} с назад", now.duration_since(n.last_announce).as_secs())
@@ -3341,6 +3604,11 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         a.iroh_relay = c.iroh_relay;
         a.relay_quic_port = c.relay_quic_port.unwrap_or(a.relay_quic_port);
         if !c.relay_urls.is_empty() { a.relay_url = c.relay_urls.join(","); }
+        a.reality_listen = c.reality_listen.or(a.reality_listen.clone());
+        a.reality_dest = c.reality_dest.or(a.reality_dest.clone());
+        if !c.reality_sni.is_empty() { a.reality_sni = c.reality_sni.join(","); }
+        if !c.reality_proxy_trusted.is_empty() { a.reality_proxy_trusted = c.reality_proxy_trusted.join(","); }
+        a.reality_public_port = c.reality_public_port.or(a.reality_public_port);
     }
     let _ = CLIENT_NET.set(parse_net(&a.client_net)?);
     // Имя узла: --name / config, иначе state/node-name.txt (его же задаёт телефон в настройках), иначе имя хоста. Одна нормализация на все пути.
@@ -3367,6 +3635,19 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     let exit_args = ["--tun-mtu", "1327", "--tun-ip", "10.99.0.1/24", "--tun-txqlen", "10240", "--tun-qdisc", "fq_codel", "--tun-name", a.tun_name.as_str()];
     let b = start_base("n", &a.state, true, Some(a.port), key, Some(identity.clone()), a.quic_cc_mbit, if a.no_exit { &[] } else { &exit_args[..] }, None, &parse_relay_urls(&a.relay_url)).await?;
     let (node, sh, ep, cli, events, admin_lxmf) = (b.node.clone(), b.sh.clone(), b.ep.clone(), b.cli.clone(), b.events, b.admin_lxmf);
+    // REALITY-сервер (по умолчанию выключен). Неверный конфиг - ошибка запуска, а не молчаливое отключение. Доверие из REALITY не выводится: туннель несёт обычный QUIC
+    let rl_pub = match (&a.reality_listen, reality_carrier::global()) {
+        (Some(listen), Some(rc)) => {
+            let Some(dest) = a.reality_dest.as_deref() else { bail!("--reality-listen требует --reality-dest") };
+            let split = |s: &str| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect::<Vec<_>>();
+            let conf = reality_carrier::ServerConf::parse(listen, dest, &split(&a.reality_sni), &split(&a.reality_proxy_trusted), a.reality_public_port)?;
+            let shn = sh.clone();
+            let (hint, _) = rc.start_server(&conf, &a.state, Arc::new(move |m| shn.note(m))).await?;
+            Some(hint)
+        }
+        (Some(_), None) => bail!("--reality-listen при KNOTHOP_REALITY=0"),
+        _ => None,
+    };
 
     // тег назначения един для всей сети: нода находит соседей по тегам корней в анонсе
     let tag = T13_TAG.to_string();
@@ -3436,7 +3717,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     sh.health.init(a.state.join("carrier_health.json"));
     let ctx = Arc::new(NodeCtx {
         node: node.clone(), sh: sh.clone(), ep: ep.clone(), state: a.state.clone(), name: a.name.clone(), tag: tag.clone(),
-        identity: node_identity, my_pk, my_id, my_dest, my_key, ep_id: ep.id().to_string(), advertise: Mutex::new(advertise), adv_auto,
+        identity: node_identity, my_pk, my_id, my_dest, my_key, ep_id: ep.id().to_string(), rl_pub, advertise: Mutex::new(advertise), adv_auto,
         announce_s: a.announce_s, dead: Duration::from_secs(a.dead_s), path_gate: path::PathGate::default(), client_info: Mutex::new(HashMap::new()), peer_clients: Mutex::new(HashMap::new()),
         links: Mutex::new(HashMap::new()), neigh: Mutex::new(HashMap::new()),
         tun, started: Instant::now(),
@@ -3933,6 +4214,16 @@ fn old_dest13(pk: &[u8; 64]) -> [u8; 16] {
 }
 
 /// Адреса выходов хранятся по хешу назначения; после смены имени (ADR 0016) старые ключи перекладываем на новые по известным ключам нод.
+/// `hints-rl.json`: подсказки REALITY, прошедшие тот же разбор, что и из каталога (файл недоверенный, не больше 64 КБ и 64 записей).
+fn load_rl_hints(state: &Path) -> HashMap<String, reality_carrier::RealityHint> {
+    let Ok(b) = std::fs::read(state.join("hints-rl.json")) else { return HashMap::new() };
+    if b.len() > 64 * 1024 {
+        return HashMap::new();
+    }
+    let Ok(m) = serde_json::from_slice::<HashMap<String, serde_json::Value>>(&b) else { return HashMap::new() };
+    m.into_iter().filter(|(k, _)| k.len() == 32).filter_map(|(k, v)| reality_carrier::RealityHint::from_json(&v).map(|h| (k, h))).take(64).collect()
+}
+
 fn migrate_hints(hints: &mut HashMap<String, Vec<String>>, pks: impl Iterator<Item = [u8; 64]>) {
     for pk in pks {
         let (old, new) = (hex(&old_dest13(&pk)), hex(&dest_from_pub_tag(&pk, T13_TAG)));
@@ -5169,12 +5460,12 @@ impl NodeCtx {
             let mut list = vec![];
             let mine = self.adv();
             if !mine.is_empty() {
-                list.push(serde_json::json!({"d":hex(&self.my_dest),"k":hex(&self.my_pk),"e":self.ep_id,"a":mine,"n":self.name}));
+                list.push(with_rl(serde_json::json!({"d":hex(&self.my_dest),"k":hex(&self.my_pk),"e":self.ep_id,"a":mine,"n":self.name}), self.rl_pub.as_ref()));
             }
             let n = self.neigh.lock().unwrap();
             list.extend(n.values().filter(|nb| !nb.addrs.is_empty() && directory_node_visible(&tr, &roots, &nb.pk))
-                .take(DIR_MAX - list.len()).map(|nb| serde_json::json!({"d":hex(&nb.dest),"k":hex(&nb.pk),"e":nb.ep,
-                    "a":nb.addrs.get().into_iter().take(3).collect::<Vec<_>>(),"n":nb.name})));
+                .take(DIR_MAX - list.len()).map(|nb| with_rl(serde_json::json!({"d":hex(&nb.dest),"k":hex(&nb.pk),"e":nb.ep,
+                    "a":nb.addrs.get().into_iter().take(3).collect::<Vec<_>>(),"n":nb.name}), nb.addrs.rl().as_ref())));
             (list, tr.records_visible_to(&pk), roots)
         };
         let me = Arc::downgrade(self);
@@ -5231,14 +5522,14 @@ impl NodeCtx {
             let mut v: Vec<serde_json::Value> = Vec::new();
             let mine = self.adv();
             if !mine.is_empty() {
-                v.push(serde_json::json!({"d": hex(&self.my_dest), "k": hex(&self.my_pk), "e": self.ep_id, "a": mine, "n": self.name}));
+                v.push(with_rl(serde_json::json!({"d": hex(&self.my_dest), "k": hex(&self.my_pk), "e": self.ep_id, "a": mine, "n": self.name}), self.rl_pub.as_ref()));
             }
             v.extend(n.values()
                 .filter(|nb| !nb.addrs.is_empty() && tr.effective(&nb.pk, now_ms() as u64) & trust::TRANSIT != 0)
                 .take(DIR_MAX - v.len())
                 .map(|nb| {
                     let a: Vec<String> = nb.addrs.get().into_iter().take(3).collect();
-                    serde_json::json!({"d": hex(&nb.dest), "k": hex(&nb.pk), "e": nb.ep, "a": a, "n": nb.name})
+                    with_rl(serde_json::json!({"d": hex(&nb.dest), "k": hex(&nb.pk), "e": nb.ep, "a": a, "n": nb.name}), nb.addrs.rl().as_ref())
                 }));
             v
         };
@@ -5462,7 +5753,7 @@ impl NodeCtx {
             let n = self.neigh.lock().unwrap();
             n.values()
                 .filter(|nb| !nb.addrs.is_empty() && (tr.rights(&nb.pk) != 0 || trust::hash_of(&nb.pk).map(|h| tr.has_anchor(&h)).unwrap_or(false)))
-                .map(|nb| serde_json::json!({"d": hex(&nb.dest), "k": hex(&nb.pk), "e": nb.ep, "a": nb.addrs.get().into_iter().take(3).collect::<Vec<_>>(), "n": nb.name}))
+                .map(|nb| with_rl(serde_json::json!({"d": hex(&nb.dest), "k": hex(&nb.pk), "e": nb.ep, "a": nb.addrs.get().into_iter().take(3).collect::<Vec<_>>(), "n": nb.name}), nb.addrs.rl().as_ref()))
                 .collect()
         };
         list.sort_by_key(|v| v["d"].as_str().unwrap_or("").to_string());
@@ -5488,7 +5779,7 @@ impl NodeCtx {
                 continue;
             }
             let key: [u8; 32] = e.pk[32..64].try_into().unwrap();
-            n.insert(e.dest, Neighbor { dest: e.dest, key, pk: e.pk, name: e.name, ep: e.ep, addrs: Addrs::new(e.addrs), tags: vec![], accepts_links: true, last_announce: Instant::now(),
+            n.insert(e.dest, Neighbor { dest: e.dest, key, pk: e.pk, name: e.name, ep: e.ep, addrs: Addrs::new_rl(e.addrs, e.rl), tags: vec![], accepts_links: true, last_announce: Instant::now(),
                 link: None, last_heard: Instant::now() - Duration::from_secs(3600), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(),
                 last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0 });
         }
@@ -5677,6 +5968,14 @@ fn neighbor_room(entries: &[([u8; 16], bool, Instant)], new_protected: bool) -> 
     oldest.map(NeighborRoom::Evict).unwrap_or(NeighborRoom::Full)
 }
 
+/// Добавить к записи каталога подсказку REALITY (`rl`), если она есть. Подсказка едет только там, где едут адреса (приватный каталог/книга), в анонс RNS не попадает.
+fn with_rl(mut v: serde_json::Value, rl: Option<&reality_carrier::RealityHint>) -> serde_json::Value {
+    if let (Some(h), Some(o)) = (rl, v.as_object_mut()) {
+        o.insert("rl".into(), h.to_json());
+    }
+    v
+}
+
 /// Запись каталога: подсказка адреса (недоверенная). Допуск - только по записям о правах.
 struct DirEnt {
     dest: [u8; 16],
@@ -5684,6 +5983,8 @@ struct DirEnt {
     ep: String,
     addrs: Vec<String>,
     name: String,
+    /// подсказка REALITY узла (поле `rl`); недоверенная, как и адреса
+    rl: Option<reality_carrier::RealityHint>,
 }
 
 /// Разбор каталога: не более DIR_MAX записей; dest обязан совпасть с ключом (тег `tag`); без адресов запись бесполезна.
@@ -5711,7 +6012,8 @@ fn parse_dir_values(arr: &[serde_json::Value], tag: &str, max: usize) -> Vec<Dir
         }
         let ep = x["e"].as_str().filter(|s| s.len() <= 64).unwrap_or("").to_string();
         let name: String = x["n"].as_str().unwrap_or("?").chars().take(32).collect();
-        out.push(DirEnt { dest, pk, ep, addrs, name });
+        let rl = reality_carrier::RealityHint::from_json(&x["rl"]);
+        out.push(DirEnt { dest, pk, ep, addrs, name, rl });
     }
     out
 }
@@ -5773,6 +6075,8 @@ fn on_dir_node(ctx: &Arc<NodeCtx>, sender: trust::Pk, dir: &[serde_json::Value])
                 if nb.addrs.is_empty() || own {
                     nb.addrs.set(e.addrs);
                 }
+                // подсказка REALITY от самого узла главнее прежней (в том числе отключение); о третьих лицах - только если своей нет
+                if own { nb.addrs.set_rl(e.rl.clone()); } else { nb.addrs.rl_fill(&e.rl) }
                 if (own || nb.name == "?") && e.name != "?" {
                     nb.name = e.name;
                 }
@@ -5790,7 +6094,7 @@ fn on_dir_node(ctx: &Arc<NodeCtx>, sender: trust::Pk, dir: &[serde_json::Value])
         let mut n = ctx.neigh.lock().unwrap();
         let key: [u8; 32] = e.pk[32..64].try_into().unwrap();
         // соседство решают записи (neighbor_policy/evaluate), не этот каталог; tags пусты до анонса; срок забывания - от now
-        n.insert(e.dest, Neighbor { dest: e.dest, key, pk: e.pk, name: e.name, ep: e.ep, addrs: Addrs::new(e.addrs), tags: vec![], accepts_links: true, last_announce: Instant::now(),
+        n.insert(e.dest, Neighbor { dest: e.dest, key, pk: e.pk, name: e.name, ep: e.ep, addrs: Addrs::new_rl(e.addrs, e.rl), tags: vec![], accepts_links: true, last_announce: Instant::now(),
             link: None, last_heard: Instant::now() - Duration::from_secs(3600), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(),
             last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0 });
     }
@@ -6113,7 +6417,7 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
                     if path::link_timed_out(now, heard.get(&l).copied(), ctx.dead) {
                         let silent = heard.get(&l).map(|t| now.duration_since(*t).as_millis()).unwrap_or(0);
                         let detail = format!("тишина {silent} мс, носитель {}, смен носителя {}, потери пингов {}, rtt {}, допущен {} с назад",
-                            if nb.ctl.is_quic() { "QUIC" } else { "TCP" }, nb.ctl.switches.load(Relaxed),
+                            nb.ctl.mode_label(), nb.ctl.switches.load(Relaxed),
                             nb.qmon.loss().or_else(|| nb.loss.loss(None, Duration::from_secs(10), 1)).map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "?".into()),
                             nb.rtt_ms.map(|r| format!("{r:.0} мс")).unwrap_or_else(|| "?".into()), nb.admitted_at.elapsed().as_secs());
                         to_close.push((l, nb.name.clone(), detail));
@@ -6936,6 +7240,8 @@ struct C13 {
     /// последние известные адреса выходов (dest -> `host:порт`), `hints.json` в state. После зачисления приглашение игнорируется,
     /// а публичная RNS адрес может и не объявлять: без этого кэша клиент после перезапуска не нашёл бы ни одного выхода. Это подсказки, не доверие.
     hints: Mutex<HashMap<String, Vec<String>>>,
+    /// подсказки REALITY выходов (dest -> `rl`), `hints-rl.json` в state: нужны, когда UDP и TCP к выходу уже закрыты, а каталог не пришлёт новых
+    rl_hints: Mutex<HashMap<String, reality_carrier::RealityHint>>,
     /// админ-режим: ноды, к которым мы звонили для зачисления (Link -> ожидаемый ключ), и Link, где зачисление завершено
     enrollees: Mutex<HashMap<LinkId, [u8; 64]>>,
     /// админ-режим: приглашённые пользователи, получившие запись через посредника (hex хеша -> когда); для показа в приложении
@@ -7111,6 +7417,30 @@ impl ClientCtx {
         }
         if let Ok(b) = serde_json::to_vec(&*h) {
             write_atomic(&self.state.join("hints.json"), &b);
+        }
+    }
+
+    /// Запомнить подсказку REALITY выхода (`own` - пришла от самого узла: заменяет и стирает; иначе только если своей нет).
+    fn remember_rl(&self, dest: &[u8; 16], rl: &Option<reality_carrier::RealityHint>, own: bool) {
+        let Some(c) = &self.c13 else { return };
+        let k = hex(dest);
+        let mut h = c.rl_hints.lock().unwrap();
+        match rl {
+            Some(v) if own || !h.contains_key(&k) => {
+                if h.get(&k) == Some(v) {
+                    return;
+                }
+                if h.len() >= 64 && !h.contains_key(&k) {
+                    return;
+                }
+                h.insert(k, v.clone());
+            }
+            None if own && h.remove(&k).is_some() => {}
+            _ => return,
+        }
+        let m: HashMap<&String, serde_json::Value> = h.iter().map(|(k, v)| (k, v.to_json())).collect();
+        if let Ok(b) = serde_json::to_vec(&m) {
+            write_atomic(&self.state.join("hints-rl.json"), &b);
         }
     }
 
@@ -7371,6 +7701,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
     let mut hints: HashMap<String, Vec<String>> = std::fs::read(a.state.join("hints.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     migrate_hints(&mut hints, tr.holders_with(trust::USE | trust::TRANSIT | trust::EXIT).into_iter().chain(tr.anchors().into_iter().map(|(_, pk)| pk)));
     let c13 = Some(C13 { trust: Arc::new(Mutex::new(tr)), invite: Mutex::new(inv), rejected: Mutex::new(None), peers: Mutex::new(HashMap::new()), hints: Mutex::new(hints),
+        rl_hints: Mutex::new(load_rl_hints(&a.state)),
         enrollees: Mutex::new(HashMap::new()),
         users: Mutex::new(Vec::new()) });
     if let Some(c) = &c13 { let _ = RELAY_TRUST.set(c.trust.clone()); }
@@ -7959,6 +8290,10 @@ fn on_dir_client(ctx: &Arc<ClientCtx>, sender: trust::Pk, dir: &[serde_json::Val
         if set_book {
             ctx.book_for(&e.dest).set(e.addrs.clone());
         }
+        let own = sender == e.pk;
+        ctx.remember_rl(&e.dest, &e.rl, own);
+        let book = ctx.book_for(&e.dest);
+        if own { book.set_rl(e.rl.clone()); } else { book.rl_fill(&e.rl); }
     }
     ctx.refresh_servers13();
     start_dialers(ctx);
@@ -7975,6 +8310,9 @@ fn start_dialer(ctx: &Arc<ClientCtx>, s: &CServer) {
     let book = ctx.book_for(&s.dest);
     if !s.addrs.is_empty() {
         book.set(s.addrs.clone());
+    }
+    if let Some(h) = ctx.c13.as_ref().and_then(|c| c.rl_hints.lock().unwrap().get(&hex(&s.dest)).cloned()) {
+        book.rl_fill(&Some(h));
     }
     let (Ok(id), false) = (s.ep.parse::<EndpointId>(), book.is_empty()) else { return };
     let alive = Arc::new(AtomicBool::new(true));
@@ -8787,6 +9125,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
     let fin = ctx.state.join("fin");
     let sel_file = ctx.state.join("select");
     let mut banned = path::ExitBackoff::default();
+    let mut seen_up: HashMap<[u8; 16], u32> = HashMap::new();
     let mut avoid: HashMap<[u8; 16], usize> = HashMap::new();
     // Рабочий запасной Link живёт и во время проверки выбранного выхода.
     // Неудачная проба не создаёт новый Link к прежнему выходу и не считается сменой.
@@ -8813,6 +9152,16 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             }
             continue;
         }
+        // У пира снова появился носитель (после перерыва без носителя): отступ выхода, набранный за время без связи (10 -> 20 -> ... с на неудачных попытках
+        // Link), больше не отражает состояние пути - новый Link поднимаем сразу, не дожидаясь его конца.
+        for (d, cc) in ctx.carriers.lock().unwrap().iter() {
+            let e = cc.up_epoch.load(Relaxed);
+            if seen_up.insert(*d, e).is_some_and(|old| old != e) {
+                banned.succeeded(d);
+                // «Не этот интерфейс» относилось к прежнему носителю: интерфейс пира (`mux.rs`) переживает смену носителя, и после неё он единственный путь к пиру
+                avoid.remove(d);
+            }
+        }
         // выбор пользователя: "auto" или хеш выхода
         let want: Option<[u8; 16]> = std::fs::read_to_string(&sel_file).ok().and_then(|t| dest32(t.trim()));
         // выход, на котором только что сменили носитель, идёт первым
@@ -8828,7 +9177,9 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         }
         let mut connected = None;
         for c in cands {
-            if let Some(old) = active.as_ref().filter(|a| a.0.dest == c.dest && !keep_trying.get(&c.dest).map(|t| *t > Instant::now()).unwrap_or(false)) {
+            // Закрытый Link (Stale и др.) не переиспользуем: иначе внутренний цикл тут же выходит с тем же «link закрыт» и новый Link никогда не поднимается
+            // (шторм каждые 250 мс, найден lab13 realityfail --control). Закрытый - значит RNS признал пира мёртвым на этом Link: нужен новый.
+            if let Some(old) = active.as_ref().filter(|a| a.0.dest == c.dest && !ctx.sh.closed.lock().unwrap().contains_key(&hex(a.1.as_bytes())) && !keep_trying.get(&c.dest).map(|t| *t > Instant::now()).unwrap_or(false)) {
                 connected = Some(old.clone());
                 break;
             }
@@ -8883,7 +9234,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             }
         }
         if connected.is_none() {
-            connected = active.as_ref().filter(|old| want.map_or(true, |d| old.0.dest == d)).cloned();
+            connected = active.as_ref().filter(|old| want.map_or(true, |d| old.0.dest == d) && !ctx.sh.closed.lock().unwrap().contains_key(&hex(old.1.as_bytes()))).cloned();
         }
         let Some((cand, id, handle)) = connected else {
             *ctx.tun.client_link.write().unwrap() = None;
@@ -9019,7 +9370,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             if crate::debug() && last_snap.elapsed() >= Duration::from_secs(5) {
                 last_snap = Instant::now();
                 let car = ctx.carriers.lock().unwrap().get(&cand.dest).cloned();
-                let car = car.map(|c| format!("{} смен {}", if c.is_quic() { "QUIC" } else { "TCP" }, c.switches.load(Relaxed))).unwrap_or_else(|| "?".into());
+                let car = car.map(|c| format!("{} смен {}", c.mode_label(), c.switches.load(Relaxed))).unwrap_or_else(|| "?".into());
                 let rtt = ctx.rtt_ms.lock().unwrap().map(|r| format!("{r:.0} мс")).unwrap_or_else(|| "?".into());
                 let loss = if let Some(ref conn) = quic_carrier {
                     format!("QUIC lost_packets={} (за соединение)", conn.stats().lost_packets)
@@ -9115,7 +9466,15 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             keep_trying.insert(cand.dest, Instant::now() + Duration::from_secs(25));
             ctx.sh.note(format!("{}: смена носителя, остаюсь на этом выходе", cand.name));
         }
-        if !user {
+        // Долго жившего Link закрыл сам RNS (Stale): пир замолчал (смена носителя заняла дольше окна stale), а не выход «отказал». Новый Link поднимаем сразу,
+        // без отступа и без отказа от интерфейса: смена носителя идёт внутри того же интерфейса пира (`mux.rs`). Короткоживущий закрытый Link - прежняя ветка
+        // (отступ 10 с, растёт вдвое): так закрывающий сразу после допуска выход не даёт шторм.
+        let soft_close = is_soft_link_close(&reason, connected_at.elapsed());
+        if soft_close {
+            ctx.lk_fail.lock().unwrap().insert(cand.dest, (Instant::now(), reason.chars().take(80).collect()));
+            ctx.sh.note(format!("{}: Link закрыт ({reason}), поднимаю новый сразу", cand.name));
+            pending_reason = Some(reason.clone());
+        } else if !user {
             // Отказавший выход отступает независимо от работающего запасного.
             ctx.lk_fail.lock().unwrap().insert(cand.dest, (Instant::now(), reason.chars().take(80).collect()));
             banned.failed(cand.dest, Instant::now());
@@ -9148,6 +9507,28 @@ mod carrier_tests {
     #[test]
     fn silence_grace_covers_carrier_switch_and_path_discovery() {
         assert!(SILENCE_GRACE >= Duration::from_secs(25), "TCP handshake and discovery must get time to recover");
+    }
+
+    #[test]
+    fn carrier_up_epoch_grows_only_when_a_carrier_appears_after_none() {
+        let cc = CarrierCtl::new();
+        assert_eq!(cc.up_epoch.load(Relaxed), 0);
+        cc.set_mode("quic");
+        assert_eq!(cc.up_epoch.load(Relaxed), 1, "none -> quic");
+        cc.set_mode("tcp");
+        cc.set_mode("reality");
+        assert_eq!(cc.up_epoch.load(Relaxed), 1, "смена носителя без перерыва отступ не сбрасывает");
+        cc.set_mode("none");
+        cc.set_mode("tcp");
+        assert_eq!(cc.up_epoch.load(Relaxed), 2, "носитель появился после перерыва");
+    }
+
+    #[test]
+    fn closed_long_lived_link_is_reestablished_at_once_and_grace_outlives_stale() {
+        assert!(is_soft_link_close("link закрыт: Stale", Duration::from_secs(180)), "долго жившего Link поднимаем заново сразу");
+        assert!(!is_soft_link_close("link закрыт: Stale", Duration::from_secs(2)), "закрытый сразу после допуска Link - отступ, не шторм");
+        assert!(!is_soft_link_close("нет ответа 12000 мс", Duration::from_secs(180)));
+        assert!(mux::GRACE >= Duration::from_secs(55), "интерфейс пира должен пережить stale Link клиента (2 x 25 с)");
     }
 
     #[test]

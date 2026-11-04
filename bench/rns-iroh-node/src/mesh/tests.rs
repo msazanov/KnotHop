@@ -749,7 +749,7 @@ async fn second_connection_to_mesh_peer_rides_mesh_and_is_not_a_neighbor() {
     a.mesh.warm(&e.id());
     let before = a.mesh.c.tx.load(Relaxed);
     a.mesh.send_payload(&e.id(), b"x");
-    assert_eq!(a.mesh.c.tx.load(Relaxed), before + 1, "кадр уходит через T, а не в соединение к E");
+    assert_eq!(a.mesh.c.tx.load(Relaxed), before + 1, "кадр уходит через T, а не в соединение к E: {}", a.mesh.stats());
 }
 
 /// Патч iroh (`bench/vendor/iroh/PATCH.md`): при соединении с IP-адресом И mesh-адресом mesh-путь открывается тёплым запасным (Backup), IP выбран основным.
@@ -1221,4 +1221,13 @@ async fn nat_exit_behind_1to1_nat_with_ip_hint_goes_direct() {
 async fn nat_public_exit_with_ip_hint_goes_direct() {
     let r = nat_run(false, true, false).await;
     assert!(r.is_some(), "с подсказкой IP клиент остался на mesh");
+}
+
+#[test]
+fn only_mesh_custom_addr_is_mesh() {
+    // REALITY-путь (другой id custom-транспорта) не mesh: соединение по туннелю REALITY годится соседом
+    let key = [7u8; 32];
+    assert!(is_mesh_addr(&TransportAddr::Custom(addr_of(&key))));
+    assert!(!is_mesh_addr(&TransportAddr::Custom(crate::reality_carrier::addr_of(1))));
+    assert!(!is_mesh_addr(&TransportAddr::Ip("192.0.2.1:47001".parse().unwrap())));
 }

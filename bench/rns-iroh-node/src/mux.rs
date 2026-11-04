@@ -17,8 +17,11 @@ use std::sync::{Arc, Mutex, Weak};
 use super::*;
 
 /// Сколько интерфейс живёт без единого носителя: Link за это время ещё может продолжить на вернувшемся носителе.
-/// Больше окна «нет приёма» (12 с): Link, который не оживёт, закроет сам узел.
-pub const GRACE: Duration = Duration::from_secs(20);
+/// Покрывает окно Link до закрытия самим RNS: stale (2 x keepalive клиента 25 с = 50 с) плюс запас. Стороны замечают потерю носителя в разное время
+/// (сервер по idle QUIC через ~15 с, клиент позже и ещё до 12 с на повторы QUIC, затем TCP): при 20 с сервер снимал интерфейс раньше, чем клиент приходил
+/// по TCP, и вернувшийся носитель получал новый интерфейс, к которому прежний Link не привязан (lab13 realityfail --control --idle). Link, который не оживёт,
+/// закроет сам узел; пустой интерфейс стоит лишь записи в реестре (потолок `MAX_MUX`, вытеснение самых давних пустых).
+pub const GRACE: Duration = Duration::from_secs(60);
 /// Интерфейс, от которого не пришло ни одного пакета (ключ без Link: сканер, мусор), держится после потери носителей лишь это время.
 const GRACE_IDLE: Duration = Duration::from_secs(2);
 /// Не больше стольких носителей одного пира одновременно (рабочий + кандидат).
@@ -278,6 +281,11 @@ impl Mux {
 
     fn rx_from(&self, id: u64) {
         self.rx_pkts.fetch_add(1, Relaxed);
+        self.follow_data(id);
+    }
+
+    /// Пакет данных пира (RNS или VPN `0xFE`) пришёл с носителя `id`: принимающая сторона переключается на него после `FOLLOW_AFTER` подряд.
+    pub(crate) fn follow_data(&self, id: u64) {
         if !self.follow || self.send_on.load(Relaxed) == id {
             return;
         }
@@ -386,7 +394,11 @@ impl MuxSource {
                                     *fut = read_dg(conn);
                                     if dataplane::is_tag(&b) {
                                         // VPN-данные прямого канала: в RNS не идут никогда; ключ пира - только из TLS соединения
-                                        dataplane::plane().on_datagram(conn.remote_id().as_bytes(), &b[1..]);
+                                        if dataplane::plane().on_datagram(conn.remote_id().as_bytes(), &b[1..]) {
+                                            // данные пира пришли по этому носителю: принимающая сторона отвечает туда же. Иначе при возврате на QUIC (REALITY -> IP)
+                                            // ответы VPN шли бы в умирающий прежний носитель, пока от нового не придут два пакета RNS (keepalive раз в 25 с)
+                                            mux.follow_data(*id);
+                                        }
                                         if filter.ate() {
                                             yielded = true;
                                             break;

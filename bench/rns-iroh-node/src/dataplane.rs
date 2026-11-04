@@ -425,18 +425,20 @@ impl Plane {
 
     /// Принять тело датаграммы (без метки) от соединения с ключом `peer` (из `remote_id()`). Нет привязки - отбросить. Иначе пакет уходит тому же
     /// обработчику, что и пакеты этого Link; окончательную проверку (allowed, source-IP, ACL, HOST_ACCESS) делает он.
-    pub fn on_datagram(&self, peer: &[u8; 32], body: &[u8]) {
+    /// true - пакет принят привязанным Link (мультиплексор принимающей стороны считает такой приём данными пира и идёт за носителем, см. `Mux::follow_data`).
+    pub fn on_datagram(&self, peer: &[u8; 32], body: &[u8]) -> bool {
         let Some(link) = self.link_of(peer) else {
             self.c.unbound_drops.fetch_add(1, Relaxed);
-            return;
+            return false;
         };
         let sink = self.sink.read().unwrap().clone();
         let Some(sink) = sink else {
             self.c.unbound_drops.fetch_add(1, Relaxed);
-            return;
+            return false;
         };
         self.c.rx.fetch_add(1, Relaxed);
         sink(link, body);
+        true
     }
 
     pub fn stats(&self) -> serde_json::Value {

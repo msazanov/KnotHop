@@ -1,0 +1,16 @@
+tcp:
+  routers:
+    rr:
+      rule: "HostSNI(`cover.lab`)"
+      entryPoints: [websecure]
+      tls: {passthrough: true}
+      service: rr-svc
+  services:
+    rr-svc:
+      loadBalancer:
+        serversTransport: pp2
+        servers:
+          - address: "srv:8444"
+  serversTransports:
+    pp2:
+      proxyProtocol: {version: 2}
