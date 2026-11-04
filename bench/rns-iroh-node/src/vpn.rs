@@ -9164,6 +9164,12 @@ fn candidates(ctx: &Arc<ClientCtx>, banned: &path::ExitBackoff, only: Option<[u8
         v.retain(|s| s.dest == o);
         return v;
     }
+    // Фильтр имён (настройка маршрутизации): только для автовыбора. Если он отсекает все выходы, лучше работать через остальные, чем без связи.
+    let filter = ctx.rcfg.read().unwrap().exit_filter.clone();
+    if !filter.words.is_empty() {
+        let kept: Vec<CServer> = v.iter().filter(|s| filter.allows(&ctx.shown_name(s))).cloned().collect();
+        if !kept.is_empty() { v = kept; }
+    }
     // «Авто»: сначала узлы с измеренным RTT полного RNS Link; затем остальные по хопам и RTT из таблицы сервера
     // (это RTT между сервером и узлом, а не телефоном, поэтому как главный критерий не годится). Равные в пределах 15% и 3 мс считаются равными: тогда решает число хопов.
     let phone_rtt = |d: &[u8; 16]| -> Option<f64> {

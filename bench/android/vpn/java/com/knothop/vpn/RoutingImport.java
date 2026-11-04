@@ -183,30 +183,4 @@ final class RoutingImport {
         if (done > 0) cfg.mode = RoutingCfg.MODE_RULES;
         return done;
     }
-
-    // ---------------------------------------------------------------- шаблоны
-
-    static final class Template {
-        final String title, note, json;
-        Template(String title, String note, String json) { this.title = title; this.note = note; this.json = json; }
-    }
-
-    /** Локальные сети задаются подсетями, поэтому работают без файлов списков. */
-    static final Template[] TEMPLATES = {
-        new Template("Локальные сети напрямую",
-                "Адреса домашней и рабочей сети (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16) идут мимо VPN. Файлы списков не нужны. Применяется при следующем подключении в режиме «VPN».",
-                "[{\"enabled\":true,\"outboundTag\":\"direct\",\"remarks\":\"Direct LAN\",\"ip\":[\"10.0.0.0/8\",\"172.16.0.0/12\",\"192.168.0.0/16\",\"169.254.0.0/16\"]}]"),
-        new Template("Россия напрямую",
-                "Сайты и адреса из списков geosite:category-ru и geoip:ru идут мимо VPN, остальное через выход. Нужны файлы списков. Мимо VPN работают только адреса (geoip), сайты пойдут через выход по умолчанию.",
-                "[{\"enabled\":true,\"outboundTag\":\"direct\",\"remarks\":\"Bypass Russia domains\",\"domain\":[\"geosite:category-ru\"]},"
-                        + "{\"enabled\":true,\"outboundTag\":\"direct\",\"remarks\":\"Bypass Russia IP\",\"ip\":[\"geoip:ru\"]}]"),
-        new Template("Локальные сети и РФ напрямую",
-                "Локальные сети и российские адреса идут напрямую, остальное через выбранный выход. Доменные direct-условия сохраняются, но их обход VPN пока не реализован. Неподдерживаемые условия протокола и блокировки перечислены отдельно.",
-                "[{\"enabled\":true,\"locked\":false,\"outboundTag\":\"direct\",\"protocol\":[\"bittorrent\"],\"remarks\":\"Bypass bittorrent\"},"
-                        + "{\"enabled\":true,\"locked\":false,\"network\":\"udp\",\"outboundTag\":\"block\",\"port\":\"443\",\"remarks\":\"Block udp443\"},"
-                        + "{\"enabled\":true,\"ip\":[\"geoip:private\"],\"locked\":false,\"outboundTag\":\"direct\",\"remarks\":\"Direct LAN IP\"},"
-                        + "{\"domain\":[\"geosite:private\"],\"enabled\":true,\"locked\":false,\"outboundTag\":\"direct\",\"remarks\":\"Direct LAN domains\"},"
-                        + "{\"domain\":[\"geosite:category-ru\"],\"enabled\":true,\"locked\":false,\"outboundTag\":\"direct\",\"remarks\":\"Bypass Russia domains\"},"
-                        + "{\"enabled\":true,\"ip\":[\"geoip:ru\"],\"locked\":false,\"outboundTag\":\"direct\",\"remarks\":\"Bypass Russia IP\"}]"),
-    };
 }

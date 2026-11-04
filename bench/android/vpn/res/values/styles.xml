@@ -1,20 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Светлая тема по умолчанию; тёмная включается системой (values-night). Цвета текста и фона даёт сама тема. -->
-    <style name="Theme.KnotHop" parent="@android:style/Theme.DeviceDefault.Light">
-        <item name="android:windowBackground">#FFFFFF</item>
-        <item name="android:textColorPrimary">#1B1B1B</item>
-        <item name="android:textColorSecondary">#555555</item>
-        <item name="android:textColorHint">#666666</item>
+    <!-- Одна тёмная тема (values и values-night одинаковы); цвета повторяют Ui.java. -->
+    <style name="Theme.KnotHop" parent="@android:style/Theme.DeviceDefault">
+        <item name="android:windowBackground">#0D0E11</item>
+        <item name="android:textColorPrimary">#ECEEF2</item>
+        <item name="android:textColorSecondary">#9BA1AE</item>
+        <item name="android:textColorHint">#767C89</item>
         <item name="android:textViewStyle">@style/Widget.KnotHop.Text</item>
-        <item name="android:statusBarColor">#FFFFFF</item>
-        <item name="android:navigationBarColor">#FFFFFF</item>
-        <item name="android:windowLightStatusBar">true</item>
-        <item name="android:windowLightNavigationBar">true</item>
-        <item name="android:colorAccent">#2468A9</item>
+        <item name="android:statusBarColor">#0D0E11</item>
+        <item name="android:navigationBarColor">#16181D</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:colorAccent">#FF9F43</item>
         <item name="android:forceDarkAllowed">false</item>
     </style>
     <style name="Widget.KnotHop.Text" parent="@android:style/Widget.TextView">
-        <item name="android:textColor">#1B1B1B</item>
+        <item name="android:textColor">#ECEEF2</item>
     </style>
 </resources>

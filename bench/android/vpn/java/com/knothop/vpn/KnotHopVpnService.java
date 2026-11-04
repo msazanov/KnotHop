@@ -66,6 +66,11 @@ public class KnotHopVpnService extends VpnService {
     private int excludedRouteCount;
     /** Подсети (a.b.c.d/n), реально исключённые из туннеля; тест скорости не должен ходить на такие адреса. */
     private List<String> excludedRoutes = new ArrayList<>();
+    /** Режим «в туннель только выбранное»: в TUN добавлены только эти подсети (остальное идёт напрямую). Пусто и includeMode=false - обычный полный туннель. */
+    private List<String> includeRoutes = new ArrayList<>();
+    private boolean includeMode;
+    /** Результат rules-compile последнего подключения. */
+    private List<String> compiledDirect = new ArrayList<>(), compiledTunnel = new ArrayList<>();
     private static volatile KnotHopVpnService live;
     private final Handler serviceUi = new Handler(Looper.getMainLooper());
     private FileObserver serviceObserver;
@@ -203,25 +208,40 @@ public class KnotHopVpnService extends VpnService {
      * затем без исключений. Вызывать под modeLock.
      */
     private void establishTun() throws Exception {
-        List<String> direct = directRoutes();
+        RoutingCfg rc = RoutingCfg.load(state);
+        boolean allDirect = RoutingPresets.ALL_DIRECT.equals(rc.preset());   // «Всё напрямую»: TUN без маршрутов, трафик идёт мимо VPN (в интерфейсе красное предупреждение)
+        compileRoutes(rc);
+        boolean wantInclude = !allDirect && rc.mode.equals("rules") && rc.splitInclude();
+        if (wantInclude && compiledTunnel.isEmpty()) {
+            // списки не загружены или пусты: молчаливо оставить всё без защиты нельзя, поэтому полный туннель
+            Util.svc("режим «только заблокированное»: список подсетей пуст (нет геоданных?), включён полный туннель");
+            wantInclude = false;
+        }
+        List<String> direct = wantInclude || allDirect ? new ArrayList<String>() : compiledDirect;
+        List<String> inc = wantInclude ? compiledTunnel : new ArrayList<String>();
         int excluded = Build.VERSION.SDK_INT >= 33 ? direct.size() : 0;
+        int included = inc.size();
         ParcelFileDescriptor made;
         while (true) {
             try {
-                Builder b;
-                excluded = addExcluded(b = newBuilder(tunIp), direct, excluded);
+                Builder b = newBuilder(tunIp, wantInclude && included > 0 ? inc.subList(0, included) : null, allDirect);
+                excluded = addExcluded(b, direct, excluded);
                 made = b.establish();
                 break;
             } catch (Throwable t) {
-                if (excluded == 0) throw t;
-                Util.svc("establish with " + excluded + " excluded failed: " + t);
-                excluded = excluded > 200 ? excluded / 2 : 0;
+                int n = wantInclude && included > 0 ? included : excluded;
+                if (n == 0) throw t;
+                Util.svc("establish with " + n + " routes failed: " + t);
+                n = n > 200 ? n / 2 : 0;
+                if (wantInclude && included > 0) included = n; else excluded = n;
             }
         }
         if (made == null) throw new IllegalStateException("система не выдала TUN (разрешение VPN отозвано?)");
         tun = made;
         excludedRouteCount = excluded;
         excludedRoutes = new ArrayList<>(direct.subList(0, Math.min(excluded, direct.size())));
+        includeMode = wantInclude && included > 0;
+        includeRoutes = includeMode ? new ArrayList<>(inc.subList(0, included)) : new ArrayList<String>();
         getSharedPreferences("p", MODE_PRIVATE).edit().putString("routing_sig", RoutingCfg.load(state).directSig()).apply();
         Util.svc("excluded routes: " + excluded + " of " + direct.size() + ", tun fd " + made.getFd());
         try { if (carrierNetwork != null) setUnderlyingNetworks(new Network[]{carrierNetwork}); } catch (Throwable ignored) { }
@@ -247,6 +267,8 @@ public class KnotHopVpnService extends VpnService {
                             tun = null;
                             excludedRouteCount = 0;
                             excludedRoutes = new ArrayList<>();
+                            includeRoutes = new ArrayList<>();
+                            includeMode = false;
                         }
                     }
                     updateNotification(statusText());
@@ -312,9 +334,26 @@ public class KnotHopVpnService extends VpnService {
         foreground("VPN не работает, трафик заблокирован");
     }
 
-    private Builder newBuilder(String tunIp) throws Exception {
-        Builder b = new Builder().setSession("KnotHop").setMtu(Util.MTU).addAddress(tunIp, 32).addRoute("0.0.0.0", 0)
-                .addDnsServer("1.1.1.1").addDnsServer("8.8.8.8");
+    /**
+     * @param include null - маршрут по умолчанию (весь трафик в туннель); иначе в туннель идут только эти подсети и DNS-серверы
+     * @param allDirect «Всё напрямую»: ни одного маршрута и DNS не задаём, трафик остаётся на физической сети
+     */
+    private Builder newBuilder(String tunIp, List<String> include, boolean allDirect) throws Exception {
+        Builder b = new Builder().setSession("KnotHop").setMtu(Util.MTU).addAddress(tunIp, 32);
+        if (allDirect) {
+            if (Build.VERSION.SDK_INT >= 29) b.setMetered(false);
+            return b;
+        }
+        if (include == null) {
+            b.addRoute("0.0.0.0", 0);
+        } else {
+            for (String c : include) {
+                try { String[] pr = c.split("/"); b.addRoute(pr[0], Integer.parseInt(pr[1])); } catch (Throwable ignored) { }
+            }
+            // DNS идёт через туннель, иначе запросы к заблокированным доменам подменяются провайдером
+            b.addRoute("1.1.1.1", 32).addRoute("8.8.8.8", 32);
+        }
+        b.addDnsServer("1.1.1.1").addDnsServer("8.8.8.8");
         if (Build.VERSION.SDK_INT >= 29) b.setMetered(false);
         // IPv6 туннелем не переносится: маршрут по умолчанию загоняет его в туннель, где пакеты отбрасываются (нет утечки мимо VPN).
         b.addAddress("fd99:99::2", 128).addRoute("::", 0);
@@ -367,7 +406,13 @@ public class KnotHopVpnService extends VpnService {
             if (b.length != 4) return false;
             long ip = ((b[0] & 0xffL) << 24) | ((b[1] & 0xffL) << 16) | ((b[2] & 0xffL) << 8) | (b[3] & 0xffL);
             List<String> ex;
-            synchronized (service) { ex = service.excludedRoutes; }
+            boolean inc;
+            synchronized (service) { ex = service.includeMode ? service.includeRoutes : service.excludedRoutes; inc = service.includeMode; }
+            if (inc) {
+                // в туннеле только перечисленные подсети: остальные адреса идут напрямую
+                for (String c : ex) if (inNet(ip, c)) return false;
+                return true;
+            }
             for (String c : ex) {
                 try {
                     String[] pr = c.split("/");
@@ -379,6 +424,16 @@ public class KnotHopVpnService extends VpnService {
                 } catch (Throwable ignored) { }
             }
             return false;
+        }
+        private static boolean inNet(long ip, String c) {
+            try {
+                String[] pr = c.split("/");
+                byte[] n = InetAddress.getByName(pr[0]).getAddress();
+                int len = Integer.parseInt(pr[1]);
+                long net = ((n[0] & 0xffL) << 24) | ((n[1] & 0xffL) << 16) | ((n[2] & 0xffL) << 8) | (n[3] & 0xffL);
+                long mask = len == 0 ? 0 : (0xffffffffL << (32 - len)) & 0xffffffffL;
+                return (ip & mask) == (net & mask);
+            } catch (Throwable ignored) { return false; }
         }
         boolean valid() {
             synchronized (service) {
@@ -438,16 +493,21 @@ public class KnotHopVpnService extends VpnService {
         return done;
     }
 
-    /** Подсети правил «мимо VPN» (строки a.b.c.d/n) из direct.cidr, который собирает нативная часть по routing.json и файлам списков. */
-    private List<String> directRoutes() {
-        List<String> out = new ArrayList<>();
+    /**
+     * Подсети правил из файлов, которые собирает нативная часть по routing.json и спискам: direct.cidr (правила «мимо VPN», исключаются из туннеля)
+     * и tunnel.cidr (режим «только выбранное»: что войдёт в туннель). Результат - в compiledDirect / compiledTunnel.
+     */
+    private void compileRoutes(RoutingCfg rc) {
+        compiledDirect = new ArrayList<>();
+        compiledTunnel = new ArrayList<>();
         try {
             new File(state, "direct.cidr").delete();
-            if (!RoutingCfg.load(state).mode.equals("rules")) return out;
-            if (Native.runVpn("rules-compile --state " + state.getAbsolutePath(), state.getAbsolutePath()) != 0) return out;
-            for (String l : Util.read(new File(state, "direct.cidr")).split("\n")) if (l.matches("\\d{1,3}(\\.\\d{1,3}){3}/\\d{1,2}")) out.add(l);
+            new File(state, "tunnel.cidr").delete();
+            if (!rc.mode.equals("rules")) return;
+            if (Native.runVpn("rules-compile --state " + state.getAbsolutePath(), state.getAbsolutePath()) != 0) return;
+            for (String l : Util.read(new File(state, "direct.cidr")).split("\n")) if (l.matches("\\d{1,3}(\\.\\d{1,3}){3}/\\d{1,2}")) compiledDirect.add(l);
+            for (String l : Util.read(new File(state, "tunnel.cidr")).split("\n")) if (l.matches("\\d{1,3}(\\.\\d{1,3}){3}/\\d{1,2}")) compiledTunnel.add(l);
         } catch (Throwable ignored) { }
-        return out;
     }
 
     private boolean watching(Object session) {

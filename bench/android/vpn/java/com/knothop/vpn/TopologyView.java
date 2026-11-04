@@ -112,7 +112,7 @@ final class TopologyView extends View {
         edgeHalo.set(t);
         edgeHalo.setStyle(Paint.Style.STROKE);
         edgeHalo.setStrokeWidth(3.5f * d);
-        edgeHalo.setColor(Ui.dark(getContext()) ? 0xFF000000 : 0xFFFFFFFF);
+        edgeHalo.setColor(Ui.CARD);
         canvas.drawText(label,x,y,edgeHalo);
         canvas.drawText(label,x,y,t);
     }
@@ -458,7 +458,7 @@ final class TopologyView extends View {
         Paint.FontMetrics m = b.getFontMetrics();
         c.drawText(s, cx, cy - (m.ascent + m.descent) / 2f, b);
         if (dim) {
-            p.setColor(Ui.dark(getContext()) ? 0x99000000 : 0x99FFFFFF);
+            p.setColor((Ui.CARD & 0xFFFFFF) | 0x99000000);
             c.drawCircle(cx, cy, r, p);
         }
     }
@@ -644,7 +644,7 @@ final class TopologyView extends View {
         Paint h = new Paint(t);
         h.setStyle(Paint.Style.STROKE);
         h.setStrokeWidth(3.2f * d);
-        h.setColor(Ui.dark(getContext()) ? 0xDD000000 : 0xDDFFFFFF);
+        h.setColor((Ui.CARD & 0xFFFFFF) | 0xDD000000);
         for (Node n : ns) {
             boolean isCur = "current".equals(n.state);
             String l1 = labelOf(n);

@@ -60,7 +60,8 @@ public class RoutingActivity extends Activity {
     private List<RoutingIssues.Issue> issues = new ArrayList<>();
     private JSONObject cats;
     private ScrollView sv;
-    private LinearLayout root;
+    private LinearLayout root, out;
+    private boolean showPresetRules;
     private TextView detailsView;
     private volatile String dlText = "";
     private volatile boolean dlBusy, importBusy;
@@ -86,6 +87,8 @@ public class RoutingActivity extends Activity {
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(16), dp(24), dp(16), dp(32));
+        out = root;
+        sv.setBackgroundColor(Ui.BG);
         sv.addView(root);
         setContentView(sv);
         RoutingCfg.migrateLegacy(state);
@@ -210,11 +213,10 @@ public class RoutingActivity extends Activity {
     }
 
     private Button button(String s, View.OnClickListener l) {
-        Button b = new Button(this);
-        b.setAllCaps(false);
-        b.setText(s);
-        b.setMinHeight(dp(48));
-        b.setOnClickListener(v -> { Ui.tick(v); l.onClick(v); });
+        Button b = Ui.secondary(this, s, l);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(8);
+        b.setLayoutParams(lp);
         return b;
     }
 
@@ -227,62 +229,170 @@ public class RoutingActivity extends Activity {
         st = RoutingStatus.read(state);
         issues = collectIssues();
         root.removeAllViews();
+        out = root;
         detailsView = null;
-        if (target.isEmpty()) root.addView(NodeTabs.bar(this, NodeTabs.ROUTING));
-        TextView title = text(target.isEmpty() ? "Маршрутизация" : "Маршруты через " + (targetName.isEmpty() ? lb.nameOf(target) : targetName), 22, true, 0xFF000000);
+        if (target.isEmpty()) out.addView(NodeTabs.bar(this, NodeTabs.ROUTING));
+        TextView title = text(target.isEmpty() ? "Маршрутизация" : "Маршруты через " + (targetName.isEmpty() ? lb.nameOf(target) : targetName), 24, true, Ui.TEXT);
+        title.setPadding(0, dp(8), 0, 0);
         if (Build.VERSION.SDK_INT >= 28) title.setAccessibilityHeading(true);
-        root.addView(title);
-        root.addView(note("Изменения сохраняются сразу."));
+        out.addView(title);
         renderLegacyBanner();
-        if (target.isEmpty()) renderMode();
-        else {
-            root.addView(note("Здесь только правила с выходом через эту ноду. Другие правила телефона сохраняются."));
-            if (!cfg.mode.equals(RoutingCfg.MODE_RULES)) root.addView(button("Включить маршрутизацию по правилам", v -> { cfg.mode = RoutingCfg.MODE_RULES; saveAndRender(); }));
-            root.addView(button("Все правила телефона", v -> startActivity(new android.content.Intent(this, RoutingActivity.class))));
-        }
-        renderTemplates();
-        if (target.isEmpty()) renderDefaultExit();
-        renderIssues();
-        if (!target.isEmpty() || cfg.mode.equals(RoutingCfg.MODE_RULES)) {
-            root.addView(note(RoutingLabels.ORDER_NOTE));
+        if (target.isEmpty()) {
+            renderPresets();
+            renderExitFilter();
+            renderIssues();
+            beginCard("Свои правила", "Ваши адреса, домены и списки проверяются раньше правил режима, поэтому могут его переопределить. Сначала идут «Свои адреса и домены» сверху вниз, затем «Списки» сверху вниз; "
+                    + "действует первое совпавшее правило, иначе трафик идёт по режиму. Подсети «Мимо VPN» система исключает из туннеля при подключении, поэтому они срабатывают раньше остальных. "
+                    + RoutingLabels.DOMAIN_NOTE);
+            renderManual();
+            renderLists();
+            out.addView(button("Импорт правил JSON…", v -> importDialog("")));
+            out.addView(button("Приложения мимо VPN…", v -> startActivity(new android.content.Intent(this, AppsActivity.class))));
+            if (RoutingPresets.find(cfg.preset()) != null) {
+                out.addView(button(showPresetRules ? "Скрыть правила режима" : "Показать правила режима", v -> { showPresetRules = !showPresetRules; render(); }));
+            }
+            endCard();
+            renderFiles();
+        } else {
+            out.addView(note("Здесь только правила с выходом через эту ноду. Другие правила телефона сохраняются."));
+            if (!cfg.mode.equals(RoutingCfg.MODE_RULES)) out.addView(button("Включить маршрутизацию по правилам", v -> { cfg.mode = RoutingCfg.MODE_RULES; saveAndRender(); }));
+            out.addView(button("Все правила телефона", v -> startActivity(new android.content.Intent(this, RoutingActivity.class))));
+            out.addView(button("Импорт правил JSON…", v -> importDialog("")));
+            renderIssues();
             renderManual();
             renderLists();
             renderFiles();
-            if (cfg.hasDomainRules() || hasDirect()) root.addView(note(RoutingLabels.DOMAIN_NOTE));
-        } else if (!cfg.rules.isEmpty() || !cfg.manual.isEmpty()) {
-            root.addView(note("Сохранено правил: " + (cfg.rules.size() + cfg.manual.size()) + ". Выберите «По правилам», чтобы их включить."));
         }
         renderDetails();
         renderSig = signature();
         sv.post(() -> sv.scrollTo(0, scroll));
     }
 
+    // ---------------------------------------------------------------- карточки
+
+    private void beginCard(String title, String help) {
+        LinearLayout c = Ui.card(this);
+        c.addView(Ui.titleWithHelp(this, title, help));
+        root.addView(c, Ui.cardParams(this));
+        out = c;
+    }
+
+    private void endCard() { out = root; }
+
+    // ---------------------------------------------------------------- режимы (пресеты)
+
+    private void renderPresets() {
+        beginCard("Режим", "Готовые режимы маршрутизации. Выбранный режим записывает свои правила; ваши собственные правила остаются и работают поверх него. "
+                + "Изменения вступают в силу при следующем включении VPN.");
+        String cur = cfg.preset();
+        for (RoutingPresets.Preset p : RoutingPresets.ALL) {
+            boolean on = p.id.equals(cur);
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(12), dp(6), dp(8), dp(6));
+            row.setMinimumHeight(dp(52));
+            int accent = p.unsafe ? Ui.RED : Ui.GREEN;
+            row.setBackground(on ? Ui.roundStroke(0xFF1E2A22, accent, 12, this) : Ui.roundStroke(Ui.CARD_HI, Ui.STROKE, 12, this));
+            TextView dot = Ui.text(this, on ? "●" : "○", 18, on ? accent : Ui.MUTED, false);
+            dot.setPadding(0, 0, dp(10), 0);
+            row.addView(dot);
+            TextView name = Ui.text(this, p.title, 15, p.unsafe ? Ui.RED : Ui.TEXT, on);
+            row.addView(name, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            row.addView(Ui.help(this, p.title, p.help), Ui.helpParams(this));
+            row.setClickable(true);
+            row.setOnClickListener(v -> { Ui.tick(v); if (!on) choosePreset(p); });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = dp(8);
+            out.addView(row, lp);
+        }
+        if (cur.isEmpty() || RoutingPresets.find(cur) == null) out.addView(note("Сейчас правила настроены вручную."));
+        if (RoutingPresets.ALL_DIRECT.equals(cur)) {
+            TextView w = text("⚠ Трафик не защищён: идёт напрямую, мимо VPN", 13, true, Ui.RED);
+            w.setPadding(0, dp(10), 0, 0);
+            out.addView(w);
+        }
+        out.addView(button("Сбросить к умолчанию", v -> new AlertDialog.Builder(this).setTitle("Сбросить маршрутизацию?")
+                .setMessage("Режим «Обход только заблокированного», выбор выходов без «Россия». Свои правила будут удалены.")
+                .setPositiveButton("Сбросить", (d, w2) -> {
+                    cfg.rules.clear(); cfg.manual.clear();
+                    RoutingPresets.apply(cfg, RoutingPresets.DEFAULT);
+                    cfg.setExitFilter(true, java.util.Arrays.asList(RoutingPresets.DEFAULT_EXCLUDE));
+                    saveAndRender();
+                }).setNegativeButton("Отмена", null).show()));
+        endCard();
+    }
+
+    private void choosePreset(RoutingPresets.Preset p) {
+        Runnable go = () -> {
+            RoutingPresets.apply(cfg, p.id);
+            saveAndRender();
+            boolean needLists = p.id.equals(RoutingPresets.BLOCKED) || p.id.equals(RoutingPresets.RU_DIRECT);
+            Toast.makeText(this, needLists && !RulesFiles.present(files) ? "Режим выбран. Нужны файлы списков: скачайте их ниже" : "Режим выбран. Вступит в силу при следующем включении VPN", Toast.LENGTH_LONG).show();
+        };
+        if (!p.unsafe) { go.run(); return; }
+        new AlertDialog.Builder(this).setTitle("Всё напрямую?")
+                .setMessage("Трафик НЕ будет защищён: он пойдёт мимо VPN, сайты и провайдер увидят ваш настоящий адрес. Включайте только осознанно.")
+                .setPositiveButton("Всё напрямую", (d, w) -> go.run())
+                .setNegativeButton("Отмена", null).show();
+    }
+
+    // ---------------------------------------------------------------- выбор выходов
+
+    private void renderExitFilter() {
+        beginCard("Выбор выходов", "Автовыбор выхода пропускает ноды по имени: «не содержит» исключает ноды, в имени которых есть любое из слов (по умолчанию «Россия»), "
+                + "«содержит» оставляет только такие. Регистр не важен. Нода, выбранная вами тапом на главном экране, фильтром не отключается. "
+                + "Если фильтр отсёк все выходы, работа продолжится через остальные, а не остановится.");
+        LinearLayout seg = new LinearLayout(this);
+        seg.setOrientation(LinearLayout.HORIZONTAL);
+        boolean ex = cfg.filterExclude();
+        Button a = segButton("Имя не содержит", ex), b = segButton("Имя содержит", !ex);
+        a.setOnClickListener(v -> { Ui.tick(v); cfg.setExitFilter(true, cfg.filterWords()); saveAndRender(); });
+        b.setOnClickListener(v -> { Ui.tick(v); cfg.setExitFilter(false, cfg.filterWords()); saveAndRender(); });
+        LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        l1.rightMargin = dp(8);
+        seg.addView(a, l1);
+        seg.addView(b, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        sl.topMargin = dp(10);
+        out.addView(seg, sl);
+        List<String> words = cfg.filterWords();
+        TextView w = text(words.isEmpty() ? "Слов нет — фильтр выключен" : String.join(", ", words), 15, !words.isEmpty(), words.isEmpty() ? GREY : Ui.TEXT);
+        w.setPadding(0, dp(10), 0, dp(4));
+        out.addView(w);
+        out.addView(button("Изменить слова", v -> editWords(words)));
+        String now;
+        if (st.error) now = "VPN остановлен из-за ошибки";
+        else if (!st.active) now = "";
+        else if (st.currentDest.isEmpty()) now = "Выход ещё ищется";
+        else now = "Сейчас: " + lb.nameOf(st.currentDest);
+        if (!now.isEmpty()) out.addView(note(now));
+        endCard();
+    }
+
+    private Button segButton(String s, boolean on) {
+        Button b = on ? Ui.primary(this, s, null) : Ui.secondary(this, s, null);
+        b.setTextSize(13);
+        return b;
+    }
+
+    private void editWords(List<String> current) {
+        EditText e = new EditText(this);
+        e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        e.setSingleLine(true);
+        e.setHint("россия, russia");
+        e.setText(String.join(", ", current));
+        e.setSelection(e.getText().length());
+        new AlertDialog.Builder(this).setTitle("Слова в имени ноды (через запятую)").setView(e)
+                .setPositiveButton("Сохранить", (d, w) -> {
+                    List<String> ws = new ArrayList<>();
+                    for (String x : e.getText().toString().split("[,;\\n]")) { String t = x.trim(); if (!t.isEmpty()) ws.add(t); }
+                    cfg.setExitFilter(cfg.filterExclude(), ws);
+                    saveAndRender();
+                }).setNegativeButton("Отмена", null).show();
+    }
+
     // ---------------------------------------------------------------- шаблоны и совместимый импорт JSON
-
-    private void renderTemplates() {
-        root.addView(section("Шаблоны и импорт"));
-        root.addView(note("Готовые наборы и совместимый JSON-импорт. Неподдерживаемые условия перечисляются до сохранения."));
-        if (target.isEmpty()) root.addView(button("Локальные сети и РФ напрямую", v -> {
-            try { confirmImport(RoutingImport.parse(RoutingImport.TEMPLATES[2].json), RoutingImport.TEMPLATES[2].title, RoutingImport.TEMPLATES[2].note); }
-            catch (Exception e) { Toast.makeText(this, "Шаблон не разобран", Toast.LENGTH_LONG).show(); }
-        }));
-        if (target.isEmpty()) root.addView(button("Шаблоны правил…", v -> pickTemplate()));
-        if (target.isEmpty()) root.addView(button("Приложения мимо VPN…", v -> startActivity(new android.content.Intent(this, AppsActivity.class))));
-        root.addView(button("Импорт правил JSON…", v -> importDialog("")));
-    }
-
-    private void pickTemplate() {
-        String[] titles = new String[RoutingImport.TEMPLATES.length];
-        for (int i = 0; i < titles.length; i++) titles[i] = RoutingImport.TEMPLATES[i].title;
-        new AlertDialog.Builder(this).setTitle("Шаблон правил").setItems(titles, (d, i) -> {
-            RoutingImport.Template t = RoutingImport.TEMPLATES[i];
-            try {
-                confirmImport(RoutingImport.parse(t.json), t.title, t.note);
-            } catch (Exception e) {
-                Toast.makeText(this, "Шаблон не разобран: " + e.getMessage(), Toast.LENGTH_LONG).show();
-            }
-        }).setNegativeButton("Отмена", null).show();
-    }
 
     private void importDialog(String prefill) {
         EditText e = new EditText(this);
@@ -366,76 +476,20 @@ public class RoutingActivity extends Activity {
         box.addView(button("Понятно", v -> { cfg.ackLegacy(); saveAndRender(); }));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(8);
-        root.addView(box, lp);
+        out.addView(box, lp);
     }
 
     // ---------------------------------------------------------------- режим
-
-    private CharSequence titled(String title, String desc) {
-        SpannableStringBuilder b = new SpannableStringBuilder(title);
-        b.setSpan(new StyleSpan(Typeface.BOLD), 0, b.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        int s = b.length();
-        b.append('\n').append(desc);
-        b.setSpan(new RelativeSizeSpan(0.82f), s, b.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        b.setSpan(new ForegroundColorSpan(GREY), s, b.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        return b;
-    }
-
-    private void renderMode() {
-        root.addView(section("Куда направлять трафик"));
-        RadioGroup g = new RadioGroup(this);
-        g.setOrientation(RadioGroup.VERTICAL);
-        String[][] ms = {{RoutingCfg.MODE_ALL, RoutingLabels.MODE_ALL_TITLE, RoutingLabels.MODE_ALL_DESC},
-                {RoutingCfg.MODE_RULES, RoutingLabels.MODE_RULES_TITLE, RoutingLabels.MODE_RULES_DESC}};
-        for (String[] m : ms) {
-            RadioButton rb = new RadioButton(this);
-            rb.setId(View.generateViewId());
-            rb.setText(titled(m[1], m[2]));
-            rb.setTextSize(15);
-            rb.setTextColor(Ui.ink(this, TEXT));
-            rb.setMinHeight(dp(56));
-            rb.setPadding(dp(8), dp(8), dp(8), dp(8));
-            rb.setChecked(cfg.mode.equals(m[0]));
-            g.addView(rb, new RadioGroup.LayoutParams(RadioGroup.LayoutParams.MATCH_PARENT, RadioGroup.LayoutParams.WRAP_CONTENT));
-            rb.setOnClickListener(v -> {
-                if (cfg.mode.equals(m[0])) return;
-                cfg.mode = m[0];
-                saveAndRender();
-            });
-        }
-        root.addView(g);
-    }
-
-    // ---------------------------------------------------------------- выход по умолчанию
-
-    private void renderDefaultExit() {
-        root.addView(section("Выход по умолчанию"));
-        String now;
-        if (st.error) now = "VPN остановлен из-за ошибки";
-        else if (!st.active) now = "VPN выключен: настройки сохранены и вступят в силу при подключении.";
-        else if (st.currentDest.isEmpty()) now = "Сейчас: выход ещё ищется";
-        else now = "Сейчас: " + lb.nameOf(st.currentDest);
-        TextView t = text(now, 15, true, TEXT);
-        t.setPadding(0, 0, 0, dp(2));
-        root.addView(t);
-        if (st.active && st.selectedButNotUsed()) {
-            root.addView(note("Вы выбрали " + lb.nameOf(st.selectedDest) + ", но сейчас работа идёт через "
-                    + (st.currentDest.isEmpty() ? "другой выход" : lb.nameOf(st.currentDest)) + ": выбранный выход недоступен или идёт переключение."));
-        } else {
-            root.addView(note(st.active && !st.selectedDest.isEmpty() ? RoutingLabels.DEFAULT_EXIT_PICKED : RoutingLabels.DEFAULT_EXIT_AUTO));
-        }
-        root.addView(button("Выбрать ноду на главном экране", v -> finish()));
-    }
 
     // ---------------------------------------------------------------- предупреждения
 
     private void renderIssues() {
         if (issues.isEmpty()) return;
-        root.addView(section("На что обратить внимание"));
+        out.addView(section("На что обратить внимание"));
         for (RoutingIssues.Issue i : issues) {
             TextView t = text((i.warn ? "⚠ " : "ℹ ") + i.text, 13, false, i.warn ? WARN : GREY);
             t.setPadding(0, dp(3), 0, dp(3));
-            root.addView(t);
+            out.addView(t);
         }
     }
 
@@ -536,16 +590,15 @@ public class RoutingActivity extends Activity {
     // ---------------------------------------------------------------- свои адреса и домены
 
     private void renderManual() {
-        root.addView(section("Свои адреса и домены"));
-        root.addView(note("Проверяются первыми."));
-        if (cfg.manual.isEmpty()) root.addView(note("Пока пусто."));
+        out.addView(section("Свои адреса и домены"));
         for (int i = 0; i < cfg.manual.size(); i++) {
             final int k = i;
             final RoutingCfg.Manual m = cfg.manual.get(i);
             if (!target.isEmpty() && !m.action.equals("exit:" + target)) continue;
+            if (target.isEmpty() && !showPresetRules && RoutingPresets.isPresetManual(m)) continue;
             String title = m.value.length() > 60 ? m.value.substring(0, 60) + "…" : m.value;
             String sub = (m.ip() ? "подсеть/IP" : "домен") + " → " + lb.action(m.action);
-            root.addView(ruleRow(title, sub, m.enabled, m.valid() && RoutingCfg.cleanManual(m.value) != null, on -> { m.enabled = on; saveAndRender(); }, () ->
+            out.addView(ruleRow(title, sub, m.enabled, m.valid() && RoutingCfg.cleanManual(m.value) != null, on -> { m.enabled = on; saveAndRender(); }, () ->
                     itemMenu(title, k, cfg.manual.size(), m.enabled, item -> {
                         switch (item) {
                             case 0: pickAction(m.ip(), a -> { m.action = a; saveAndRender(); }); break;
@@ -556,7 +609,7 @@ public class RoutingActivity extends Activity {
                         }
                     })));
         }
-        root.addView(button("Добавить адреса и домены", v -> addManualDialog()));
+        out.addView(button("Добавить адреса и домены", v -> addManualDialog()));
     }
 
     private void addManualDialog() {
@@ -631,15 +684,14 @@ public class RoutingActivity extends Activity {
     // ---------------------------------------------------------------- списки geoip / geosite
 
     private void renderLists() {
-        root.addView(section("Списки"));
-        root.addView(note("Проверяются после своих адресов и доменов."));
-        if (cfg.rules.isEmpty()) root.addView(note("Пока пусто."));
+        out.addView(section("Списки"));
         for (int i = 0; i < cfg.rules.size(); i++) {
             final int k = i;
             final RoutingCfg.Rule r = cfg.rules.get(i);
             if (!target.isEmpty() && !r.action.equals("exit:" + target)) continue;
+            if (target.isEmpty() && !showPresetRules && RoutingPresets.isPresetRule(r)) continue;
             String title = RoutingLabels.ruleTitle(r);
-            root.addView(ruleRow(title, "→ " + lb.action(r.action), r.enabled, r.valid(), on -> { r.enabled = on; saveAndRender(); }, () ->
+            out.addView(ruleRow(title, "→ " + lb.action(r.action), r.enabled, r.valid(), on -> { r.enabled = on; saveAndRender(); }, () ->
                     itemMenu(title, k, cfg.rules.size(), r.enabled, item -> {
                         switch (item) {
                             case 0: pickAction(r.geoip(), a -> { r.action = a; saveAndRender(); }); break;
@@ -653,8 +705,7 @@ public class RoutingActivity extends Activity {
         LinearLayout acts = new LinearLayout(this);
         acts.setOrientation(LinearLayout.HORIZONTAL);
         acts.addView(button("Добавить список", v -> addRuleDialog()), weight());
-        if (target.isEmpty()) acts.addView(button("Шаблоны", v -> presets()), weight());
-        root.addView(acts);
+        out.addView(acts);
     }
 
     private void putRule(String type, String name, String action) {
@@ -669,25 +720,6 @@ public class RoutingActivity extends Activity {
         }
         if (cfg.rules.size() < RoutingCfg.MAX_RULES) cfg.rules.add(new RoutingCfg.Rule(type, name, action));
         else Toast.makeText(this, "Не больше " + RoutingCfg.MAX_RULES + " правил по спискам", Toast.LENGTH_SHORT).show();
-    }
-
-    private void presets() {
-        if (!hasCats()) { Toast.makeText(this, RulesFiles.present(files) ? "Списки ещё разбираются, повторите через секунду" : "Сначала скачайте списки", Toast.LENGTH_SHORT).show(); return; }
-        String[] items = {"Россия — мимо VPN ⚠", "Заблокированное в РФ — через выбранный выход"};
-        new AlertDialog.Builder(this).setTitle("Шаблоны").setItems(items, (dlg, w) -> {
-            if (w == 0) {
-                confirmDirect(() -> {
-                    putRule("geoip", "RU", "direct");
-                    saveAndRender();
-                });
-            } else {
-                pickAction(false, a -> {
-                    putRule("geosite", "RU-BLOCKED", a);
-                    putRule("geoip", "RU-BLOCKED", a);
-                    saveAndRender();
-                });
-            }
-        }).setNegativeButton("Отмена", null).show();
     }
 
     private boolean hasCats() {
@@ -766,9 +798,9 @@ public class RoutingActivity extends Activity {
     // ---------------------------------------------------------------- файлы списков
 
     private void renderFiles() {
-        root.addView(section("Файлы списков"));
+        beginCard("Файлы списков", "Источник: runetfreedom/russia-v2ray-rules-dat, обновляется каждые 6 часов. Около 90 МБ — лучше качать по Wi-Fi. Нужны режимам «Обход только заблокированного» и «Всё РФ напрямую».");
         boolean have = RulesFiles.present(files);
-        String info = "Не загружены. Источник: runetfreedom/russia-v2ray-rules-dat (обновляется каждые 6 часов), около 90 МБ — лучше по Wi-Fi.";
+        String info = "Не загружены";
         if (have) {
             File g1 = new File(RulesFiles.dir(files), "geoip.dat"), g2 = new File(RulesFiles.dir(files), "geosite.dat");
             info = "Загружены: geoip " + (g1.length() >> 20) + " МБ, geosite " + (g2.length() >> 20) + " МБ, "
@@ -776,10 +808,11 @@ public class RoutingActivity extends Activity {
             if (importBusy) info += "\nРазбираю имеющиеся файлы…";
             else if (!hasCats()) info += "\nКаталог категорий пуст: обновите списки.";
         }
-        root.addView(text(dlBusy ? "Загрузка… " + dlText : info, 14, false, TEXT));
+        out.addView(text(dlBusy ? "Загрузка… " + dlText : info, 14, false, TEXT));
         Button b = button(have ? "Обновить списки" : "Скачать списки", v -> startDownload());
         b.setEnabled(!dlBusy);
-        root.addView(b);
+        out.addView(b);
+        endCard();
         ensureCatalog();
     }
 
@@ -835,12 +868,12 @@ public class RoutingActivity extends Activity {
     // ---------------------------------------------------------------- подробности
 
     private void renderDetails() {
-        root.addView(button(showDetails ? "Скрыть подробности" : "Показать подробности", v -> { showDetails = !showDetails; render(); }));
+        out.addView(button(showDetails ? "Скрыть подробности" : "Показать подробности", v -> { showDetails = !showDetails; render(); }));
         if (!showDetails) return;
         detailsView = text(detailsText(), 12, false, 0xFF333333);
         detailsView.setTypeface(Typeface.MONOSPACE);
         detailsView.setPadding(0, dp(8), 0, 0);
-        root.addView(detailsView);
+        out.addView(detailsView);
     }
 
     private String detailsText() {

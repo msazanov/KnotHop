@@ -247,11 +247,31 @@ pub struct Cfg {
     pub mode: String,
     pub rules: Vec<RuleCfg>,
     pub manual: Vec<ManualCfg>,
+    /// Фильтр автоматического выбора выхода по имени ноды. Явно выбранный пользователем выход фильтр не затрагивает.
+    pub exit_filter: ExitFilter,
+    /// true: в туннель идут только подсети правил с действием не «мимо VPN» (`tunnel.cidr`), остальное - напрямую (раздельное туннелирование «включить»).
+    pub split_include: bool,
+}
+
+/// Фильтр имён выходов: `exclude` - пропускать ноды, в имени которых есть любое слово; иначе - только ноды с любым словом. Регистр не важен.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExitFilter {
+    pub exclude: bool,
+    pub words: Vec<String>,
+}
+
+impl ExitFilter {
+    pub fn allows(&self, name: &str) -> bool {
+        if self.words.is_empty() { return true; }
+        let n = name.to_lowercase();
+        let hit = self.words.iter().any(|w| n.contains(w.as_str()));
+        hit != self.exclude
+    }
 }
 
 impl Default for Cfg {
     fn default() -> Cfg {
-        Cfg { mode: "auto".into(), rules: Vec::new(), manual: Vec::new() }
+        Cfg { mode: "auto".into(), rules: Vec::new(), manual: Vec::new(), exit_filter: ExitFilter::default(), split_include: false }
     }
 }
 
@@ -269,7 +289,12 @@ impl Cfg {
             let value = x["v"].as_str().map(str::trim).filter(|n| !n.is_empty() && n.len() <= 253)?.to_string();
             Some(ManualCfg { value, action: Action::parse(x["a"].as_str()?)? })
         }).take(MAX_MANUAL).collect()).unwrap_or_default();
-        Cfg { mode, rules, manual }
+        let exit_filter = v["exit_filter"].as_object().map(|o| ExitFilter {
+            exclude: o.get("mode").and_then(|m| m.as_str()) != Some("include"),
+            words: o.get("words").and_then(|w| w.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).map(|w| w.trim().to_lowercase()).filter(|w| !w.is_empty() && w.len() <= 40).take(16).collect()).unwrap_or_default(),
+        }).unwrap_or_default();
+        let split_include = v["split"].as_str() == Some("include");
+        Cfg { mode, rules, manual, exit_filter, split_include }
     }
 
     pub fn load(state: &Path) -> Cfg {
@@ -530,6 +555,17 @@ impl Router {
         ranges_to_cidrs(&merge(all))
     }
 
+    /// Подсети, которые правила велят отправлять в туннель (действие не «мимо VPN»): для включаемых маршрутов в режиме `split_include`.
+    pub fn tunnel_cidrs(&self) -> Vec<(u32, u8)> {
+        let mut all: Vec<(u32, u32)> = Vec::new();
+        for (rank, v) in &self.ips {
+            if self.action(*rank) != Action::Direct {
+                all.extend(v.iter().copied());
+            }
+        }
+        ranges_to_cidrs(&merge(all))
+    }
+
     /// Предупреждение, если подсетей «мимо туннеля» больше, чем принимает система (см. `MAX_EXCLUDED`).
     pub fn cap_note(&self) -> Option<String> {
         let all = self.direct_cidrs();
@@ -730,9 +766,18 @@ pub fn cmd_compile(state: &Path) -> Result<()> {
     }
     std::fs::create_dir_all(state)?;
     put(&state.join("direct.cidr"), t.as_bytes());
+    // режим «в туннель только выбранное»: список подсетей для включаемых маршрутов (тот же предел системы, мелкие блоки уходят напрямую)
+    let mut tun_total = 0;
+    let mut tun_text = String::new();
+    if cfg.mode == "rules" && cfg.split_include {
+        let all = r.tunnel_cidrs();
+        tun_total = all.len();
+        for (ip, p) in cap_cidrs(all, MAX_EXCLUDED).0 { tun_text.push_str(&format!("{}/{p}\n", std::net::Ipv4Addr::from(ip))); }
+    }
+    put(&state.join("tunnel.cidr"), tun_text.as_bytes());
     let mut warnings = r.warnings.clone();
     warnings.extend(r.cap_note());
-    let rep = serde_json::json!({"warnings": warnings, "stats": r.stats, "direct": cidrs.len(), "direct_total": total, "covered": covered});
+    let rep = serde_json::json!({"warnings": warnings, "stats": r.stats, "direct": cidrs.len(), "direct_total": total, "tunnel_total": tun_total, "covered": covered});
     put(&state.join("rules-report.json"), rep.to_string().as_bytes());
     Ok(())
 }
@@ -857,6 +902,7 @@ mod tests {
                 RuleCfg { kind: "geoip".into(), name: "BIG".into(), action: exit_a() },
             ],
             manual: vec![ManualCfg { value: "10.1.2.3".into(), action: Action::Default }],
+            ..Default::default()
         };
         let r = Router::build(&cfg, &d);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
@@ -877,6 +923,7 @@ mod tests {
             mode: "rules".into(),
             rules: vec![RuleCfg { kind: "geosite".into(), name: "youtube".into(), action: exit_a() }],
             manual: vec![ManualCfg { value: "domain:example.org".into(), action: Action::Direct }],
+            ..Default::default()
         };
         let r = Router::build(&cfg, &d);
         assert!(r.has_domains());
@@ -968,6 +1015,13 @@ mod tests {
         assert_eq!(c.manual[0].value, "a.com");
         assert_eq!(c.exits(), vec![[0xaa; 16]]);
         assert_eq!(Cfg::parse("{not json").mode, "auto");
+        let f = Cfg::parse(r#"{"mode":"rules","split":"include","exit_filter":{"mode":"exclude","words":[" Россия ","DE",""]}}"#);
+        assert!(f.split_include);
+        assert_eq!(f.exit_filter.words, vec!["россия".to_string(), "de".to_string()]);
+        assert!(!f.exit_filter.allows("Нода Россия-1") && f.exit_filter.allows("Finland"));
+        let inc = Cfg::parse(r#"{"exit_filter":{"mode":"include","words":["fin"]}}"#);
+        assert!(inc.exit_filter.allows("fin1") && !inc.exit_filter.allows("de"));
+        assert!(Cfg::parse("{}").exit_filter.allows("anything"));
         let legacy = Cfg::parse(r#"{"mode":"priority","priority":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}"#);
         assert_eq!(legacy.mode, "auto");
     }
@@ -1033,6 +1087,7 @@ mod tests {
                 RuleCfg { kind: "geosite".into(), name: "YOUTUBE".into(), action: exit_a() },
             ],
             manual: vec![],
+            ..Default::default()
         };
         let t1 = Instant::now();
         let r = Router::build(&cfg, &d);

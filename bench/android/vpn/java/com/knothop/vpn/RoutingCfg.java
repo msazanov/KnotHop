@@ -86,12 +86,8 @@ final class RoutingCfg {
     static synchronized boolean ensureDefaults(File state) {
         if (file(state).exists()) return false;
         RoutingCfg c = new RoutingCfg();
-        c.mode = MODE_RULES;
-        for (String cidr : new String[]{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"}) c.manual.add(new Manual(cidr, "direct"));
-        c.rules.add(new Rule("geoip", "private", "direct"));
-        c.rules.add(new Rule("geosite", "private", "direct"));
-        c.rules.add(new Rule("geosite", "category-ru", "direct"));
-        c.rules.add(new Rule("geoip", "ru", "direct"));
+        RoutingPresets.apply(c, RoutingPresets.DEFAULT);
+        c.setExitFilter(true, java.util.Arrays.asList(RoutingPresets.DEFAULT_EXCLUDE));
         return c.save(state).isEmpty();
     }
 
@@ -259,6 +255,54 @@ final class RoutingCfg {
         return p == null ? 0 : p.length();
     }
 
+    // ---------------------------------------------------------------- пресет, фильтр выходов, режим включаемых маршрутов (поля вне списка правил)
+
+    /** Выбранный режим маршрутизации (RoutingPresets.*); пусто - правила настроены вручную или прежней версией. */
+    String preset() { return rest.optString("preset", ""); }
+
+    void setPreset(String id) { putRest("preset", id == null || id.isEmpty() ? null : id); }
+
+    /** true: в туннель идут только подсети правил не-direct, остальное напрямую (нативная часть пишет tunnel.cidr). */
+    boolean splitInclude() { return "include".equals(rest.optString("split", "")); }
+
+    void setSplitInclude(boolean on) { putRest("split", on ? "include" : null); }
+
+    boolean filterExclude() {
+        JSONObject f = rest.optJSONObject("exit_filter");
+        return f == null || !"include".equals(f.optString("mode", "exclude"));
+    }
+
+    List<String> filterWords() {
+        List<String> out = new ArrayList<>();
+        JSONObject f = rest.optJSONObject("exit_filter");
+        JSONArray a = f == null ? null : f.optJSONArray("words");
+        for (int i = 0; a != null && i < a.length() && out.size() < 16; i++) {
+            String w = a.optString(i, "").trim().toLowerCase(Locale.ROOT);
+            if (!w.isEmpty() && w.length() <= 40) out.add(w);
+        }
+        return out;
+    }
+
+    /** Нативная часть при автовыборе пропускает ноды, чьё имя содержит одно из слов (exclude) либо оставляет только такие (include). */
+    void setExitFilter(boolean exclude, List<String> words) {
+        try {
+            JSONArray a = new JSONArray();
+            for (String w : words) { String t = w.trim().toLowerCase(Locale.ROOT); if (!t.isEmpty() && t.length() <= 40 && a.length() < 16) a.put(t); }
+            if (a.length() == 0) rest.remove("exit_filter");
+            else rest.put("exit_filter", new JSONObject().put("mode", exclude ? "exclude" : "include").put("words", a));
+        } catch (Throwable ignored) { }
+    }
+
+    /** Коротко для главного экрана: «без: россия, russia» / «только: fin»; пусто - фильтра нет. */
+    String exitFilterSummary() {
+        List<String> w = filterWords();
+        return w.isEmpty() ? "" : (filterExclude() ? "без: " : "только: ") + String.join(", ", w);
+    }
+
+    private void putRest(String k, Object v) {
+        try { if (v == null) rest.remove(k); else rest.put(k, v); } catch (Throwable ignored) { }
+    }
+
     /** Поля файла вне модели (для проверок). */
     JSONObject rest() { return rest; }
 
@@ -274,8 +318,14 @@ final class RoutingCfg {
 
     /** Подпись частей, которые действуют только при создании туннеля (правила «мимо VPN»): изменились - нужно переподключиться. */
     String directSig() {
+        if (RoutingPresets.ALL_DIRECT.equals(preset())) return "all-direct";
         if (!mode.equals(MODE_RULES)) return "";
         StringBuilder s = new StringBuilder();
+        if (splitInclude()) {
+            s.append("include;");
+            for (Rule r : rules) if (r.enabled && !r.action.equals("direct")) s.append(r.type).append(':').append(r.name).append(';');
+            for (Manual m : manual) if (m.enabled && !m.action.equals("direct")) s.append(m.value).append(';');
+        }
         for (Rule r : rules) if (r.enabled && r.action.equals("direct")) s.append(r.type).append(':').append(r.name).append(';');
         for (Manual m : manual) if (m.enabled && m.action.equals("direct")) s.append(m.value).append(';');
         return s.toString();

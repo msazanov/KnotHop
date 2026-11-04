@@ -11,8 +11,11 @@ public final class RoutingNodeCheck {
         File state = Files.createTempDirectory("kh-default-routing-").toFile();
         check(RoutingCfg.ensureDefaults(state), "first setup writes defaults");
         RoutingCfg defaults = RoutingCfg.load(state);
-        check(defaults.mode.equals("rules") && defaults.rules.size() == 4 && defaults.manual.size() == 4, "LAN and Russia preset");
-        check(defaults.rules.stream().allMatch(r -> r.action.equals("direct")), "only explicit direct defaults");
+        check(defaults.mode.equals("rules") && defaults.rules.size() == 4 && defaults.manual.size() == 4, "blocked-only preset");
+        check(defaults.preset().equals("blocked") && defaults.splitInclude(), "default preset is blocked-only with include routes");
+        check(defaults.filterExclude() && defaults.filterWords().contains("россия"), "default exit filter excludes Russia");
+        check(defaults.manual.stream().allMatch(m -> m.action.equals("direct")), "LAN stays direct");
+        check(defaults.rules.stream().filter(r -> r.name.equals("RU-BLOCKED")).allMatch(r -> r.action.equals("default")), "blocked lists go to the tunnel");
         defaults.manual.add(new RoutingCfg.Manual("example.org", "exit:"+a)); defaults.save(state);
         String before = Files.readString(RoutingCfg.file(state).toPath());
         check(!RoutingCfg.ensureDefaults(state) && before.equals(Files.readString(RoutingCfg.file(state).toPath())), "never overwrite user settings");

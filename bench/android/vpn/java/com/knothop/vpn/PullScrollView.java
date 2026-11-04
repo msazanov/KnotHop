@@ -7,33 +7,38 @@ import android.view.ViewConfiguration;
 import android.widget.ScrollView;
 
 /**
- * ScrollView с жестом «потяни вниз, чтобы обновить» (androidx в сборке нет). Жест начинается только у верхнего края; пока тянем,
- * содержимое не прокручивается, а слушатель получает долю натяжения (0..1). Обновление - при отпускании после полного натяжения.
+ * ScrollView с жестом «потяни вниз, чтобы обновить» (androidx в сборке нет). Жест начинается только у верхнего края. Содержимое едет
+ * за пальцем (с затуханием), под ним открывается подсказка, которую рисует владелец; слушатель получает долю натяжения (0..1+).
+ * Пока палец держит дальше порога, подсказка говорит «Отпустите, чтобы обновить»; обновление запускается при отпускании.
  */
 class PullScrollView extends ScrollView {
     interface Listener {
+        /** Доля натяжения: 0 - не тянут, 1 - порог достигнут. */
         void onPull(float fraction);
         void onRefresh();
-        /** Страница дотянута до низа и потянута вверх: открыть журнал. */
-        default void onPullUp() { }
     }
 
     private Listener listener;
-    private final float slop, trigger;
+    private final float slop, trigger, maxPull;
     private float downY;
-    private boolean pulling, pullingUp, ready;
+    private boolean pulling, ready;
 
     PullScrollView(Context c) {
         super(c);
-        slop = ViewConfiguration.get(c).getScaledTouchSlop() * 2;
-        trigger = c.getResources().getDisplayMetrics().density * 90;
+        float d = c.getResources().getDisplayMetrics().density;
+        slop = ViewConfiguration.get(c).getScaledTouchSlop();
+        trigger = d * 72;       // смещение содержимого, при котором срабатывает обновление
+        maxPull = d * 120;
     }
 
     void setListener(Listener l) { listener = l; }
 
-    private boolean atBottom() {
-        View c = getChildAt(0);
-        return c != null && getScrollY() + getHeight() >= c.getHeight() - 4;
+    private View content() { return getChildAt(0); }
+
+    private float offset(float dy) {
+        // затухание: палец уходит дальше, чем содержимое
+        float x = Math.max(0f, dy) * 0.5f;
+        return Math.min(maxPull, x);
     }
 
     @Override
@@ -42,15 +47,10 @@ class PullScrollView extends ScrollView {
             case MotionEvent.ACTION_DOWN:
                 downY = e.getY();
                 pulling = false;
-                pullingUp = false;
                 ready = false;
                 break;
             case MotionEvent.ACTION_MOVE:
-                if (!pullingUp && listener != null && atBottom() && downY - e.getY() > slop * 2) {
-                    pullingUp = true;
-                    return true;
-                }
-                if (!pulling && listener != null && getScrollY() == 0 && e.getY() - downY > slop) {
+                if (!pulling && listener != null && getScrollY() == 0 && e.getY() - downY > slop * 2) {
                     pulling = true;
                     return true;
                 }
@@ -63,47 +63,43 @@ class PullScrollView extends ScrollView {
 
     @Override
     public boolean onTouchEvent(MotionEvent e) {
-        if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+        int a = e.getActionMasked();
+        if (a == MotionEvent.ACTION_DOWN) {
             downY = e.getY();
-            pulling = pullingUp = ready = false;
+            pulling = ready = false;
         }
-        // Когда ScrollView уже перехватил прокрутку, Android больше не зовёт onInterceptTouchEvent для MOVE.
-        // Поэтому достижение нижнего края проверяем и в собственном обработчике жеста.
-        if (!pulling && !pullingUp && listener != null && e.getActionMasked() == MotionEvent.ACTION_MOVE
-                && atBottom() && downY - e.getY() > slop * 2) pullingUp = true;
-        // Аналогично у верхнего края: пустая область/уже перехваченная прокрутка тоже должна запускать pull-to-refresh.
-        if (!pulling && !pullingUp && listener != null && e.getActionMasked() == MotionEvent.ACTION_MOVE
-                && getScrollY() == 0 && e.getY() - downY > slop) pulling = true;
-        if (pullingUp) {
-            int a = e.getActionMasked();
-            if (a == MotionEvent.ACTION_UP) {
-                pullingUp = false;
-                if (downY - e.getY() >= trigger * 0.6f) listener.onPullUp();
-            } else if (a == MotionEvent.ACTION_CANCEL) {
-                pullingUp = false;
-            }
-            return true;
-        }
+        // ScrollView мог уже перехватить прокрутку, тогда onIntercept для MOVE не зовётся: условие проверяем и здесь.
+        if (!pulling && listener != null && a == MotionEvent.ACTION_MOVE && getScrollY() == 0 && e.getY() - downY > slop * 2) pulling = true;
         if (!pulling) return super.onTouchEvent(e);
-        float frac = Math.max(0f, Math.min(1f, (e.getY() - downY) / trigger));
-        switch (e.getActionMasked()) {
+        View c = content();
+        float off = offset(e.getY() - downY);
+        switch (a) {
             case MotionEvent.ACTION_MOVE:
-                if (frac >= 1f && !ready) Ui.tick(this);
-                ready = frac >= 1f;
-                listener.onPull(frac);
+                if (c != null) c.setTranslationY(off);
+                boolean now = off >= trigger;
+                if (now && !ready) Ui.tick(this);
+                ready = now;
+                listener.onPull(off / trigger);
                 break;
             case MotionEvent.ACTION_UP:
                 pulling = false;
-                listener.onPull(0f);
-                if (frac >= 1f) { Ui.click(this); listener.onRefresh(); }
+                release(c);
+                if (ready) { Ui.click(this); listener.onRefresh(); }
+                ready = false;
                 break;
             case MotionEvent.ACTION_CANCEL:
                 pulling = false;
-                listener.onPull(0f);
+                ready = false;
+                release(c);
                 break;
             default:
                 break;
         }
         return true;
+    }
+
+    private void release(View c) {
+        listener.onPull(0f);
+        if (c != null) c.animate().translationY(0).setDuration(180).start();
     }
 }
