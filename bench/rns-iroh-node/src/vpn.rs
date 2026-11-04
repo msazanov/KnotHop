@@ -20,6 +20,8 @@ mod lxmf_admin;
 mod lxmf_sync;
 #[path = "enroll_net.rs"]
 mod enroll_net;
+#[path = "server_join.rs"]
+mod server_join;
 #[path = "rrc.rs"]
 mod rrc;
 
@@ -51,6 +53,10 @@ pub enum VpnCmd {
     List(StateArg),
     /// выпустить приглашение `kh-…` для новой ноды (локальная команда админа)
     Invite(InviteArgs),
+    /// код сервера `khs-…` (ADR 0027): создать от своего корня; серверы вступают по нему сами (`knothopd node --invite-file`)
+    InviteServer(InviteServerArgs),
+    /// коды серверов: список с числом вступивших (JSON), отзыв `--revoke ID`, повторный показ `--show ID --out ФАЙЛ`
+    ServerInvites(ServerInvitesArgs),
     /// выдать или изменить права ноды (запись подписывается identity из --state)
     Grant(GrantArgs),
     /// что эта нода согласна делать в сети (0015): политика подписывается ею самой и сужает выданные права; нода применит за несколько секунд
@@ -480,6 +486,36 @@ pub struct RevokeArgs {
     /// префикс хеша держателя (из `list`)
     #[arg(long)]
     pub id: String,
+}
+
+#[derive(Args, Clone)]
+pub struct InviteServerArgs {
+    /// каталог состояния админа (identity и trust.json); корнем становится эта identity
+    #[arg(long)]
+    pub state: PathBuf,
+    /// права серверу: подмножество USE|TRANSIT|EXIT (ADD/REMOVE/CONFIG кодом не выдаются)
+    #[arg(long, default_value = "transit+exit")]
+    pub rights: String,
+    /// сколько серверов могут вступить по этому коду
+    #[arg(long, default_value_t = server_join::DEFAULT_MAX)]
+    pub max: u8,
+    /// записать код в файл (0600); без него — в stdout
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args, Clone)]
+pub struct ServerInvitesArgs {
+    #[arg(long)]
+    pub state: PathBuf,
+    /// отозвать код (32 hex): новые серверы не вступят
+    #[arg(long)]
+    pub revoke: Option<String>,
+    /// записать строку кода в файл `--out` (32 hex id из списка)
+    #[arg(long)]
+    pub show: Option<String>,
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -3620,14 +3656,28 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         bail!("нужен --state (флагом или в --config)");
     }
     let invite_raw = match &a.invite_file {
+        // `-`: код сервера со стандартного ввода (не попадает ни в argv, ни на диск)
+        Some(f) if f == Path::new("-") => { use std::io::Read; let mut s = String::new(); std::io::stdin().take(8192).read_to_string(&mut s)?; s }
         // отсутствующий файл приглашения - не ошибка: нода уже зачислена и pin погашен (0013: приглашение после зачисления не используется)
         Some(f) => match std::fs::read_to_string(f) {
-            Ok(s) => s,
+            Ok(s) => {
+                use std::os::unix::fs::PermissionsExt;
+                if s.trim_start().starts_with(server_join::PREFIX) && std::fs::metadata(f).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                    eprintln!("Предупреждение: файл кода сервера {} доступен другим пользователям; код — секрет, нужны права 0600", f.display());
+                }
+                s
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).with_context(|| format!("invite-file {}", f.display())),
         },
         None => a.invite.clone(),
     };
+    // ADR 0027: код сервера `khs-…` (создаёт админ на телефоне). Только файл/stdin: в argv секрет виден через /proc.
+    let server_code = if invite_raw.trim_start().starts_with(server_join::PREFIX) {
+        if a.invite_file.is_none() { bail!("код сервера нельзя передавать через --invite (виден в списке процессов): используйте --invite-file ФАЙЛ_0600 или --invite-file -"); }
+        Some(server_join::Code::parse(&invite_raw).context("код сервера")?)
+    } else { None };
+    let invite_raw = if server_code.is_some() { String::new() } else { invite_raw };
     let identity = load_or_create_identity(&a.state)?;
     let key = iroh_key_from_identity(&identity)?;
     // сертификат relay делается из ключа ноды; копию держим только если relay включён
@@ -3661,7 +3711,12 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
 
     // модель 0013: права, якоря доверия и (до зачисления) приглашение
     let t13 = {
-        let tr = trust::Trust::load(node_identity.clone(), &a.state).context("trust.json")?;
+        let mut tr = trust::Trust::load(node_identity.clone(), &a.state).context("trust.json")?;
+        if let Some(code) = &server_code {
+            // якорь корня ставится только из кода и только на пустом trust; чужая сеть — отказ без изменений (fail-closed)
+            let how = server_join::adopt(&mut tr, code, now_ms() as u64 / 1000).context("код сервера не применён")?;
+            eprintln!("Код сервера: корень {} ({})", hex(&code.root_hash()), if how == server_join::Adopt::Fresh { "якорь поставлен" } else { "якорь уже был" });
+        }
         let mut inv = None;
         if !invite_raw.trim().is_empty() {
             match trust::Invite::parse(&invite_raw) {
@@ -3747,6 +3802,11 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     if let Some(runtime) = admin_lxmf {
         if let Some(t) = &ctx.t13 { runtime.pn.set_source(t.trust.clone()); }
         lxmf_admin::spawn_node_worker(runtime, ctx.clone());
+    }
+    if let (Some(code), Some(t)) = (server_code, &ctx.t13) {
+        let shn = sh.clone();
+        server_join::spawn_join(a.state.clone(), ctx.identity.clone(), t.trust.clone(), code, ctx.name.clone(),
+            a.invite_file.clone().filter(|f| f != Path::new("-")), Arc::new(move |m| shn.note(m)));
     }
     if let Some(t) = &ctx.t13 {
         let tr = t.trust.lock().unwrap();
@@ -6726,6 +6786,51 @@ fn admin_invite(a: InviteArgs) -> Result<()> {
     Ok(())
 }
 
+/// ADR 0027: код сервера от корня этого телефона/админа. Сеть держать не нужно: состояние кода — файл `server-codes/`;
+/// запросы серверов принимает работающий узел/клиент (режим «Сеть»).
+fn admin_invite_server(a: InviteServerArgs) -> Result<()> {
+    let rights = trust::parse_rights(&a.rights)?;
+    let id = load_identity_strict(&a.state)?;
+    let code = server_join::create(&a.state, &id, rights, a.max)?;
+    match a.out {
+        Some(out) => crate::enroll::write(&out, code.as_bytes())?,
+        None => println!("{code}"), // явная команда владельца; предпочтителен --out (0600)
+    }
+    Ok(())
+}
+
+fn admin_server_invites(a: ServerInvitesArgs) -> Result<()> {
+    if let Some(id) = &a.revoke { server_join::revoke(&a.state, id)?; }
+    if let Some(id) = &a.show {
+        let out = a.out.as_ref().context("--show требует --out ФАЙЛ")?;
+        crate::enroll::write(out, server_join::show(&a.state, id)?.as_bytes())?;
+        return Ok(());
+    }
+    println!("{}", server_join::list(&a.state));
+    Ok(())
+}
+
+/// `server-invites` для JNI: только список и отзыв, фиксированные флаги; строку кода этот мост не отдаёт.
+fn server_invites_cli(words: &[&str], state_dir: &str) -> String {
+    let bad = |why: &str| serde_json::json!({"version": 1, "accepted": false, "error": why}).to_string();
+    let mut revoke = None;
+    let mut i = 1;
+    while i < words.len() {
+        if i + 1 >= words.len() { return bad("invalid_cli_arguments"); }
+        match words[i] {
+            "--state" => {}
+            "--revoke" => revoke = Some(words[i + 1]),
+            _ => return bad("invalid_cli_arguments"),
+        }
+        i += 2;
+    }
+    let state = Path::new(state_dir);
+    if let Some(id) = revoke {
+        if server_join::revoke(state, id).is_err() { return bad("revoke_failed"); }
+    }
+    server_join::list(state).to_string()
+}
+
 /// H14: держатель по префиксу хеша. Префикс не короче 8 hex; совпасть должен ровно один держатель, иначе ошибка.
 fn holder_by_prefix(prefix: &str, known: &[(String, trust::Pk)]) -> Result<trust::Pk> {
     if prefix.len() < 8 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -7016,6 +7121,8 @@ pub fn run_admin(cmd: VpnCmd) -> Result<()> {
         VpnCmd::RulesList(a) => route::cmd_list(&a.state),
         VpnCmd::RulesCompile(a) => route::cmd_compile(&a.state),
         VpnCmd::Invite(a) => admin_invite(a),
+        VpnCmd::InviteServer(a) => admin_invite_server(a),
+        VpnCmd::ServerInvites(a) => admin_server_invites(a),
         VpnCmd::Grant(a) => admin_grant(a),
         VpnCmd::Policy(a) => admin_policy(a),
         VpnCmd::List(a) => admin_list(&a.state),
@@ -7176,6 +7283,7 @@ pub fn run_cli_json(command: &str, state_dir: &str) -> String {
     }
     let words: Vec<&str> = command.split_whitespace().collect();
     if words.first().is_some_and(|w| matches!(*w, "trust-view" | "rights-set")) { return my_node_cli(&words, state_dir); }
+    if words.first() == Some(&"server-invites") { return server_invites_cli(&words, state_dir); }
     if words.is_empty() || !matches!(words[0], "admin-view" | "admin-submit" | "admin-status") { return fail("unsupported_command"); }
     let mut argv = vec!["knothopd".to_string(), words[0].to_string()];
     let mut i = 1;

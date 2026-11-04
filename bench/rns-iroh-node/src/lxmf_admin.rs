@@ -382,7 +382,7 @@ impl AdminProcessor {
                     RouterEvent::MessageReceived(message) => {
                         let message = *message;
                         // Propagated - почта с PN сети; подпись и права всё равно проверяет Trust
-                        if (message.verification != Verification::Valid && message.title != super::enroll_net::TITLE) || !matches!(message.method, DeliveryMethod::Direct | DeliveryMethod::Propagated)
+                        if (message.verification != Verification::Valid && message.title != super::enroll_net::TITLE && message.title != super::server_join::TITLE) || !matches!(message.method, DeliveryMethod::Direct | DeliveryMethod::Propagated)
                             || message.content.len() > MAX_ADMIN_CONTENT {
                             continue;
                         }
@@ -937,6 +937,13 @@ pub fn spawn_node_worker(runtime: AdminRuntime, ctx: Arc<super::NodeCtx>) {
                         ctx.enforce_rights();
                         continue;
                     }
+                    if message.title == super::server_join::TITLE {
+                        // ADR 0027: ответ админа на запрос вступления (сервер) или запрос другого сервера (если эта нода — корень)
+                        if let Some(t) = &ctx.t13 {
+                            if super::server_join::on_lxmf(&state, &ctx.identity, &t.trust, &message) { ctx.enforce_rights(); }
+                        }
+                        continue;
+                    }
                     if message.title == super::lxmf_sync::TITLE {
                         super::on_sync_node(&ctx, &message);
                         continue;
@@ -1327,6 +1334,10 @@ pub fn spawn_client_worker(runtime: AdminRuntime, ctx: Arc<super::ClientCtx>, tr
                     let Some(ctx) = ctx.upgrade() else { break };
                     if message.title == super::enroll_net::TITLE {
                         super::enroll_net::on_lxmf(&state, &message); ctx.refresh_servers13(); super::start_dialers(&ctx);
+                    }
+                    else if message.title == super::server_join::TITLE {
+                        // ADR 0027: телефон-админ принимает запросы серверов по коду; права выдаёт корень этого телефона
+                        if super::server_join::on_lxmf(&state, &identity, &trust, &message) { ctx.refresh_servers13(); super::start_dialers(&ctx); }
                     }
                     else if message.title == super::lxmf_sync::TITLE { super::on_sync_client(&ctx, &message); }
                     else { handle_client_reply(&state, &identity, &trust, &message); }

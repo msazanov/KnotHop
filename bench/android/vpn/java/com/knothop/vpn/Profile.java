@@ -48,6 +48,7 @@ final class Profile {
             pr.enrolled = true;
             return pr;
         }
+        if (s.startsWith("khs-")) throw new Exception("это код сервера (khs-): его вводят на сервере (knothopd node --invite-file), а не в приложении");
         if (s.startsWith("kh-")) return parseInvite(s);
         throw new Exception("это не профиль KnotHop (нужно приглашение kh-base64 или QR)");
     }

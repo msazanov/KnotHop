@@ -36,6 +36,7 @@
         <activity android:name=".NodeSettingsActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />
         <activity android:name=".MyNodeActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />
         <activity android:name=".InviteActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />
+        <activity android:name=".ServerInviteActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />
         <activity android:name=".ScanActivity" android:exported="false" android:screenOrientation="portrait" />
         <service android:name=".KnotHopVpnService" android:exported="false" android:permission="android.permission.BIND_VPN_SERVICE"
                  android:foregroundServiceType="systemExempted">

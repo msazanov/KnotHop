@@ -119,8 +119,9 @@ public final class InviteActivity extends Activity {
         box.addView(text("Пригласить: шаг 1 из 2", 20, true));
         if (nodes.isEmpty()) {
             box.addView(text("Пока нет доступных нод с правом выпуска приглашений. Для выпуска достаточно режима «Сеть» — включать VPN не требуется.", 14, false));
-            box.addView(text("Если это новая собственная сеть, сначала привяжите корень этого телефона к своей серверной ноде (команда knothopd trust-anchor на сервере). "
+            box.addView(text("Это новая собственная сеть: создайте КОД СЕРВЕРА и разверните по нему свои серверы — они сами вступят в сеть, ключи вручную привязывать не нужно. "
                     + "Название телефона не зачисляет серверы в сеть и не даёт прав в чужой сети. Публичные RNS-узлы не заменяют ваш VPN-выход.", 14, false));
+            box.addView(button("Пригласить сервер (новая сеть)", v -> startActivity(new Intent(this, ServerInviteActivity.class))));
             if ("idle".equals(KnotHopVpnService.phase) || ("error".equals(KnotHopVpnService.phase) && !KnotHopVpnService.tunHeld)) {
                 box.addView(button("Включить сеть без VPN", v -> {
                     try {
@@ -176,6 +177,7 @@ public final class InviteActivity extends Activity {
             }
             show2();
         }));
+        box.addView(button("Пригласить сервер по коду", v -> startActivity(new Intent(this, ServerInviteActivity.class))));
     }
 
     // ---------------------------------------------------------------- страница 2: права
