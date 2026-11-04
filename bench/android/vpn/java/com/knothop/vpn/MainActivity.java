@@ -45,7 +45,8 @@ public class MainActivity extends Activity {
     private LinearLayout pairBox, mainBox, adminBox, usersBox;
     private TextView usersTitle;
     private EditText profileField;
-    private TextView pairMsg, header, status, usersView, nodesMsg, updMsg;
+    private TextView pairMsg, header, status, usersView, nodesMsg, updMsg, updView;
+    private AppUpdater updater;
     private Button benchBtn;
     private TextView pullHint, modeText;
     private LogConsole logConsole;
@@ -139,6 +140,17 @@ public class MainActivity extends Activity {
         updMsg = new LogText(this, "версия");
         updMsg.setText("Версия " + installedName() + " (" + installedCode() + ")");
         mainBox.addView(updMsg);
+        updater = new AppUpdater(this, sp, ui);
+        AppUpdater.cleanup(this);
+        Button updBtn = new Button(this);
+        updBtn.setAllCaps(false);
+        updBtn.setText("Проверить обновление");
+        updBtn.setOnClickListener(v -> { Ui.tick(v); checkUpdate(true); });
+        mainBox.addView(updBtn);
+        updView = new TextView(this);
+        updView.setTextSize(12);
+        updView.setText("Версия " + installedName() + " (" + installedCode() + ")");
+        mainBox.addView(updView);
         // --- админ: приглашения. Видны только в своей сети (профиль «своя сеть»); пользователь по чужому приглашению их не видит.
         adminBox = new LinearLayout(this);
         adminBox.setOrientation(LinearLayout.VERTICAL);
@@ -266,6 +278,9 @@ public class MainActivity extends Activity {
         super.onResume();
         if (!sp.contains("profile")) offerShown = "";   // профиль мог быть забыт на экране своей ноды
         topo.setActive(true);
+        String updRes = sp.getString("upd_result", "");
+        if (!updRes.isEmpty()) { updView.setText(updRes); sp.edit().remove("upd_result").apply(); }
+        updater.resume();
         Util.dbg("экран открыт");
         ui.post(tick);
     }
@@ -741,38 +756,41 @@ public class MainActivity extends Activity {
         try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception e) { return "?"; }
     }
 
-    private static final long UPDATE_EVERY_MS = 12L * 3600 * 1000;
+    private static final long UPDATE_EVERY_MS = 24L * 3600 * 1000;
+
+    private void updShow(String t) {
+        updMsg.setText(t);
+        if (updView != null) updView.setText(t);
+    }
 
     /**
-     * Свежий релиз на GitHub. Автоматически: при запуске, не чаще раза в 12 часов, молча, если нечего предлагать или нет сети; одну и ту же версию
-     * после «Позже» повторно не предлагаем. Вручную (кнопка): всегда отвечает. Запрос идёт в фоновом потоке, старт экрана не ждёт.
+     * Свежий релиз на GitHub. Автоматически (при открытии, не чаще раза в сутки): только строка «Доступна версия X» под кнопкой, без диалога
+     * и без скачивания. Вручную (кнопка, потяни-чтобы-обновить): ответ всегда, при новой версии - диалог с загрузкой через {@link AppUpdater}.
      */
     private void checkUpdate(final boolean manual) {
         if (isFinishing() || isDestroyed()) return;
         long now = System.currentTimeMillis();
         if (!manual && now - sp.getLong("upd_ts", 0) < UPDATE_EVERY_MS) return;
-        if (manual) updMsg.setText("Проверяю…");
+        if (manual) updShow("Проверяю…");
         final long have = installedCode();
         UpdateCheck.run(r -> ui.post(() -> {
             if (isFinishing() || isDestroyed()) return;
             if (r.error != null) {
-                if (manual) { updMsg.setText("Не удалось проверить: " + r.error); }
+                if (manual) updShow("Не удалось проверить: " + r.error);
                 return;
             }
             sp.edit().putLong("upd_ts", System.currentTimeMillis()).apply();
             if (r.latest <= have) {
-                if (manual) updMsg.setText("Установлена последняя версия " + installedName() + " (" + have + ")");
+                if (manual) updShow("Установлена последняя версия " + installedName() + " (" + have + ")");
                 return;
             }
-            updMsg.setText("Доступна версия " + r.tag + " (у вас " + installedName() + ", " + have + ")");
-            if (!manual && sp.getLong("upd_dismissed", 0) >= r.latest) return;
+            updShow("Доступна версия " + r.tag + " (у вас " + installedName() + ", " + have + ")");
+            if (!manual) return;
             new AlertDialog.Builder(this).setTitle("Доступно обновление")
-                .setMessage("Вышла версия " + r.tag + ", у вас " + installedName() + ".\nСкачать APK? После загрузки откройте файл и подтвердите установку поверх: профиль и права сохранятся.")
-                .setPositiveButton("Скачать", (d, w) -> {
-                    try { startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(UpdateCheck.APK))); }
-                    catch (Exception e) { android.widget.Toast.makeText(this, "Нет приложения для открытия ссылки", android.widget.Toast.LENGTH_LONG).show(); }
-                })
-                .setNegativeButton("Позже", (d, w) -> sp.edit().putLong("upd_dismissed", r.latest).apply())
+                .setMessage("Вышла версия " + r.tag + ", у вас " + installedName() + ".\nПриложение скачает файл с GitHub, проверит контрольную сумму и подпись и предложит установить. "
+                    + "Установка перезапустит приложение: VPN прервётся, включите его заново.")
+                .setPositiveButton("Скачать", (d, w) -> updater.start(r.tag))
+                .setNegativeButton("Позже", null)
                 .show();
         }));
     }
