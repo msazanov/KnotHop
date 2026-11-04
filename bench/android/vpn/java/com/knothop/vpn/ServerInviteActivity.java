@@ -53,7 +53,7 @@ public final class ServerInviteActivity extends Activity {
     private Bitmap qr;
     private ImageView qrView;
     private TextView codeText, statusText;
-    private boolean useTransit = true, useExit = true, useUse = false;
+    private boolean useTransit = true, useExit = true, useAdd = true, useUse = false;
     private int slots = 16;
     private final Runnable poll = new Runnable() {
         @Override public void run() {
@@ -124,12 +124,15 @@ public final class ServerInviteActivity extends Activity {
                 + "Код действует 48 часов и может использоваться несколькими серверами (до выбранного числа).", 14, false));
         CheckBox cTransit = check("TRANSIT — пропускать трафик между серверами", useTransit);
         CheckBox cExit = check("EXIT — быть выходом в интернет", useExit);
+        CheckBox cAdd = check("ADD — выпускать приглашения клиентам (kh-), права не шире своих", useAdd);
         CheckBox cUse = check("USE — пользоваться сетью как клиент", useUse);
         cTransit.setOnCheckedChangeListener((v, on) -> useTransit = on);
         cExit.setOnCheckedChangeListener((v, on) -> useExit = on);
+        cAdd.setOnCheckedChangeListener((v, on) -> useAdd = on);
         cUse.setOnCheckedChangeListener((v, on) -> useUse = on);
         box.addView(cTransit);
         box.addView(cExit);
+        box.addView(cAdd);
         box.addView(cUse);
         box.addView(text("Сколько серверов могут вступить по коду:", 14, false));
         RadioGroup g = new RadioGroup(this);
@@ -147,7 +150,7 @@ public final class ServerInviteActivity extends Activity {
             if (r != null && r.getTag() instanceof Integer) slots = (Integer) r.getTag();
         });
         box.addView(g);
-        box.addView(text("Права ADD, REMOVE и CONFIG кодом не выдаются. Обычное приглашение пользователей (kh-) работает как раньше.", 12, false));
+        box.addView(text("Права REMOVE и CONFIG кодом не выдаются. С правом ADD сервер можно выбрать входной нодой приглашения пользователей (kh-); новый пользователь получает только USE.", 12, false));
         box.addView(button("Создать код сервера", v -> {
             if (busy) return;
             if (rightsText().isEmpty()) {
@@ -179,6 +182,7 @@ public final class ServerInviteActivity extends Activity {
         if (useUse) s.append("use");
         if (useTransit) s.append(s.length() == 0 ? "" : "+").append("transit");
         if (useExit) s.append(s.length() == 0 ? "" : "+").append("exit");
+        if (useAdd) s.append(s.length() == 0 ? "" : "+").append("add");
         return s.toString();
     }
 

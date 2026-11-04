@@ -27,9 +27,10 @@ pub const TITLE: &[u8] = b"server.join/1";
 pub const TTL: u64 = 48 * 3600;
 pub const DEFAULT_MAX: u8 = 16;
 pub const MAX_SLOTS: u8 = 64;
-/// Сервер получает только эти права; ADD/REMOVE/CONFIG кодом не выдаются.
-pub const ALLOWED: u16 = trust::USE | trust::TRANSIT | trust::EXIT;
-pub const DEFAULT_RIGHTS: u16 = trust::TRANSIT | trust::EXIT;
+/// Сервер получает только эти права; REMOVE/CONFIG кодом не выдаются. ADD — ограниченное делегирование (0013/0014): нода выдаёт права
+/// не шире своих и принимает приглашения клиентов `kh-` как входная нода; зачисление клиента ограничено грантом админа (`enroll::CAP`).
+pub const ALLOWED: u16 = trust::USE | trust::TRANSIT | trust::EXIT | trust::ADD;
+pub const DEFAULT_RIGHTS: u16 = trust::TRANSIT | trust::EXIT | trust::ADD;
 /// Не больше одновременно действующих кодов на админа.
 const MAX_ACTIVE_CODES: usize = 8;
 const BODY_LEN: usize = 1 + 64 + 2 + 8 + 8 + 1 + 24;
@@ -549,7 +550,7 @@ mod tests {
         assert!(Code::parse(&s[..s.len() - 2]).is_err());
         assert!(Code::parse("kh-AAAA").is_err());
         assert!(Code::parse(&"x".repeat(5000)).is_err());
-        for rights in [0, trust::ADD, trust::USE | trust::CONFIG, trust::ALL, trust::HOST_ACCESS] {
+        for rights in [0, trust::REMOVE, trust::ADD | trust::REMOVE, trust::USE | trust::CONFIG, trust::ALL, trust::HOST_ACCESS] {
             assert!(Code::new(root.public_key_bytes(), rights, 1, now_s()).is_err(), "права {rights}");
         }
         for max in [0, MAX_SLOTS + 1] { assert!(Code::new(root.public_key_bytes(), DEFAULT_RIGHTS, max, now_s()).is_err()); }
@@ -643,7 +644,7 @@ mod tests {
         for (s, n) in [(&s1, "a"), (&s2, "b")] {
             let changed = on_join(&f.dir, &f.root, &f.tr, &message(s, &f.root, &join_msg(&f.code, s, n)), join_msg(&f.code, s, n));
             assert!(changed);
-            assert_eq!(f.tr.lock().unwrap().rights_in(f.root.hash(), s.hash()), DEFAULT_RIGHTS, "ровно права из кода, без USE/ADD");
+            assert_eq!(f.tr.lock().unwrap().rights_in(f.root.hash(), s.hash()), DEFAULT_RIGHTS, "ровно права из кода, без USE");
         }
         // повтор того же сервера: слот не тратится, trust не меняется
         let again = on_join(&f.dir, &f.root, &f.tr, &message(&s1, &f.root, &join_msg(&f.code, &s1, "a")), join_msg(&f.code, &s1, "a"));
@@ -793,6 +794,47 @@ mod tests {
         std::fs::remove_dir_all(sdir).unwrap();
     }
 
+    /// ADR 0027 §1: сервер с ADD из кода — входная нода приглашения клиента `kh-`; клиент получает только USE на эту ноду.
+    #[test]
+    fn server_with_add_from_code_serves_kh_invite_and_client_gets_only_scoped_use() {
+        use crate::enroll::{EnRec, Grant, Invite, Store};
+        let f = admin_fixture(2);
+        assert!(DEFAULT_RIGHTS & trust::ADD != 0, "по умолчанию код несёт ADD");
+        let (server, client) = (id(), id());
+        let m = join_msg(&f.code, &server, "es");
+        on_join(&f.dir, &f.root, &f.tr, &message(&server, &f.root, &m), m);
+        let rec = own_chain_record(&f.tr.lock().unwrap(), &server.public_key_bytes(), f.root.hash()).unwrap();
+        let mut st = Trust::new(server.clone(), None);
+        st.add_anchor(&f.root.public_key_bytes()).unwrap();
+        assert!(!matches!(st.offer(rec), trust::Offer::Rejected(_)));
+        assert_eq!(st.rights_in(f.root.hash(), server.hash()), DEFAULT_RIGHTS);
+        // админ (корень) выпускает kh- с этой нодой входной; права клиента в гранте — только USE
+        let inv = Invite::new(vec![*server.hash()]).unwrap();
+        let now = now_s();
+        let g = Grant::create(&f.root, *f.root.hash(), &inv, trust::USE, now).unwrap();
+        g.verify(&st, &f.root.public_key_bytes()).unwrap();
+        let dir = tmp("kh");
+        let store = Store::new(&dir).unwrap();
+        let mut chain = st.chain_for(&server.public_key_bytes());
+        chain.retain(|r| r.root == *f.root.hash());
+        store.issue(&st, &g, &inv.pin, &f.root.public_key_bytes(), &chain, now).unwrap();
+        let mut p = store.lookup(&inv.pin, now).unwrap();
+        // шире гранта (TRANSIT) клиент получить не может, даже подписав согласие сам
+        let wide = EnRec::consent(&client, &g, trust::USE | trust::TRANSIT).unwrap();
+        assert!(EnRec::create(&server, &g, client.public_key_bytes(), trust::USE | trust::TRANSIT, wide, now_ms() as u64).is_err());
+        let consent = EnRec::consent(&client, &g, trust::USE).unwrap();
+        p.rec = EnRec::create(&server, &g, client.public_key_bytes(), trust::USE, consent, now_ms() as u64).unwrap();
+        let mut ct = Trust::new(client.clone(), None);
+        ct.add_anchor(&f.root.public_key_bytes()).unwrap();
+        ct.offer_enrollment(p).unwrap();
+        assert_eq!(ct.rights_at(f.root.hash(), client.hash(), server.hash()), trust::USE, "USE на ноду-входную");
+        assert_eq!(ct.rights_in(f.root.hash(), client.hash()), 0, "в корне прав нет");
+        assert_eq!(ct.rights_at(f.root.hash(), client.hash(), id().hash()), 0, "на другую ноду прав нет");
+        // сервер без ADD (TRANSIT+EXIT) тоже может быть в гранте, но грант админа от этого шире не становится
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(f.dir).unwrap();
+    }
+
     #[test]
     fn grant_without_pending_state_or_for_other_code_is_ignored() {
         let f = admin_fixture(4);
@@ -812,7 +854,7 @@ mod tests {
 
     use leviculum_std::api::NodeBuilder;
 
-    struct Peer { id: Identity, dir: PathBuf, trust: Arc<Mutex<Trust>>, _keep: Vec<Box<dyn std::any::Any>> }
+    struct Peer { id: Identity, dir: PathBuf, trust: Arc<Mutex<Trust>>, dirs: Arc<Mutex<Vec<serde_json::Value>>>, _keep: Vec<Box<dyn std::any::Any>> }
 
     async fn peer(name: &str, base: &Path, id: Identity, hub: std::net::SocketAddr) -> Peer {
         let dir = base.join(name);
@@ -824,6 +866,8 @@ mod tests {
         node.start().await.unwrap();
         let sync = lxmf_sync::register(&dir, rt.sync.clone());
         let (d, i, t) = (dir.clone(), id.clone(), trust.clone());
+        let dirs: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let dirs_rx = dirs.clone();
         std::thread::spawn(move || {
             while let Ok(m) = rt.inbound.recv() {
                 if m.title == TITLE { on_lxmf(&d, &i, &t, &m); }
@@ -831,6 +875,8 @@ mod tests {
                     // минимальный приём trust.sync (в узле это on_sync_node): ack и записи; подпись записи проверяет Trust::offer
                     let Some(w) = lxmf_sync::Wire::decode(&m) else { continue };
                     if let Some(a) = w.ack { lxmf_sync::received_ack(&d, m.source_hash, a); continue; }
+                    // каталог (в узле это on_dir_node): сохраняем строки для проверки, подтверждаем получение
+                    if !w.dir.is_empty() { dirs_rx.lock().unwrap().extend(w.dir.clone()); continue; }
                     if let Some((recs, _)) = lxmf_sync::parsed(&w) {
                         let mut tr = t.lock().unwrap();
                         for r in recs { let _ = tr.offer(r); }
@@ -839,7 +885,7 @@ mod tests {
                 }
             }
         });
-        Peer { id, dir, trust, _keep: vec![Box::new(node), Box::new(sync)] }
+        Peer { id, dir, trust, dirs, _keep: vec![Box::new(node), Box::new(sync)] }
     }
 
     async fn wait_until(secs: u64, mut f: impl FnMut() -> bool) -> bool {
@@ -887,7 +933,20 @@ mod tests {
         let now = now_ms() as u64;
         assert!(p1.trust.lock().unwrap().common_with(&s2.public_key_bytes(), trust::TRANSIT, trust::TRANSIT, true, true, now), "s1 видит s2 соседом");
         assert!(p2.trust.lock().unwrap().common_with(&s1.public_key_bytes(), trust::TRANSIT, trust::TRANSIT, true, true, now), "s2 видит s1 соседом");
-        // права ровно из кода: ни USE, ни ADD
+        // свежая сеть без addr-book: сервер шлёт соседу свою строку каталога обычным LXMF (то, что делает dir_bootstrap);
+        // получатель принимает её как подсказку, только если отправитель — эффективный TRANSIT в его записях (dir_sender_ok)
+        let line = serde_json::json!({"d": hex(&crate::vpn::dest_from_pub_tag(&s1.public_key_bytes(), crate::vpn::T13_TAG)), "k": hex(&s1.public_key_bytes()), "e": "ep1", "a": ["203.0.113.7:47001"], "n": "s1"});
+        assert!(lxmf_sync::send_dir(&p1.dir, s2.public_key_bytes(), vec![line], Arc::new(|| Some(true))));
+        let rx = p2.dirs.clone();
+        assert!(wait_until(60, || !rx.lock().unwrap().is_empty()).await, "строка каталога не дошла по LXMF");
+        let got = crate::vpn::parse_dir_values(&rx.lock().unwrap(), crate::vpn::T13_TAG, 8);
+        assert_eq!(got.len(), 1, "строка проходит разбор и фильтр адресов");
+        assert_eq!(got[0].pk, s1.public_key_bytes());
+        let ok = crate::vpn::dir_sender_ok(&Default::default(), &Default::default(), None, &p2.trust.lock().unwrap(), &s1.public_key_bytes(), now_ms() as u64);
+        assert!(ok, "s1 — TRANSIT в записях s2: каталог принят");
+        let stranger = id();
+        assert!(!crate::vpn::dir_sender_ok(&Default::default(), &Default::default(), None, &p2.trust.lock().unwrap(), &stranger.public_key_bytes(), now_ms() as u64), "чужой ключ каталог не подсовывает");
+        // права ровно из кода: ни USE, ни REMOVE/CONFIG
         for p in &servers { assert_eq!(p.trust.lock().unwrap().rights_in(&root, p.id.hash()) & !DEFAULT_RIGHTS, 0); }
         // третий сверх лимита
         let p3 = peer("s3", &base, s3.clone(), addr).await;

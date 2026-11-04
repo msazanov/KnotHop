@@ -493,8 +493,8 @@ pub struct InviteServerArgs {
     /// каталог состояния админа (identity и trust.json); корнем становится эта identity
     #[arg(long)]
     pub state: PathBuf,
-    /// права серверу: подмножество USE|TRANSIT|EXIT (ADD/REMOVE/CONFIG кодом не выдаются)
-    #[arg(long, default_value = "transit+exit")]
+    /// права серверу: подмножество USE|TRANSIT|EXIT|ADD (REMOVE/CONFIG кодом не выдаются)
+    #[arg(long, default_value = "transit+exit+add")]
     pub rights: String,
     /// сколько серверов могут вступить по этому коду
     #[arg(long, default_value_t = server_join::DEFAULT_MAX)]
@@ -4608,6 +4608,36 @@ mod ordinary_admission_tests {
         assert!(dir_sender_ok(&links, &none, None, &tr, &stranger, now) && dir_recipient_ok(&links, None, &tr, &stranger, now));
     }
 
+    /// ADR 0027 §6а: цели «свежей сети» — члены с взаимным TRANSIT без известного адреса; сам я, клиент (USE), чужой корень и уже известный не нужны.
+    #[test]
+    fn dir_bootstrap_targets_are_mutual_transit_members_without_known_address() {
+        let (root, me, peer, known, client, foreign) = (leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity(),
+            leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity(), leviculum_std::api::generate_identity());
+        let mut rt = trust::Trust::new(root.clone(), None);
+        let mut recs = vec![];
+        for (id, r) in [(&me, trust::TRANSIT | trust::EXIT), (&peer, trust::TRANSIT | trust::EXIT), (&known, trust::TRANSIT), (&client, trust::USE)] {
+            recs.push(rt.issue(*root.hash(), id.public_key_bytes(), r).unwrap());
+        }
+        let mut tr = trust::Trust::new(me.clone(), None);
+        tr.add_anchor(&root.public_key_bytes()).unwrap();
+        for r in recs { tr.offer(r); }
+        let _ = foreign;
+        let tag = T13_TAG;
+        let mut have = HashSet::new();
+        let now = now_ms() as u64;
+        let mut t = dir_bootstrap_targets(&tr, &me.public_key_bytes(), tag, &have, now);
+        t.sort();
+        let mut want = vec![peer.public_key_bytes(), known.public_key_bytes()];
+        want.sort();
+        assert_eq!(t, want, "я, клиент (USE) не цели");
+        have.insert(dest_from_pub_tag(&known.public_key_bytes(), tag));
+        assert_eq!(dir_bootstrap_targets(&tr, &me.public_key_bytes(), tag, &have, now), vec![peer.public_key_bytes()], "известный адрес — цель снята");
+        // без TRANSIT у меня соседей нет
+        let mut tr2 = trust::Trust::new(client.clone(), None);
+        tr2.add_anchor(&root.public_key_bytes()).unwrap();
+        assert!(dir_bootstrap_targets(&tr2, &client.public_key_bytes(), tag, &HashSet::new(), now).is_empty());
+    }
+
     #[test]
     fn member_directory_is_root_scoped_and_revocation_closes_it() {
         let mut f = fixture(true);
@@ -5856,6 +5886,35 @@ impl NodeCtx {
         for pk in clients { self.send_member_directory(pk); }
     }
 
+    /// ADR 0027 §6а: свежая сеть без адресов. Анонсы RNS адресов не несут (AGENTS п.9), а Link к соседу строится только по нашим носителям,
+    /// поэтому два сервера с одним корнем сами друг друга не находят. Раз в минуту: каждому члену корня с TRANSIT (взаимный, по записям),
+    /// чьего адреса нет в таблице соседей, шлём свою строку каталога и просим его каталог — обычным LXMF (`trust.sync`/dir), путь строит RNS.
+    /// Это подсказки: получатель берёт адреса через `on_dir_node` (отправитель — эффективный TRANSIT в его записях, адреса фильтруются).
+    /// Повтор для одного ключа — с растущей паузой 1 → 30 мин, пока адрес не появится.
+    fn dir_bootstrap(self: &Arc<Self>) {
+        use std::sync::OnceLock;
+        static BACKOFF: OnceLock<Mutex<HashMap<trust::Pk, (Instant, Duration)>>> = OnceLock::new();
+        let Some(t) = &self.t13 else { return };
+        let known: HashSet<[u8; 16]> = self.neigh.lock().unwrap().values().filter(|nb| !nb.addrs.is_empty()).map(|nb| nb.dest).collect();
+        let targets = {
+            let tr = t.trust.lock().unwrap();
+            dir_bootstrap_targets(&tr, &self.my_pk, &self.tag, &known, now_ms() as u64)
+        };
+        let mine = self.adv();
+        let own = (!mine.is_empty()).then(|| with_rl(serde_json::json!({"d": hex(&self.my_dest), "k": hex(&self.my_pk), "e": self.ep_id, "a": mine, "n": self.name}), self.rl_pub.as_ref()));
+        let mut b = BACKOFF.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        b.retain(|k, _| targets.contains(k));
+        for pk in targets {
+            if b.get(&pk).is_some_and(|(at, wait)| at.elapsed() < *wait) { continue; }
+            let wait = b.get(&pk).map_or(Duration::from_secs(60), |(_, w)| (*w * 2).min(Duration::from_secs(1800)));
+            b.insert(pk, (Instant::now(), wait));
+            let a = own.clone().map(|line| lxmf_sync::send_dir(&self.state, pk, vec![line], self.dir_gate(pk))).unwrap_or(false);
+            let r = lxmf_sync::request_dir(&self.state, pk, self.dir_gate(pk));
+            self.sh.note(format!("каталог новому члену сети {}: своя строка {}, запрос его каталога {}", &hex(&trust::hash_of(&pk).unwrap_or([0; 16]))[..8],
+                if a { "в очереди" } else { "не отправлена" }, if r { "в очереди" } else { "не поставлен" }));
+        }
+    }
+
     fn admit_client13(self: &Arc<Self>, link: LinkId, pk: [u8; 64]) {
         let Some(t) = &self.t13 else { return };
         if self.link_is_public(&link) {
@@ -6084,6 +6143,13 @@ fn dir_sender_ok(links: &HashMap<LinkId, LinkInfo>, pair_sent: &HashSet<LinkId>,
     links.iter().any(|(k, l)| l.peer_pk == Some(*sender) && (matches!(l.role, Role::Server { .. }) || pair_sent.contains(k)))
         || admin == Some(*sender)
         || tr.effective(sender, now) & trust::TRANSIT != 0
+}
+
+/// Члены корня с взаимным TRANSIT (по записям), чьего адреса нет среди `known` (dest соседей с адресами): им нужны наша строка и их каталог.
+fn dir_bootstrap_targets(tr: &trust::Trust, me: &trust::Pk, tag: &str, known: &HashSet<[u8; 16]>, now: u64) -> Vec<trust::Pk> {
+    tr.holders_with(trust::TRANSIT).into_iter()
+        .filter(|pk| pk != me && !known.contains(&dest_from_pub_tag(pk, tag)) && tr.common_with(pk, trust::TRANSIT, trust::TRANSIT, true, true, now))
+        .take(16).collect()
 }
 
 /// Каталог ещё нужен адресату `pk`: у него живой Link (новичок или сосед-сервер), он админ ожидающего приглашения или имеет эффективный TRANSIT.
@@ -6390,6 +6456,9 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
         }
         if ctx.t13.is_some() && tick % 600 == 301 {
             ctx.dir_tick();
+        }
+        if ctx.t13.is_some() && tick % 120 == 61 {
+            ctx.dir_bootstrap();
         }
         if ctx.t13.is_some() && tick % 120 == 17 {
             ctx.book_save();
@@ -8728,7 +8797,8 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
             start_dialer(ctx, cand);
             let carrier_now = || {
                 let label = ctx.carriers.lock().unwrap().get(&cand.dest).filter(|x| *x.mode.lock().unwrap() != "none").map(|x| x.label.lock().unwrap().clone()).unwrap_or_default();
-                out_carrier_iface(&ctx.node, &label)
+                // прямого носителя нет: сквозное mesh-QUIC к выходу (mesh_first) — тоже наш носитель, путь 1 хоп по нему
+                out_carrier_iface(&ctx.node, &label).or_else(|| out_carrier_iface(&ctx.node, &mesh_label(&cand.key)))
             };
             wait_our_path(&ctx.node, &ctx.path_gate, &dest, || carrier_ifaces(ctx, avoid_iface), carrier_now, avoid_iface, if avoid_iface.is_some() { 6 } else { 8 }).await;
         }
@@ -8790,7 +8860,23 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     }
     let dest = DestinationHash::new(cand.dest);
     let t0 = Instant::now();
-    let (id, handle) = open_link(ctx, cand, avoid_iface).await?;
+    // ADR 0028: прямой путь к выходу заблокирован (QUIC и TCP не проходят) — сквозной mesh-носитель через соседа-транзит строим ДО Link,
+    // иначе Link идёт по RNS-транзиту (3+ хопа), который может не пройти. Права и допуск после Link прежние.
+    let blocked = mesh_first_eligible(ctx, cand) && endpoint_peer_id(&cand.key).is_some_and(|p| ctx.sh.health.blocked_for(&p).is_some());
+    if blocked {
+        let ok = mesh_first(ctx, cand).await;
+        ctx.sh.note(format!("{}: прямой путь заблокирован, mesh-носитель до Link {}", cand.name, if ok { "готов" } else { "не поднялся" }));
+    }
+    let (id, handle) = match open_link(ctx, cand, avoid_iface).await {
+        Ok(v) => v,
+        // Link не поднялся (нет пути/не установился): если к выходу нет своего QUIC — один раз пробуем через mesh-носитель
+        Err(e) if !blocked && mesh_first_eligible(ctx, cand) => {
+            ctx.sh.note(format!("{}: Link не поднялся ({e:#}), строю mesh-носитель и повторяю", cand.name));
+            if !mesh_first(ctx, cand).await { return Err(e); }
+            open_link(ctx, cand, avoid_iface).await?
+        }
+        Err(e) => return Err(e),
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     ctx.auth_wait.lock().unwrap().insert(id, tx);
     if let Some(c) = &ctx.c13 {
@@ -8900,6 +8986,29 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     Ok((id, handle))
 }
 
+fn mesh_label(key: &[u8; 32]) -> String { format!("mesh-{}", &hex(key)[..8]) }
+
+fn endpoint_peer_id(key: &[u8; 32]) -> Option<String> { EndpointId::from_bytes(key).ok().map(|i| i.to_string()) }
+
+/// Mesh до Link возможен: модель 0013, проверенный ключ кандидата (ключ подписи Link = ключ iroh), mesh включён, прямого QUIC-носителя ещё нет.
+fn mesh_first_eligible(ctx: &Arc<ClientCtx>, cand: &CServer) -> bool {
+    let Some(m) = mesh::global() else { return false };
+    ctx.c13.is_some() && m.enabled() && mesh::quic_cfg().is_some() && cand.pk.is_some_and(|pk| pk[32..64] == cand.key) && !dataplane::plane().has_carrier(&cand.key)
+}
+
+/// Поднять сквозное QUIC к выходу через соседа-транзит и дождаться интерфейса мультиплексора (до 15 с). Данные не принимаются:
+/// bind в dataplane — только после AUTH_OK и проверки EXIT в `connect_exit`; ключ пира берётся из TLS (`mark_e2e`/`add_quic(owner)`).
+async fn mesh_first(ctx: &Arc<ClientCtx>, cand: &CServer) -> bool {
+    mesh_carrier(ctx, cand);
+    let label = mesh_label(&cand.key);
+    let until = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < until {
+        if out_carrier_iface(&ctx.node, &label).is_some() { return true; }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
 /// Выходы, к которым сейчас идёт попытка mesh-соединения (не больше `MESH_DIAL_MAX` одновременно).
 static MESH_DIALING: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
 const MESH_DIAL_MAX: usize = 2;
@@ -8952,7 +9061,7 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
                         conn.close(0u32.into(), b"mesh table full");
                         break;
                     }
-                    let Ok(mx) = mux::Mux::new(&ctx.node, &ctx.sh, mux::next_name("iroh-dg-out", &format!("mesh-{}", &hex(&key)[..8])), false) else { conn.close(0u32.into(), b"no interface"); break };
+                    let Ok(mx) = mux::Mux::new(&ctx.node, &ctx.sh, mux::next_name("iroh-dg-out", &mesh_label(&key)), false) else { conn.close(0u32.into(), b"no interface"); break };
                     if mx.add_quic(conn.clone(), true, key).is_none() {
                         conn.close(0u32.into(), b"too many carriers");
                         break;
