@@ -208,6 +208,8 @@ public class KnotHopVpnService extends VpnService {
      * затем без исключений. Вызывать под modeLock.
      */
     private void establishTun() throws Exception {
+        // защита от петли: без привязки к физической сети носитель ушёл бы в собственный туннель
+        if (carrierNetwork == null && !tryBindCarrier()) throw new IllegalStateException(bindFailText());
         RoutingCfg rc = RoutingCfg.load(state);
         boolean allDirect = RoutingPresets.ALL_DIRECT.equals(rc.preset());   // «Всё напрямую»: TUN без маршрутов, трафик идёт мимо VPN (в интерфейсе красное предупреждение)
         compileRoutes(rc);
@@ -384,11 +386,25 @@ public class KnotHopVpnService extends VpnService {
     /** Process binding replaces UID exclusion. Never clear it while TUN exists (loop guard). */
     private void bindCarrierBeforeTun() {
         cm = (ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);
-        Network candidate = physicalNetwork();
-        if (candidate == null) throw new IllegalStateException("Нет физической сети для носителя VPN");
-        if (!cm.bindProcessToNetwork(candidate)) throw new IllegalStateException("Не удалось привязать носитель к сети");
-        carrierNetwork = candidate;
         live = this;
+        if (tryBindCarrier()) return;
+        // Режим «Сеть» (своего TUN нет): петли в собственный туннель быть не может, поэтому узел работает и без привязки — через сеть,
+        // которую даёт система (в том числе чужой VPN). Для VPN привязка обязательна: её проверяет establishTun.
+        if (mode == 2) throw new IllegalStateException(bindFailText());
+        Util.svc("носитель не привязан к физической сети (другой VPN?): режим «Сеть» работает через системную сеть");
+    }
+
+    /** Привязать процесс к физической сети. false — сети нет или система запретила (обычно активен другой VPN, в том числе «постоянный»). */
+    private boolean tryBindCarrier() {
+        Network candidate = physicalNetwork();
+        if (candidate == null || !cm.bindProcessToNetwork(candidate)) return false;
+        carrierNetwork = candidate;
+        return true;
+    }
+
+    private String bindFailText() {
+        return physicalNetwork() == null ? "Нет подключения к интернету (Wi-Fi или мобильная сеть)"
+                : "Включён другой VPN: Android не даёт KnotHop выйти в сеть мимо него. Отключите другой VPN (и «постоянный VPN» в настройках) и включите снова";
     }
 
     static final class SpeedPath {
@@ -583,7 +599,11 @@ public class KnotHopVpnService extends VpnService {
                     if (watchSession != session) return;
                     NetworkCapabilities caps = cm.getNetworkCapabilities(n);
                     if (caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) return;
-                    if (!cm.bindProcessToNetwork(n)) { fail("Носитель потерял физическую сеть", session); return; }
+                    if (!cm.bindProcessToNetwork(n)) {
+                        if (tun != null) { fail("Носитель потерял физическую сеть", session); return; }
+                        poke();   // режим «Сеть»: работаем через системную сеть
+                        return;
+                    }
                     carrierNetwork = n;
                     Util.dbg("физическая сеть доступна: " + (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ? "Wi-Fi" : caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ? "мобильная" : "другая"));
                     try { if (tun != null) setUnderlyingNetworks(new Network[]{n}); } catch (Throwable ignored) { }
