@@ -213,13 +213,9 @@ final class AppUpdater {
 
     @SuppressWarnings("deprecation")
     private static Set<String> signers(PackageInfo pi) throws Exception {
-        Signature[] sigs;
-        if (Build.VERSION.SDK_INT >= 28) {
-            if (pi.signingInfo == null) return null;
-            sigs = pi.signingInfo.getApkContentsSigners();
-        } else {
-            sigs = pi.signatures;
-        }
+        Signature[] sigs = null;
+        if (Build.VERSION.SDK_INT >= 28 && pi.signingInfo != null) sigs = pi.signingInfo.getApkContentsSigners();
+        if (sigs == null || sigs.length == 0) sigs = pi.signatures;
         if (sigs == null || sigs.length == 0) return null;
         Set<String> out = new HashSet<>();
         for (Signature s : sigs) out.add(hex(MessageDigest.getInstance("SHA-256").digest(s.toByteArray())));
@@ -234,14 +230,16 @@ final class AppUpdater {
     @SuppressWarnings("deprecation")
     private void verifyPackage(File apk) throws Exception {
         PackageManager pm = act.getPackageManager();
-        int flags = Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES;
+        // Для файла часть прошивок (EMUI, Android 10) не заполняет signingInfo: просим оба поля, `signers` берёт любое заполненное
+        int flags = PackageManager.GET_SIGNATURES | (Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : 0);
         PackageInfo cand = pm.getPackageArchiveInfo(apk.getAbsolutePath(), flags);
         if (cand == null) throw new Refusal("Файл не является корректным APK. Обновление отменено.");
         if (!act.getPackageName().equals(cand.packageName)) throw new Refusal("Файл относится к другому приложению. Обновление отменено.");
         PackageInfo mine = pm.getPackageInfo(act.getPackageName(), flags);
         Set<String> a = signers(cand), b = signers(mine);
-        if (a == null) throw new Refusal("Не удалось прочитать подпись скачанного файла. Обновление отменено.");
-        if (b == null || !a.equals(b)) throw new Refusal("Подпись скачанного файла не совпадает с подписью установленного приложения (возможно, другой ключ). Обновление отменено, ничего не установлено.");
+        // Система не отдала подпись файла: заранее сравнить нечем. Целостность уже проверена по SHA256SUMS тега, а обновление с другой подписью
+        // отвергнет сам Android при установке (INSTALL_FAILED_UPDATE_INCOMPATIBLE). Прочитанная и несовпавшая подпись - отказ.
+        if (a != null && (b == null || !a.equals(b))) throw new Refusal("Подпись скачанного файла не совпадает с подписью установленного приложения (возможно, другой ключ). Обновление отменено, ничего не установлено.");
         if (code(cand) <= code(mine)) throw new Refusal("В скачанном файле не более новая версия (" + code(cand) + ", у вас " + code(mine) + "). Обновление не требуется.");
     }
 

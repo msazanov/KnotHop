@@ -676,9 +676,12 @@ impl AdminProcessor {
             let Some(identity) = lxmf_sync::public_identity(&pending.request.pk) else { remove.push(id.clone()); continue };
             let destination = lxmf_destination(identity.hash());
             core.remember_identity(DestinationHash::new(destination), identity);
-            if pending.request.title == super::server_join::TITLE {
-                // join идёт через публичную RNS (чужие транспорты пропускают только стандартный CBC); тело зашифровано LXMF на получателя
+            if pending.request.title == super::server_join::TITLE || pending.request.title == lxmf_sync::TITLE {
+                // join, записи прав и каталог идут и через публичную RNS (чужие транспорты пропускают только стандартный CBC);
+                // тело зашифровано LXMF на получателя и подписано, шифр Link здесь только транспорт
                 router.node_mut().use_cbc_links_to(DestinationHash::new(destination));
+            }
+            if pending.request.title == super::server_join::TITLE {
                 super::server_join::jlog(format!("LXMF {} -> {}: попытка доставки, путь {}", "join", &super::hex(&destination)[..8],
                     if core.has_path(&DestinationHash::new(destination)) { "известен" } else { "неизвестен (роутер запросит путь)" }));
             }
