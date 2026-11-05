@@ -5909,6 +5909,10 @@ impl NodeCtx {
             if b.get(&pk).is_some_and(|(at, wait)| at.elapsed() < *wait) { continue; }
             let wait = b.get(&pk).map_or(Duration::from_secs(60), |(_, w)| (*w * 2).min(Duration::from_secs(1800)));
             b.insert(pk, (Instant::now(), wait));
+            // Своя запись прав — раньше каталога: админ мог разослать её не всем (телефон офлайн), а без неё сосед не примет ни каталог, ни Link.
+            // Запись подписана по цепочке до якоря получателя и проверяется им как обычно (Trust::offer); канал ничего не добавляет.
+            let proof: Vec<_> = t.trust.lock().unwrap().export_all().into_iter().filter(|r| r.holder == self.my_pk).take(16).collect();
+            if !proof.is_empty() { let _ = lxmf_sync::send(&self.state, pk, &proof, &[], self.dir_gate(pk)); }
             let a = own.clone().map(|line| lxmf_sync::send_dir(&self.state, pk, vec![line], self.dir_gate(pk))).unwrap_or(false);
             let r = lxmf_sync::request_dir(&self.state, pk, self.dir_gate(pk));
             self.sh.note(format!("каталог новому члену сети {}: своя строка {}, запрос его каталога {}", &hex(&trust::hash_of(&pk).unwrap_or([0; 16]))[..8],
