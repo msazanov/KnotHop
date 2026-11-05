@@ -125,9 +125,8 @@ public final class InviteActivity extends Activity {
             if ("idle".equals(KnotHopVpnService.phase) || ("error".equals(KnotHopVpnService.phase) && !KnotHopVpnService.tunHeld)) {
                 box.addView(button("Включить сеть без VPN", v -> {
                     try {
-                        startForegroundService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_MODE)
-                                .putExtra(KnotHopVpnService.EXTRA_MODE, 1));
-                        android.widget.Toast.makeText(this, "Запускаю узел. Затем потяните страницу вниз для обновления нод", android.widget.Toast.LENGTH_LONG).show();
+                        boolean ok = NodeLauncher.start(this, 1);   // в «грязном» процессе перезапустит приложение и включит «Сеть» там
+                        android.widget.Toast.makeText(this, ok ? "Запускаю узел. Затем потяните страницу вниз для обновления нод" : "Откройте приложение, чтобы запустить узел", android.widget.Toast.LENGTH_LONG).show();
                     } catch (RuntimeException e) {
                         android.widget.Toast.makeText(this, "Не удалось запустить узел: " + e.getMessage(), android.widget.Toast.LENGTH_LONG).show();
                     }

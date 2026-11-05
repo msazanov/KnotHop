@@ -103,6 +103,14 @@ public class KnotHopVpnService extends VpnService {
             if (!"error".equals(phase)) switchMode(want);
             return START_NOT_STICKY;
         }
+        if (NodeLauncher.nativeStarted) {
+            // Нативная часть уже работала в этом процессе: чистый запуск возможен только в новом процессе (обычно сюда не доходим, ворота - NodeLauncher.start).
+            foreground("перезапускаю приложение");
+            NodeLauncher.start(this, want);
+            stopForeground(true);
+            stopSelf();
+            return START_NOT_STICKY;
+        }
         if (tun != null) cleanup();   // TUN, оставленный после сбоя (tunHeld), заменяем новым
         mode = want;
         extraArgs = intent != null && intent.getStringExtra(EXTRA_ARGS) != null ? intent.getStringExtra(EXTRA_ARGS) : "";
@@ -191,6 +199,7 @@ public class KnotHopVpnService extends VpnService {
                 } catch (Exception ignored) { }
             }
             Native.setDebug(Util.debug);
+            NodeLauncher.nativeStarted = true;   // с этого момента процесс «грязный»: следующий запуск узла - только в новом процессе
             int rc = Native.runVpn(args, state.getAbsolutePath());
             if (!"stopping".equals(phase)) {
                 String err = Util.read(new File(state, "error.txt"));
@@ -371,16 +380,7 @@ public class KnotHopVpnService extends VpnService {
      * её берём, только если она не VPN, иначе ищем среди всех: сначала проверенную системой, затем любую с интернетом.
      */
     private Network physicalNetwork() {
-        Network best = null;
-        int bestScore = -1;
-        Network active = cm.getActiveNetwork();
-        for (Network n : cm.getAllNetworks()) {
-            NetworkCapabilities c = cm.getNetworkCapabilities(n);
-            if (c == null || !c.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) || !c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue;
-            int score = (c.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ? 2 : 0) + (n.equals(active) ? 1 : 0);
-            if (score > bestScore) { best = n; bestScore = score; }
-        }
-        return best;
+        return PhysNet.find(cm);
     }
 
     /** Process binding replaces UID exclusion. Never clear it while TUN exists (loop guard). */

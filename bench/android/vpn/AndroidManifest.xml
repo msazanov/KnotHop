@@ -18,7 +18,7 @@
 
     <application android:name=".KnotHopApplication" android:theme="@style/Theme.KnotHop" android:label="KnotHop" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:usesCleartextTraffic="true" android:extractNativeLibs="true" android:allowBackup="false">
         <profileable android:shell="true" />
-        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask" android:configChanges="orientation|screenSize|keyboardHidden">
+        <activity android:name=".MainActivity" android:theme="@style/Theme.KnotHop.NoBar" android:exported="true" android:launchMode="singleTask" android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -30,6 +30,7 @@
                 <data android:scheme="knothop" android:host="i" />
             </intent-filter>
         </activity>
+        <activity android:name=".RestartActivity" android:process=":restart" android:exported="false" android:theme="@style/Theme.KnotHop.Restart" android:excludeFromRecents="true" android:taskAffinity="" android:noHistory="true" />
         <activity android:name=".RoutingActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />
         <activity android:name=".PolicyActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />
         <activity android:name=".NodeAdminActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />

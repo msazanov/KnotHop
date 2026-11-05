@@ -27,6 +27,7 @@ public final class KnotHopApplication extends Application implements Application
 
     @Override public void onCreate() {
         super.onCreate();
+        if (NodeLauncher.isRestartProcess(this)) return;   // процесс ":restart": только RestartActivity, нативная часть не нужна
         Util.init(this);
         power = (PowerManager) getSystemService(POWER_SERVICE);
         Native.setUiVisible(false); // Initializes the hint before a native runtime exists.
@@ -49,6 +50,7 @@ public final class KnotHopApplication extends Application implements Application
     private void publish(boolean value) {
         if (visible == value) return;
         visible = value;
+        NodeLauncher.uiVisible = value;
         Native.setUiVisible(value);
     }
 

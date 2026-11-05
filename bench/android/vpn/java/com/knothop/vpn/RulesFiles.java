@@ -103,7 +103,7 @@ final class RulesFiles {
     }
 
     private static HttpURLConnection open(String url) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        HttpURLConnection c = (HttpURLConnection) PhysNet.open(new URL(url));
         c.setConnectTimeout(15000);
         c.setReadTimeout(30000);
         c.setRequestProperty("User-Agent", "knothop-vpn");

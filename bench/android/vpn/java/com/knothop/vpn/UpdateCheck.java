@@ -40,7 +40,7 @@ final class UpdateCheck {
     static Result fetch() {
         HttpURLConnection c = null;
         try {
-            c = (HttpURLConnection) new URL(API).openConnection();
+            c = (HttpURLConnection) PhysNet.open(new URL(API));   // явно через физическую сеть: DNS не зависит от чужого VPN и нашего туннеля
             c.setConnectTimeout(8000);
             c.setReadTimeout(8000);
             c.setRequestProperty("Accept", "application/vnd.github+json");
@@ -62,7 +62,7 @@ final class UpdateCheck {
             if (num <= 0) return new Result(0, tag, "непонятный номер релиза: " + (tag.length() > 24 ? tag.substring(0, 24) : tag));
             return new Result(num, tag, null);
         } catch (Exception e) {
-            return new Result(0, "", e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+            return new Result(0, "", PhysNet.why(e));
         } finally {
             if (c != null) c.disconnect();
         }

@@ -127,7 +127,7 @@ final class AppUpdater {
             } catch (Refusal r) {
                 fail(r.getMessage());
             } catch (Exception e) {
-                fail(cancel ? "Загрузка отменена" : "Не удалось скачать обновление: " + e.getClass().getSimpleName());
+                fail(cancel ? "Загрузка отменена" : "Не удалось скачать обновление: " + PhysNet.why(e));
             } finally {
                 running = false;
             }
@@ -156,7 +156,7 @@ final class AppUpdater {
         for (int i = 0; i <= 5; i++) {
             URL u = new URL(url);
             if (!"https".equals(u.getProtocol()) || !hostOk(u.getHost())) throw new IOException("небезопасный адрес");
-            HttpURLConnection c = (HttpURLConnection) u.openConnection();
+            HttpURLConnection c = (HttpURLConnection) PhysNet.open(u);
             c.setInstanceFollowRedirects(false);
             c.setConnectTimeout(15000);
             c.setReadTimeout(30000);

@@ -18,11 +18,14 @@ final class Util {
      * по действию пользователя («Поделиться журналом»).
      */
     static volatile boolean debug;
+    /** Контекст приложения (для сетевых помощников без Activity). */
+    static volatile android.content.Context app;
     private static final long DBG_MAX = 256 * 1024;
     private static File dbgFile;
 
     /** Читает флажок из настроек и передаёт его нативной части. Вызывается при старте процесса. */
     static synchronized void init(android.content.Context c) {
+        app = c.getApplicationContext();
         dbgFile = new File(c.getFilesDir(), "ui-log.txt");
         setDebug(c.getSharedPreferences("p", android.content.Context.MODE_PRIVATE).getBoolean("debug", false));
     }

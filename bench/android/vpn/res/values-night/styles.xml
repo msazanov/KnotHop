@@ -14,6 +14,17 @@
         <item name="android:colorAccent">#FF9F43</item>
         <item name="android:forceDarkAllowed">false</item>
     </style>
+    <style name="Theme.KnotHop.NoBar" parent="Theme.KnotHop">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+    <style name="Theme.KnotHop.Restart" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowDisablePreview">true</item>
+    </style>
     <style name="Widget.KnotHop.Text" parent="@android:style/Widget.TextView">
         <item name="android:textColor">#ECEEF2</item>
     </style>

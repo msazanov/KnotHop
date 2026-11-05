@@ -103,9 +103,13 @@ public final class ServerInviteActivity extends Activity {
     private void ensureNetwork() {
         String p = KnotHopVpnService.phase;
         if ("idle".equals(p) || ("error".equals(p) && !KnotHopVpnService.tunHeld)) {
+            if (NodeLauncher.needsRestart()) {
+                // запуск узла перезапустил бы приложение посреди создания кода: узел включается вручную на главном экране
+                android.widget.Toast.makeText(this, "Код создаётся. Чтобы серверы могли вступить, включите «Сеть» на главном экране", android.widget.Toast.LENGTH_LONG).show();
+                return;
+            }
             try {
-                startForegroundService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_MODE)
-                        .putExtra(KnotHopVpnService.EXTRA_MODE, 1));
+                NodeLauncher.start(this, 1);   // в «грязном» процессе перезапустит приложение и включит «Сеть» там
             } catch (RuntimeException e) {
                 android.widget.Toast.makeText(this, "Не удалось запустить узел: " + e.getMessage(), android.widget.Toast.LENGTH_LONG).show();
             }

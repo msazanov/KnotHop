@@ -46,7 +46,11 @@ public class MainActivity extends Activity {
     private LinearLayout pairBox, mainBox, adminBox, usersBox;
     private TextView usersTitle;
     private EditText profileField;
-    private TextView pairMsg, header, status, statusTitle, usersView, nodesMsg, updMsg, updView, directWarn, routingSummary, statePill;
+    private TextView pairMsg, header, status, usersView, nodesMsg, updMsg, updView, directWarn, routingSummary, topStatus;
+    private LinearLayout stateCard;
+    /** Из status.json для верхней строки состояния: число известных нод и имя текущего выхода. */
+    private int nodeCount;
+    private String exitName = "";
     private AppUpdater updater;
     private TextView pullHint, modeText;
     private LogConsole logConsole;
@@ -80,7 +84,7 @@ public class MainActivity extends Activity {
         sv.setVerticalScrollBarEnabled(false);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(22), dp(16), dp(72));   // снизу запас под ручку журнала
+        root.setPadding(dp(16), dp(12), dp(16), dp(72));   // снизу запас под ручку журнала
         sv.addView(root);
         pullHint = Ui.text(this, "", 13, Ui.ORANGE, true);
         pullHint.setGravity(Gravity.CENTER);
@@ -132,19 +136,8 @@ public class MainActivity extends Activity {
         // --- главный экран
         mainBox = new LinearLayout(this);
         mainBox.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout head = new LinearLayout(this);
-        head.setOrientation(LinearLayout.HORIZONTAL);
-        head.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout nameCol = new LinearLayout(this);
-        nameCol.setOrientation(LinearLayout.VERTICAL);
-        nameCol.addView(Ui.text(this, "KnotHop", 26, Ui.TEXT, true));
-        updView = Ui.text(this, "Версия " + installedName() + " (" + installedCode() + ")", 12, Ui.MUTED, false);
-        nameCol.addView(updView);
-        head.addView(nameCol, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        statePill = Ui.text(this, "", 12, Ui.ON_ACCENT, true);
-        statePill.setPadding(dp(12), dp(5), dp(12), dp(5));
-        head.addView(statePill);
-        mainBox.addView(head);
+        updView = Ui.text(this, "Версия " + installedName() + " (" + installedCode() + ")", 11, Ui.MUTED, false);
+        updView.setGravity(Gravity.CENTER);
         header = Ui.text(this, "", 13, Ui.ORANGE, false);
         header.setVisibility(View.GONE);
         header.setPadding(0, dp(8), 0, 0);
@@ -165,11 +158,8 @@ public class MainActivity extends Activity {
         mainBox.addView(directWarn, lpMatch(12));
 
         // --- состояние
-        LinearLayout stateCard = Ui.card(this);
-        statusTitle = Ui.text(this, "", 20, Ui.TEXT, true);
-        stateCard.addView(statusTitle);
+        stateCard = Ui.card(this);
         status = Ui.text(this, "", 13, Ui.MUTED, false);
-        status.setPadding(0, dp(4), 0, 0);
         stateCard.addView(status);
         mainBox.addView(stateCard, Ui.cardParams(this));
 
@@ -227,12 +217,22 @@ public class MainActivity extends Activity {
         usersBox.setVisibility(View.GONE);
         adminBox.addView(usersBox);
         mainBox.addView(adminBox, Ui.cardParams(this));
+        mainBox.addView(updView, lpMatch(12));   // версия и результат проверки обновления: мелко внизу
         root.addView(mainBox);
 
         // --- сборка экрана: [кадр: подсказка, прокрутка, шторка журнала] + панель режимов
         LinearLayout outer = new LinearLayout(this);
         outer.setOrientation(LinearLayout.VERTICAL);
         outer.setBackgroundColor(Ui.BG);
+        // закреплённая сверху строка: текущее состояние подключения (вместо названия приложения)
+        topStatus = Ui.text(this, "", 17, Ui.TEXT, true);
+        topStatus.setGravity(Gravity.CENTER);
+        topStatus.setSingleLine(true);
+        topStatus.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        topStatus.setBackground(Ui.roundStroke(Ui.CARD, Ui.STROKE, 0, this));
+        topStatus.setPadding(dp(16), dp(12), dp(16), dp(12));
+        topStatus.setVisibility(View.GONE);
+        outer.addView(topStatus, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         FrameLayout frame = new FrameLayout(this);
         FrameLayout.LayoutParams hp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP);
         hp.topMargin = dp(8);
@@ -327,6 +327,9 @@ public class MainActivity extends Activity {
         if (!updRes.isEmpty()) { updView.setText(updRes); sp.edit().remove("upd_result").apply(); }
         updater.resume();
         Util.dbg("экран открыт");
+        // режим, ради которого приложение было перезапущено (NodeLauncher): запись стирается до исполнения, цикла нет
+        int pm = NodeLauncher.takePending(sp);
+        if (pm != 0 && sp.contains("profile")) applyMode(pm);
         ui.post(tick);
     }
 
@@ -360,7 +363,7 @@ public class MainActivity extends Activity {
         }
         if (in.getBooleanExtra("stop", false)) {
             startService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_STOP));
-        } else if (in.getBooleanExtra("auto", false) && VpnService.prepare(this) == null && !active() && sp.contains("profile")) {
+        } else if (in.getBooleanExtra("auto", false) && VpnService.prepare(this) == null && !active() && !NodeLauncher.needsRestart() && sp.contains("profile")) {
             startForegroundService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_START)
                     .putExtra(KnotHopVpnService.EXTRA_ARGS, in.getStringExtra("args") == null ? "" : in.getStringExtra("args")));
         }
@@ -610,7 +613,11 @@ public class MainActivity extends Activity {
     }
 
     private void sendMode(int m) {
-        startForegroundService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_MODE).putExtra(KnotHopVpnService.EXTRA_MODE, m));
+        // единые ворота: в «грязном» процессе (узел уже запускался) перезапускает приложение и продолжает после перезапуска
+        if (!NodeLauncher.start(this, m)) {
+            pendingMode = -1;
+            android.widget.Toast.makeText(this, "Не удалось перезапустить приложение. Закройте его и откройте снова", android.widget.Toast.LENGTH_LONG).show();
+        }
     }
 
     private TextView geoMsg;
@@ -881,7 +888,7 @@ public class MainActivity extends Activity {
         UpdateCheck.run(r -> ui.post(() -> {
             if (isFinishing() || isDestroyed()) return;
             if (r.error != null) {
-                if (manual) updShow("Не удалось проверить: " + r.error);
+                if (manual) updShow("Не удалось проверить обновление: " + r.error);
                 return;
             }
             sp.edit().putLong("upd_ts", System.currentTimeMillis()).apply();
@@ -974,6 +981,7 @@ public class MainActivity extends Activity {
         else getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         pairBox.setVisibility(paired ? View.GONE : View.VISIBLE);
         mainBox.setVisibility(paired ? View.VISIBLE : View.GONE);
+        topStatus.setVisibility(paired ? View.VISIBLE : View.GONE);
         if (!paired) return;
         try {
             Profile pr = Profile.parse(saved);
@@ -1010,6 +1018,9 @@ public class MainActivity extends Activity {
                 String st = j.optString("status");
                 logChange("статус", st);
                 if (doing == null && !st.isEmpty() && !st.startsWith("выход:")) doing = st;   // «подключаюсь к …», «выбранный выход недоступен …»
+                JSONArray exAll = j.optJSONArray("exits");
+                nodeCount = exAll == null ? 0 : exAll.length();
+                exitName = cur == null ? "" : TopologyView.shortName(cur.optString("n"));
                 if (cur != null) {
                     StringBuilder c = new StringBuilder("выход: ").append(TopologyView.shortName(cur.optString("n")));
                     if (pinned.equalsIgnoreCase(cur.optString("d"))) c.append("  ★");
@@ -1048,6 +1059,8 @@ public class MainActivity extends Activity {
                 doing = "статус: " + e;
             }
         } else {
+            nodeCount = 0;
+            exitName = "";
             prevTs = 0;
             rUp = rDown = 0;
             try { topo.update(new JSONObject("{\"state\":\"idle\",\"ip\":\"\"}")); } catch (Exception ignored) { }
@@ -1061,7 +1074,8 @@ public class MainActivity extends Activity {
         if (s.length() > 0) s.setLength(s.length() - 1);
         status.setText(s);
         status.setVisibility(s.length() == 0 ? View.GONE : View.VISIBLE);
-        showState(doing != null && doing.startsWith("Сбой"));
+        stateCard.setVisibility(s.length() == 0 ? View.GONE : View.VISIBLE);
+        showState(doing != null && doing.startsWith("Сбой") ? doing : null);
         Util.lab("STATUS " + s.toString().replace("\n", " | "));
         String log = Util.read(new File(state, "log.txt"));
         String[] lines = Util.mergedLog(log);
@@ -1069,18 +1083,33 @@ public class MainActivity extends Activity {
         if (lines.length > 0) Util.lab("LOG " + lines[lines.length - 1]);
     }
 
-    /** Заголовок состояния, значок в шапке, предупреждение «всё напрямую» и краткая сводка маршрутизации. */
-    private void showState(boolean failed) {
+    private static String nodesWord(int n) {
+        int a = n % 100, b = n % 10;
+        return a >= 11 && a <= 14 ? "нод" : b == 1 ? "нода" : b >= 2 && b <= 4 ? "ноды" : "нод";
+    }
+
+    /**
+     * Закреплённая сверху строка состояния (цвет по режиму), предупреждение «всё напрямую» и краткая сводка маршрутизации.
+     * @param failure текст сбоя («Сбой: …») или null
+     */
+    private void showState(String failure) {
         int m = curMode();
         boolean held = KnotHopVpnService.tunHeld;
-        String[] titles = {"Отключено", "В сети нод", "VPN включён"};
-        String[] pills = {"ОТКЛ.", "СЕТЬ", "VPN"};
-        int col = held || failed ? Ui.RED : ModeSlider.COLORS[m];
-        statusTitle.setText(held ? "VPN не работает, трафик заблокирован" : titles[m]);
-        statusTitle.setTextColor(col == ModeSlider.COLORS[0] ? Ui.TEXT : col);
-        statePill.setText(held ? "СБОЙ" : pills[m]);
-        statePill.setTextColor(Ui.ON_ACCENT);
-        statePill.setBackground(Ui.round(col, 12, this));
+        String t;
+        int col;
+        if (held) { t = "Сбой: VPN не работает, трафик заблокирован"; col = Ui.RED; }
+        else if (failure != null) {
+            String why = failure.startsWith("Сбой: ") ? failure.substring(6) : failure;
+            t = "Сбой: " + (why.length() > 40 ? why.substring(0, 40) + "…" : why);
+            col = Ui.RED;
+        } else if (m == 0) { t = "Отключено"; col = Ui.MUTED; }
+        else if (m == 1) {
+            if (nodeCount > 0) { t = "Сеть: " + nodeCount + " " + nodesWord(nodeCount); col = ModeSlider.COLORS[1]; }
+            else { t = "Сеть: подключаюсь…"; col = ModeSlider.COLORS[1]; }
+        } else if (!exitName.isEmpty() && "up".equals(KnotHopVpnService.phase)) { t = "VPN: " + exitName; col = ModeSlider.COLORS[2]; }
+        else { t = "VPN: подключаюсь…"; col = ModeSlider.COLORS[1]; }
+        topStatus.setText(t);
+        topStatus.setTextColor(col);
         RoutingCfg rc = RoutingCfg.load(new File(getFilesDir(), "state"));
         routingSummary.setText(RoutingPresets.title(rc) + (rc.exitFilterSummary().isEmpty() ? "" : " · " + rc.exitFilterSummary()));
         directWarn.setVisibility(m == 2 && RoutingPresets.ALL_DIRECT.equals(rc.preset()) ? View.VISIBLE : View.GONE);
