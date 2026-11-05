@@ -69,6 +69,8 @@ public class KnotHopVpnService extends VpnService {
     /** Режим «в туннель только выбранное»: в TUN добавлены только эти подсети (остальное идёт напрямую). Пусто и includeMode=false - обычный полный туннель. */
     private List<String> includeRoutes = new ArrayList<>();
     private boolean includeMode;
+    /** TUN поднят пресетом «Всё напрямую»: маршрутов нет, туннеля для трафика нет. */
+    private volatile boolean allDirectTun;
     /** Результат rules-compile последнего подключения. */
     private List<String> compiledDirect = new ArrayList<>(), compiledTunnel = new ArrayList<>();
     private static volatile KnotHopVpnService live;
@@ -221,6 +223,7 @@ public class KnotHopVpnService extends VpnService {
         if (carrierNetwork == null && !tryBindCarrier()) throw new IllegalStateException(bindFailText());
         RoutingCfg rc = RoutingCfg.load(state);
         boolean allDirect = RoutingPresets.ALL_DIRECT.equals(rc.preset());   // «Всё напрямую»: TUN без маршрутов, трафик идёт мимо VPN (в интерфейсе красное предупреждение)
+        allDirectTun = allDirect;
         compileRoutes(rc);
         boolean wantInclude = !allDirect && rc.mode.equals("rules") && rc.splitInclude();
         if (wantInclude && compiledTunnel.isEmpty()) {
@@ -362,7 +365,11 @@ public class KnotHopVpnService extends VpnService {
                 try { String[] pr = c.split("/"); b.addRoute(pr[0], Integer.parseInt(pr[1])); } catch (Throwable ignored) { }
             }
             // DNS идёт через туннель, иначе запросы к заблокированным доменам подменяются провайдером
-            b.addRoute("1.1.1.1", 32).addRoute("8.8.8.8", 32);
+            // и адрес диагностики (DiagTarget): в туннеле при любых правилах, один маршрут /32
+            for (String c : DiagTarget.INCLUDE_EXTRA) {
+                String[] pr = c.split("/");
+                b.addRoute(pr[0], Integer.parseInt(pr[1]));
+            }
         }
         b.addDnsServer("1.1.1.1").addDnsServer("8.8.8.8");
         if (Build.VERSION.SDK_INT >= 29) b.setMetered(false);
@@ -464,10 +471,17 @@ public class KnotHopVpnService extends VpnService {
     /** Почему последний вызов speedPath() не нашёл путь (для диалога и отладочного журнала); пусто, если путь найден. */
     static volatile String speedWhy = "";
 
+    /** TUN есть, но пресет «Всё напрямую»: маршрутов в туннель нет, диагностика туннеля невозможна. */
+    static boolean allDirectActive() {
+        KnotHopVpnService s = live;
+        return s != null && s.tun != null && s.allDirectTun;
+    }
+
     /** Only our current VPN, never the default/physical Network. Ambiguity is an error. */
     static SpeedPath speedPath() {
         KnotHopVpnService s = live;
         if (s == null) { speedWhy = "служба VPN не запущена"; return null; }
+        if (allDirectActive()) { speedWhy = "пресет «Всё напрямую»: туннеля нет, трафик идёт мимо VPN"; return null; }
         synchronized (s) {
             if (!"up".equals(phase) || tunHeld || s.tun == null || s.watchSession == null) {
                 speedWhy = "фаза=" + phase + (tunHeld ? ", TUN удержан" : "") + (s.tun == null ? ", TUN нет (режим «Сеть»?)" : "") + (s.watchSession == null ? ", нет сессии" : "");
@@ -523,6 +537,8 @@ public class KnotHopVpnService extends VpnService {
             if (Native.runVpn("rules-compile --state " + state.getAbsolutePath(), state.getAbsolutePath()) != 0) return;
             for (String l : Util.read(new File(state, "direct.cidr")).split("\n")) if (l.matches("\\d{1,3}(\\.\\d{1,3}){3}/\\d{1,2}")) compiledDirect.add(l);
             for (String l : Util.read(new File(state, "tunnel.cidr")).split("\n")) if (l.matches("\\d{1,3}(\\.\\d{1,3}){3}/\\d{1,2}")) compiledTunnel.add(l);
+            // адрес диагностики не должен попасть в excludeRoute: накрывающие подсети режутся на соседние блоки
+            compiledDirect = DiagTarget.carveOut(compiledDirect);
         } catch (Throwable ignored) { }
     }
 

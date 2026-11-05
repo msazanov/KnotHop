@@ -20,6 +20,8 @@ const DNS_MAP_MAX: usize = 32_768;
 const DNS_MIN: u32 = 300;
 const DNS_MAX: u32 = 3_600;
 const RANK_LIST: u32 = 1_000;
+/// 1.0.0.1: адрес диагностики приложения (`DiagTarget.HOST` в Android); должен совпадать.
+pub const DIAG_IP: u32 = 0x0100_0001;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
@@ -521,6 +523,10 @@ impl Router {
 
     /// Действие для адреса назначения.
     pub fn decide(&self, dst: u32) -> Action {
+        // адрес диагностики приложения («Пинг», «IP / регион»): всегда на основной выход, ни правила IP/домена, ни DNS-подсказки его не меняют
+        if dst == DIAG_IP {
+            return Action::Default;
+        }
         let mut best: Option<u32> = None;
         for (rank, v) in &self.ips {
             if contains(v, dst) {
@@ -912,6 +918,24 @@ mod tests {
         assert_eq!(r.decide(ip([10, 200, 0, 1])), Action::Direct);
         assert_eq!(r.decide(ip([8, 8, 8, 8])), Action::Default);
         assert_eq!(r.direct_cidrs(), vec![(0x0a000000, 8)]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn diag_ip_always_default() {
+        let d = tmp("diag");
+        std::fs::write(d.join("geoip.dat"), geoip(&[("AU", vec![([1, 0, 0, 0], 8)])])).unwrap();
+        let cfg = Cfg {
+            mode: "rules".into(),
+            rules: vec![RuleCfg { kind: "geoip".into(), name: "AU".into(), action: Action::Direct }],
+            manual: vec![ManualCfg { value: "1.0.0.1".into(), action: exit_a() }],
+            ..Default::default()
+        };
+        let r = Router::build(&cfg, &d);
+        let ip = |a: [u8; 4]| u32::from_be_bytes(a);
+        assert_eq!(DIAG_IP, ip([1, 0, 0, 1]));
+        assert_eq!(r.decide(ip([1, 0, 0, 2])), Action::Direct, "соседний адрес подчиняется правилу");
+        assert_eq!(r.decide(DIAG_IP), Action::Default, "адрес диагностики не зависит ни от Direct, ни от выхода из правил");
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -19,7 +19,7 @@ final class SpeedTest {
                 SpeedTransfer.Connection factory = url -> {
                     if (!path.valid()) throw new java.io.IOException("VPN отключён или сменился");
                     for (java.net.InetAddress a : network.getAllByName(url.getHost()))
-                        if (path.bypasses(a)) throw new java.io.IOException("адрес " + a.getHostAddress() + " идёт мимо VPN по правилам маршрутизации; замер через туннель невозможен");
+                        if (path.bypasses(a)) throw new java.io.IOException("сервер теста " + a.getHostAddress() + " по вашим правилам идёт мимо VPN, замер через туннель невозможен. Укажите другой адрес в «Тест связи» или уберите его из «мимо VPN»");
                     return (HttpURLConnection)network.openConnection(url);
                 };
                 String download;

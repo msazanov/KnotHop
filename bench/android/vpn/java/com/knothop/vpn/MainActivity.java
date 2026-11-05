@@ -653,11 +653,13 @@ public class MainActivity extends Activity {
         ui.post(() -> { if (!isFinishing() && !isDestroyed()) logConsole.setDiag(t); });
     }
 
-    /** Пинг: TCP-рукопожатие до 1.1.1.1:443 через туннель (ICMP из приложения недоступен) и RTT до текущего выхода из состояния узла. */
+    /** Пинг: TCP-рукопожатия до адреса диагностики (DiagTarget, всегда в туннеле) через сеть нашего VPN (ICMP из приложения недоступен) и RTT до текущего выхода. */
     private void diagPing() {
         final KnotHopVpnService.SpeedPath path = KnotHopVpnService.speedPath();
         if (path == null) {
-            logConsole.setDiag("Пинг через туннель: нужен режим VPN и готовый выход" + (KnotHopVpnService.speedWhy.isEmpty() ? "" : " (" + KnotHopVpnService.speedWhy + ")"));
+            logConsole.setDiag(KnotHopVpnService.allDirectActive()
+                    ? "Пинг: пресет «Всё напрямую», туннеля нет, проверять нечего"
+                    : "VPN не подключён к выходу" + (KnotHopVpnService.speedWhy.isEmpty() ? "" : " (" + KnotHopVpnService.speedWhy + ")"));
             return;
         }
         String exitRtt = "";
@@ -677,8 +679,9 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             String res;
             try {
-                java.net.InetAddress target = java.net.InetAddress.getByName("1.1.1.1");
-                if (path.bypasses(target)) throw new java.io.IOException("1.1.1.1 идёт мимо VPN по правилам маршрутизации");
+                java.net.InetAddress target = java.net.InetAddress.getByName(DiagTarget.HOST);
+                // адрес диагностики всегда в туннеле (маршрут /32, вырезка из «мимо VPN»); иначе это ошибка маршрутов, а не результат
+                if (path.bypasses(target)) throw new java.io.IOException("адрес диагностики оказался вне туннеля (ошибка маршрутов)");
                 long best = Long.MAX_VALUE, sum = 0;
                 int ok = 0;
                 for (int i = 0; i < 4 && path.valid(); i++) {
@@ -689,7 +692,8 @@ public class MainActivity extends Activity {
                         best = Math.min(best, ms); sum += ms; ok++;
                     } catch (java.io.IOException ignored) { }
                 }
-                res = ok == 0 ? "1.1.1.1 через туннель: нет ответа" : "1.1.1.1 через туннель: " + best + " мс (среднее " + sum / ok + ", ответов " + ok + " из 4)";
+                res = ok == 0 ? DiagTarget.HOST + " через туннель: нет ответа (выход не отвечает или недоступен)"
+                        : DiagTarget.HOST + " через туннель: " + best + " мс (среднее " + sum / ok + ", ответов " + ok + " из 4)";
             } catch (Throwable e) {
                 res = "Пинг не выполнен: " + e.getMessage();
             }
@@ -708,24 +712,25 @@ public class MainActivity extends Activity {
         else confirmBench();
     }
 
-    /** Внешний IP и страна: HTTPS-запрос к ipinfo.io строго через сеть нашего VPN. Адрес показывается только на экране, в журнал и logcat не пишется. */
+    /**
+     * Внешний IP и страна: Cloudflare trace по IP (без DNS) строго через сеть нашего VPN; адрес диагностики всегда в туннеле при любых правилах.
+     * «Всё напрямую» и режим без TUN: туннеля нет, запрос идёт напрямую и результат так и помечен. Адрес показывается только на экране, в журнал и logcat не пишется.
+     */
     private void diagIp() {
         final KnotHopVpnService.SpeedPath path = KnotHopVpnService.speedPath();
+        final boolean allDirect = KnotHopVpnService.allDirectActive();
         logConsole.ipBtn.setEnabled(false);
         logConsole.setDiag("Запрашиваю IP…");
         new Thread(() -> {
             String res;
             try {
-                java.net.URL url = new java.net.URL("https://ipinfo.io/json");
+                java.net.URL url = new java.net.URL(DiagTarget.URL);
                 boolean tunnel = path != null;
-                if (tunnel) {
-                    for (java.net.InetAddress a : path.network.getAllByName(url.getHost()))
-                        if (path.bypasses(a)) { tunnel = false; break; }
-                }
+                if (tunnel && path.bypasses(java.net.InetAddress.getByName(DiagTarget.HOST)))
+                    throw new java.io.IOException("адрес диагностики оказался вне туннеля (ошибка маршрутов)");
                 java.net.HttpURLConnection c = (java.net.HttpURLConnection) (tunnel ? path.network.openConnection(url) : url.openConnection());
                 c.setConnectTimeout(8000);
                 c.setReadTimeout(8000);
-                c.setRequestProperty("Accept", "application/json");
                 if (c.getResponseCode() != 200) throw new java.io.IOException("HTTP " + c.getResponseCode());
                 java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
                 try (java.io.InputStream in = c.getInputStream()) {
@@ -733,14 +738,14 @@ public class MainActivity extends Activity {
                     int n;
                     while ((n = in.read(buf)) > 0 && bo.size() < 16384) bo.write(buf, 0, n);
                 }
-                JSONObject o = new JSONObject(bo.toString("UTF-8"));
-                String cc = o.optString("country", "");
-                String country = cc.length() == 2 ? new java.util.Locale("", cc).getDisplayCountry(new java.util.Locale("ru")) + " (" + cc + ")" : cc;
-                String place = (o.optString("city", "").isEmpty() ? "" : o.optString("city") + ", ") + country;
-                res = "IP: " + o.optString("ip", "?") + "\n" + place + (o.optString("org", "").isEmpty() ? "" : "\n" + o.optString("org"))
-                        + "\n" + (tunnel ? "запрос прошёл через туннель" : path == null ? "запрос без туннеля (VPN не включён)" : "этот адрес идёт мимо VPN по правилам: показан ваш настоящий IP");
+                String[] t = DiagTarget.parseTrace(bo.toString("UTF-8"));
+                if (t[0].isEmpty()) throw new java.io.IOException("в ответе нет адреса");
+                res = "IP: " + t[0] + (t[1].isEmpty() ? "" : "\n" + DiagTarget.country(t[1]))
+                        + "\n" + (tunnel ? "запрос прошёл через туннель"
+                        : allDirect ? "туннеля нет (пресет «Всё напрямую»): это ваш прямой адрес, не VPN"
+                        : "VPN не подключён к выходу: это ваш прямой адрес, не VPN");
             } catch (Throwable e) {
-                res = "IP не получен: " + e.getMessage();
+                res = "IP не получен: " + e.getMessage() + (path == null ? (allDirect ? "\n(туннеля нет: «Всё напрямую»)" : "\n(VPN не подключён к выходу)") : "");
             }
             final String out = res;
             Util.log("проверка IP выполнена");   // адрес в журнал не пишем
