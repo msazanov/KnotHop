@@ -43,10 +43,19 @@ public final class InvitePresetCheck {
         eq(P2p.label(new JSONObject().put("n", "").put("id", "aabbccddeeff00112233445566778899")), "aabbccdd", "без имени - только хеш, без дубля");
         eq(P2p.label(new JSONObject().put("n", "aabbccdd").put("id", "aabbccddeeff00112233445566778899")), "aabbccdd", "имя = хеш - без дубля");
         eq(P2p.text(a.getJSONObject(1)), "Прямое соединение с ПК не удалось: нет адреса", "no_addr");
-        eq(P2p.text(a.getJSONObject(2)), "Прямое соединение с x не удалось: не отвечает: устройства за NAT, нужен узел-посредник или IPv6", "unreachable");
+        eq(P2p.text(a.getJSONObject(2)), "Прямое соединение с x не удалось: устройство не отвечает или путь недоступен", "unreachable без предположений о причине");
+        eq(P2p.graphLines("unreachable", -1, false)[1], "устройство или путь недоступны", "граф: недоступен без предположений о причине");
         if (!P2p.text(a.getJSONObject(3)).startsWith("Пробую")) throw new AssertionError("trying");
+        for (String path : new String[]{"mesh", "relay", "reality"}) {
+            JSONObject via = new JSONObject().put("state", path).put("n", "peer").put("rtt_ms", 8);
+            if (!P2p.connected(path)) throw new AssertionError("подключён через " + path);
+            if (P2p.text(via).contains("Прямое")) throw new AssertionError("обходной путь не прямой: " + path);
+            if (P2p.graphLines(path, 8, false)[0].contains("прямое")) throw new AssertionError("обходной путь на графе: " + path);
+            if (P2p.capability(via).isEmpty()) throw new AssertionError("свойства соединения: " + path);
+            a.put(via);
+        }
         P2p.Summary s = P2p.summary(a);
-        eq(s.direct + "/" + s.total + "/" + s.failed, "1/4/2", "сводка");
+        eq(s.connected + "/" + s.direct + "/" + s.total + "/" + s.failed, "4/1/7/2", "сводка: прямой и обходные пути");
         System.out.println("InvitePresetCheck PASS");
     }
 }

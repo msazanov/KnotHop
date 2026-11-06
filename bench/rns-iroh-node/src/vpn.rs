@@ -749,6 +749,20 @@ fn dest32(d: &str) -> Option<[u8; 16]> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn p2p_state_describes_selected_path_not_just_open_connection() {
+        for kind in ["direct", "mesh", "relay", "reality"] {
+            let info = serde_json::json!({"kind": kind});
+            assert_eq!(p2p_state(Some(&info), true, false, 0), kind);
+        }
+        let no_path = serde_json::json!({"kind": "none"});
+        assert_eq!(p2p_state(Some(&no_path), true, false, 0), "trying");
+        assert_eq!(p2p_state(None, false, false, 0), "no_addr");
+        assert_eq!(p2p_state(None, true, false, 0), "trying");
+        assert_eq!(p2p_state(None, true, false, 2), "unreachable");
+        assert_eq!(p2p_state(None, true, true, 0), "unreachable");
+    }
+
     fn ifa(name: &str, ip: &str, prefix: u8, up: bool) -> IfAddr {
         IfAddr { name: name.into(), ip: ip.parse().unwrap(), prefix, up }
     }
@@ -5104,6 +5118,26 @@ struct QStat {
     rns_rtt: Option<(Instant, f64)>,
 }
 
+/// Статус P2P описывает выбранный путь QUIC, а не просто наличие соединения:
+/// открытый QUIC может идти через mesh, relay или REALITY.
+fn p2p_state(info: Option<&serde_json::Value>, has_addr: bool, dead: bool, misses: u32) -> &'static str {
+    if let Some(info) = info {
+        match info["kind"].as_str() {
+            Some("direct") => "direct",
+            Some("mesh") => "mesh",
+            Some("relay") => "relay",
+            Some("reality") => "reality",
+            _ => "trying", // соединение есть, но путь ещё не выбран
+        }
+    } else if !has_addr {
+        "no_addr"
+    } else if dead || misses >= 2 {
+        "unreachable"
+    } else {
+        "trying"
+    }
+}
+
 impl ClientCtx {
     fn native_rtt(&self, id: &LinkId) -> Option<f64> {
         let ka = self.node.engine().with_link(id, |l| l.keepalive_rtt_ms()).flatten();
@@ -5143,8 +5177,8 @@ impl ClientCtx {
         }
     }
 
-    /// Состояние прямой связи с контактами без ролей. `state`: `direct` (QUIC установлен, RTT из пути), `no_addr` (адреса нет ни у нас,
-    /// ни от контакта), `unreachable` (набор не удался ≥2 раз подряд или нода признана мёртвой: за NAT нужен посредник или IPv6),
+    /// Состояние связи с контактами без ролей. `state`: `direct`, `mesh`, `relay`, `reality` (выбранный путь QUIC), `no_addr` (адреса нет ни у нас,
+    /// ни от контакта), `unreachable` (набор не удался ≥2 раз подряд или нода признана мёртвой),
     /// `trying` (первые попытки). `exit` - у контакта есть EXIT (тогда он годится выходом и виден в `exits`).
     fn p2p_json(&self, servers: &[CServer]) -> serde_json::Value {
         let Some(c) = &self.c13 else { return serde_json::Value::Array(vec![]) };
@@ -5162,7 +5196,7 @@ impl ClientCtx {
             let has_addr = !e.addrs.is_empty() || books.get(&e.dest).is_some_and(|b| !b.is_empty());
             let ctl = carriers.get(&e.dest);
             let (misses, dead) = ctl.map_or((0, false), |x| (x.misses.load(Relaxed), x.dead.load(Relaxed)));
-            let state = if info.is_some() { "direct" } else if !has_addr { "no_addr" } else if dead || misses >= 2 { "unreachable" } else { "trying" };
+            let state = p2p_state(info.as_ref(), has_addr, dead, misses);
             let rtt = info.as_ref().and_then(|i| i["rtt_ms"].as_f64());
             let name = tr.contact(&h).map(|x| x.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| self.shown_name(e));
             Some(serde_json::json!({"d": hex(&e.dest), "id": hex(&h), "n": name, "state": state, "rtt_ms": rtt, "path": info.as_ref().and_then(|i| i["path_desc"].as_str().map(String::from)), "lan": info.as_ref().is_some_and(|i| i["lan"].as_bool() == Some(true)),

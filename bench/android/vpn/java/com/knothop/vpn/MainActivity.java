@@ -48,8 +48,8 @@ public class MainActivity extends Activity {
     private LinearLayout stateCard;
     /** Из status.json для верхней строки состояния: число известных нод и имя текущего выхода. */
     private int nodeCount;
-    /** P2P-контакты без ролей (status.json, p2p): сколько всего, с прямым QUIC и с окончательным отказом; «подключаюсь…» для них не бесконечно. */
-    private int p2pDirect, p2pTotal, p2pFailed;
+    /** P2P-контакты без ролей: сколько всего, с выбранным QUIC-путём и с окончательным отказом. */
+    private int p2pConnected, p2pTotal, p2pFailed;
     private String exitName = "";
     private AppUpdater updater;
     private TextView pullHint, modeText;
@@ -844,7 +844,7 @@ public class MainActivity extends Activity {
                 nodeCount = exAll == null ? 0 : exAll.length();
                 if (nodeCount > 0) noExitsSince = 0; else if (noExitsSince == 0) noExitsSince = System.currentTimeMillis();
                 P2p.Summary ps = P2p.summary(j.optJSONArray("p2p"));
-                p2pDirect = ps.direct; p2pTotal = ps.total; p2pFailed = ps.failed;
+                p2pConnected = ps.connected; p2pTotal = ps.total; p2pFailed = ps.failed;
                 exitName = cur == null ? "" : TopologyView.shortName(cur.optString("n"));
                 if (cur != null) {
                     StringBuilder c = new StringBuilder("выход: ").append(TopologyView.shortName(cur.optString("n")));
@@ -863,7 +863,7 @@ public class MainActivity extends Activity {
                 }
                 // выходов нет вовсе (только P2P-контакты или пустая таблица): выбора нет, «восстанавливаю путь к выбранной ноде» неверно
                 if (cur == null && noExits() && (doing == null || !doing.startsWith("Сбой"))) {
-                    doing = "Выходов пока нет" + (p2pTotal > 0 ? "\nP2P: прямая связь с " + p2pDirect + " из " + p2pTotal + " устройств" : "");
+                    doing = "Выходов пока нет" + (p2pTotal > 0 ? "\nP2P: связь с " + p2pConnected + " из " + p2pTotal + " устройств" : "");
                 }
                 if (pinned.matches("[0-9a-fA-F]{32}") && (cur == null || !pinned.equalsIgnoreCase(cur.optString("d")))) logChange("выбор", "выбран вами " + pinned.substring(0, 8) + ", подключаюсь");
                 updateBenchUi(state, j, cur);
@@ -884,7 +884,7 @@ public class MainActivity extends Activity {
                 doing = "статус: " + e;
             }
         } else {
-            nodeCount = 0; p2pDirect = 0; p2pTotal = 0; p2pFailed = 0;
+            nodeCount = 0; p2pConnected = 0; p2pTotal = 0; p2pFailed = 0;
             noExitsSince = 0;
             exitName = "";
             prevTs = 0;
@@ -939,7 +939,7 @@ public class MainActivity extends Activity {
         } else if (m == 0) { t = "Отключено"; col = Ui.MUTED; }
         else if (m == 1) {
             if (nodeCount > 0) { t = "Сеть: " + nodeCount + " " + nodesWord(nodeCount); col = ModeSlider.COLORS[1]; }
-            else if (p2pTotal > 0) { t = "Сеть: P2P " + p2pDirect + " из " + p2pTotal + (p2pFailed > 0 ? " · не удалось: " + p2pFailed : ""); col = ModeSlider.COLORS[1]; }
+            else if (p2pTotal > 0) { t = "Сеть: P2P " + p2pConnected + " из " + p2pTotal + (p2pFailed > 0 ? " · не удалось: " + p2pFailed : ""); col = ModeSlider.COLORS[1]; }
             else { t = "Сеть: подключаюсь…"; col = ModeSlider.COLORS[1]; }
         } else if (!exitName.isEmpty() && "up".equals(KnotHopVpnService.phase)) { t = "VPN: " + exitName; col = ModeSlider.COLORS[2]; }
         else if (noExits()) { t = "VPN: выходов нет, трафик не идёт"; col = ModeSlider.COLORS[1]; }

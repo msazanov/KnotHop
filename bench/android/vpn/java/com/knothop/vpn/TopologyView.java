@@ -222,7 +222,7 @@ final class TopologyView extends View {
                 fresh.add(n);
             }
         }
-        // P2P-контакты без ролей: свои узлы со своим честным статусом (прямое соединение / нет адреса / не отвечает)
+        // P2P-контакты без ролей: показываем выбранный путь QUIC, не называя обходной путь прямым.
         JSONArray p2p = st.optJSONArray("p2p");
         for (int i = 0; p2p != null && i < p2p.length(); i++) {
             JSONObject e = p2p.optJSONObject(i);
@@ -234,9 +234,10 @@ final class TopologyView extends View {
             n.p2pLan = e.optBoolean("lan", false);
             n.state = "p2p";
             boolean direct = "direct".equals(n.p2p);
-            n.visible = direct;
-            n.vis = direct ? "direct" : "none";
-            n.carrier = direct ? "quic" : "none";
+            boolean connected = P2p.connected(n.p2p);
+            n.visible = connected;
+            n.vis = direct ? "direct" : connected ? "via" : "none";
+            n.carrier = connected ? "quic" : "none";
             n.rtt = e.isNull("rtt_ms") ? -1 : e.optDouble("rtt_ms", -1);
             fresh.add(n);
         }

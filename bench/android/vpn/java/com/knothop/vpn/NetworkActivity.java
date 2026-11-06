@@ -158,15 +158,15 @@ public final class NetworkActivity extends Activity {
         if (p2p == null || p2p.length() == 0) return;
         LinearLayout card = Ui.card(this);
         card.addView(Ui.titleWithHelp(this, "Устройства (P2P)",
-                "Прямое соединение QUIC между устройствами без серверов: оно устанавливается по адресам, которые устройства прислали друг другу в приглашении (обычно это глобальный IPv6 "
-                + "или IPv4 с проброшенным портом). Через публичный посредник соединение не строится: если оба устройства за NAT и IPv6 нет, прямая связь не получится. "
+                "Соединение QUIC между устройствами без серверов устанавливается по адресам, которыми они обмениваются при вступлении. Подходят глобальные IPv4 и IPv6, "
+                + "а в общей локальной сети — также частный IPv4 и ULA IPv6. Если устройство выключено или путь недоступен, связи не будет. Публичный посредник пока не используется. "
                 + "Выход в интернет через такое устройство возможен, только если на нём включён EXIT; после QUIC действуют обычные права из таблицы."));
         for (int i = 0; i < p2p.length(); i++) {
             JSONObject e = p2p.optJSONObject(i);
             if (e == null) continue;
             String id = e.optString("id", "");
             card.addView(Ui.text(this, P2p.label(e), 14, Ui.TEXT, true));
-            card.addView(Ui.text(this, P2p.text(e), 12, "direct".equals(e.optString("state")) ? Ui.GREEN : P2p.failed(e) ? Ui.ORANGE : Ui.MUTED, false));
+            card.addView(Ui.text(this, P2p.text(e), 12, P2p.connected(e.optString("state")) ? Ui.GREEN : P2p.failed(e) ? Ui.ORANGE : Ui.MUTED, false));
             String cap = P2p.capability(e);
             if (!cap.isEmpty()) card.addView(Ui.muted(this, cap));
         }
