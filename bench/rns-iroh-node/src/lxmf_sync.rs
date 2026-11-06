@@ -1,68 +1,51 @@
-//! Подписанные записи Trust по LXMF. Транспортный Delivered не означает применение:
-//! отправитель повторяет пакет до прикладного ACK (после save), с ограниченными TTL/очередью.
+//! Очередь служебных LXMF-сообщений ноды (`node.inv/1`, `node.cmd/1`, ADR 0028) и PN-движок сервера.
+//! Транспортный Delivered не означает применение: отправитель повторяет сообщение до прикладного ACK
+//! (ответ адресата с тем же `tag`), с ограниченными TTL/очередью; копии через PN расписаны в `lxmf_admin`.
 use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock, mpsc}};
-use leviculum_lxmf::{Message, DeliveryMethod, Verification};
 use leviculum_std::api::Identity;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use crate::trust::{self, Record, Policy, Pk};
 
-pub const TITLE: &[u8] = b"trust.sync/1";
-pub const LIMIT: usize = 32;
+pub type Pk = [u8; 64];
+
+pub const TITLE_INV: &[u8] = b"node.inv/1";
+pub const TITLE_CMD: &[u8] = b"node.cmd/1";
+pub const LIMIT: usize = 64;
+/// Срок сообщения по умолчанию, секунды; команды и приглашения задают свой (до 7 сут).
 pub const TTL: u64 = 600;
-/// Записей каталога в одном сообщении (как прежний DIR_MAX).
-pub const DIR_LIMIT: usize = 16;
+/// Срок хранения письма на PN: команды и приглашения живут до 7 суток.
+pub const MESSAGE_EXPIRY_S: u64 = 7 * 24 * 3600;
 pub static TX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TX_MESSAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RX_MESSAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `Some(true)` — слать, `Some(false)` — снять, `None` — подождать (не блокироваться на замке в потоке ядра).
 pub type Gate = Arc<dyn Fn() -> Option<bool> + Send + Sync>;
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Wire {
-    v: u8,
-    pub records: Vec<String>,
-    pub policies: Vec<String>,
-    pub ack: Option<String>,
-    /// Приватный каталог нод (бывший T_DIR): адреса — только подсказки для дозвона, не права; в анонс они не попадают (ADR 0016).
-    /// Взаимоисключимо с записями и политиками; разбор и фильтр адресов — `parse_dir` на приёме.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dir: Vec<serde_json::Value>,
-    /// Запрос свежего каталога, независимый от срока/полноты приглашения. Не выдаёт прав.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub get_dir: bool,
-}
+/// Получатель: полный ключ (шифруем сразу) либо только хеш identity из приглашения (ключ берётся из анонса RNS, хеш сверяется).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target { Pk(Pk), Hash([u8; 16]) }
 
-fn is_false(value: &bool) -> bool { !value }
-
-impl Wire {
-    pub fn decode(message: &Message) -> Option<Self> {
-        if message.title != TITLE || message.verification != Verification::Valid
-            || !matches!(message.method, DeliveryMethod::Direct | DeliveryMethod::Propagated) || message.content.len() > super::lxmf_admin::MAX_ADMIN_CONTENT { return None; }
-        let wire: Self = serde_json::from_slice(&message.content).ok()?;
-        if wire.v != 1 || wire.records.len() + wire.policies.len() > 16 || wire.dir.len() > DIR_LIMIT { return None; }
-        if wire.get_dir {
-            return (wire.records.is_empty() && wire.policies.is_empty() && wire.dir.is_empty() && wire.ack.is_none()).then_some(wire);
-        }
-        if !wire.dir.is_empty() && (!wire.records.is_empty() || !wire.policies.is_empty() || wire.ack.is_some() || !wire.dir.iter().all(|e| e.is_object())) { return None; }
-        if let Some(ack) = &wire.ack {
-            if ack.len() != 64 || !ack.bytes().all(|b| b.is_ascii_hexdigit()) || !wire.records.is_empty() || !wire.policies.is_empty() { return None; }
-        } else if wire.records.is_empty() && wire.policies.is_empty() && wire.dir.is_empty() { return None; }
-        Some(wire)
+impl Target {
+    pub fn hash(&self) -> Option<[u8; 16]> {
+        match self { Target::Pk(pk) => crate::peers::hash_of(pk), Target::Hash(h) => Some(*h) }
     }
+    pub fn destination(&self) -> Option<[u8; 16]> { self.hash().map(|h| crate::peers::lxmf_destination(&h)) }
 }
 
 #[derive(Clone)]
 pub struct Outbound {
     pub title: Vec<u8>,
-    pub pk: Pk,
+    pub target: Target,
     pub content: Vec<u8>,
     pub gate: Gate,
+    /// конец срока, секунды Unix
     pub exp: u64,
+    /// ключ дедупликации и прикладного ACK (`Acknowledged`)
+    pub tag: String,
+    /// true: сообщение само ответ/квитанция — повторов и копий на PN не нужно
     pub ack: bool,
 }
 
-pub enum Command { Send(Outbound), Acknowledged { source: [u8;16], digest: String } }
+pub enum Command { Send(Outbound), Acknowledged { source: [u8; 16], tag: String } }
 pub type Sender = mpsc::SyncSender<Command>;
 static RUNTIMES: OnceLock<Mutex<HashMap<PathBuf, Sender>>> = OnceLock::new();
 
@@ -80,126 +63,26 @@ pub(super) fn submit(state: &Path, command: Command) -> bool {
     RUNTIMES.get().and_then(|r| r.lock().unwrap().get(&key(state)).cloned())
         .is_some_and(|s| s.try_send(command).is_ok())
 }
-pub fn digest(content: &[u8]) -> String { super::hex(&Sha256::digest(content)) }
 
-/// Ограниченная пачка; цепочки передаются в исходном порядке. Gate повторно
-/// проверяется процессором непосредственно перед enqueue/retry, без ожидания mutex.
-pub fn send(state: &Path, pk: Pk, records: &[Record], policies: &[Policy], gate: Gate) -> bool {
-    if records.len() + policies.len() > 16 || (records.is_empty() && policies.is_empty()) { return false; }
-    let wire = Wire { v:1, records:records.iter().map(|r| super::hex(&r.wire())).collect(),
-        policies:policies.iter().map(|p| super::hex(&p.wire())).collect(), ack:None, dir:vec![], get_dir:false };
-    let Ok(content) = serde_json::to_vec(&wire) else { return false };
+pub fn always() -> Gate { Arc::new(|| Some(true)) }
+
+/// Поставить служебное сообщение в очередь доставки. Получатель принимает его только по своим правилам; доставка ≠ применение.
+pub fn send(state: &Path, title: &[u8], target: Target, content: Vec<u8>, tag: &str, exp: u64, gate: Gate) -> bool {
     if content.len() > super::lxmf_admin::MAX_ADMIN_CONTENT { return false; }
-    submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
+    submit(state, Command::Send(Outbound { title: title.to_vec(), target, content, gate, exp, tag: tag.to_string(), ack: false }))
 }
 
-/// Каталог нод одним сообщением. Gate проверяет, что получатель всё ещё допустимый адресат: без ожидания mutex, как у записей.
-pub fn send_dir(state: &Path, pk: Pk, mut dir: Vec<serde_json::Value>, gate: Gate) -> bool {
-    dir.truncate(DIR_LIMIT);
-    // хвост каталога отбрасываем, пока сообщение не уложится в лимит администрирования
-    let content = loop {
-        if dir.is_empty() { return false; }
-        let Ok(content) = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:None, dir:dir.clone(), get_dir:false }) else { return false };
-        if content.len() <= super::lxmf_admin::MAX_ADMIN_CONTENT { break content; }
-        dir.pop();
-    };
-    submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
+/// Ответ/квитанция: одна попытка прямой доставки (повтор запроса вызовет новый ответ).
+pub fn reply(state: &Path, title: &[u8], target: Target, content: Vec<u8>, tag: &str) -> bool {
+    if content.len() > super::lxmf_admin::MAX_ADMIN_CONTENT { return false; }
+    submit(state, Command::Send(Outbound { title: title.to_vec(), target, content, gate: always(), exp: super::now_ms() as u64 / 1000 + TTL, tag: tag.to_string(), ack: true }))
 }
 
-/// Подписанный LXMF-запрос каталога у уже авторизованной ноды. Получатель повторно проверяет членство и ограничивает частоту.
-pub fn request_dir(state: &Path, pk: Pk, gate: Gate) -> bool {
-    let wire = Wire { v:1, records:vec![], policies:vec![], ack:None, dir:vec![], get_dir:true };
-    let Ok(content) = serde_json::to_vec(&wire) else { return false };
-    submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate, exp:super::now_ms() as u64/1000+TTL, ack:false }))
+/// Пришёл прикладной ответ на сообщение с `tag` от `source` (LXMF-адрес): снять повторы и копии на PN.
+pub fn acknowledged(state: &Path, source: [u8; 16], tag: &str) {
+    submit(state, Command::Acknowledged { source, tag: tag.to_string() });
 }
 
-pub fn policy_visible(tr: &trust::Trust, p: &Policy, peer: &Pk) -> bool {
-    let Some(h) = trust::hash_of(peer) else { return false };
-    let rights = tr.rights_in(&p.root, &h);
-    (rights != 0 || p.hh == h)
-        && (rights & (trust::TRANSIT|trust::ADD|trust::REMOVE|trust::CONFIG) != 0
-            || p.hh == h || p.hh == tr.me_hash || tr.rights_in(&p.root, &p.hh) & trust::EXIT != 0)
-        && tr.export_policies(super::now_ms() as u64).contains(p)
-}
-
-pub fn queue(state: &Path, authority: Arc<Mutex<trust::Trust>>, pk: Pk, records: Vec<Record>, policies: Vec<Policy>) -> bool {
-    // В очереди ещё нет сетевой передачи; проверка в core перед enqueue обязательна.
-    let mut ok = true;
-    let entries: Vec<_> = records.iter().map(|r| (Some(r.clone()), None))
-        .chain(policies.iter().map(|p| (None, Some(p.clone())))).collect();
-    for chunk in entries.chunks(16) {
-        let recs: Vec<_> = chunk.iter().filter_map(|(r, _)| r.clone()).collect();
-        let pols: Vec<_> = chunk.iter().filter_map(|(_, p)| p.clone()).collect();
-        let (check_recs, check_pols, authority) = (recs.clone(), pols.clone(), authority.clone());
-        let gate: Gate = Arc::new(move || {
-            let tr = match authority.try_lock() {
-                Ok(tr) => tr,
-                Err(std::sync::TryLockError::WouldBlock) => return None,
-                Err(_) => return Some(false),
-            };
-            Some(check_recs.iter().all(|r| tr.record_visible_to(r, &pk))
-                && check_pols.iter().all(|p| policy_visible(&tr, p, &pk)))
-        });
-        ok &= send(state, pk, &recs, &pols, gate);
-    }
-    ok
-}
-
-/// Ключ берётся не из метки Verification, а из Trust/проверенного Link/приглашения.
-pub fn authenticated(message: &Message, me: &[u8;16], pk: &Pk) -> bool {
-    message.destination_hash == super::lxmf_admin::lxmf_destination(me)
-        && super::lxmf_admin::signed_by_trusted_source(message, pk)
-}
-
-pub fn acknowledge(state: &Path, message: &Message, pk: Pk) {
-    let content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some(digest(&message.content)), dir:vec![], get_dir:false }).unwrap();
-    submit(state, Command::Send(Outbound { title:TITLE.to_vec(), pk, content, gate:Arc::new(|| Some(true)), exp:super::now_ms() as u64/1000+TTL, ack:true }));
-}
-pub fn received_ack(state: &Path, source: [u8;16], digest: String) {
-    submit(state, Command::Acknowledged { source, digest });
-}
-
-/// Проверка записей остаётся в Trust; повторные/устаревшие записи идемпотентны.
-pub fn parsed(wire: &Wire) -> Option<(Vec<Record>, Vec<Policy>)> {
-    let records: Option<Vec<_>> = wire.records.iter().map(|s| Record::parse(&super::unhex(s))).collect();
-    let policies: Option<Vec<_>> = wire.policies.iter().map(|s| Policy::parse(&super::unhex(s))).collect();
-    Some((records?, policies?))
-}
-
-pub fn source_key(message: &Message, tr: &trust::Trust, peers: impl IntoIterator<Item=Pk>, invited: Option<Pk>) -> Option<Pk> {
-    tr.identity_for_lxmf_source(&message.source_hash).or_else(|| peers.into_iter().chain(invited)
-        .find(|pk| trust::hash_of(pk).is_some_and(|h| super::lxmf_admin::lxmf_destination(&h) == message.source_hash)))
-        .or_else(|| {
-            // Собственное доказательство может опередить identify на отдельном
-            // Link. Это ключ проверки LXMF-подписи, НЕ новый якорь.
-            let wire = Wire::decode(message)?;
-            let (records, _) = parsed(&wire)?;
-            records.into_iter().map(|r| r.holder).find(|pk| trust::hash_of(pk)
-                .is_some_and(|h| super::lxmf_admin::lxmf_destination(&h) == message.source_hash))
-        })
-}
-
-/// Собственное доказательство identity — отдельный bootstrap, не снимок чужих
-/// участников. Как прежний chain_for(me) после identify, оно не требует уже
-/// установленной роли, иначе два участника без кэша друг друга не обменяются
-/// цепочками. Включает только собственную цепочку, не общее хранилище.
-pub fn queue_proof(state: &Path, authority: Arc<Mutex<trust::Trust>>, me: Pk, peer: Pk) -> bool {
-    let records = authority.lock().unwrap().chain_for(&me);
-    let mut ok = true;
-    for chunk in records.chunks(16) {
-        let check = chunk.to_vec();
-        let tr = authority.clone();
-        let gate: Gate = Arc::new(move || {
-            let tr = match tr.try_lock() { Ok(tr) => tr, Err(std::sync::TryLockError::WouldBlock) => return None, Err(_) => return Some(false) };
-            let chain = tr.chain_for(&me);
-            Some(check.iter().all(|r| chain.contains(r)))
-        });
-        ok &= send(state, peer, chunk, &[], gate);
-    }
-    ok
-}
-
-// Используется также тестами протокола, без доверия к самодекларированной source.
 pub fn public_identity(pk: &Pk) -> Option<Identity> { Identity::from_public_key_bytes(pk).ok() }
 
 /// У builder один слот CoreProcessor: второй вызов заменил бы LXMF delivery.
@@ -408,7 +291,7 @@ fn spawn_pn(state: &Path, identity: Identity, limits: PnLimits, hold: Option<mps
         if let Some(hold) = hold { let _ = hold.recv(); }
         let t0 = std::time::Instant::now();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let mut trimmed = trim_by_name(&dir, now, crate::enroll::TTL, limits.max_files);
+        let mut trimmed = trim_by_name(&dir, now, MESSAGE_EXPIRY_S, limits.max_files);
         let mut store = match FilePropagationStore::open(&dir, limits.cap_bytes) {
             Ok(store) => store,
             Err(_) => { st.state.store(PN_FAILED, Relaxed); return; }
@@ -419,7 +302,7 @@ fn spawn_pn(state: &Path, identity: Identity, limits: PnLimits, hold: Option<mps
         let (engine, events) = Engine::new(EngineConfig {
             identity, store,
             node_config: PropagationNodeConfig { transfer_limit_kb:16, sync_limit_kb:64,
-                serve_cap_bytes:Some(64*1024), message_expiry_secs:crate::enroll::TTL, name:None, ..Default::default() },
+                serve_cap_bytes:Some(64*1024), message_expiry_secs:MESSAGE_EXPIRY_S, name:None, ..Default::default() },
             announce_interval_secs:600, announce_delay_secs:if cfg!(test) {2} else {20}, announce_at_start:false,
             peering:PeeringConfig { max_peers:8, max_inbound_syncs:2, ..Default::default() },
             peer_store:Box::new(MemoryPeerStore::default()), control_allowed:vec![], auth_allowed:None,
@@ -437,7 +320,9 @@ fn spawn_pn(state: &Path, identity: Identity, limits: PnLimits, hold: Option<mps
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leviculum_std::api::{generate_identity, NodeBuilder};
+    use leviculum_std::api::generate_identity;
+    use sha2::{Digest, Sha256};
+    use leviculum_lxmf::DeliveryMethod;
     use std::time::{Duration, Instant};
 
     fn now_secs() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() }
@@ -566,171 +451,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn sync_codec_signature_and_scope_are_not_authority() {
-        let (actor, target, attacker) = (generate_identity(), generate_identity(), generate_identity());
-        let wire = Wire { v:1, records:vec![], policies:vec![], ack:Some("11".repeat(32)), dir:vec![], get_dir:false };
-        let make = |identity:&Identity| Message::create(super::super::lxmf_admin::lxmf_destination(target.hash()),
-            super::super::lxmf_admin::lxmf_destination(actor.hash()), identity, 1.0,
-            TITLE.to_vec(), serde_json::to_vec(&wire).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
-        assert!(Wire::decode(&make(&actor)).is_some());
-        assert!(authenticated(&make(&actor), target.hash(), &actor.public_key_bytes()));
-        assert!(!authenticated(&make(&attacker), target.hash(), &actor.public_key_bytes()));
-        assert!(!authenticated(&make(&actor), attacker.hash(), &actor.public_key_bytes()));
-        let mut malformed = make(&actor);
-        malformed.content = serde_json::to_vec(&Wire { ack:Some("not-a-digest".into()), ..wire }).unwrap();
-        assert!(Wire::decode(&malformed).is_none());
+    fn peers_with_pn(me: &Identity, pn: &Identity) -> Arc<Mutex<crate::peers::Peers>> {
+        let mut t = crate::peers::Peers::new(me.public_key_bytes(), None);
+        // сервер объявил себя PN (роль TRANSIT в `accept`): доверенный кандидат PN
+        t.contact_set(pn.public_key_bytes(), "pn", vec![], "local", crate::peers::USE, crate::peers::TRANSIT, 1).unwrap();
+        Arc::new(Mutex::new(t))
     }
 
-    #[test]
-    fn directory_wire_is_exclusive_bounded_and_object_only() {
-        let (actor, target) = (generate_identity(), generate_identity());
-        let make = |wire: &Wire| Message::create(super::super::lxmf_admin::lxmf_destination(target.hash()),
-            super::super::lxmf_admin::lxmf_destination(actor.hash()), &actor, 1.0,
-            TITLE.to_vec(), serde_json::to_vec(wire).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
-        let entry = serde_json::json!({"d": "00", "k": "00", "a": ["203.0.113.7:47001"], "n": "x"});
-        let base = Wire { v:1, records:vec![], policies:vec![], ack:None, dir:vec![entry.clone()], get_dir:false };
-        let decoded = Wire::decode(&make(&base)).expect("каталог из объектов");
-        assert_eq!(decoded.dir, vec![entry.clone()]);
-        // каталог не смешивается с записями, политиками и ACK
-        assert!(Wire::decode(&make(&Wire { records:vec!["00".into()], ..base.clone() })).is_none());
-        assert!(Wire::decode(&make(&Wire { policies:vec!["00".into()], ..base.clone() })).is_none());
-        assert!(Wire::decode(&make(&Wire { ack:Some("11".repeat(32)), ..base.clone() })).is_none());
-        // не больше DIR_LIMIT и только объекты
-        assert!(Wire::decode(&make(&Wire { dir:vec![entry.clone(); DIR_LIMIT], ..base.clone() })).is_some());
-        assert!(Wire::decode(&make(&Wire { dir:vec![entry.clone(); DIR_LIMIT + 1], ..base.clone() })).is_none());
-        assert!(Wire::decode(&make(&Wire { dir:vec![serde_json::json!("203.0.113.7:47001")], ..base.clone() })).is_none());
-        // пустое сообщение по-прежнему не принимается
-        assert!(Wire::decode(&make(&Wire { dir:vec![], ..base })).is_none());
-    }
-
-    #[test]
-    fn directory_request_is_exclusive_and_small() {
-        let (actor, target) = (generate_identity(), generate_identity());
-        let make = |wire: &Wire| Message::create(super::super::lxmf_admin::lxmf_destination(target.hash()),
-            super::super::lxmf_admin::lxmf_destination(actor.hash()), &actor, 1.0,
-            TITLE.to_vec(), serde_json::to_vec(wire).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
-        let wire = Wire { v:1, records:vec![], policies:vec![], ack:None, dir:vec![], get_dir:true };
-        let msg = make(&wire);
-        assert!(Wire::decode(&msg).unwrap().get_dir);
-        assert!(msg.content.len() < 100, "request is control traffic, not an enrollment payload");
-        assert!(Wire::decode(&make(&Wire { dir:vec![serde_json::json!({})], ..wire.clone() })).is_none());
-        assert!(Wire::decode(&make(&Wire { records:vec!["00".into()], ..wire.clone() })).is_none());
-        assert!(Wire::decode(&make(&Wire { policies:vec!["00".into()], ..wire.clone() })).is_none());
-        assert!(Wire::decode(&make(&Wire { ack:Some("11".repeat(32)), ..wire })).is_none());
-    }
-
-    #[test]
-    fn directory_control_payload_budget_for_eight_nodes() {
-        let entries = (0..8).map(|i| serde_json::json!({"d":format!("{i:032x}"),"k":"11".repeat(64),"e":"22".repeat(32),
-            "a":[format!("203.0.113.{}:47001",i+1)],"n":format!("node-{i}")})).collect::<Vec<_>>();
-        let request = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:None, dir:vec![], get_dir:true }).unwrap();
-        let reply = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:None, dir:entries, get_dir:false }).unwrap();
-        assert!(request.len() < 100 && reply.len() < 4096);
-        eprintln!("directory serialized control payload: request={} B, eight-node reply={} B, two peers / 120s={} B/s (no transport/ACK/records)",
-            request.len(), reply.len(), 2 * (request.len() + reply.len()) / 120);
-    }
-
-    #[test]
-    fn sync_gate_is_root_scoped_and_rechecks_revocation_without_blocking() {
-        let (node, peer, outsider, holder) = (generate_identity(), generate_identity(), generate_identity(), generate_identity());
-        let mut tr = trust::Trust::new(node.clone(), None);
-        tr.issue(*node.hash(), peer.public_key_bytes(), trust::TRANSIT).unwrap();
-        let rec = tr.issue(*node.hash(), holder.public_key_bytes(), trust::USE).unwrap();
-        let authority = Arc::new(Mutex::new(tr));
-        let state = std::env::temp_dir().join(format!("kh-sync-gate-{}", super::super::hex(node.hash())));
-        let (tx, rx) = mpsc::sync_channel(LIMIT);
-        let _guard = register(&state, tx);
-        assert!(queue(&state, authority.clone(), peer.public_key_bytes(), vec![rec.clone()], vec![]));
-        let Command::Send(request) = rx.recv().unwrap() else { panic!() };
-        assert_eq!((request.gate)(), Some(true));
-        let mut tr = authority.lock().unwrap();
-        assert_eq!((request.gate)(), None, "core не ждёт Trust под mutex");
-        tr.issue(*node.hash(), peer.public_key_bytes(), 0).unwrap();
-        drop(tr);
-        assert_eq!((request.gate)(), Some(false), "отзыв между queue и enqueue");
-        assert!(queue(&state, authority, outsider.public_key_bytes(), vec![rec], vec![]));
-        let Command::Send(request) = rx.recv().unwrap() else { panic!() };
-        assert_eq!((request.gate)(), Some(false));
-    }
-
-    #[test]
-    fn own_proof_is_not_a_foreign_participant_snapshot() {
-        let (root, node, peer, user) = (generate_identity(), generate_identity(), generate_identity(), generate_identity());
-        let mut issuer = trust::Trust::new(root.clone(), None);
-        let own = issuer.issue(*root.hash(), node.public_key_bytes(), trust::TRANSIT).unwrap();
-        let other = issuer.issue(*root.hash(), user.public_key_bytes(), trust::USE).unwrap();
-        let mut tr = trust::Trust::new(node.clone(), None);
-        tr.add_anchor(&root.public_key_bytes()).unwrap();
-        assert_eq!(tr.offer(own.clone()), trust::Offer::Added);
-        assert_eq!(tr.offer(other), trust::Offer::Added);
-        let state = std::env::temp_dir().join(format!("kh-sync-proof-{}", super::super::hex(node.hash())));
-        let (tx, rx) = mpsc::sync_channel(LIMIT);
-        let _guard = register(&state, tx);
-        assert!(queue_proof(&state, Arc::new(Mutex::new(tr)), node.public_key_bytes(), peer.public_key_bytes()));
-        let Command::Send(request) = rx.recv().unwrap() else { panic!() };
-        assert_eq!((request.gate)(), Some(true));
-        let wire: Wire = serde_json::from_slice(&request.content).unwrap();
-        assert_eq!(parsed(&wire).unwrap().0, vec![own]);
-    }
-
-    #[test]
-    fn signed_envelope_byte_overhead() {
-        let (sender, target) = (generate_identity(), generate_identity());
-        let mut tr = trust::Trust::new(sender.clone(), None);
-        let rec = tr.issue(*sender.hash(), target.public_key_bytes(), trust::TRANSIT).unwrap();
-        for n in [1, 16] {
-            let content = serde_json::to_vec(&Wire { v:1, records:vec![super::super::hex(&rec.wire());n], policies:vec![], ack:None, dir:vec![], get_dir:false }).unwrap();
-            let message = Message::create(super::super::lxmf_admin::lxmf_destination(target.hash()),
-                super::super::lxmf_admin::lxmf_destination(sender.hash()), &sender, 1.0,
-                TITLE.to_vec(), content, vec![], DeliveryMethod::Direct).unwrap();
-            println!("LXMF_SYNC_BYTES records={n} old_channel_app={} lxmf_signed={} content={} (без Link/Resource/носителя и ACK)",
-                n*(trust::REC_LEN+1), message.pack().len(), message.content.len());
-            assert!(message.pack().len() <= super::super::lxmf_admin::MAX_ADMIN_CONTENT);
-        }
-        let ack_content = serde_json::to_vec(&Wire { v:1, records:vec![], policies:vec![], ack:Some("00".repeat(32)), dir:vec![], get_dir:false }).unwrap();
-        let ack = Message::create(super::super::lxmf_admin::lxmf_destination(sender.hash()),
-            super::super::lxmf_admin::lxmf_destination(target.hash()), &target, 1.0,
-            TITLE.to_vec(), ack_content, vec![], DeliveryMethod::Direct).unwrap();
-        println!("LXMF_SYNC_ACK_BYTES lxmf_signed={} content={} (без Link/Resource/носителя)", ack.pack().len(), ack.content.len());
-    }
-
-    /// Офлайн-доставка: адресат подключается к сети уже после отправки, письмо ждёт на PN доверенного сервера.
+    /// Офлайн-доставка служебной команды: адресат подключается к сети уже после отправки, письмо ждёт на PN доверенного сервера.
+    /// Получатель задан хешем identity, повтор до прикладного ACK идёт через PN.
     #[tokio::test(flavor="multi_thread", worker_threads=4)]
-    async fn pn_delivers_signed_records_to_recipient_that_connects_later() {
+    async fn pn_delivers_service_message_to_recipient_that_connects_later() {
         let (sender, recipient, server) = (generate_identity(), generate_identity(), generate_identity());
-        let base = std::env::temp_dir().join(format!("kh-pn-offline-{}", super::super::hex(sender.hash())));
+        let base = std::env::temp_dir().join(format!("kh-pn-offline-{}", crate::hex(sender.hash())));
         let _ = std::fs::remove_dir_all(&base);
-        // как на ES: накопленное хранилище сверх потолка; фон должен подрезать его, а PN после этого - принять и отдать письмо
         prefill(&base.join("server/lxmf/propagation"), 12_000, now_secs(), 0);
-        let (pa, ra) = super::super::lxmf_admin::AdminProcessor::new(sender.clone());
-        let (pb, rb) = super::super::lxmf_admin::AdminProcessor::new(recipient.clone());
-        let (ps, _rs) = super::super::lxmf_admin::AdminProcessor::new(server.clone());
+        let (pa, ra) = crate::lxmf_admin::AdminProcessor::new(sender.clone());
+        let (pb, rb) = crate::lxmf_admin::AdminProcessor::new(recipient.clone());
+        let (ps, _rs) = crate::lxmf_admin::AdminProcessor::new(server.clone());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let pn = propagation_processor(&base.join("server"), server.clone()).unwrap();
-        let mut srv = NodeBuilder::new().storage_path(base.join("server")).add_tcp_server(addr).core_processor(Processors(ps, pn)).build().unwrap();
+        let mut srv = leviculum_std::api::NodeBuilder::new().storage_path(base.join("server")).add_tcp_server(addr).core_processor(Processors(ps, pn)).build().unwrap();
         srv.start().await.unwrap();
-        // отправитель: сервер получает TRANSIT, поэтому его PN - выбираемый; адресат получает TRANSIT, но PN у него нет
-        let mut tr_a = trust::Trust::new(sender.clone(), None);
-        tr_a.issue(*sender.hash(), server.public_key_bytes(), trust::TRANSIT).unwrap();
-        tr_a.issue(*sender.hash(), recipient.public_key_bytes(), trust::TRANSIT).unwrap();
-        let rec = tr_a.issue(*sender.hash(), generate_identity().public_key_bytes(), trust::USE).unwrap();
-        let authority = Arc::new(Mutex::new(tr_a));
-        ra.pn.set_source(authority.clone());
-        let mut a = NodeBuilder::new().storage_path(base.join("a")).add_tcp_client(addr).core_processor(pa).build().unwrap();
+        ra.pn.set_source(peers_with_pn(&sender, &server));
+        let mut a = leviculum_std::api::NodeBuilder::new().storage_path(base.join("a")).add_tcp_client(addr).core_processor(pa).build().unwrap();
         a.start().await.unwrap();
         let _guard = register(&base, ra.sync.clone());
-        assert!(queue(&base, authority, recipient.public_key_bytes(), vec![rec.clone()], vec![]));
+        let payload = b"{\"v\":1,\"ops\":[]}".to_vec();
+        let exp = crate::now_ms() as u64 / 1000 + 600;
+        assert!(send(&base, TITLE_CMD, Target::Pk(recipient.public_key_bytes()), payload.clone(), "t-offline", exp, always()));
         // адресат ещё не в сети: прямая доставка невозможна, письмо должно уйти на PN
         tokio::time::sleep(Duration::from_secs(12)).await;
         assert!(rb.inbound.try_recv().is_err());
-        let mut tr_b = trust::Trust::new(recipient.clone(), None);
-        tr_b.issue(*recipient.hash(), server.public_key_bytes(), trust::TRANSIT).unwrap();
-        tr_b.issue(*recipient.hash(), sender.public_key_bytes(), trust::USE).unwrap();
-        rb.pn.set_source(Arc::new(Mutex::new(tr_b)));
-        let mut b = NodeBuilder::new().storage_path(base.join("b")).add_tcp_client(addr).core_processor(pb).build().unwrap();
+        rb.pn.set_source(peers_with_pn(&recipient, &server));
+        let mut b = leviculum_std::api::NodeBuilder::new().storage_path(base.join("b")).add_tcp_client(addr).core_processor(pb).build().unwrap();
         b.start().await.unwrap();
         let until = Instant::now() + Duration::from_secs(90);
         let message = loop {
@@ -739,78 +495,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         assert_eq!(message.method, DeliveryMethod::Propagated);
-        assert!(authenticated(&message, recipient.hash(), &sender.public_key_bytes()));
-        assert_eq!(parsed(&Wire::decode(&message).unwrap()).unwrap().0, vec![rec]);
+        assert_eq!(message.title, TITLE_CMD);
+        assert_eq!(message.content, payload);
+        assert!(crate::lxmf_admin::signed_by_trusted_source(&message, &sender.public_key_bytes()));
         a.stop().await.unwrap();
         b.stop().await.unwrap();
         srv.stop().await.unwrap();
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[tokio::test(flavor="multi_thread", worker_threads=2)]
-    async fn direct_lxmf_sync_local_smoke() {
-        let (sender, recipient) = (generate_identity(), generate_identity());
-        let base = std::env::temp_dir().join(format!("kh-sync-smoke-{}", super::super::hex(sender.hash())));
-        let (p1, r1) = super::super::lxmf_admin::AdminProcessor::new(sender.clone());
-        let (p2, r2) = super::super::lxmf_admin::AdminProcessor::new(recipient.clone());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let pn = propagation_processor(&base.join("server"), recipient.clone()).unwrap();
-        let mut server = NodeBuilder::new().storage_path(base.join("server")).add_tcp_server(addr).core_processor(Processors(p2, pn)).build().unwrap();
-        server.start().await.unwrap();
-        let mut client = NodeBuilder::new().storage_path(base.join("client")).add_tcp_client(addr).core_processor(p1).build().unwrap();
-        client.start().await.unwrap();
-        let _guard = register(&base, r1.sync.clone());
-        let mut tr = trust::Trust::new(sender.clone(), None);
-        tr.issue(*sender.hash(), recipient.public_key_bytes(), trust::TRANSIT).unwrap();
-        let rec = tr.issue(*sender.hash(), generate_identity().public_key_bytes(), trust::USE).unwrap();
-        let authority = Arc::new(Mutex::new(tr));
-        assert!(queue(&base, authority, recipient.public_key_bytes(), vec![rec.clone()], vec![]));
-        let until = Instant::now()+Duration::from_secs(20);
-        let message = loop {
-            if let Ok(message) = r2.inbound.try_recv() { break message; }
-            assert!(Instant::now()<until, "LXMF message not delivered over local TCP");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert!(authenticated(&message, recipient.hash(), &sender.public_key_bytes()));
-        let wire = Wire::decode(&message).unwrap();
-        assert_eq!(parsed(&wire).unwrap().0, vec![rec]);
-        // Транспортная доставка сама не создаёт прикладной ACK.
-        assert!(r1.inbound.try_recv().is_err());
-        let _server_guard = register(&base.join("server"), r2.sync.clone());
-        acknowledge(&base.join("server"), &message, sender.public_key_bytes());
-        let ack = loop {
-            if let Ok(message) = r1.inbound.try_recv() { break message; }
-            assert!(Instant::now()<until, "application ACK not delivered");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert!(authenticated(&ack, sender.hash(), &recipient.public_key_bytes()));
-        assert_eq!(Wire::decode(&ack).unwrap().ack, Some(digest(&message.content)));
-        // Каталог запрашивается тем же LXMF router, независимо от наличия enrollment/приглашения.
-        assert!(request_dir(&base, recipient.public_key_bytes(), Arc::new(|| Some(true))));
-        let request = loop {
-            if let Ok(message) = r2.inbound.try_recv() {
-                if Wire::decode(&message).is_some_and(|w| w.get_dir) { break message; }
-            }
-            assert!(Instant::now()<until, "directory request not delivered");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert!(authenticated(&request, recipient.hash(), &sender.public_key_bytes()));
-        let entries = (0..8).map(|i| serde_json::json!({"n":format!("node-{i}"),"a":[format!("203.0.113.{}:47001",i+1)]})).collect::<Vec<_>>();
-        assert!(send_dir(&base.join("server"), sender.public_key_bytes(), entries.clone(), Arc::new(|| Some(true))));
-        let reply = loop {
-            if let Ok(message) = r1.inbound.try_recv() {
-                if Wire::decode(&message).is_some_and(|w| !w.dir.is_empty()) { break message; }
-            }
-            assert!(Instant::now()<until, "directory reply not delivered");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert!(authenticated(&reply, sender.hash(), &recipient.public_key_bytes()));
-        assert_eq!(Wire::decode(&reply).unwrap().dir, entries);
-        assert!(parsed(&Wire::decode(&reply).unwrap()).unwrap().0.is_empty(), "каталог не создаёт записей о правах");
-        assert!(base.join("server/lxmf/propagation").is_dir());
-        client.stop().await.unwrap();
-        server.stop().await.unwrap();
     }
 }

@@ -33,8 +33,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 mod meas;
 mod vpn;
-mod trust;
-mod enroll;
+mod lxmf_admin;
+mod lxmf_sync;
+mod invite;
+mod ncmd;
+mod peers;
 mod tcpc;
 mod mux;
 mod relay;
@@ -2109,11 +2112,11 @@ fn set_link_host_access(host_access: &HostAccessSet, allowed: &AllowedMap, link_
 /// Lock order: Trust -> host_access -> allowed. Neither packet processing nor TUN table writers
 /// acquire Trust while holding these locks. In particular, never acquire the host commit gate here.
 fn publish_host_access_decision<R>(
-    authority: &Mutex<trust::Trust>, pk: &trust::Pk,
-    inspect: impl FnOnce(&trust::Trust) -> R, publish: impl FnOnce(bool) -> bool,
+    authority: &Mutex<peers::Peers>, pk: &peers::Pk,
+    inspect: impl FnOnce(&peers::Peers) -> R, publish: impl FnOnce(bool) -> bool,
 ) -> (R, bool) {
     let tr = authority.lock().unwrap();
-    let granted = !tr.host_access_roots(pk, &tr.me_hash).is_empty();
+    let granted = tr.rights_pk(pk) & peers::HOST_ACCESS != 0;
     let result = inspect(&tr);
     let applied = publish(granted);
     // Keep the authority guard alive through the actual ACL write, not just the decision.
@@ -2850,55 +2853,36 @@ mod tests {
         (t.0.read().unwrap().len(), t.1.read().unwrap().len(), t.2.read().unwrap().len())
     }
 
-    // Synthetic authority; production Trust, HostCommit and TUN permission core, not an ACL model.
+    // Таблица прав ноды (ADR 0028) и настоящее ядро разрешений TUN; не модель ACL.
     struct HostPublicationFixture {
-        authority: Arc<Mutex<trust::Trust>>,
-        pk: trust::Pk,
-        host_revoke: trust::HostAccessRecord,
-        issuer_revoke: trust::Record,
+        authority: Arc<Mutex<peers::Peers>>,
+        pk: peers::Pk,
     }
 
     fn host_publication_fixture() -> HostPublicationFixture {
-        let root = leviculum_std::api::generate_identity();
-        let admin = leviculum_std::api::generate_identity();
+        let node = leviculum_std::api::generate_identity();
         let holder = leviculum_std::api::generate_identity();
         let pk = holder.public_key_bytes();
-        let mut issuer = trust::Trust::new(root.clone(), None);
-        let delegation = issuer.issue(*root.hash(), admin.public_key_bytes(), trust::ADD | trust::REMOVE | trust::USE).unwrap();
-        let holder_record = issuer.issue(*root.hash(), pk, trust::USE).unwrap();
-        let mut delegate = trust::Trust::new(admin.clone(), None);
-        delegate.add_anchor(&root.public_key_bytes()).unwrap();
-        assert_eq!(delegate.offer(delegation.clone()), trust::Offer::Added);
-        let scoped_authority = issuer.sign_host_access(*root.hash(), *root.hash(), admin.public_key_bytes(), true).unwrap();
-        let grant = delegate.sign_host_access(*root.hash(), *root.hash(), pk, true).unwrap();
-        let host_revoke = delegate.sign_host_access(*root.hash(), *root.hash(), pk, false).unwrap();
-        let issuer_revoke = issuer.issue(*root.hash(), admin.public_key_bytes(), 0).unwrap();
-        let mut target = trust::Trust::new(root, None);
-        assert_eq!(target.offer(delegation), trust::Offer::Added);
-        assert_eq!(target.offer(holder_record), trust::Offer::Added);
-        let authority = Arc::new(Mutex::new(target));
-        for record in [scoped_authority, grant] {
-            commit_publication_record(&authority, &record);
-        }
-        HostPublicationFixture { authority, pk, host_revoke, issuer_revoke }
+        let mut table = peers::Peers::new(node.public_key_bytes(), None);
+        table.set_config(&peers::Actor::Local, None, Some(true)).unwrap();
+        table.peer_set(&peers::Actor::Local, pk, peers::USE | peers::HOST_ACCESS, "holder", 10, 10).unwrap();
+        HostPublicationFixture { authority: Arc::new(Mutex::new(table)), pk }
     }
 
-    fn commit_publication_record(authority: &Mutex<trust::Trust>, record: &trust::HostAccessRecord) {
-        let commit = authority.lock().unwrap().prepare_host_access(record).unwrap();
-        // Same split as the LXMF worker: commit gate/I/O never requested under Trust.
-        commit.commit(authority).unwrap();
-    }
-
-    fn publish_acl(authority: &Mutex<trust::Trust>, pk: &trust::Pk, t: &Tables) -> bool {
+    fn publish_acl(authority: &Mutex<peers::Peers>, pk: &peers::Pk, t: &Tables) -> bool {
         publish_host_access_decision(authority, pk, |_| (), |grant| set_link_host_access(&t.0, &t.1, &lid(1), grant)).1
+    }
+
+    fn host_granted(authority: &Mutex<peers::Peers>, pk: &peers::Pk) -> bool {
+        authority.lock().unwrap().rights_pk(pk) & peers::HOST_ACCESS != 0
     }
 
     #[test]
     fn host_publication_delayed_evaluator_cannot_restore_revoked_access() {
         use std::sync::mpsc::channel;
-        // Ordinary authority revocation must work too; it need not change host_version.
-        for revoke_issuer in [false, true] {
-            let HostPublicationFixture { authority, pk, host_revoke, issuer_revoke } = host_publication_fixture();
+        // Отзыв бита HOST_ACCESS и полное снятие записи: поздний оценщик не должен вернуть доступ.
+        for remove_peer in [false, true] {
+            let HostPublicationFixture { authority, pk } = host_publication_fixture();
             let t = Arc::new(tables());
             admit(&t, 1, 0xc6120107).unwrap();
             assert!(publish_acl(&authority, &pk, &t));
@@ -2908,33 +2892,33 @@ mod tests {
             let old_authority = authority.clone();
             let old_tables = t.clone();
             let old = std::thread::spawn(move || {
-                // The former evaluator could carry this true across revoke/ACK. The actual
-                // shared publisher accepts no snapshot; on resumption it must read Trust itself.
-                let stale_true = {
-                    let tr = old_authority.lock().unwrap();
-                    !tr.host_access_roots(&pk, &tr.me_hash).is_empty()
-                };
+                // Прежний оценщик мог унести это true через отзыв и ACK. Общий публикатор снимков не принимает:
+                // после возобновления он обязан сам прочитать таблицу.
+                let stale_true = host_granted(&old_authority, &pk);
                 paused.send(stale_true).unwrap();
                 resumed.recv_timeout(Duration::from_secs(5)).unwrap();
                 assert!(publish_acl(&old_authority, &pk, &old_tables));
             });
             assert!(ready.recv_timeout(Duration::from_secs(5)).unwrap());
-            if revoke_issuer {
-                assert_eq!(authority.lock().unwrap().offer(issuer_revoke), trust::Offer::Added);
-            } else {
-                commit_publication_record(&authority, &host_revoke);
-            }
-            assert!(publish_acl(&authority, &pk, &t)); // enforce_rights publication before ACK
             {
-                let tr = authority.lock().unwrap();
-                assert!(tr.host_access_roots(&pk, &tr.me_hash).is_empty()); // ACK effective=false
-                assert_ne!(tr.rights(&pk) & trust::USE, 0, "holder USE survives host/issuer revoke");
+                let mut tr = authority.lock().unwrap();
+                let h = peers::hash_of(&pk).unwrap();
+                if remove_peer {
+                    tr.peer_remove(&peers::Actor::Local, &h, 20, 20).unwrap();
+                } else {
+                    tr.peer_set(&peers::Actor::Local, pk, peers::USE, "holder", 20, 20).unwrap();
+                }
+            }
+            assert!(publish_acl(&authority, &pk, &t)); // enforce_rights до ACK
+            assert!(!host_granted(&authority, &pk));
+            if !remove_peer {
+                assert_ne!(authority.lock().unwrap().rights_pk(&pk) & peers::USE, 0, "USE переживает снятие HOST_ACCESS");
             }
             assert!(!t.0.read().unwrap().contains(&lid(1)));
             resume.send(()).unwrap();
             old.join().unwrap();
-            assert!(!t.0.read().unwrap().contains(&lid(1)), "old evaluator must not restore host access after revoke/ACK");
-            assert_eq!(snapshot(&t), (0, 1, 1), "revoking host access does not revoke ordinary admission");
+            assert!(!t.0.read().unwrap().contains(&lid(1)), "старый оценщик не вернёт доступ после отзыва/ACK");
+            assert_eq!(snapshot(&t), (0, 1, 1), "снятие HOST_ACCESS не снимает обычный допуск");
             let mut inventory = host_acl::Inventory::default();
             let host = u32::from(std::net::Ipv4Addr::new(10, 99, 0, 1));
             inventory.owned.insert(host);
@@ -2946,12 +2930,11 @@ mod tests {
     }
 
     #[test]
-    fn host_publication_holds_trust_through_delayed_setter() {
+    fn host_publication_holds_table_through_delayed_setter() {
         use std::sync::{TryLockError, mpsc::channel};
-        let HostPublicationFixture { authority, pk, host_revoke, .. } = host_publication_fixture();
+        let HostPublicationFixture { authority, pk } = host_publication_fixture();
         let t = Arc::new(tables());
         admit(&t, 1, 0xc6120107).unwrap();
-        let revoke = authority.lock().unwrap().prepare_host_access(&host_revoke).unwrap();
         let (paused, ready) = channel();
         let (resume, resumed) = channel();
         let old_authority = authority.clone();
@@ -2964,8 +2947,8 @@ mod tests {
             })
         });
         assert!(ready.recv_timeout(Duration::from_secs(5)).unwrap());
-        // This is the exact former TOCTOU boundary. Revoke cannot commit here, so cannot
-        // publish false/ACK and then be overwritten by this already computed true.
+        // Точная прежняя граница TOCTOU: отзыв не может зафиксироваться здесь, поэтому не опубликует false/ACK,
+        // чтобы затем быть перезаписанным уже вычисленным true.
         let guarded = matches!(authority.try_lock(), Err(TryLockError::WouldBlock));
         let (attempted, attempt) = channel();
         let (acked, ack) = channel();
@@ -2973,10 +2956,9 @@ mod tests {
         let new_tables = t.clone();
         let new = std::thread::spawn(move || {
             attempted.send(()).unwrap();
-            revoke.commit(&new_authority).unwrap();
+            new_authority.lock().unwrap().peer_set(&peers::Actor::Local, pk, peers::USE, "holder", 20, 20).unwrap();
             assert!(publish_acl(&new_authority, &pk, &new_tables));
-            let tr = new_authority.lock().unwrap();
-            acked.send(!tr.host_access_roots(&pk, &tr.me_hash).is_empty()).unwrap();
+            acked.send(host_granted(&new_authority, &pk)).unwrap();
         });
         attempt.recv_timeout(Duration::from_secs(5)).unwrap();
         let no_early_ack = matches!(ack.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
@@ -2984,34 +2966,22 @@ mod tests {
         assert_eq!(old.join().unwrap(), ((), true));
         assert!(!ack.recv_timeout(Duration::from_secs(5)).unwrap());
         new.join().unwrap();
-        assert!(guarded, "Trust was dropped before the actual setter");
-        assert!(no_early_ack, "revoke/ACK must wait for the in-flight publisher");
+        assert!(guarded, "таблица отпущена до самого сеттера");
+        assert!(no_early_ack, "отзыв/ACK ждёт выполняющийся публикатор");
         assert!(!t.0.read().unwrap().contains(&lid(1)));
     }
 
     #[test]
-    fn host_publication_preserves_root_union_and_authoritative_admission() {
-        let HostPublicationFixture { authority, pk, host_revoke, .. } = host_publication_fixture();
+    fn host_publication_needs_admitted_link_and_does_not_resurrect_closed_one() {
+        let HostPublicationFixture { authority, pk } = host_publication_fixture();
         let t = tables();
-        assert!(!publish_acl(&authority, &pk, &t), "a valid Trust grant cannot admit a Link");
+        assert!(!publish_acl(&authority, &pk, &t), "запись в таблице не допускает Link");
         assert_eq!(snapshot(&t), (0, 0, 0));
         admit(&t, 1, 0xc6120107).unwrap();
-        let other_root = leviculum_std::api::generate_identity();
-        let mut other = trust::Trust::new(other_root.clone(), None);
-        let holder_record = other.issue(*other_root.hash(), pk, trust::USE).unwrap();
-        let grant = {
-            let mut tr = authority.lock().unwrap();
-            tr.add_anchor(&other_root.public_key_bytes()).unwrap();
-            tr.allow_host_root(*other_root.hash(), 16);
-            assert_eq!(tr.offer(holder_record), trust::Offer::Added);
-            other.sign_host_access(*other_root.hash(), tr.me_hash, pk, true).unwrap()
-        };
-        commit_publication_record(&authority, &grant);
-        commit_publication_record(&authority, &host_revoke);
         assert!(publish_acl(&authority, &pk, &t));
-        assert!(t.0.read().unwrap().contains(&lid(1)), "another accepted root still grants HOST_ACCESS");
+        assert!(t.0.read().unwrap().contains(&lid(1)));
         disallow_link(&t.0, &t.1, &t.2, &lid(1));
-        assert!(!publish_acl(&authority, &pk, &t), "a late evaluator cannot resurrect a closed Link");
+        assert!(!publish_acl(&authority, &pk, &t), "поздний оценщик не воскресит закрытый Link");
         assert_eq!(snapshot(&t), (0, 0, 0));
     }
 

@@ -81,7 +81,7 @@ def should_exclude(rel: Path) -> bool:
         return True
     if any(part in EXCLUDED_DIRS for part in rel.parts) or rel.suffix.lower() in EXCLUDED_SUFFIXES:
         return True
-    if rel.name in {"identity.key", "group.key", "trust.json", "node.json", "known_hosts", "enroll-join.json"}:
+    if rel.name in {"identity.key", "group.key", "trust.json", "peers.json", "pending-invite.json", "cmd-journal.json", "cmd-outbox.json", "status-cache.json", "node.json", "known_hosts", "enroll-join.json"}:
         return True
     if rel.name.startswith("invite") or rel.name.endswith(".profile"):
         return True

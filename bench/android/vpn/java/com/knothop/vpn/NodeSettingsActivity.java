@@ -15,14 +15,15 @@ import java.nio.file.StandardCopyOption;
 
 /** Настройки использования конкретной ноды на ЭТОМ телефоне. Не дают удалённых полномочий и не меняют выход при открытии. */
 public final class NodeSettingsActivity extends Activity {
+    static final String EXTRA_TARGET = "target", EXTRA_NAME = "name", EXTRA_FINGERPRINT = "fingerprint";
     private String target, name, fingerprint;
     private LinearLayout box;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
-        target = getIntent().getStringExtra(NodeAdminActivity.EXTRA_TARGET);
-        name = RightsEditor.clip(getIntent().getStringExtra(NodeAdminActivity.EXTRA_NAME));
-        fingerprint = getIntent().getStringExtra(NodeAdminActivity.EXTRA_FINGERPRINT);
+        target = getIntent().getStringExtra(EXTRA_TARGET);
+        name = Rights.clip(getIntent().getStringExtra(EXTRA_NAME));
+        fingerprint = getIntent().getStringExtra(EXTRA_FINGERPRINT);
         if (target == null || !target.matches("[0-9a-fA-F]{32}")) { finish(); return; }
         target = target.toLowerCase(java.util.Locale.ROOT);
         ScrollView scroll = new ScrollView(this);
@@ -41,10 +42,8 @@ public final class NodeSettingsActivity extends Activity {
                 .putExtra(RoutingActivity.EXTRA_TARGET, target).putExtra(RoutingActivity.EXTRA_NAME, name)));
         button("Приложения мимо VPN", () -> startActivity(new Intent(this, AppsActivity.class)));
         button("Все правила телефона", () -> startActivity(new Intent(this, RoutingActivity.class)));
-        text("Администрирование сервера — отдельные права. Наличие USE не позволяет менять чужую ноду.", 13);
-        button("Управление сервером и права", () -> startActivity(new Intent(this, NodeAdminActivity.class)
-                .putExtra(NodeAdminActivity.EXTRA_TARGET, target).putExtra(NodeAdminActivity.EXTRA_NAME, name)
-                .putExtra(NodeAdminActivity.EXTRA_FINGERPRINT, fingerprint)));
+        text("Права и приглашения — раздел «Сеть»: управлять можно только нодами, которые приняли ваше приглашение с правами управления.", 13);
+        button("Сеть: ноды, приглашения, права", () -> startActivity(new Intent(this, NetworkActivity.class)));
     }
 
     private void text(String value, int size) {

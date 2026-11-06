@@ -254,8 +254,8 @@ impl NftHostAccess {
     /// under those locks. Only the single worker publishes snapshots to nft.
     pub(crate) fn start(
         self, tun: &std::sync::Arc<crate::TunState>,
-        authority: std::sync::Arc<std::sync::Mutex<crate::trust::Trust>>,
-        peers: impl Fn() -> Option<Vec<(leviculum_std::api::LinkId, crate::trust::Pk)>> + Send + 'static,
+        authority: std::sync::Arc<std::sync::Mutex<crate::peers::Peers>>,
+        peers: impl Fn() -> Option<Vec<(leviculum_std::api::LinkId, crate::peers::Pk)>> + Send + 'static,
     ) -> Result<()> {
         let tun = std::sync::Arc::downgrade(tun);
         let (send, recv) = std::sync::mpsc::sync_channel(1);
@@ -308,15 +308,15 @@ impl NftHostAccess {
 }
 
 fn authorized_clients(
-    tr: &crate::trust::Trust,
-    peers: &[(leviculum_std::api::LinkId, crate::trust::Pk)],
+    tr: &crate::peers::Peers,
+    peers: &[(leviculum_std::api::LinkId, crate::peers::Pk)],
     permissions: &HashSet<leviculum_std::api::LinkId>,
     allowed: &std::collections::HashMap<leviculum_std::api::LinkId, u32>,
 ) -> HashSet<u32> {
-    let now = crate::now_ms() as u64;
     peers.iter().filter(|(link, pk)| {
-        permissions.contains(link) && !tr.host_access_roots(pk, &tr.me_hash).is_empty()
-            && tr.common_with(pk, crate::trust::EXIT, crate::trust::USE, true, false, now)
+        // HOST_ACCESS - бит записи клиента на этой ноде (ADR 0028 §3.3); туннель - exit_enabled и USE
+        let r = tr.rights_pk(pk);
+        permissions.contains(link) && r & crate::peers::HOST_ACCESS != 0 && r & crate::peers::USE != 0 && tr.config().exit_enabled
     }).filter_map(|(link, _)| allowed.get(link).copied()).collect()
 }
 
@@ -489,30 +489,28 @@ mod tests {
     }
 
     #[test]
-    fn nft_authorization_rechecks_scoped_trust_not_just_cached_tun_bits() {
-        use crate::trust::{Trust, USE};
+    fn nft_authorization_rechecks_table_not_just_cached_tun_bits() {
+        use crate::peers::{Actor, Peers, HOST_ACCESS, USE};
         let node = leviculum_std::api::generate_identity();
         let holder = leviculum_std::api::generate_identity().public_key_bytes();
-        let root = *node.hash();
-        let mut tr = Trust::new(node, None);
-        tr.issue(root, holder, USE).unwrap();
+        let mut tr = Peers::new(node.public_key_bytes(), None);
+        tr.peer_set(&Actor::Local, holder, USE, "h", 1, 1).unwrap();
         let link = leviculum_std::api::LinkId::new([71; 16]);
         let peers = [(link, holder)];
         let permissions = [link].into();
         let allowed = [(link, ip("198.18.1.7"))].into();
-        assert!(authorized_clients(&tr, &peers, &permissions, &allowed).is_empty());
-        // A signed record for a different node is never a fallback grant.
-        let other = tr.sign_host_access(root, [42; 16], holder, true).unwrap();
-        assert!(tr.accept_host_access(other).is_err());
-        assert!(authorized_clients(&tr, &peers, &permissions, &allowed).is_empty());
-        let grant = tr.sign_host_access(root, root, holder, true).unwrap();
-        tr.accept_host_access(grant).unwrap();
+        assert!(authorized_clients(&tr, &peers, &permissions, &allowed).is_empty(), "USE без HOST_ACCESS");
+        tr.peer_set(&Actor::Local, holder, USE | HOST_ACCESS, "h", 2, 2).unwrap();
+        assert!(authorized_clients(&tr, &peers, &permissions, &allowed).is_empty(), "нода не выход: exit_enabled выключен");
+        tr.set_config(&Actor::Local, None, Some(true)).unwrap();
         assert_eq!(authorized_clients(&tr, &peers, &permissions, &allowed).len(), 1);
         assert!(authorized_clients(&tr, &[], &permissions, &allowed).is_empty(), "closed Link");
         assert!(authorized_clients(&tr, &peers, &permissions, &Default::default()).is_empty(), "disallowed Link");
-        let revoke = tr.sign_host_access(root, root, holder, false).unwrap();
-        tr.accept_host_access(revoke).unwrap();
+        tr.peer_set(&Actor::Local, holder, USE, "h", 3, 3).unwrap();
         assert!(authorized_clients(&tr, &peers, &permissions, &allowed).is_empty(), "stale TUN bits cannot restore revoke");
+        tr.peer_set(&Actor::Local, holder, USE | HOST_ACCESS, "h", 4, 4).unwrap();
+        tr.set_config(&Actor::Local, None, Some(false)).unwrap();
+        assert!(authorized_clients(&tr, &peers, &permissions, &allowed).is_empty(), "exit_enabled снят: доступ к хосту не выдаётся");
     }
 
     #[test]

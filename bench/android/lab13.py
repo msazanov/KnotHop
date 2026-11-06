@@ -44,6 +44,12 @@ if sys.argv[1:2] in (["realityfail"],):
     os.environ.setdefault("LAB13_ROOT", str(Path.home() / ".cache/knothop-rl13/lab"))
     os.environ.setdefault("LAB13_SUBNET", "172.29.103.0/24")
     os.environ.setdefault("KNOTHOP_BIN", str(Path.home() / ".cache/knothop-target/check-rns-iroh-node/debug/knothopd"))
+if sys.argv[1:2] == ["rootless"]:
+    # ADR 0028: сеть без корня на локальной Docker-сети с хабом вместо публичной RNS; отладочная сборка knothopd, свой префикс и подсеть
+    os.environ.setdefault("LAB13_PREFIX", "rt")
+    os.environ.setdefault("LAB13_ROOT", str(Path.home() / ".cache/knothop-rt13/lab"))
+    os.environ.setdefault("LAB13_SUBNET", "172.29.104.0/24")
+    os.environ.setdefault("KNOTHOP_BIN", str(Path.home() / ".cache/knothop-target/check-rns-iroh-node/debug/knothopd"))
 if sys.argv[1:2] in (["perf"], ["meshperf"], ["meshfail"], ["blockfail"]):
     # Замер идёт в отдельной внутренней сети со своим префиксом, release-бинарём и без подробного журнала (KNOTHOP_DEBUG замедляет путь данных).
     os.environ.setdefault("LAB13_PREFIX", "perf")
@@ -139,7 +145,8 @@ def node_cmd(name, ip, only_ip, has_invite, lan="", auto_adv=False):
     inv = " --invite-file /state/invite.txt" if has_invite else ""
     # auto_adv: адрес не задан явно, нода берёт его с интерфейса и перепроверяет (0014 R4: смена IP)
     adv = " --advertise-private" if auto_adv else f" --advertise {ip}:47001{lan}"
-    return (isolate(only_ip) + f"python3 /lab/lab_web.py whoami {name} & "
+    inv_own = "chown root:root /state/invite.txt 2>/dev/null; chmod 600 /state/invite.txt 2>/dev/null; " if has_invite else ""
+    return (isolate(only_ip) + inv_own + f"python3 /lab/lab_web.py whoami {name} & "
             f"iptables -t nat -A POSTROUTING -s {CLIENT_NET} ! -o tun0 -j MASQUERADE; "
             # носитель не должен попадать в собственный туннель (журнал N30)
             f"iptables -I OUTPUT -d {CLIENT_NET} -p udp --sport 47001 -j DROP; "
@@ -1058,6 +1065,253 @@ def mesh_up_blk(block):
     mesh_up(1, direct=True, pre_client=block)
 
 
+# ---------------------------------------------------------------------------------------------------- rootless: сеть без корня (ADR 0028)
+def kd(c, *args, check=True):
+    """knothopd внутри контейнера; JSON-ответ или None."""
+    r = sh("docker", "exec", c, "knothopd", *args, check=check)
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return r.stdout.strip()
+
+
+def wait_until(pred, secs, what, step=1.0):
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        try:
+            v = pred()
+        except Exception:                   # noqa: BLE001 - опрос: нода ещё поднимается
+            v = None
+        if v:
+            return time.time() - t0
+        time.sleep(step)
+    sys.exit(f"rootless: не дождался: {what} ({secs} с)")
+
+
+def whoami_hash(c):
+    return kd(c, "whoami", "--state", "/state")["hash"]
+
+
+def view(c):
+    return kd(c, "list", "--state", "/state")
+
+
+def issue_invite(src, *args):
+    """Строка приглашения выпускается нодой src в файл 0600 и читается оттуда; в argv и логи она не попадает."""
+    path = f"/state/.inv-{os.getpid()}-{time.time_ns()}"
+    sh("docker", "exec", src, "knothopd", "invite", "--state", "/state", "--out", path, *args)
+    try:
+        return sh("docker", "exec", src, "cat", path).stdout.strip()
+    finally:
+        sh("docker", "exec", src, "shred", "-u", path, check=False)
+
+
+def put_invite(name, text):
+    write_private(state_dir(name) / "invite.txt", text)
+
+
+def own_root(c):
+    """Файл приглашения создан пользователем лаборатории; нода в контейнере работает от root и требует своего владельца (0600)."""
+    sh("docker", "exec", c, "sh", "-c", "chown root:root /state/invite.txt && chmod 600 /state/invite.txt")
+
+
+def outbox_all_applied(c, targets=None):
+    ob = view(c)["outbox"]
+    mine = [o for o in ob if targets is None or o["target"] in targets]
+    return bool(mine) and all(o["state"] == "applied" for o in mine)
+
+
+def node_links(c):
+    """Хеши соседей-серверов с живым Link (из status.json ноды)."""
+    r = sh("docker", "exec", c, "cat", "/state/status.json", check=False)
+    try:
+        st = json.loads(r.stdout)
+    except ValueError:
+        return set()
+    return set(range(int(st.get("links", 0))))
+
+
+SRV_IPS = {}
+
+
+def curl_exit(c, secs=8):
+    """Имя выхода, через который пришёл запрос к «интернету» (сайт отвечает адресом источника = адрес контейнера выхода за NAT)."""
+    r = sh("docker", "exec", c, "curl", "-s", "-m", str(secs), f"http://{INET}/", check=False)
+    try:
+        src = json.loads(r.stdout)["you_are"]
+    except (ValueError, KeyError):
+        return None
+    return next((n for n, ip in SRV_IPS.items() if ip == src), src)
+
+
+def forged_invite(admin_hash):
+    """Строка приглашения с верным хешем админа и неверным пином (тот же формат, что в invite.rs)."""
+    import base64
+    import hashlib
+    body = bytes([1, 1]) + bytes.fromhex(admin_hash) + b"\x55" * 16
+    body += hashlib.sha256(b"knothop-invite-v5" + body).digest()[:4]
+    return base64.urlsafe_b64encode(body).decode().rstrip("=")
+
+
+def cmd_rootless(a):
+    res = {"scenario": "rootless"}
+    T = {}
+    t_all = time.time()
+    if not BIN.exists():
+        sys.exit(f"нет {BIN}: bash bench/cargo_fork.sh rns-iroh-node build --offline --locked --bin knothopd")
+    cmd_down(a)
+    shutil_rmtree = __import__("shutil").rmtree
+    shutil_rmtree(LAB, ignore_errors=True)
+    sh("docker", "network", "create", "--subnet", SUBNET, NET)
+    hub = state_dir("hub")
+    run(HUB_NAME, HUB_IP, "exec knothopd hub --state /state --port 47000 --tcp-port 4242", hub)
+    run(SITE_NAME, SITE_IP, "exec python3 /lab/lab_web.py site", hub)
+    wait_until(lambda: sh("docker", "exec", SITE_NAME, "ip", "addr", "add", f"{INET}/32", "dev", "lo", check=False).returncode == 0, 20, "адрес «интернета» на сайте")
+    # админ — клиентская нода без приглашений (как телефон): корня нет, он просто первый, кто выпускает коды
+    d = state_dir("adm"); write_pub(d)
+    run("adm", next_ip(), client_cmd("", False), d)
+    wait_file("adm", "/state/identity.key")
+    wait_until(lambda: view("adm").get("me"), 30, "ядро админа")
+    adm = whoami_hash("adm")
+    # 1. три сервера стартуют с пустым state по коду админа
+    t0 = time.time()
+    srv = {}
+    for n in ("s1", "s2", "s3"):
+        d = state_dir(n); write_pub(d)
+        put_invite(n, issue_invite("adm", "--rights", "use", "--mgmt", "admin"))
+        ip = next_ip()
+        pre = ("printf '%s' '{\"version\":1,\"aliases\":[],\"allow\":[]}' > /state/host-acl.json; chmod 600 /state/host-acl.json; "
+               f"ip route replace {INET}/32 via {SITE_IP}; ")
+        run(n, ip, pre + node_cmd(n, ip, None, True), d)
+        srv[n] = {"ip": ip}
+        SRV_IPS[n] = ip
+    for n in srv:
+        wait_file(n, "/state/server.json")
+        srv[n]["hash"] = whoami_hash(n)
+    T["join_first_s"] = None
+    for n in srv:
+        dt = wait_until(lambda n=n: adm in view(n).get("controllers", []), 240, f"{n}: админ управляет нодой")
+        T["join_first_s"] = min(T["join_first_s"] or 1e9, time.time() - t0)
+        srv[n]["joined_s"] = round(time.time() - t0, 1)
+    T["join_all_s"] = round(time.time() - t0, 1)
+    print("серверы вступили:", {n: v["joined_s"] for n, v in srv.items()})
+    # 2. роли: s1 — выход+транзит, s2/s3 — транзит (быть PN, relay и пересылать)
+    hs = {n: v["hash"] for n, v in srv.items()}
+    kd("adm", "peers", "config", "--state", "/state", "--target", hs["s1"], "--transit", "true", "--exit", "true")
+    kd("adm", "peers", "config", "--state", "/state", "--target", hs["s2"], "--transit", "true")
+    kd("adm", "peers", "config", "--state", "/state", "--target", hs["s3"], "--transit", "true")
+    T["config_s"] = round(wait_until(lambda: outbox_all_applied("adm", set(hs.values())), 120, "config.set применён"), 1)
+    # 3. знакомство нод: пакеты операций ставит админ, дальше ноды сами
+    t1 = time.time()
+    if a.offline_node:
+        sh("docker", "stop", "-t", "1", "s3")
+    kd("adm", "introduce", "--state", "/state", "--nodes", ",".join(hs.values()), "--rights", "server")
+    online = {h for n, h in hs.items() if not (a.offline_node and n == "s3")}
+    wait_until(lambda: outbox_all_applied("adm", online) , 120, "пакеты знакомства применены на доступных нодах")
+    T["introduce_applied_s"] = round(time.time() - t1, 1)
+    if a.offline_node:
+        time.sleep(45)         # копия на PN уходит после 30 с без ответа
+    sh("docker", "stop", "-t", "1", "adm")       # админа нет: ноды гасят приглашения сами
+    if a.offline_node:
+        sh("docker", "start", "s3")
+    def full_mesh():
+        for n in srv:
+            v = view(n)
+            known = {p["hash"] for p in v["peers"] if p["rights"]}
+            others = {h for m, h in hs.items() if m != n}
+            if not others <= known or len([c for c in v["contacts"] if c["hash"] in others]) < len(others):
+                return False
+        return True
+    T["mesh_table_s"] = round(wait_until(full_mesh, 600 if a.offline_node else 180, "полная таблица (пиры+контакты) на всех серверах") + (time.time() - t1) - 0, 1)
+    def quic_mesh():
+        for n in srv:
+            if len(node_links(n)) < 2:
+                return False
+        return True
+    try:
+        T["mesh_links_s"] = round(wait_until(quic_mesh, 120, "Link между всеми серверами") + (time.time() - t1), 1)
+    except SystemExit:
+        T["mesh_links_s"] = None
+    res["links"] = {n: sorted(node_links(n)) for n in srv}
+    # 4. админ возвращается; приглашение для клиента на все три ноды (клиент = USE на всех, EXIT — свойство s1)
+    sh("docker", "start", "adm")
+    wait_until(lambda: view("adm").get("me"), 60, "админ вернулся")
+    t2 = time.time()
+    inv = issue_invite("adm", "--nodes", ",".join(hs.values()), "--rights", "user")
+    wait_until(lambda: outbox_all_applied("adm", set(hs.values())), 120, "invite.add применён на всех нодах")
+    T["invite_ready_s"] = round(time.time() - t2, 1)
+    d = state_dir("cl"); write_pub(d); put_invite("cl", inv)
+    run("cl", next_ip(), client_cmd("", False), d)
+    sh("docker", "exec", "cl", "sh", "-c", f"until ip link show tun0 >/dev/null 2>&1; do sleep 0.3; done; ip route replace {INET}/32 dev tun0")
+    wait_file("cl", "/state/identity.key")
+    wait_until(lambda: view("cl").get("me"), 30, "ядро клиента")
+    t3 = time.time()
+    own_root("cl")
+    kd("cl", "join", "--state", "/state", "--invite-file", "/state/invite.txt")
+    cl = whoami_hash("cl")
+    T["client_join_s"] = round(wait_until(lambda: len(view("cl")["contacts"]) == 3 and not view("cl")["pending"]["pairs"], 180, "клиент погасил все три пары"), 1)
+    # 5. трафик через выход
+    T["traffic_s"] = round(wait_until(lambda: curl_exit("cl") == "s1", 120, "трафик через выход s1") + (time.time() - t3), 1)
+    res["site_src"] = curl_exit("cl")
+    # 6. блок прямого пути клиент→выход: обход через транзит (s2/s3 знают клиента и s1)
+    sh("docker", "exec", "cl", "sh", "-c", f"iptables -I OUTPUT -d {srv['s1']['ip']} -j DROP; iptables -I INPUT -s {srv['s1']['ip']} -j DROP")
+    t4 = time.time()
+    time.sleep(2)
+    T["bypass_s"] = round(wait_until(lambda: curl_exit("cl", 4) == "s1", 180, "обход блока через транзит") + (time.time() - t4), 1)
+    cs = json.loads(sh("docker", "exec", "cl", "cat", "/state/status.json").stdout)
+    res["bypass_current"] = cs.get("current")
+    res["transit_status"] = {n: json.loads(sh("docker", "exec", n, "cat", "/state/status.json").stdout).get("clients") for n in ("s2", "s3")}
+    # 7. снятие USE у клиента на выходе → доступ потерян
+    sh("docker", "exec", "cl", "sh", "-c", f"iptables -D OUTPUT -d {srv['s1']['ip']} -j DROP; iptables -D INPUT -s {srv['s1']['ip']} -j DROP")
+    kd("adm", "peers", "remove", "--state", "/state", "--target", hs["s1"], "--hash", cl)
+    t5 = time.time()
+    wait_until(lambda: curl_exit("cl", 3) is None, 120, "клиент потерял выход после снятия USE")
+    T["revoke_use_s"] = round(time.time() - t5, 1)
+    # 7б. вернуть USE (запись новее надгробия), затем выключить exit_enabled на выходе: клиент теряет выход и по этой причине
+    cl_pk = kd("cl", "whoami", "--state", "/state")["pk"]
+    kd("adm", "peers", "set", "--state", "/state", "--target", hs["s1"], "--pk", cl_pk, "--rights", "use")
+    t6 = time.time()
+    T["restore_use_s"] = round(wait_until(lambda: curl_exit("cl", 4) == "s1", 180, "выход вернулся после повторной выдачи USE") + (time.time() - t6), 1)
+    kd("adm", "peers", "config", "--state", "/state", "--target", hs["s1"], "--exit", "false")
+    t7 = time.time()
+    wait_until(lambda: curl_exit("cl", 3) is None, 120, "клиент потерял выход после exit_enabled=false")
+    T["exit_off_s"] = round(time.time() - t7, 1)
+    # 8. неверный пин → молчание; повтор приглашения вторым получателем → отказ
+    d = state_dir("bad"); write_pub(d); put_invite("bad", forged_invite(adm))
+    run("bad", next_ip(), client_cmd("", False), d)
+    wait_file("bad", "/state/identity.key"); wait_until(lambda: view("bad").get("me"), 30, "ядро bad")
+    own_root("bad")
+    kd("bad", "join", "--state", "/state", "--invite-file", "/state/invite.txt")
+    open_before = [i for i in view("adm")["invites"] if i["state"] == "open"]
+    time.sleep(45)
+    bad = view("bad")
+    res["wrong_pin"] = {"bad_contacts": len(bad["contacts"]), "bad_pending_pairs": len(bad["pending"]["pairs"]),
+                        "adm_open_invites_unchanged": len([i for i in view("adm")["invites"] if i["state"] == "open"]) == len(open_before),
+                        "adm_knows_bad": any(p["hash"] == whoami_hash("bad") for p in view("adm")["peers"])}
+    inv2 = issue_invite("adm", "--rights", "user")
+    d = state_dir("c1"); write_pub(d); put_invite("c1", inv2)
+    run("c1", next_ip(), client_cmd("", False), d)
+    d = state_dir("c2"); write_pub(d); put_invite("c2", inv2)
+    run("c2", next_ip(), client_cmd("", False), d)
+    for c in ("c1", "c2"):
+        wait_file(c, "/state/identity.key"); wait_until(lambda c=c: view(c).get("me"), 30, f"ядро {c}")
+    own_root("c1"); own_root("c2")
+    kd("c1", "join", "--state", "/state", "--invite-file", "/state/invite.txt")
+    wait_until(lambda: len(view("c1")["contacts"]) == 1, 120, "первый получатель погасил")
+    kd("c2", "join", "--state", "/state", "--invite-file", "/state/invite.txt")
+    time.sleep(40)
+    v2 = view("c2")
+    res["second_redeemer"] = {"contacts": len(v2["contacts"]), "pending_pairs": len(v2["pending"]["pairs"]),
+                              "adm_has_c2": any(p["hash"] == whoami_hash("c2") for p in view("adm")["peers"])}
+    T["total_s"] = round(time.time() - t_all, 1)
+    res["times"] = T
+    res["nodes"] = {n: v["hash"][:8] for n, v in srv.items()}
+    print(json.dumps(res, ensure_ascii=False, indent=1))
+    if not a.keep:
+        cmd_down(a)
+
+
+
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 sp = ap.add_subparsers(dest="c", required=True)
 x = sp.add_parser("up"); x.add_argument("--phone", action="store_true", help="опубликовать порт adm на LAN-адресе ноутбука для телефона"); x.add_argument("--no-adm", action="store_true", help="без ноды adm (админом будет клиент: lab13.py admin NAME)"); x.set_defaults(f=cmd_up)
@@ -1098,5 +1352,8 @@ x.add_argument("--control", action="store_true", help="без REALITY, закр�
 x.add_argument("--idle", type=int, default=0, help="после блока N секунд без трафика, затем ping выхода; время восстановления считается от начала ping")
 x.add_argument("--unblock", type=int, default=0, help="после проверок снять блок и ждать N секунд (возврат на QUIC)")
 x.set_defaults(f=cmd_realityfail)
+x = sp.add_parser("rootless", help="ADR 0028: сеть без корня (3 сервера по коду админа, знакомство, клиент, обход блока, отзыв)")
+x.add_argument("--offline-node", action="store_true", help="s3 выключен при знакомстве, админ уходит, письмо ждёт на PN (долго: ждёт анонс PN)")
+x.add_argument("--keep", action="store_true"); x.set_defaults(f=cmd_rootless)
 a = ap.parse_args()
 a.f(a)

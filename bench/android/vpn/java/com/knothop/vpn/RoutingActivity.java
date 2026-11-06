@@ -78,7 +78,7 @@ public class RoutingActivity extends Activity {
         String chosen = getIntent().getStringExtra(EXTRA_TARGET);
         if (chosen != null && chosen.matches("[0-9a-fA-F]{32}")) {
             target = chosen.toLowerCase(Locale.ROOT);
-            targetName = RightsEditor.clip(getIntent().getStringExtra(EXTRA_NAME));
+            targetName = Rights.clip(getIntent().getStringExtra(EXTRA_NAME));
         }
         rstate = new File(files, "rstate");
         rstate.mkdirs();
@@ -231,7 +231,6 @@ public class RoutingActivity extends Activity {
         root.removeAllViews();
         out = root;
         detailsView = null;
-        if (target.isEmpty()) out.addView(NodeTabs.bar(this, NodeTabs.ROUTING));
         TextView title = text(target.isEmpty() ? "Маршрутизация" : "Маршруты через " + (targetName.isEmpty() ? lb.nameOf(target) : targetName), 24, true, Ui.TEXT);
         title.setPadding(0, dp(8), 0, 0);
         if (Build.VERSION.SDK_INT >= 28) title.setAccessibilityHeading(true);
