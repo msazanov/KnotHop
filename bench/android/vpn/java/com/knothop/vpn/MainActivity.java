@@ -49,6 +49,8 @@ public class MainActivity extends Activity {
     private LinearLayout stateCard;
     /** Из status.json для верхней строки состояния: число известных нод и имя текущего выхода. */
     private int nodeCount;
+    /** P2P-контакты без ролей (status.json, p2p): сколько всего, с прямым QUIC и с окончательным отказом; «подключаюсь…» для них не бесконечно. */
+    private int p2pDirect, p2pTotal, p2pFailed;
     private String exitName = "";
     private AppUpdater updater;
     private TextView pullHint, modeText;
@@ -971,6 +973,8 @@ public class MainActivity extends Activity {
                 if (doing == null && !st.isEmpty() && !st.startsWith("выход:")) doing = st;   // «подключаюсь к …», «выбранный выход недоступен …»
                 JSONArray exAll = j.optJSONArray("exits");
                 nodeCount = exAll == null ? 0 : exAll.length();
+                P2p.Summary ps = P2p.summary(j.optJSONArray("p2p"));
+                p2pDirect = ps.direct; p2pTotal = ps.total; p2pFailed = ps.failed;
                 exitName = cur == null ? "" : TopologyView.shortName(cur.optString("n"));
                 if (cur != null) {
                     StringBuilder c = new StringBuilder("выход: ").append(TopologyView.shortName(cur.optString("n")));
@@ -985,7 +989,8 @@ public class MainActivity extends Activity {
                     conn = c.toString();
                     logChange("соединение", conn + " (носитель - открытый сокет, не путь RNS)");
                 } else if (doing == null) {
-                    doing = curMode() == 1 ? "Узел работает в сети. Выходы для VPN появятся, когда нода ответит" : "Ищу выход…";
+                    doing = p2pTotal > 0 && nodeCount == 0 ? "P2P: прямая связь с " + p2pDirect + " из " + p2pTotal + " устройств. Выход в интернет возможен только через устройство с правом EXIT"
+                            : curMode() == 1 ? "Узел работает в сети. Выходы для VPN появятся, когда нода ответит" : "Ищу выход…";
                 }
                 if (pinned.matches("[0-9a-fA-F]{32}") && (cur == null || !pinned.equalsIgnoreCase(cur.optString("d")))) logChange("выбор", "выбран вами " + pinned.substring(0, 8) + ", подключаюсь");
                 updateBenchUi(state, j, cur);
@@ -1006,7 +1011,7 @@ public class MainActivity extends Activity {
                 doing = "статус: " + e;
             }
         } else {
-            nodeCount = 0;
+            nodeCount = 0; p2pDirect = 0; p2pTotal = 0; p2pFailed = 0;
             exitName = "";
             prevTs = 0;
             rUp = rDown = 0;
@@ -1052,6 +1057,7 @@ public class MainActivity extends Activity {
         } else if (m == 0) { t = "Отключено"; col = Ui.MUTED; }
         else if (m == 1) {
             if (nodeCount > 0) { t = "Сеть: " + nodeCount + " " + nodesWord(nodeCount); col = ModeSlider.COLORS[1]; }
+            else if (p2pTotal > 0) { t = "Сеть: P2P " + p2pDirect + " из " + p2pTotal + (p2pFailed > 0 ? " · не удалось: " + p2pFailed : ""); col = ModeSlider.COLORS[1]; }
             else { t = "Сеть: подключаюсь…"; col = ModeSlider.COLORS[1]; }
         } else if (!exitName.isEmpty() && "up".equals(KnotHopVpnService.phase)) { t = "VPN: " + exitName; col = ModeSlider.COLORS[2]; }
         else { t = "VPN: подключаюсь…"; col = ModeSlider.COLORS[1]; }

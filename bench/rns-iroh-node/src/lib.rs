@@ -1048,6 +1048,13 @@ const MAX_INCOMING: usize = 256;
 const MAX_INCOMING_PER_IP: usize = 8;
 
 async fn accept_loop(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>) {
+    accept_loop_with(ep, node, sh, None).await
+}
+
+/// Фильтр ключей входящих QUIC (телефон): соединение с незнакомым ключом закрывается сразу после рукопожатия TLS, до интерфейса RNS.
+type AdmitKey = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
+
+async fn accept_loop_with(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, admit: Option<AdmitKey>) {
     let mut n = 0u32;
     let slots: SlotsRef = Default::default();
     while let Some(incoming) = ep.accept().await {
@@ -1061,6 +1068,7 @@ async fn accept_loop(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>) {
             continue;
         };
         let (node, sh, ep2) = (node.clone(), sh.clone(), ep.clone());
+        let admit = admit.clone();
         n += 1;
         let id = n;
         tokio::spawn(async move {
@@ -1084,6 +1092,13 @@ async fn accept_loop(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>) {
                 let Ok(conn) = incoming.await else { return };
                 conn
             };
+            if let Some(f) = &admit {
+                // ключ из TLS (не из содержимого): незнакомый ключ не получает ни интерфейса RNS, ни слота носителя
+                if !f(conn.remote_id().as_bytes()) {
+                    conn.close(0u32.into(), b"unknown key");
+                    return;
+                }
+            }
             let peer = conn.remote_id().fmt_short().to_string();
             let via_reality = reality_carrier::incoming_is_reality(&conn_addr_kind);
             sh.note(format!("quic accepted from {peer}{}", if via_mesh { " (mesh)" } else if via_reality { " (reality)" } else { "" }));

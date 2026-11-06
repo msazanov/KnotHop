@@ -116,6 +116,13 @@ fn fixed<const N: usize>(j: &serde_json::Value, k: &str) -> Option<[u8; N]> {
     unhex(j[k].as_str()?).try_into().ok()
 }
 
+/// Подсказки адресов от пира: строки ≤80 Б, прошедшие тот же фильтр, что и при наборе (глобальные IP или нормальное имя; частные - только
+/// с `KNOTHOP_ALLOW_PRIVATE_DIAL`), не больше трёх и с минимум одним адресом каждого семейства IP. Фильтр получателя не зависит от отправителя.
+pub(crate) fn clean_hints(v: &serde_json::Value) -> Vec<String> {
+    let all: Vec<String> = v.as_array().map(|a| a.iter().filter_map(|s| s.as_str()).filter(|s| s.len() <= 80 && crate::vpn::sane_hint_addr(s)).map(String::from).collect()).unwrap_or_default();
+    peers::balance_hints(all, peers::MAX_HINTS)
+}
+
 // ------------------------------------------------------------------------------------------------ pending-invite.json
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +144,8 @@ pub struct Accepted {
     pub hints: Vec<String>,
     /// подсказка REALITY выдавшей ноды; подсказка, не полномочие
     pub rl: serde_json::Value,
+    /// выдавшая нода объявила себя клиентом (телефон)
+    pub client: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -183,7 +192,7 @@ fn load_pending(state: &Path) -> Result<Pending> {
                 pk_h: fixed(a, "pk_h").ok_or_else(|| anyhow!("pending-invite.json: pk_h"))?, rights: a["rights"].as_u64().unwrap_or(0) as u16,
                 mgmt: a["mgmt"].as_u64().unwrap_or(0) as u16, roles: a["roles"].as_u64().unwrap_or(0) as u16,
                 name_h: a["name_h"].as_str().unwrap_or("").to_string(), hints: a["hints"].as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).take(3).collect()).unwrap_or_default(),
-                rl: a["rl"].clone(),
+                rl: a["rl"].clone(), client: a["client"].as_bool().unwrap_or(false),
             })
         } else { None };
         p.pairs.push(Pair {
@@ -204,7 +213,7 @@ fn save_pending(state: &Path, p: &Pending) -> Result<()> {
     let pairs: Vec<_> = p.pairs.iter().map(|x| {
         let mut j = serde_json::json!({"h": hex(&x.h), "pin": hex(&x.pin), "n": hex(&x.n_nonce), "state": match x.state { PairState::None => "none", PairState::Consent => "consent", PairState::Settled => "settled" }});
         if let Some(a) = &x.acc {
-            j["acc"] = serde_json::json!({"pk_h": hex(&a.pk_h), "rights": a.rights, "mgmt": a.mgmt, "roles": a.roles, "name_h": a.name_h, "hints": a.hints, "rl": a.rl});
+            j["acc"] = serde_json::json!({"pk_h": hex(&a.pk_h), "rights": a.rights, "mgmt": a.mgmt, "roles": a.roles, "name_h": a.name_h, "hints": a.hints, "rl": a.rl, "client": a.client});
         }
         j
     }).collect();
@@ -290,6 +299,8 @@ pub struct Core {
     pub(crate) rate_cmd: Mutex<Rate>,
     f2b: Mutex<Fail2Ban>,
     enq: Mutex<HashMap<String, Instant>>,
+    /// когда последний раз проверяли свои адреса и какие разослали контактам (`addr`)
+    last_addr: Mutex<(Option<Instant>, Vec<String>)>,
     pub(crate) cmd: crate::ncmd::State,
 }
 
@@ -323,7 +334,7 @@ impl Core {
         Ok(Arc::new(Core {
             state: state.to_path_buf(), me_pk, me_hash, peers, sink, consent_required, name: Mutex::new(String::new()), rl: Mutex::new(serde_json::Value::Null), hints, on_change, log,
             pending: Mutex::new(pending), rate_inv: Mutex::new(Rate::new(6, 30)), rate_cmd: Mutex::new(Rate::new(12, 60)), f2b: Mutex::new(Fail2Ban::default()),
-            enq: Mutex::new(HashMap::new()), cmd: crate::ncmd::State::load(state),
+            enq: Mutex::new(HashMap::new()), last_addr: Mutex::new((None, Vec::new())), cmd: crate::ncmd::State::load(state),
         }))
     }
 
@@ -385,7 +396,59 @@ impl Core {
             Some("accept") => self.on_accept(m, &j),
             Some("ack") => self.on_ack(m, &j),
             Some("deny") => self.on_deny(m, &j),
+            Some("addr") => self.on_addr(m, &j),
             _ => {}
+        }
+    }
+
+    /// Обновление адресов известного контакта (сменился IP/порт): подписанное LXMF от ключа контакта. Меняются только подсказки
+    /// (после того же фильтра, что и у `accept`); права и роли не затрагиваются. Незнакомый источник - молчание.
+    fn on_addr(&self, m: &Message, j: &serde_json::Value) {
+        let hints = clean_hints(&j["hints"]);
+        if hints.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut p = self.peers.lock().unwrap();
+            let Some(pk) = p.pk_for_lxmf_source(&m.source_hash) else { return };
+            let Some(h) = peers::hash_of(&pk) else { return };
+            if p.contact(&h).is_none() || !crate::lxmf_admin::signed_by_trusted_source(m, &pk) {
+                return;
+            }
+            p.contact_set_hints(&h, hints) && p.save().is_ok()
+        };
+        if changed {
+            self.changed();
+        }
+    }
+
+    /// Раз в ≈30 с: если мои адреса сменились, разослать `addr` контактам, которых я набираю (им разрешено использовать меня либо я им).
+    fn announce_addrs(&self) {
+        {
+            let mut l = self.last_addr.lock().unwrap();
+            if l.0.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+                return;
+            }
+            l.0 = Some(Instant::now());
+        }
+        let now = peers::balance_hints((self.hints)(), peers::MAX_HINTS);
+        if now.is_empty() {
+            return;
+        }
+        let targets: Vec<Pk> = {
+            let mut l = self.last_addr.lock().unwrap();
+            if l.1 == now {
+                return;
+            }
+            l.1 = now.clone();
+            let p = self.peers.lock().unwrap();
+            p.contact_list().into_iter().filter(|c| c.they_grant & peers::USE != 0 || p.rights_pk(&c.pk) != 0).map(|c| c.pk).take(32).collect()
+        };
+        let body = serde_json::json!({"v": 1, "op": "addr", "hints": now}).to_string();
+        let ver = hex(&Sha256::digest(body.as_bytes())[..4]);
+        for pk in targets {
+            let tag = format!("inv:addr:{}:{ver}", &hex(&peers::hash_of(&pk).unwrap_or([0; 16]))[..8]);
+            self.send(lxmf_sync::TITLE_INV, Target::Pk(pk), body.clone().into_bytes(), &tag, now_s() + 3600, false);
         }
     }
 
@@ -412,7 +475,7 @@ impl Core {
                 let hn = h_nonce(&key, &pk_n, &n_nonce);
                 let tag_mac = mac(&key, &[b"accept", &me, &pk_n, &n_nonce, &hn, &rights_bytes(rights, mgmt, roles)]);
                 let body = serde_json::json!({"v": 1, "op": "accept", "pid": hex(&pid), "n_nonce": hex(&n_nonce), "h_nonce": hex(&hn), "pk_h": hex(&self.me_pk),
-                    "rights": rights, "mgmt": mgmt, "roles": roles, "name_h": self.name(), "hints": (self.hints)().into_iter().take(3).collect::<Vec<_>>(), "rl": self.rl.lock().unwrap().clone(), "mac": hex(&tag_mac)});
+                    "rights": rights, "mgmt": mgmt, "roles": roles, "name_h": self.name(), "hints": peers::balance_hints((self.hints)(), peers::MAX_HINTS), "rl": self.rl.lock().unwrap().clone(), "cl": self.consent_required, "mac": hex(&tag_mac)});
                 let exp = exp.max(now_s() + 600);
                 self.send(lxmf_sync::TITLE_INV, Target::Pk(pk_n), serde_json::to_vec(&body).unwrap(), &format!("inv:accept:{}", hex(&pid)), exp, false);
                 if fresh {
@@ -451,8 +514,8 @@ impl Core {
         }
         let acc = Accepted {
             pk_h, rights, mgmt, roles, name_h: j["name_h"].as_str().unwrap_or("").chars().take(48).collect(),
-            hints: j["hints"].as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).filter(|s| s.len() <= 80).take(3).collect()).unwrap_or_default(),
-            rl: j["rl"].clone(),
+            hints: clean_hints(&j["hints"]),
+            rl: j["rl"].clone(), client: j["cl"].as_bool().unwrap_or(false),
         };
         match pair.state {
             PairState::Settled => {
@@ -485,6 +548,7 @@ impl Core {
                 return false;
             }
             p.contact_rl(&acc.pk_h, &acc.rl);
+            if let Some(h) = peers::hash_of(&acc.pk_h) { p.set_contact_client(&h, acc.client); }
             if p.save().is_err() {
                 return false;
             }
@@ -504,7 +568,9 @@ impl Core {
     }
 
     fn send_ack(&self, pair: &Pair, hn: &[u8; 16]) {
-        let body = serde_json::json!({"v": 1, "op": "ack", "pid": hex(&pair.pid()), "n_nonce": hex(&pair.n_nonce), "mac2": hex(&mac(&pair.key(), &[b"ack", hn]))});
+        // ответные подсказки: мои адреса и имя едут выдавшему в том же шифрованном LXMF (для обратного дозвона); права от них не меняются
+        let body = serde_json::json!({"v": 1, "op": "ack", "pid": hex(&pair.pid()), "n_nonce": hex(&pair.n_nonce), "mac2": hex(&mac(&pair.key(), &[b"ack", hn])),
+            "name": self.name(), "cl": self.consent_required, "hints": peers::balance_hints((self.hints)(), peers::MAX_HINTS)});
         self.send(lxmf_sync::TITLE_INV, Target::Hash(pair.h), serde_json::to_vec(&body).unwrap(), &format!("inv:ack:{}", hex(&pair.pid())), now_s() + 600, true);
     }
 
@@ -528,9 +594,19 @@ impl Core {
         if !mac_ok(&key, &[b"ack", &hn], &mac2) {
             return;
         }
+        let hints = clean_hints(&j["hints"]);
+        let name: String = j["name"].as_str().unwrap_or("").chars().filter(|c| !c.is_control()).take(48).collect();
         let ok = {
             let mut p = self.peers.lock().unwrap();
             let r = p.invite_settle(&pid, &pk);
+            // запись контакта о получателе (обратный дозвон): права `peers` не трогаются; уже известный контакт (взаимное знакомство)
+            // сохраняет свои they_grant/роли, обновляются только адреса
+            if r {
+                if let Some(h) = peers::hash_of(&pk) {
+                    if p.contact(&h).is_some() { p.contact_set_hints(&h, hints); } else { let _ = p.contact_set(pk, &name, hints, "invite", 0, 0, now_ms() as u64); }
+                    p.set_contact_client(&h, j["cl"].as_bool().unwrap_or(false));
+                }
+            }
             r && p.save().is_ok()
         };
         if ok {
@@ -640,6 +716,7 @@ impl Core {
                 let _ = p.save();
             }
         }
+        self.announce_addrs();
         let mut enq = self.enq.lock().unwrap();
         let mut pend = self.pending.lock().unwrap();
         if !pend.pairs.is_empty() && now > pend.created + PENDING_TTL_MS {
@@ -681,13 +758,18 @@ pub(crate) mod tests {
     }
 
     pub fn node(tag: &str, consent: bool) -> Node {
+        node_h(tag, consent, vec!["203.0.113.5:47001".into()])
+    }
+
+    /// Нода с заданными адресами-подсказками (то, что она объявит в accept/ack/addr).
+    pub fn node_h(tag: &str, consent: bool, hints: Vec<String>) -> Node {
         let id = generate_identity();
         let dir = std::env::temp_dir().join(format!("kh-inv-{tag}-{}-{}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let peers = Arc::new(Mutex::new(Peers::load(id.public_key_bytes(), &dir).unwrap()));
         let out: Outbox = Arc::new(Mutex::new(Vec::new()));
         let o = out.clone();
-        let core = Core::new(&dir, id.clone(), peers, consent, Box::new(|| vec!["203.0.113.5:47001".into()]), Box::new(|| {}), Box::new(|_| {})).unwrap();
+        let core = Core::new(&dir, id.clone(), peers, consent, Box::new(move || hints.clone()), Box::new(|| {}), Box::new(|_| {})).unwrap();
         let core = core.with_sink(Arc::new(move |title, target, content, tag, _exp, _ack| { o.lock().unwrap().push((title.to_vec(), target, content, tag.to_string())); }));
         core.set_name(tag);
         Node { core, identity: id, out }
@@ -873,6 +955,83 @@ pub(crate) mod tests {
         let m = Message::create(peers::lxmf_destination(&h.core.me_hash), [3; 16], &h.identity, 1.0, lxmf_sync::TITLE_INV.to_vec(), b"not json".to_vec(), vec![], DeliveryMethod::Direct).unwrap();
         h.core.on_message(&m);
         assert!(h.out.lock().unwrap().is_empty());
+    }
+
+    fn v6_of(hints: &[String]) -> bool {
+        hints.iter().any(|h| h.parse::<std::net::SocketAddr>().is_ok_and(|s| s.is_ipv6()))
+    }
+
+    #[test]
+    fn accept_and_ack_carry_hints_both_ways_filtered_and_dual_stack() {
+        // выдавший A: три IPv4, один глобальный IPv6 и частный адрес; получатель B: IPv4 + IPv6
+        let a_hints: Vec<String> = ["8.8.8.8:47001", "8.8.4.4:47002", "1.1.1.1:47003", "[2606:4700::1111]:47004", "10.0.0.5:47005"].iter().map(|s| s.to_string()).collect();
+        let b_hints: Vec<String> = ["9.9.9.9:5001", "[2a00:1450::1]:5002", "192.168.1.9:5003"].iter().map(|s| s.to_string()).collect();
+        let (a, b) = (node_h("p2p-a", false, a_hints), node_h("p2p-b", true, b_hints));
+        let s = issue_self(&a.core, peers::USE, 0, peers::INVITE_DEFAULT_MS);
+        b.core.join(&s).unwrap();
+        b.core.tick();
+        deliver(&b, &a);
+        deliver(&a, &b);
+        // B получил подсказки A: не больше трёх, IPv6 не вытеснен тремя IPv4, частный адрес отброшен фильтром получателя
+        let ha = b.core.peers.lock().unwrap().contact(&a.core.me_hash).unwrap().hints.clone();
+        assert_eq!(ha.len(), 3, "{ha:?}");
+        assert!(v6_of(&ha), "IPv6 сохранён при лимите: {ha:?}");
+        assert!(ha.iter().all(|h| !h.starts_with("10.")));
+        deliver(&b, &a); // ack с адресами B
+        // A получил контакт B для обратного дозвона; права на A не изменились, никаких they_grant/ролей не появилось
+        let p = a.core.peers.lock().unwrap();
+        let cb = p.contact(&b.core.me_hash).expect("контакт получателя у выдавшего");
+        assert_eq!(cb.hints, vec!["9.9.9.9:5001".to_string(), "[2a00:1450::1]:5002".to_string()], "частный 192.168.* отброшен");
+        assert_eq!((cb.they_grant, cb.roles, cb.intro_by.as_str()), (0, 0, "invite"));
+        assert!(cb.client, "B объявил себя клиентом (телефон)");
+        assert_eq!(p.rights(&b.core.me_hash), peers::USE, "права B на A прежние");
+    }
+
+    #[test]
+    fn addr_update_from_known_contact_only_changes_hints() {
+        let (a, b) = (node_h("addr-a", false, vec!["8.8.8.8:1".into()]), node_h("addr-b", false, vec!["9.9.9.9:2".into()]));
+        let s = issue_self(&a.core, peers::USE, 0, peers::INVITE_DEFAULT_MS);
+        b.core.join(&s).unwrap();
+        b.core.tick();
+        deliver(&b, &a);
+        deliver(&a, &b);
+        deliver(&b, &a);
+        let send_addr = |from: &Node, to: &Node, hints: serde_json::Value| {
+            let body = serde_json::json!({"v":1,"op":"addr","hints":hints});
+            let m = Message::create(peers::lxmf_destination(&to.core.me_hash), peers::lxmf_destination(&from.core.me_hash), &from.identity, 1.0, lxmf_sync::TITLE_INV.to_vec(), serde_json::to_vec(&body).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
+            to.core.on_message(&m);
+        };
+        send_addr(&b, &a, serde_json::json!(["4.4.4.4:9", "[2001:4860::8888]:9", "10.1.1.1:9"]));
+        let h = a.core.peers.lock().unwrap().contact(&b.core.me_hash).unwrap().hints.clone();
+        assert_eq!(h, vec!["4.4.4.4:9".to_string(), "[2001:4860::8888]:9".to_string()]);
+        assert_eq!(a.core.peers.lock().unwrap().rights(&b.core.me_hash), peers::USE);
+        // чужой (нет контакта): молчание, подсказки не меняются
+        let stranger = node("addr-x", false);
+        send_addr(&stranger, &a, serde_json::json!(["5.5.5.5:9"]));
+        assert_eq!(a.core.peers.lock().unwrap().contact(&b.core.me_hash).unwrap().hints, h);
+        assert!(a.core.peers.lock().unwrap().contact(&stranger.core.me_hash).is_none());
+        // только частные адреса - пустой список после фильтра, ничего не меняется
+        send_addr(&b, &a, serde_json::json!(["192.168.0.2:1"]));
+        assert_eq!(a.core.peers.lock().unwrap().contact(&b.core.me_hash).unwrap().hints, h);
+    }
+
+    #[test]
+    fn announce_addrs_sends_only_on_change_to_dialable_contacts() {
+        let (a, b) = (node_h("an-a", false, vec!["8.8.8.8:1".into()]), node("an-b", false));
+        let s = issue_self(&a.core, peers::USE, 0, peers::INVITE_DEFAULT_MS);
+        b.core.join(&s).unwrap();
+        b.core.tick();
+        deliver(&b, &a);
+        deliver(&a, &b);
+        deliver(&b, &a);
+        a.out.lock().unwrap().clear();
+        a.core.announce_addrs();
+        let sent = a.out.lock().unwrap().iter().filter(|m| m.3.starts_with("inv:addr:")).count();
+        assert_eq!(sent, 1, "первая проверка рассылает адреса контакту");
+        a.core.last_addr.lock().unwrap().0 = None; // обойти 30-секундный темп
+        a.out.lock().unwrap().clear();
+        a.core.announce_addrs();
+        assert!(a.out.lock().unwrap().is_empty(), "адреса не менялись - не рассылаем");
     }
 
     #[test]

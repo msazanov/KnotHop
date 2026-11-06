@@ -736,6 +736,34 @@ mod tests {
     }
 
     #[test]
+    fn ctl_issue_works_for_own_node_alone_and_mixed_with_managed_and_foreign_limits() {
+        let (a, s) = pair();
+        // только своя нода (нет других узлов): применяется сразу, строка из одной пары
+        let r = a.core.ctl(&serde_json::json!({"cmd": "issue", "nodes": [{"hash": hex(&a.core.me_hash), "rights": USE, "mgmt": 0}]}));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(crate::invite::decode(r["invite"].as_str().unwrap()).unwrap().len(), 1);
+        assert_eq!(a.core.peers.lock().unwrap().invite_list().iter().filter(|i| i.state == peers::InviteState::Open).count(), 1);
+        // смесь: своя + управляемая S, у каждой свой пин; для S уходит «ожидай»
+        let r = a.core.ctl(&serde_json::json!({"cmd": "issue", "nodes": [
+            {"hash": hex(&a.core.me_hash), "rights": USE, "mgmt": 0}, {"hash": hex(&s.core.me_hash), "rights": USE, "mgmt": 0}]}));
+        assert_eq!(r["ok"], true, "{r}");
+        let pairs = crate::invite::decode(r["invite"].as_str().unwrap()).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_ne!(pairs[0].1, pairs[1].1, "пины разные");
+        assert_eq!(r["requests"].as_array().unwrap().len(), 2);
+        assert_eq!(deliver(&a, &s), 1, "ожидай ушло только чужой ноде");
+        // чужая нода сама отказывает выше прав актора: у ADD-держателя нет CONFIG
+        s.out.lock().unwrap().clear();
+        let adder = node("adder2", false);
+        s.core.peers.lock().unwrap().peer_set(&Actor::Local, adder.core.me_pk, USE | peers::ADD, "ad", 5, 5).unwrap();
+        let rid = adder.core.submit(s.core.me_hash, vec![serde_json::json!({"op": "invite.add", "pid": hex(&[1u8; 8]), "key": hex(&[2u8; 32]), "rights": peers::CONFIG | USE, "mgmt": 0})], 3600).unwrap();
+        deliver(&adder, &s);
+        let out = std::mem::take(&mut *s.out.lock().unwrap());
+        let rep: serde_json::Value = serde_json::from_slice(&out[0].2).unwrap();
+        assert_eq!(rep["results"][0]["code"], "rights_exceed", "{rep} {rid}");
+    }
+
+    #[test]
     fn introduce_makes_mutual_peers_without_admin_after_queueing() {
         // админ + три сервера; админ имеет CONFIG на каждом
         let adm = node("adm2", true);

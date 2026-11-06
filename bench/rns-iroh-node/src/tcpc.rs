@@ -119,6 +119,14 @@ pub async fn run(mux: Arc<mux::Mux>, mut rd: tokio::net::tcp::OwnedReadHalf, mut
 /// Слушать TCP на том же порту, что и QUIC (порты TCP и UDP независимы). С `relay` тот же порт обслуживает и TLS-relay iroh:
 /// соединение различается по первому байту (`R` - маркер носителя, `0x16` - TLS), без relay поведение прежнее.
 pub async fn listen(node: Arc<Node>, sh: Arc<Shared>, port: u16, self_sk: iroh::SecretKey, relay: Option<Arc<relay::Host>>) {
+    // IPv6: отдельный сокет `[::]` только для v6 (IPV6_V6ONLY), независимо от sysctl bindv6only; нет стека IPv6 - остаётся IPv4
+    match bind_v6(port) {
+        Ok(l6) => {
+            sh.note(format!("TCP-носитель слушает {port}/tcp (IPv6)"));
+            tokio::spawn(serve(l6, node.clone(), sh.clone(), self_sk.clone(), relay.clone()));
+        }
+        Err(e) => sh.note(format!("TCP-носитель: IPv6 {port}/tcp не открыт ({e}), только IPv4")),
+    }
     let l = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -127,6 +135,25 @@ pub async fn listen(node: Arc<Node>, sh: Arc<Shared>, port: u16, self_sk: iroh::
         }
     };
     sh.note(format!("TCP-носитель слушает {port}/tcp"));
+    serve(l, node, sh, self_sk, relay).await
+}
+
+/// Слушатель `[::]:порт` только для IPv6 (не зависит от sysctl `bindv6only`, не конфликтует с IPv4-слушателем того же порта).
+fn bind_v6(port: u16) -> std::io::Result<TcpListener> {
+    use std::os::fd::AsRawFd;
+    let s = tokio::net::TcpSocket::new_v6()?;
+    let one: libc::c_int = 1;
+    // SAFETY: валидный дескриптор только что созданного сокета, указатель на c_int нужной длины
+    let rc = unsafe { libc::setsockopt(s.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &one as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    s.set_reuseaddr(true)?;
+    s.bind(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)))?;
+    s.listen(1024)
+}
+
+async fn serve(l: TcpListener, node: Arc<Node>, sh: Arc<Shared>, self_sk: iroh::SecretKey, relay: Option<Arc<relay::Host>>) {
     loop {
         let (s, peer) = match l.accept().await {
             Ok(v) => v,
@@ -291,6 +318,24 @@ pub async fn reachable(addrs: &[SocketAddr]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// IPv6-слушатель носителя только для v6 и не мешает IPv4-слушателю на том же порту (оба семейства принимаются).
+    #[tokio::test]
+    async fn v6_listener_is_v6_only_and_coexists_with_v4_on_same_port() {
+        let l6 = match bind_v6(0) {
+            Ok(l) => l,
+            Err(e) => { eprintln!("IPv6 в этом окружении недоступен ({e}): пропуск"); return; }
+        };
+        let addr = l6.local_addr().unwrap();
+        assert!(addr.is_ipv6());
+        let l4 = TcpListener::bind(("0.0.0.0", addr.port())).await.expect("IPv4 на том же порту рядом с v6");
+        let c6 = TcpStream::connect(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port())));
+        let c4 = TcpStream::connect(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, addr.port())));
+        let (r6, r4) = tokio::join!(c6, c4);
+        assert!(r6.is_ok() && r4.is_ok());
+        assert!(l6.accept().await.unwrap().1.is_ipv6());
+        assert!(l4.accept().await.unwrap().1.is_ipv4());
+    }
 
     /// Принимающая сторона на loopback; возвращает её адрес и ключ.
     async fn acceptor() -> (SocketAddr, iroh::SecretKey) {

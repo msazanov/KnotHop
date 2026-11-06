@@ -43,8 +43,28 @@ pub const INVITE_AUDIT_MS: u64 = 7 * 24 * 3600 * 1000;
 /// seq — время в мс; запись из далёкого будущего не принимаем (иначе актор мог бы заранее занять слот записи).
 pub const SEQ_FUTURE_MS: u64 = 10 * 60 * 1000;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_HINTS: usize = 3;
+pub const MAX_HINTS: usize = 3;
 const MAX_NAME: usize = 48;
+
+/// Не больше `max` адресов-подсказок с сохранением порядка, но если в списке есть и IPv4, и IPv6 - минимум по одному каждого семейства
+/// (иначе три IPv4 вытесняют глобальный IPv6, а он часто единственный путь без NAT). Имена `host:порт` идут как IPv4.
+pub fn balance_hints(list: Vec<String>, max: usize) -> Vec<String> {
+    let is6 = |a: &str| a.parse::<std::net::SocketAddr>().map(|s| s.is_ipv6()).unwrap_or(false);
+    let mut seen = std::collections::HashSet::new();
+    let list: Vec<String> = list.into_iter().filter(|a| seen.insert(a.clone())).collect();
+    if list.len() <= max || max < 2 {
+        return list.into_iter().take(max).collect();
+    }
+    let first6 = list.iter().position(|a| is6(a));
+    let first4 = list.iter().position(|a| !is6(a));
+    let mut keep: Vec<usize> = [first4, first6].into_iter().flatten().collect();
+    for i in 0..list.len() {
+        if keep.len() >= max { break; }
+        if !keep.contains(&i) { keep.push(i); }
+    }
+    keep.sort_unstable();
+    keep.into_iter().map(|i| list[i].clone()).collect()
+}
 
 pub fn rights_text(r: u16) -> String {
     if r == 0 {
@@ -198,6 +218,8 @@ pub struct Contact {
     pub at: u64,
     /// подсказка REALITY этой ноды (`accept`): подсказка, не полномочие; разбирает и проверяет `RealityHint::from_json` при использовании
     pub rl: serde_json::Value,
+    /// нода сама объявила, что она клиент (телефон/ПК с согласием на управление): сервер не делает её соседом-транзитом; набирают её только клиенты (P2P)
+    pub client: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -329,8 +351,8 @@ impl Peers {
         }
         for c in v["contacts"].as_array().ok_or_else(|| anyhow!("peers.json: нет contacts"))? {
             let pk = pk_of(&c["pk"])?;
-            let hints = c["hints"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).take(MAX_HINTS).collect()).unwrap_or_default();
-            let e = Contact { pk, name: sane_name(&s(c, "name")), hints, intro_by: s(c, "intro_by"), they_grant: (c["they_grant"].as_u64().unwrap_or(0) as u16) & KNOWN, roles: (c["roles"].as_u64().unwrap_or(0) as u16) & (TRANSIT | EXIT), rl: c["rl"].clone(), at: c["at"].as_u64().unwrap_or(0) };
+            let hints = c["hints"].as_array().map(|a| balance_hints(a.iter().filter_map(|x| x.as_str().map(String::from)).collect(), MAX_HINTS)).unwrap_or_default();
+            let e = Contact { pk, name: sane_name(&s(c, "name")), hints, intro_by: s(c, "intro_by"), they_grant: (c["they_grant"].as_u64().unwrap_or(0) as u16) & KNOWN, roles: (c["roles"].as_u64().unwrap_or(0) as u16) & (TRANSIT | EXIT), rl: c["rl"].clone(), at: c["at"].as_u64().unwrap_or(0), client: c["client"].as_bool().unwrap_or(false) };
             t.contacts.insert(hash_of(&pk).unwrap(), e);
         }
         for i in v["invites"].as_array().ok_or_else(|| anyhow!("peers.json: нет invites"))? {
@@ -361,7 +383,7 @@ impl Peers {
 
     fn to_json(&self) -> serde_json::Value {
         let peers: Vec<_> = self.peers.values().map(|p| serde_json::json!({"pk": hex(&p.pk), "rights": p.rights, "by": p.by, "seq": p.seq, "at": p.at, "name": p.name})).collect();
-        let contacts: Vec<_> = self.contacts.values().map(|c| serde_json::json!({"pk": hex(&c.pk), "name": c.name, "hints": c.hints, "intro_by": c.intro_by, "they_grant": c.they_grant, "roles": c.roles, "at": c.at, "rl": c.rl})).collect();
+        let contacts: Vec<_> = self.contacts.values().map(|c| serde_json::json!({"pk": hex(&c.pk), "name": c.name, "hints": c.hints, "intro_by": c.intro_by, "they_grant": c.they_grant, "roles": c.roles, "at": c.at, "rl": c.rl, "client": c.client})).collect();
         let invites: Vec<_> = self.invites.values().map(|i| {
             let mut j = serde_json::json!({"pid": hex(&i.pid), "key": hex(&i.key), "rights": i.rights, "mgmt": i.mgmt, "created": i.created, "expires": i.expires, "issuer": i.issuer});
             match &i.state {
@@ -803,18 +825,33 @@ impl Peers {
         }
         let old = self.contacts.get(&h);
         let rl = old.map_or(serde_json::Value::Null, |o| o.rl.clone());
+        let client = old.is_some_and(|o| o.client);
         let name = sane_name(name);
         let name = if name.is_empty() { old.map(|o| o.name.clone()).unwrap_or_default() } else { name };
-        let hints = if hints.is_empty() { old.map(|o| o.hints.clone()).unwrap_or_default() } else { hints.into_iter().take(MAX_HINTS).collect() };
+        let hints = if hints.is_empty() { old.map(|o| o.hints.clone()).unwrap_or_default() } else { balance_hints(hints, MAX_HINTS) };
         let intro_by = old.filter(|o| o.intro_by != "invite" && intro_by == "invite").map_or(intro_by.to_string(), |o| o.intro_by.clone());
-        self.contacts.insert(h, Contact { pk, name, hints, intro_by, they_grant: they_grant & KNOWN, roles: roles & (TRANSIT | EXIT), at: now, rl });
+        self.contacts.insert(h, Contact { pk, name, hints, intro_by, they_grant: they_grant & KNOWN, roles: roles & (TRANSIT | EXIT), at: now, rl, client });
         Ok(())
+    }
+
+    /// Пометка «нода - клиент» (по её же сообщению `accept`/`ack`): подсказка, не полномочие.
+    pub fn set_contact_client(&mut self, h: &Hash, client: bool) {
+        if let Some(c) = self.contacts.get_mut(h) { c.client = client; }
     }
 
     /// Роли контакта по его собственному статусу; false - контакта нет или роли не изменились.
     pub fn set_contact_roles(&mut self, h: &Hash, roles: u16) -> bool {
         match self.contacts.get_mut(h) {
             Some(c) if c.roles != roles & (TRANSIT | EXIT) => { c.roles = roles & (TRANSIT | EXIT); true }
+            _ => false,
+        }
+    }
+
+    /// Новые адреса-подсказки известного контакта (сообщение `addr`). false - контакта нет, список пуст или не изменился.
+    pub fn contact_set_hints(&mut self, h: &Hash, hints: Vec<String>) -> bool {
+        let hints = balance_hints(hints, MAX_HINTS);
+        match self.contacts.get_mut(h) {
+            Some(c) if !hints.is_empty() && c.hints != hints => { c.hints = hints; true }
             _ => false,
         }
     }
@@ -855,7 +892,7 @@ impl Peers {
                 "state": match &i.state { InviteState::Open => "open", InviteState::Redeemed { .. } => "redeemed", InviteState::Settled => "settled", InviteState::Cancelled => "cancelled", InviteState::Expired => "expired" },
                 "by": match &i.state { InviteState::Redeemed { pk, .. } => hash_of(pk).map(|h| hex(&h)), _ => None },
             })).collect::<Vec<_>>(),
-            "contacts": self.contacts.iter().map(|(h, c)| serde_json::json!({"hash": hex(h), "name": c.name, "they_grant": c.they_grant, "roles": c.roles, "intro_by": c.intro_by})).collect::<Vec<_>>(),
+            "contacts": self.contacts.iter().map(|(h, c)| serde_json::json!({"hash": hex(h), "name": c.name, "they_grant": c.they_grant, "roles": c.roles, "intro_by": c.intro_by, "hints": c.hints.len()})).collect::<Vec<_>>(),
             "transit_enabled": self.cfg.transit_enabled, "exit_enabled": self.cfg.exit_enabled,
         })
     }
@@ -894,6 +931,38 @@ mod tests {
     }
     fn good(pin: [u8; 16]) -> impl FnOnce(&[u8; 32]) -> bool {
         move |k| *k == pin_key(&pin)
+    }
+
+    #[test]
+    fn balance_hints_keeps_one_address_per_family_within_the_limit() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // три IPv4 раньше вытесняли IPv6 (`take(3)`): теперь v6 остаётся, порядок сохраняется
+        let out = balance_hints(s(&["1.1.1.1:1", "2.2.2.2:1", "3.3.3.3:1", "[2606::1]:1"]), 3);
+        assert_eq!(out, s(&["1.1.1.1:1", "2.2.2.2:1", "[2606::1]:1"]));
+        // только v4 или только v6 - просто первые три; повторы убираются
+        assert_eq!(balance_hints(s(&["1.1.1.1:1", "1.1.1.1:1", "2.2.2.2:1", "3.3.3.3:1", "4.4.4.4:1"]), 3).len(), 3);
+        assert_eq!(balance_hints(s(&["[2606::1]:1", "[2606::2]:1", "[2606::3]:1", "[2606::4]:1"]), 3), s(&["[2606::1]:1", "[2606::2]:1", "[2606::3]:1"]));
+        // v6 вперёд в списке: v4 всё равно сохраняется
+        let out = balance_hints(s(&["[2606::1]:1", "[2606::2]:1", "[2606::3]:1", "9.9.9.9:1"]), 3);
+        assert!(out.contains(&"9.9.9.9:1".to_string()) && out.contains(&"[2606::1]:1".to_string()) && out.len() == 3);
+        assert!(balance_hints(vec![], 3).is_empty());
+    }
+
+    #[test]
+    fn contact_hints_update_is_idempotent_and_persisted_balanced() {
+        let (mut t, _) = table();
+        let (_, c) = ident();
+        t.contact_set(c, "c", s_hints(&["1.1.1.1:1"]), "invite", 0, 0, T0).unwrap();
+        let h = hh(&c);
+        assert!(!t.contact_set_hints(&h, vec![]), "пустой список не затирает");
+        assert!(t.contact_set_hints(&h, s_hints(&["2.2.2.2:1", "3.3.3.3:1", "4.4.4.4:1", "[2606::1]:1"])));
+        assert!(t.contact(&h).unwrap().hints.iter().any(|a| a.starts_with('[')), "v6 не вытеснен");
+        assert!(!t.contact_set_hints(&h, t.contact(&h).unwrap().hints.clone()), "без изменений - false");
+        assert!(!t.contact_set_hints(&[7; 16], s_hints(&["1.1.1.1:1"])), "нет контакта");
+    }
+
+    fn s_hints(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
     }
 
     #[test]

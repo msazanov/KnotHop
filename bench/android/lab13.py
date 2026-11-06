@@ -50,6 +50,12 @@ if sys.argv[1:2] == ["rootless"]:
     os.environ.setdefault("LAB13_ROOT", str(Path.home() / ".cache/knothop-rt13/lab"))
     os.environ.setdefault("LAB13_SUBNET", "172.29.104.0/24")
     os.environ.setdefault("KNOTHOP_BIN", str(Path.home() / ".cache/knothop-target/check-rns-iroh-node/debug/knothopd"))
+if sys.argv[1:2] == ["p2p"]:
+    # P2P без серверов: два клиента и хаб вместо публичной RNS; свой префикс и подсеть, отладочная сборка knothopd
+    os.environ.setdefault("LAB13_PREFIX", "p2")
+    os.environ.setdefault("LAB13_ROOT", str(Path.home() / ".cache/knothop-p2-13/lab"))
+    os.environ.setdefault("LAB13_SUBNET", "172.29.105.0/24")
+    os.environ.setdefault("KNOTHOP_BIN", str(Path.home() / ".cache/knothop-target/check-rns-iroh-node/debug/knothopd"))
 if sys.argv[1:2] in (["perf"], ["meshperf"], ["meshfail"], ["blockfail"]):
     # Замер идёт в отдельной внутренней сети со своим префиксом, release-бинарём и без подробного журнала (KNOTHOP_DEBUG замедляет путь данных).
     os.environ.setdefault("LAB13_PREFIX", "perf")
@@ -1311,6 +1317,70 @@ def cmd_rootless(a):
         cmd_down(a)
 
 
+# ---------------------------------------------------------------------------------------------------- p2p: два клиента без серверов
+def p2p_status(c):
+    """Список p2p из status.json клиента: {id(hex 32): запись}."""
+    r = sh("docker", "exec", c, "cat", "/state/status.json", check=False)
+    try:
+        return {e["id"]: e for e in json.loads(r.stdout).get("p2p", [])}
+    except ValueError:
+        return {}
+
+
+def cmd_p2p(a):
+    """A выпускает приглашение на себя, B гасит (LXMF через «публичную RNS» - хаб); дальше QUIC между ними на адресах Docker
+    (KNOTHOP_ALLOW_PRIVATE_DIAL=1); затем блок между ними - статус должен честно стать «не отвечает», а не вечное «подключаюсь»."""
+    res = {"scenario": "p2p"}
+    T = {}
+    t_all = time.time()
+    if not BIN.exists():
+        sys.exit(f"нет {BIN}: bash bench/cargo_fork.sh rns-iroh-node build --offline --locked --bin knothopd")
+    cmd_down(a)
+    __import__("shutil").rmtree(LAB, ignore_errors=True)
+    sh("docker", "network", "create", "--subnet", SUBNET, NET)
+    hub = state_dir("hub")
+    run(HUB_NAME, HUB_IP, "exec knothopd hub --state /state --port 47000 --tcp-port 4242", hub)
+    ips = {}
+    for n in ("pa", "pb"):
+        d = state_dir(n); write_pub(d)
+        ips[n] = next_ip()
+        run(n, ips[n], client_cmd("", False), d)
+    for n in ips:
+        wait_file(n, "/state/identity.key")
+        wait_until(lambda n=n: view(n).get("me"), 40, f"ядро {n}")
+    ha, hb = whoami_hash("pa"), whoami_hash("pb")
+    # A выпускает приглашение на себя (никаких других узлов), B гасит
+    inv = issue_invite("pa", "--rights", "use")
+    put_invite("pb", inv)
+    own_root("pb")
+    t0 = time.time()
+    kd("pb", "join", "--state", "/state", "--invite-file", "/state/invite.txt")
+    wait_until(lambda: view("pb")["contacts"] and not view("pb")["pending"]["pairs"], 240, "B погасил приглашение A")
+    T["redeem_s"] = round(time.time() - t0, 1)
+    wait_until(lambda: any(c["hash"] == hb for c in view("pa")["contacts"]), 120, "A получил контакт B из ack (обратный дозвон)")
+    T["ack_contact_s"] = round(time.time() - t0, 1)
+    va, vb = view("pa"), view("pb")
+    res["rights"] = {"B_on_A": next((p["rights"] for p in va["peers"] if p["hash"] == hb), 0), "A_on_B": next((p["rights"] for p in vb["peers"] if p["hash"] == ha), 0)}
+    res["hints_count"] = {"A_has_B": next(c["hints"] for c in va["contacts"] if c["hash"] == hb), "B_has_A": next(c["hints"] for c in vb["contacts"] if c["hash"] == ha)}
+    # QUIC между ними
+    wait_until(lambda: p2p_status("pa").get(hb, {}).get("state") == "direct" and p2p_status("pb").get(ha, {}).get("state") == "direct", 150, "прямое соединение A<->B")
+    T["direct_s"] = round(time.time() - t0, 1)
+    res["direct"] = {"A": p2p_status("pa")[hb], "B": p2p_status("pb")[ha]}
+    # блок между ними (оба направления): QUIC умирает по таймауту простоя, набор не удаётся
+    for n, other in (("pa", "pb"), ("pb", "pa")):
+        sh("docker", "exec", n, "sh", "-c", f"iptables -I OUTPUT -d {ips[other]} -j DROP; iptables -I INPUT -s {ips[other]} -j DROP")
+    t1 = time.time()
+    wait_until(lambda: p2p_status("pa").get(hb, {}).get("state") == "unreachable", 240, "статус «не отвечает» после блока")
+    T["unreachable_s"] = round(time.time() - t1, 1)
+    res["blocked"] = {"A": p2p_status("pa")[hb], "B": p2p_status("pb").get(ha)}
+    # права и выход не изменились ни от адресов, ни от блока: у B нет EXIT, выход через A недоступен
+    res["rights_after"] = {"B_on_A": next((p["rights"] for p in view("pa")["peers"] if p["hash"] == hb), 0)}
+    T["total_s"] = round(time.time() - t_all, 1)
+    res["times"] = T
+    print(json.dumps(res, ensure_ascii=False, indent=1))
+    if not a.keep:
+        cmd_down(a)
+
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 sp = ap.add_subparsers(dest="c", required=True)
@@ -1355,5 +1425,7 @@ x.set_defaults(f=cmd_realityfail)
 x = sp.add_parser("rootless", help="ADR 0028: сеть без корня (3 сервера по коду админа, знакомство, клиент, обход блока, отзыв)")
 x.add_argument("--offline-node", action="store_true", help="s3 выключен при знакомстве, админ уходит, письмо ждёт на PN (долго: ждёт анонс PN)")
 x.add_argument("--keep", action="store_true"); x.set_defaults(f=cmd_rootless)
+x = sp.add_parser("p2p", help="P2P без серверов: A выпускает на себя, B гасит, QUIC между ними, затем блок - честный статус")
+x.add_argument("--keep", action="store_true"); x.set_defaults(f=cmd_p2p)
 a = ap.parse_args()
 a.f(a)

@@ -43,6 +43,7 @@ final class TopologyView extends View {
         String rules = "", extraVia = "";
         boolean extraLink, extraFlow, extraPathKnown;
         int ra;                         // сколько выходов сообщают, что видят узел живым соседом
+        String p2p = "";                // P2P-контакт без ролей: direct | no_addr | unreachable | trying, "" - обычная нода
         String vis = "", nh = "";       // путь RNS (R8): direct | via | none, "" - поля нет; nh - dest следующего хопа при via, "" - неизвестно
         float x, y;
         boolean moved;
@@ -216,6 +217,23 @@ final class TopologyView extends View {
                 }
                 fresh.add(n);
             }
+        }
+        // P2P-контакты без ролей: свои узлы со своим честным статусом (прямое соединение / нет адреса / не отвечает)
+        JSONArray p2p = st.optJSONArray("p2p");
+        for (int i = 0; p2p != null && i < p2p.length(); i++) {
+            JSONObject e = p2p.optJSONObject(i);
+            if (e == null) continue;
+            Node n = new Node();
+            n.name = P2p.name(e);
+            n.dest = e.optString("d");
+            n.p2p = e.optString("state", "trying");
+            n.state = "p2p";
+            boolean direct = "direct".equals(n.p2p);
+            n.visible = direct;
+            n.vis = direct ? "direct" : "none";
+            n.carrier = direct ? "quic" : "none";
+            n.rtt = e.isNull("rtt_ms") ? -1 : e.optDouble("rtt_ms", -1);
+            fresh.add(n);
         }
         int before;
         synchronized (nodes) {
@@ -657,6 +675,7 @@ final class TopologyView extends View {
             else if (n.visible) { l2 = "носитель " + carrierName(n.carrier); if (n.hops >= 0) l3 = "путь RNS " + n.hops + " хоп"; }
             else l2 = n.ra > 0 ? "видят другие узлы" : "нет свежих данных";
             if (n.extraLink) l2 = n.extraFlow ? "трафик по правилам" : "дополнительный Link";
+            if (!n.p2p.isEmpty()) { String[] pl = P2p.graphLines(n.p2p, n.rtt); l2 = pl[0]; l3 = pl[1]; }
             if (!n.rules.isEmpty()) l3 = n.rules + (n.extraLink || isCur ? "" : " · ожидает Link");
             t.setTextSize(11 * d); h.setTextSize(11 * d);
             h.setTextAlign(Paint.Align.CENTER);

@@ -84,6 +84,7 @@ public final class NetworkActivity extends Activity {
         }
         if (view.optBoolean("offline")) box.addView(Ui.text(this, "Нода не запущена: показана таблица с диска. Включите «Сеть» на главном экране.", 12, Ui.ORANGE, false));
         renderNodes(keep);
+        renderP2p();
         renderInvites();
         renderAdmins();
     }
@@ -133,6 +134,34 @@ public final class NetworkActivity extends Activity {
         }
         if (shown.size() >= 2) {
             card.addView(Ui.primary(this, "Познакомить выбранные", v -> introduce()), Ui.cardParams(this));
+        }
+        box.addView(card, Ui.cardParams(this));
+    }
+
+    /**
+     * Устройства без серверов (P2P): прямое соединение QUIC с теми, с кем вы обменялись приглашениями. Честный статус вместо вечного «подключаюсь…».
+     * Если у них нет EXIT, через них доступна только связь между устройствами, не выход в интернет.
+     */
+    private void renderP2p() {
+        JSONArray p2p = null;
+        try {
+            String js = Util.read(new java.io.File(Ctl.state(this), "status.json"));
+            if (!js.isEmpty()) p2p = new JSONObject(js).optJSONArray("p2p");
+        } catch (Exception ignored) { }
+        if (p2p == null || p2p.length() == 0) return;
+        LinearLayout card = Ui.card(this);
+        card.addView(Ui.titleWithHelp(this, "Устройства (P2P)",
+                "Прямое соединение QUIC между устройствами без серверов: оно устанавливается по адресам, которые устройства прислали друг другу в приглашении (обычно это глобальный IPv6 "
+                + "или IPv4 с проброшенным портом). Через публичный посредник соединение не строится: если оба устройства за NAT и IPv6 нет, прямая связь не получится. "
+                + "Выход в интернет через такое устройство возможен, только если на нём включён EXIT; после QUIC действуют обычные права из таблицы."));
+        for (int i = 0; i < p2p.length(); i++) {
+            JSONObject e = p2p.optJSONObject(i);
+            if (e == null) continue;
+            String id = e.optString("id", "");
+            card.addView(Ui.text(this, P2p.name(e) + (id.length() >= 8 ? "  " + id.substring(0, 8) : ""), 14, Ui.TEXT, true));
+            card.addView(Ui.text(this, P2p.text(e), 12, "direct".equals(e.optString("state")) ? Ui.GREEN : P2p.failed(e) ? Ui.ORANGE : Ui.MUTED, false));
+            String cap = P2p.capability(e);
+            if (!cap.isEmpty()) card.addView(Ui.muted(this, cap));
         }
         box.addView(card, Ui.cardParams(this));
     }
