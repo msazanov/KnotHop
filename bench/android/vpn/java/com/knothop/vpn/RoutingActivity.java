@@ -73,6 +73,7 @@ public class RoutingActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        setTitle("Маршрутизация");
         files = getFilesDir();
         state = new File(files, "state");
         String chosen = getIntent().getStringExtra(EXTRA_TARGET);

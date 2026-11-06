@@ -9,9 +9,9 @@ import android.widget.Toast;
 import java.io.File;
 
 /**
- * «Забыть профиль» (решение владельца 04.11): стирается ВСЁ состояние телефона — ключ (identity), собственный корень и его записи,
- * чужие якоря, профиль, приглашения, коды серверов, очереди LXMF. Остаётся только имя телефона. Следующий запуск создаёт новую identity:
- * телефон начинает с чистого листа, прежняя сеть (в том числе серверы, вступившие по кодам этого корня) остаётся без админа.
+ * «Забыть профиль» (решение владельца 04.11): стирается ВСЁ состояние телефона — ключ (identity), таблица прав и контакты, приглашения,
+ * очереди LXMF. Остаётся только имя телефона. Следующий запуск приложения создаёт новую identity (главный экран открывается сразу):
+ * телефон начинает с чистого листа, управляемые им ноды остаются без этого админа.
  * Кнопка живёт в настройках своей ноды (долгое нажатие на свой телефон на графе).
  */
 final class ProfileReset {
@@ -63,7 +63,7 @@ final class ProfileReset {
                 if (!"idle".equals(KnotHopVpnService.phase) || KnotHopVpnService.tunHeld) throw new IllegalStateException("Узел ещё останавливается; повторите позже");
                 new File(st, "status.json").delete(); // только после остановки: CLI проверяет свежесть статуса
                 wipe(st);
-                app.getSharedPreferences("p", Context.MODE_PRIVATE).edit().remove("profile").apply();
+                app.getSharedPreferences("p", Context.MODE_PRIVATE).edit().remove("profile").remove("name_asked").apply();   // "profile" - остаток прежней схемы
             } catch (Exception ex) {
                 err = ex.getMessage();
             } finally {

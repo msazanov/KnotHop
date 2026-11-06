@@ -106,12 +106,12 @@ def next_ip():
     sys.exit("нет свободных адресов")
 
 
-def run(name, ip, cmd, state, extra=(), net=None):
+def run(name, ip, cmd, state, extra=(), net=None, private_dial=True):
     sh("docker", "rm", "-f", name, check=False)
     debug = ("-e", "KNOTHOP_DEBUG=1") if os.environ.get("LAB13_DEBUG", "1") != "0" else ()
     cpus = ("--cpuset-cpus", CPUSETS[name]) if name in CPUSETS else ()
     sh("docker", "run", "-d", "--name", name, "--hostname", name, "--network", net or NET, "--ip", ip, "--cap-add", "NET_ADMIN", "--device", "/dev/net/tun",
-       "--sysctl", "net.ipv4.ip_forward=1", *debug, *cpus, "-e", "KNOTHOP_ALLOW_PRIVATE_DIAL=1", "-e", "KNOTHOP_TCP_BACKOFF_S=30",
+       "--sysctl", "net.ipv4.ip_forward=1", *debug, *cpus, *(("-e", "KNOTHOP_ALLOW_PRIVATE_DIAL=1") if private_dial else ()), "-e", "KNOTHOP_TCP_BACKOFF_S=30",
        "-v", f"{BIN}:/usr/local/bin/knothopd:ro", "-v", f"{HERE}:/lab:ro", "-v", f"{state}:/state", *extra, "--entrypoint", "sh", IMAGE, "-c", cmd)
 
 
@@ -1184,7 +1184,7 @@ def cmd_rootless(a):
     srv = {}
     for n in ("s1", "s2", "s3"):
         d = state_dir(n); write_pub(d)
-        put_invite(n, issue_invite("adm", "--rights", "use", "--mgmt", "admin"))
+        put_invite(n, issue_invite("adm", "--rights", "use"))
         ip = next_ip()
         pre = ("printf '%s' '{\"version\":1,\"aliases\":[],\"allow\":[]}' > /state/host-acl.json; chmod 600 /state/host-acl.json; "
                f"ip route replace {INET}/32 via {SITE_IP}; ")
@@ -1328,8 +1328,8 @@ def p2p_status(c):
 
 
 def cmd_p2p(a):
-    """A выпускает приглашение на себя, B гасит (LXMF через «публичную RNS» - хаб); дальше QUIC между ними на адресах Docker
-    (KNOTHOP_ALLOW_PRIVATE_DIAL=1); затем блок между ними - статус должен честно стать «не отвечает», а не вечное «подключаюсь»."""
+    """A выпускает приглашение на себя, B гасит (LXMF через «публичную RNS» - хаб); дальше QUIC между ними по ЛОКАЛЬНОЙ СЕТИ
+    (адреса Docker 172.29.98.0/24 - подсеть интерфейса eth0; KNOTHOP_ALLOW_PRIVATE_DIAL не задан: работает только исключение для контактов); затем блок между ними - статус должен честно стать «не отвечает», а не вечное «подключаюсь»."""
     res = {"scenario": "p2p"}
     T = {}
     t_all = time.time()
@@ -1344,7 +1344,7 @@ def cmd_p2p(a):
     for n in ("pa", "pb"):
         d = state_dir(n); write_pub(d)
         ips[n] = next_ip()
-        run(n, ips[n], client_cmd("", False), d)
+        run(n, ips[n], client_cmd("", False), d, private_dial=False)   # без KNOTHOP_ALLOW_PRIVATE_DIAL: путь только по LAN-исключению для контактов
     for n in ips:
         wait_file(n, "/state/identity.key")
         wait_until(lambda n=n: view(n).get("me"), 40, f"ядро {n}")
@@ -1366,6 +1366,7 @@ def cmd_p2p(a):
     wait_until(lambda: p2p_status("pa").get(hb, {}).get("state") == "direct" and p2p_status("pb").get(ha, {}).get("state") == "direct", 150, "прямое соединение A<->B")
     T["direct_s"] = round(time.time() - t0, 1)
     res["direct"] = {"A": p2p_status("pa")[hb], "B": p2p_status("pb")[ha]}
+    assert res["direct"]["A"].get("lan") and res["direct"]["B"].get("lan"), f"путь должен быть помечен как локальная сеть: {res['direct']}"
     # блок между ними (оба направления): QUIC умирает по таймауту простоя, набор не удаётся
     for n, other in (("pa", "pb"), ("pb", "pa")):
         sh("docker", "exec", n, "sh", "-c", f"iptables -I OUTPUT -d {ips[other]} -j DROP; iptables -I INPUT -s {ips[other]} -j DROP")

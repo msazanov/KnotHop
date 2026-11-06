@@ -11,8 +11,6 @@ import android.view.WindowManager;
 import android.widget.CheckBox;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.RadioButton;
-import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
@@ -31,19 +29,19 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Один экран выпуска приглашения (ADR 0028 §2.2-2.5). «Сервер / Пользователь / Админ / Свои» - только пресеты: они заполняют флажки прав
- * в спойлере «Права ▸» (права получателя на выбранных нодах и управление получателем для выдавшего), ручная правка переключает на «Свои».
+ * Один экран выпуска приглашения (ADR 0028 §2.2-2.5). «Пользователь / Сервер / Админ / Свои» - только пресеты: они заполняют флажки прав
+ * в спойлере «Права ▸» (права получателя НА ВЫПУСТИВШЕЙ НОДЕ; второго набора флагов нет), ручная правка переключает на «Свои».
  * Логика выпуска одна: стопка пар по выбранным нодам, у каждой нода свой пин. Первой всегда идёт «Этот телефон» (любая нода сама себе админ:
  * приглашение выпускается без других узлов, пара своей ноды применяется сразу, остальным уходит команда «ожидай»).
  * Права на чужой ноде не выше моих на ней: подсказка здесь, отказ - на ноде. Экран закрыт FLAG_SECURE; строка и QR стираются при уходе с экрана.
  */
 public final class InviteIssueActivity extends Activity {
-    private static final int[] TTL_H = {6, 24, 48, 168};
+    private static final int[] TTL_H = {6, 24, 48, 168};   // индекс плитки срока
     private static final String[] TTL_NAMES = {"6 часов", "сутки", "48 часов", "7 суток"};
     private LinearLayout box, nodeBox, rightsBody, resultBox;
-    private RadioGroup preset, ttl;
-    private CheckBox[] rightBoxes, mgmtBoxes;
-    private TextView rightsToggle, hintView;
+    private ChoiceGrid preset, ttl;
+    private CheckBox[] rightBoxes;
+    private TextView rightsToggle, hintView, presetHint;
     private boolean filling, rightsOpen;
     private final List<Row> rows = new ArrayList<>();
     private JSONObject view = new JSONObject();
@@ -76,42 +74,34 @@ public final class InviteIssueActivity extends Activity {
         box.setPadding(Ui.dp(this, 16), Ui.dp(this, 20), Ui.dp(this, 16), Ui.dp(this, 24));
         scroll.addView(box);
         setContentView(scroll);
+        setTitle("Пригласить");
         box.addView(Ui.titleWithHelp(this, "Приглашение",
                 "Приглашение — одноразовая строка из пар «хеш ноды + пин»; в ней нет ни прав, ни ключей. Права назначаете вы здесь, а нода применит их при погашении. "
                 + "Срок — до 7 суток (по умолчанию 48 часов). Строку передавайте только доверенным каналом: пока она не погашена, любой её обладатель получит эти права."));
         LinearLayout kind = Ui.card(this);
-        kind.addView(Ui.titleWithHelp(this, "Пресет", "Пресет только выставляет права ниже и больше ничего не меняет. «Сервер»: новая нода, этот телефон становится её админом. "
-                + "«Пользователь»: USE на выбранных нодах (выход в интернет — свойство самой ноды). «Админ»: CONFIG, ADD, REMOVE и USE. «Свои»: любые права вручную."));
-        preset = new RadioGroup(this);
-        preset.setOrientation(RadioGroup.HORIZONTAL);
-        for (int i = 0; i < Rights.PRESET_NAMES.length; i++) {
-            RadioButton r = new RadioButton(this);
-            r.setId(100 + i);
-            r.setText(Rights.PRESET_NAMES[i]);
-            r.setTextColor(Ui.TEXT);
-            r.setTextSize(12);
-            preset.addView(r);
-        }
-        preset.setOnCheckedChangeListener((g, id) -> { if (!filling && id >= 100 && id != 100 + Rights.P_CUSTOM) applyPreset(id - 100); });
-        kind.addView(preset);
+        kind.addView(Ui.titleWithHelp(this, "Пресет", "Пресет только выставляет права ниже и больше ничего не меняет; права получателя хранятся на выпустившей ноде. «Пользователь»: USE на выбранных нодах "
+                + "(выход в интернет — свойство самой ноды). «Сервер»: тоже USE, а сервер по этой строке при первом запуске признает вас админом. "
+                + "«Админ»: CONFIG, ADD, REMOVE и USE. «Свои»: любые права вручную."));
+        preset = new ChoiceGrid(this, Rights.PRESET_NAMES, 2);
+        preset.setListener((i, user) -> { if (presetHint != null) presetHint.setText(Rights.PRESET_HINTS[i]); if (!filling && user && i != Rights.P_CUSTOM) applyPreset(i); });
+        LinearLayout.LayoutParams gp = new LinearLayout.LayoutParams(-1, -2);
+        gp.topMargin = Ui.dp(this, 8);
+        kind.addView(preset, gp);
+        presetHint = Ui.muted(this, "");
+        presetHint.setTextSize(12);
+        presetHint.setPadding(0, Ui.dp(this, 6), 0, 0);
+        kind.addView(presetHint);
         box.addView(kind, Ui.cardParams(this));
         buildRights();
         nodeBox = Ui.card(this);
         box.addView(nodeBox, Ui.cardParams(this));
         LinearLayout t = Ui.card(this);
         t.addView(Ui.title(this, "Срок"));
-        ttl = new RadioGroup(this);
-        ttl.setOrientation(RadioGroup.HORIZONTAL);
-        for (int i = 0; i < TTL_H.length; i++) {
-            RadioButton r = new RadioButton(this);
-            r.setId(200 + i);
-            r.setText(TTL_NAMES[i]);
-            r.setTextColor(Ui.TEXT);
-            r.setTextSize(12);
-            ttl.addView(r);
-        }
-        ttl.check(202);
-        t.addView(ttl);
+        ttl = new ChoiceGrid(this, TTL_NAMES, 2);
+        ttl.select(2);
+        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(-1, -2);
+        tp.topMargin = Ui.dp(this, 8);
+        t.addView(ttl, tp);
         box.addView(t, Ui.cardParams(this));
         hintView = Ui.text(this, "", 12, Ui.ORANGE, false);
         box.addView(hintView);
@@ -124,7 +114,7 @@ public final class InviteIssueActivity extends Activity {
         loadNodes();
     }
 
-    /** Спойлер «Права ▸»: флажки прав получателя и управления получателем; заполняет пресет, ручная правка переключает на «Свои». */
+    /** Спойлер «Права ▸»: флажки прав получателя на выпустившей ноде; заполняет пресет, ручная правка переключает на «Свои». */
     private void buildRights() {
         LinearLayout card = Ui.card(this);
         rightsToggle = Ui.text(this, "", 15, Ui.TEXT, true);
@@ -136,10 +126,6 @@ public final class InviteIssueActivity extends Activity {
                 + "На чужой ноде нельзя выдать больше, чем есть у вас на ней (нода откажет). HOST_ACCESS выдаёт только админ ноды (CONFIG)."));
         rightBoxes = new CheckBox[Rights.BITS.length];
         for (int i = 0; i < rightBoxes.length; i++) rightBoxes[i] = rightBox(rightsBody, i);
-        rightsBody.addView(Ui.titleWithHelp(this, "Управление получателем", "Что получит выдавший (этот телефон) на ноде получателя: "
-                + "для нового сервера — права админа над ним. Применяется к паре «Этот телефон»; у чужих нод управление не запрашивается."));
-        mgmtBoxes = new CheckBox[Rights.BITS.length];
-        for (int i = 0; i < mgmtBoxes.length; i++) mgmtBoxes[i] = rightBox(rightsBody, i);
         card.addView(rightsBody);
         box.addView(card, Ui.cardParams(this));
         updateRights();
@@ -153,7 +139,8 @@ public final class InviteIssueActivity extends Activity {
         cb.setOnCheckedChangeListener((v, on) -> {
             if (filling) return;
             filling = true;
-            preset.check(100 + Rights.P_CUSTOM);   // ручная правка = «Свои»
+            int cur = preset.checked();
+            preset.select(cur >= 0 && cur != Rights.P_CUSTOM && Rights.presetRights(cur) == rightsMask() ? cur : Rights.P_CUSTOM);
             filling = false;
             updateRights();
         });
@@ -163,9 +150,10 @@ public final class InviteIssueActivity extends Activity {
 
     private void applyPreset(int p) {
         filling = true;
-        preset.check(100 + p);
-        int r = Rights.presetRights(p), m = Rights.presetMgmt(p);
-        for (int i = 0; i < rightBoxes.length; i++) { rightBoxes[i].setChecked((r & Rights.BITS[i]) != 0); mgmtBoxes[i].setChecked((m & Rights.BITS[i]) != 0); }
+        preset.select(p);
+        presetHint.setText(Rights.PRESET_HINTS[p]);
+        int r = Rights.presetRights(p);
+        for (int i = 0; i < rightBoxes.length; i++) rightBoxes[i].setChecked((r & Rights.BITS[i]) != 0);
         filling = false;
         updateRights();
     }
@@ -176,16 +164,10 @@ public final class InviteIssueActivity extends Activity {
         return r;
     }
 
-    private int mgmtMask() {
-        int m = 0;
-        for (int i = 0; i < mgmtBoxes.length; i++) if (mgmtBoxes[i].isChecked()) m |= Rights.BITS[i];
-        return m;
-    }
-
     /** Заголовок спойлера с краткой сводкой, подсказки о правах выше моих на чужих нодах. */
     private void updateRights() {
         if (rightsToggle == null || rightsBody == null) return;
-        rightsToggle.setText((rightsOpen ? "Права ▾" : "Права ▸") + "   " + Rights.text(rightsMask()) + (mgmtMask() != 0 ? "  ·  управление: " + Rights.text(mgmtMask()) : ""));
+        rightsToggle.setText((rightsOpen ? "Права ▾" : "Права ▸") + "   " + Rights.text(rightsMask()));
         rightsBody.setVisibility(rightsOpen ? android.view.View.VISIBLE : android.view.View.GONE);
         int r = rightsMask();
         StringBuilder h = new StringBuilder();
@@ -197,7 +179,6 @@ public final class InviteIssueActivity extends Activity {
             if (ex != 0 && row.cb.isChecked()) h.append("На ").append(row.hash.substring(0, 8)).append(" нельзя выдать больше ваших прав: ").append(Rights.text(ex)).append(". ");
         }
         if ((r & Rights.HOST_ACCESS) != 0) h.append("HOST_ACCESS нода примет только от админа (CONFIG). ");
-        if (mgmtMask() != 0 && !selfChecked()) h.append("Управление получателем применяется только при выбранном «Этот телефон». ");
         if (hintView != null) hintView.setText(h.toString().trim());
     }
 
@@ -277,8 +258,8 @@ public final class InviteIssueActivity extends Activity {
     }
 
     private void issue() {
-        long ttlMs = TTL_H[Math.max(0, ttl.getCheckedRadioButtonId() - 200)] * 3600_000L;
-        int r = rightsMask(), m = mgmtMask();
+        long ttlMs = TTL_H[Math.max(0, ttl.checked())] * 3600_000L;
+        int r = rightsMask();
         if (r == 0) { resultMsg("Выберите хотя бы одно право получателя."); return; }
         JSONObject req = Ctl.req("issue");
         try {
@@ -288,12 +269,12 @@ public final class InviteIssueActivity extends Activity {
             for (Row row : rows) if (!row.self && row.cb.isChecked()) foreign++;
             if (!self && foreign == 0) { resultMsg("Выберите хотя бы одну ноду."); return; }
             if (foreign == 0) {
-                req.put("rights", r).put("mgmt", m);              // только своя нода: работает и при выключенной «Сети»
+                req.put("rights", r);              // только своя нода: работает и при выключенной «Сети»
             } else {
                 if (self && me.isEmpty()) { resultMsg("Хеш этой ноды неизвестен: включите «Сеть» и повторите."); return; }
                 JSONArray nodes = new JSONArray();
-                if (self) nodes.put(new JSONObject().put("hash", me).put("rights", r).put("mgmt", m));
-                for (Row row : rows) if (!row.self && row.cb.isChecked()) nodes.put(new JSONObject().put("hash", row.hash).put("rights", r).put("mgmt", 0));
+                if (self) nodes.put(new JSONObject().put("hash", me).put("rights", r));
+                for (Row row : rows) if (!row.self && row.cb.isChecked()) nodes.put(new JSONObject().put("hash", row.hash).put("rights", r));
                 req.put("nodes", nodes);
             }
         } catch (Exception e) { resultMsg("Ошибка: " + e.getMessage()); return; }

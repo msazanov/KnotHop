@@ -48,6 +48,7 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        setTitle("Сканировать QR");
         hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
         FrameLayout root = new FrameLayout(this);
         view = new SurfaceView(this);
@@ -161,7 +162,7 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
                     QRCodeReader reader = new QRCodeReader();
                     Result r = reader.decode(new BinaryBitmap(new HybridBinarizer(src)), hints);
                     String t = r.getText();
-                    if (t != null && (t.startsWith(Profile.LINK) || t.startsWith("kh-")) && !done) {
+                    if (t != null && t.startsWith(Profile.LINK) && !done) {
                         done = true;
                         runOnUiThread(() -> {
                             if (!resumed || isFinishing() || isDestroyed()) { done = false; return; }

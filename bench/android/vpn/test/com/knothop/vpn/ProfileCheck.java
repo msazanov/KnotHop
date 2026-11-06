@@ -54,7 +54,7 @@ public final class ProfileCheck {
         String one = enc(new byte[][]{node(1)}, pins(1, 7));
         check(one.length() == 51, "одна нода 51 знак");
         Profile p = Profile.parse(one);
-        check(p.nodeCount == 1 && !p.own() && p.nodeHash(0).equals("01".repeat(16)), "одна нода и её хеш");
+        check(p.nodeCount == 1 && p.nodeHash(0).equals("01".repeat(16)), "одна нода и её хеш");
         check(Profile.parse(" " + one.substring(0, 20) + "\n" + one.substring(20) + " ").nodeCount == 1, "пробелы и переносы");
         check(Profile.parse(Profile.LINK + one).raw.equals(one), "ссылка из QR");
 
@@ -64,10 +64,12 @@ public final class ProfileCheck {
         check(max.length() == 350, "восемь нод 350 знаков");
         check(Profile.parse(max).nodeCount == 8, "восемь нод");
 
-        check(Profile.parse("").own() && Profile.parse("own").own(), "своя сеть");
-        Profile en = Profile.parse("enrolled");
-        check(en.enrolled && !en.own() && en.raw.isEmpty() && en.nodeCount == 0, "погашенное приглашение: без pin, не своя сеть");
-        check(!Profile.parse("").enrolled && !Profile.parse(one).enrolled, "enrolled только у маркера");
+        // состояния «своя сеть / настроен» больше нет: пустое и пустая ссылка - не приглашение
+        bad("", "пустая строка");
+        bad("   \n", "пробелы");
+        bad(Profile.LINK, "пустая ссылка knothop://i/");
+        bad("own", "маркер своей сети");
+        bad("enrolled", "маркер погашенного");
 
         bad(enc(new byte[][]{node(2), node(1)}, pins(2, 7)), "порядок нод");
         bad(enc(new byte[][]{node(1), node(1)}, pins(2, 7)), "повтор ноды");

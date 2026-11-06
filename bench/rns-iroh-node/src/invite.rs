@@ -104,11 +104,10 @@ fn h_nonce(key: &[u8; 32], pk_n: &Pk, n_nonce: &[u8; 16]) -> [u8; 16] {
     mac(key, &[b"hn", pk_n, n_nonce])[..16].try_into().unwrap()
 }
 
-fn rights_bytes(rights: u16, mgmt: u16, roles: u16) -> [u8; 6] {
-    let mut b = [0u8; 6];
+fn rights_bytes(rights: u16, roles: u16) -> [u8; 4] {
+    let mut b = [0u8; 4];
     b[0..2].copy_from_slice(&rights.to_le_bytes());
-    b[2..4].copy_from_slice(&mgmt.to_le_bytes());
-    b[4..6].copy_from_slice(&roles.to_le_bytes());
+    b[2..4].copy_from_slice(&roles.to_le_bytes());
     b
 }
 
@@ -118,9 +117,13 @@ fn fixed<const N: usize>(j: &serde_json::Value, k: &str) -> Option<[u8; N]> {
 
 /// Подсказки адресов от пира: строки ≤80 Б, прошедшие тот же фильтр, что и при наборе (глобальные IP или нормальное имя; частные - только
 /// с `KNOTHOP_ALLOW_PRIVATE_DIAL`), не больше трёх и с минимум одним адресом каждого семейства IP. Фильтр получателя не зависит от отправителя.
-pub(crate) fn clean_hints(v: &serde_json::Value) -> Vec<String> {
-    let all: Vec<String> = v.as_array().map(|a| a.iter().filter_map(|s| s.as_str()).filter(|s| s.len() <= 80 && crate::vpn::sane_hint_addr(s)).map(String::from).collect()).unwrap_or_default();
-    peers::balance_hints(all, peers::MAX_HINTS)
+///
+/// `lan` (только нода-клиент): дополнительно принимаются литеральные частные IPv4 и ULA IPv6 (`vpn::sane_hint_addr_lan`). Это синтаксис;
+/// решение «набирать ли» принимается позже, на момент набора, по подсетям текущих интерфейсов (ADR 0028 §2.4a, п.5 AGENTS).
+pub(crate) fn clean_hints(v: &serde_json::Value, lan: bool) -> Vec<String> {
+    let ok = |s: &str| if lan { crate::vpn::sane_hint_addr_lan(s) } else { crate::vpn::sane_hint_addr(s) };
+    let all: Vec<String> = v.as_array().map(|a| a.iter().filter_map(|s| s.as_str()).filter(|s| s.len() <= 80 && ok(s)).map(String::from).collect()).unwrap_or_default();
+    peers::balance_hints(all, peers::MAX_CONTACT_HINTS)
 }
 
 // ------------------------------------------------------------------------------------------------ pending-invite.json
@@ -129,8 +132,6 @@ pub(crate) fn clean_hints(v: &serde_json::Value) -> Vec<String> {
 pub enum PairState {
     /// погашение ещё не завершено
     None,
-    /// `accept` получен, ждём согласия пользователя (права управления)
-    Consent,
     Settled,
 }
 
@@ -138,7 +139,6 @@ pub enum PairState {
 pub struct Accepted {
     pub pk_h: Pk,
     pub rights: u16,
-    pub mgmt: u16,
     pub roles: u16,
     pub name_h: String,
     pub hints: Vec<String>,
@@ -155,13 +155,19 @@ pub struct Pair {
     pub n_nonce: [u8; 16],
     pub state: PairState,
     pub acc: Option<Accepted>,
+    /// 0 - обычное вступление; `ADOPT_IF_EMPTY` / `ADOPT_FORCE` - первый запуск сервера по `--invite-file`: после проверенного `accept`
+    /// выдавший записывается управляющим (только если у ноды ещё нет управляющих / при `--accept-manage`)
+    pub adopt: u8,
 }
+
+pub const ADOPT_IF_EMPTY: u8 = 1;
+pub const ADOPT_FORCE: u8 = 2;
 
 impl Pair {
     fn new(h: Hash, pin: [u8; 16]) -> Pair {
         let mut n = [0u8; 16];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut n);
-        Pair { h, pin, n_nonce: n, state: PairState::None, acc: None }
+        Pair { h, pin, n_nonce: n, state: PairState::None, acc: None, adopt: 0 }
     }
     fn pid(&self) -> Pid {
         peers::pin_id(&self.pin)
@@ -190,7 +196,7 @@ fn load_pending(state: &Path) -> Result<Pending> {
             let a = &x["acc"];
             Some(Accepted {
                 pk_h: fixed(a, "pk_h").ok_or_else(|| anyhow!("pending-invite.json: pk_h"))?, rights: a["rights"].as_u64().unwrap_or(0) as u16,
-                mgmt: a["mgmt"].as_u64().unwrap_or(0) as u16, roles: a["roles"].as_u64().unwrap_or(0) as u16,
+                roles: a["roles"].as_u64().unwrap_or(0) as u16,
                 name_h: a["name_h"].as_str().unwrap_or("").to_string(), hints: a["hints"].as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).take(3).collect()).unwrap_or_default(),
                 rl: a["rl"].clone(), client: a["client"].as_bool().unwrap_or(false),
             })
@@ -198,7 +204,8 @@ fn load_pending(state: &Path) -> Result<Pending> {
         p.pairs.push(Pair {
             h: fixed(x, "h").ok_or_else(|| anyhow!("pending-invite.json: h"))?, pin: fixed(x, "pin").ok_or_else(|| anyhow!("pending-invite.json: pin"))?,
             n_nonce: fixed(x, "n").ok_or_else(|| anyhow!("pending-invite.json: n"))?,
-            state: match x["state"].as_str() { Some("consent") => PairState::Consent, Some("settled") => PairState::Settled, _ => PairState::None }, acc,
+            state: match x["state"].as_str() { Some("settled") => PairState::Settled, _ => PairState::None }, acc,
+            adopt: x["adopt"].as_u64().unwrap_or(0).min(ADOPT_FORCE as u64) as u8,
         });
     }
     Ok(p)
@@ -211,13 +218,61 @@ fn save_pending(state: &Path, p: &Pending) -> Result<()> {
         return Ok(());
     }
     let pairs: Vec<_> = p.pairs.iter().map(|x| {
-        let mut j = serde_json::json!({"h": hex(&x.h), "pin": hex(&x.pin), "n": hex(&x.n_nonce), "state": match x.state { PairState::None => "none", PairState::Consent => "consent", PairState::Settled => "settled" }});
+        let mut j = serde_json::json!({"h": hex(&x.h), "pin": hex(&x.pin), "n": hex(&x.n_nonce), "state": match x.state { PairState::None => "none", PairState::Settled => "settled" }, "adopt": x.adopt});
         if let Some(a) = &x.acc {
-            j["acc"] = serde_json::json!({"pk_h": hex(&a.pk_h), "rights": a.rights, "mgmt": a.mgmt, "roles": a.roles, "name_h": a.name_h, "hints": a.hints, "rl": a.rl, "client": a.client});
+            j["acc"] = serde_json::json!({"pk_h": hex(&a.pk_h), "rights": a.rights, "roles": a.roles, "name_h": a.name_h, "hints": a.hints, "rl": a.rl, "client": a.client});
         }
         j
     }).collect();
     crate::lxmf_admin::write_private_atomic(&path, &serde_json::to_vec(&serde_json::json!({"v": 1, "created": p.created, "pairs": pairs}))?)
+}
+
+/// Добавить пары новой строки к неоконченной стопке. Уже имеющаяся пара (тот же хеш и пин) не дублируется и не сбрасывается:
+/// погашенные (`Settled`) и открытые пары остаются как есть. Лимит считается только по новым парам, так что повтор той же
+/// строки при полной стопке - не ошибка. Срок 7 суток отсчитывается от последнего добавления (хранится один `created` на стопку).
+/// Возвращает число добавленных пар.
+fn merge_pairs(pend: &mut Pending, pairs: &[(Hash, [u8; 16])], me: &Hash, now: u64, adopt: u8) -> Result<usize> {
+    if pairs.iter().any(|(h, _)| h == me) {
+        bail!("приглашение выпущено этой же нодой");
+    }
+    let fresh: Vec<&(Hash, [u8; 16])> = pairs.iter().filter(|(h, pin)| !pend.pairs.iter().any(|x| x.h == *h && x.pin == *pin)).collect();
+    if pend.pairs.len() + fresh.len() > MAX_PENDING_PAIRS {
+        bail!("слишком много неоконченных приглашений");
+    }
+    for (h, pin) in &fresh {
+        let mut p = Pair::new(*h, *pin);
+        p.adopt = adopt;
+        pend.pairs.push(p);
+    }
+    if !fresh.is_empty() {
+        pend.created = now;
+    }
+    Ok(fresh.len())
+}
+
+fn pending_json(p: &Pending) -> serde_json::Value {
+    serde_json::json!({
+        "created": p.created, "expires": p.created + PENDING_TTL_MS,
+        "pairs": p.pairs.iter().map(|x| serde_json::json!({"h": hex(&x.h), "state": match x.state { PairState::None => "waiting", PairState::Settled => "done" },
+            "rights": x.acc.as_ref().map(|a| a.rights), "name": x.acc.as_ref().map(|a| a.name_h.clone())})).collect::<Vec<_>>(),
+    })
+}
+
+/// Вступление при выключенной «Сети» (ноды в процессе нет): пары дописываются в `pending-invite.json`, нода погасит их при запуске.
+/// Только когда ядра этого state в процессе нет - иначе писать должно оно (`Core::join`).
+pub fn join_offline(state: &Path, me: &Hash, s: &str) -> Result<(Vec<Hash>, usize)> {
+    let pairs = decode(s)?;
+    let mut pend = load_pending(state)?;
+    let added = merge_pairs(&mut pend, &pairs, me, now_ms() as u64, 0)?;
+    if added > 0 {
+        save_pending(state, &pend)?;
+    }
+    Ok((pairs.iter().map(|p| p.0).collect(), added))
+}
+
+/// Ожидающие пары с диска (для приложения при выключенной ноде); нечитаемый файл - пустое представление.
+pub fn pending_view_offline(state: &Path) -> serde_json::Value {
+    pending_json(&load_pending(state).unwrap_or_default())
 }
 
 // ------------------------------------------------------------------------------------------------ лимиты
@@ -287,8 +342,8 @@ pub struct Core {
     pub me_hash: Hash,
     pub peers: Arc<Mutex<Peers>>,
     sink: Sink,
-    /// телефон: права управления (`mgmt != 0`) принимаются только после явного согласия пользователя
-    pub consent_required: bool,
+    /// нода-клиент (телефон): объявляет это в `accept`/`ack` (`cl`); управления собой никому не даёт
+    pub is_client: bool,
     name: Mutex<String>,
     rl: Mutex<serde_json::Value>,
     hints: Box<dyn Fn() -> Vec<String> + Send + Sync>,
@@ -322,7 +377,7 @@ pub fn now_s() -> u64 {
 }
 
 impl Core {
-    pub fn new(state: &Path, identity: Identity, peers: Arc<Mutex<Peers>>, consent_required: bool, hints: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    pub fn new(state: &Path, identity: Identity, peers: Arc<Mutex<Peers>>, is_client: bool, hints: Box<dyn Fn() -> Vec<String> + Send + Sync>,
                on_change: Box<dyn Fn() + Send + Sync>, log: Box<dyn Fn(String) + Send + Sync>) -> Result<Arc<Core>> {
         let st = state.to_path_buf();
         let sink: Sink = Arc::new(move |title, target, content, tag, exp, ack| {
@@ -332,7 +387,7 @@ impl Core {
         let me_pk = identity.public_key_bytes();
         let me_hash = peers::hash_of(&me_pk).ok_or_else(|| anyhow!("identity"))?;
         Ok(Arc::new(Core {
-            state: state.to_path_buf(), me_pk, me_hash, peers, sink, consent_required, name: Mutex::new(String::new()), rl: Mutex::new(serde_json::Value::Null), hints, on_change, log,
+            state: state.to_path_buf(), me_pk, me_hash, peers, sink, is_client, name: Mutex::new(String::new()), rl: Mutex::new(serde_json::Value::Null), hints, on_change, log,
             pending: Mutex::new(pending), rate_inv: Mutex::new(Rate::new(6, 30)), rate_cmd: Mutex::new(Rate::new(12, 60)), f2b: Mutex::new(Fail2Ban::default()),
             enq: Mutex::new(HashMap::new()), last_addr: Mutex::new((None, Vec::new())), cmd: crate::ncmd::State::load(state),
         }))
@@ -404,7 +459,7 @@ impl Core {
     /// Обновление адресов известного контакта (сменился IP/порт): подписанное LXMF от ключа контакта. Меняются только подсказки
     /// (после того же фильтра, что и у `accept`); права и роли не затрагиваются. Незнакомый источник - молчание.
     fn on_addr(&self, m: &Message, j: &serde_json::Value) {
-        let hints = clean_hints(&j["hints"]);
+        let hints = clean_hints(&j["hints"], self.is_client);
         if hints.is_empty() {
             return;
         }
@@ -431,7 +486,7 @@ impl Core {
             }
             l.0 = Some(Instant::now());
         }
-        let now = peers::balance_hints((self.hints)(), peers::MAX_HINTS);
+        let now = peers::balance_hints((self.hints)(), peers::MAX_CONTACT_HINTS);
         if now.is_empty() {
             return;
         }
@@ -465,7 +520,7 @@ impl Core {
             p.redeem(&pid, &pk_n, &name, now_ms() as u64, |key| mac_ok(key, &[b"redeem", &me, &pk_n, &n_nonce, name.as_bytes()], &proof))
         };
         match outcome {
-            Redeem::Accepted { rights, mgmt, fresh, .. } => {
+            Redeem::Accepted { rights, fresh, .. } => {
                 let (key, exp, roles) = {
                     let p = self.peers.lock().unwrap();
                     let inv = p.invite(&pid).cloned();
@@ -473,9 +528,9 @@ impl Core {
                 };
                 let Some(key) = key else { return };
                 let hn = h_nonce(&key, &pk_n, &n_nonce);
-                let tag_mac = mac(&key, &[b"accept", &me, &pk_n, &n_nonce, &hn, &rights_bytes(rights, mgmt, roles)]);
+                let tag_mac = mac(&key, &[b"accept", &me, &pk_n, &n_nonce, &hn, &rights_bytes(rights, roles)]);
                 let body = serde_json::json!({"v": 1, "op": "accept", "pid": hex(&pid), "n_nonce": hex(&n_nonce), "h_nonce": hex(&hn), "pk_h": hex(&self.me_pk),
-                    "rights": rights, "mgmt": mgmt, "roles": roles, "name_h": self.name(), "hints": peers::balance_hints((self.hints)(), peers::MAX_HINTS), "rl": self.rl.lock().unwrap().clone(), "cl": self.consent_required, "mac": hex(&tag_mac)});
+                    "rights": rights, "roles": roles, "name_h": self.name(), "hints": peers::balance_hints((self.hints)(), peers::MAX_CONTACT_HINTS), "rl": self.rl.lock().unwrap().clone(), "cl": self.is_client, "mac": hex(&tag_mac)});
                 let exp = exp.max(now_s() + 600);
                 self.send(lxmf_sync::TITLE_INV, Target::Pk(pk_n), serde_json::to_vec(&body).unwrap(), &format!("inv:accept:{}", hex(&pid)), exp, false);
                 if fresh {
@@ -502,33 +557,25 @@ impl Core {
     fn on_accept(&self, m: &Message, j: &serde_json::Value) {
         let (Some(pid), Some(n_nonce), Some(hn), Some(pk_h), Some(tag)) =
             (fixed::<8>(j, "pid"), fixed::<16>(j, "n_nonce"), fixed::<16>(j, "h_nonce"), fixed::<64>(j, "pk_h"), fixed::<32>(j, "mac")) else { return };
-        let (rights, mgmt, roles) = (j["rights"].as_u64().unwrap_or(0) as u16 & peers::KNOWN, j["mgmt"].as_u64().unwrap_or(0) as u16 & peers::KNOWN, j["roles"].as_u64().unwrap_or(0) as u16);
+        let (rights, roles) = (j["rights"].as_u64().unwrap_or(0) as u16 & peers::KNOWN, j["roles"].as_u64().unwrap_or(0) as u16);
         let Some(h) = peers::hash_of(&pk_h) else { return };
         let mut pend = self.pending.lock().unwrap();
         let Some(idx) = pend.pairs.iter().position(|x| x.h == h && x.pid() == pid && x.n_nonce == n_nonce) else { return };
         let pair = pend.pairs[idx].clone();
         let key = pair.key();
         if !crate::lxmf_admin::signed_by_trusted_source(m, &pk_h)
-            || !mac_ok(&key, &[b"accept", &h, &self.me_pk, &n_nonce, &hn, &rights_bytes(rights, mgmt, roles)], &tag) {
+            || !mac_ok(&key, &[b"accept", &h, &self.me_pk, &n_nonce, &hn, &rights_bytes(rights, roles)], &tag) {
             return;
         }
         let acc = Accepted {
-            pk_h, rights, mgmt, roles, name_h: j["name_h"].as_str().unwrap_or("").chars().take(48).collect(),
-            hints: clean_hints(&j["hints"]),
+            pk_h, rights, roles, name_h: j["name_h"].as_str().unwrap_or("").chars().take(48).collect(),
+            hints: clean_hints(&j["hints"], self.is_client),
             rl: j["rl"].clone(), client: j["cl"].as_bool().unwrap_or(false),
         };
         match pair.state {
             PairState::Settled => {
                 drop(pend);
                 self.send_ack(&pair, &hn);
-            }
-            _ if self.consent_required && mgmt != 0 => {
-                pend.pairs[idx].state = PairState::Consent;
-                pend.pairs[idx].acc = Some(acc);
-                let _ = save_pending(&self.state, &pend);
-                self.note(format!("приглашение от {}: нужно согласие на управление (mgmt {})", &hex(&h)[..8], peers::rights_text(mgmt)));
-                drop(pend);
-                self.changed();
             }
             _ => {
                 if self.settle(&mut pend, idx, acc, &hn) {
@@ -539,13 +586,22 @@ impl Core {
         }
     }
 
-    /// Применить `accept` на получателе: контакт, управляющий (если `mgmt`), на диск, затем `ack`. false — не записалось, повторится.
+    /// Применить `accept` на получателе: контакт (и управляющий - только для помеченной при `--invite-file` пары сервера), на диск, затем `ack`. false — не записалось, повторится.
     fn settle(&self, pend: &mut Pending, idx: usize, acc: Accepted, hn: &[u8; 16]) -> bool {
         let pair = pend.pairs[idx].clone();
+        let mut adopted = false;
         {
             let mut p = self.peers.lock().unwrap();
-            if p.accepted(acc.pk_h, &acc.name_h, acc.hints.clone(), acc.rights, acc.roles, acc.mgmt, now_ms() as u64).is_err() {
+            if p.accepted(acc.pk_h, &acc.name_h, acc.hints.clone(), acc.rights, acc.roles, now_ms() as u64).is_err() {
                 return false;
+            }
+            // управление - свойство запуска, а не приглашения (ADR 0028 §2.5): только сервер, только по помеченной паре, и только если
+            // таблица ещё без управляющих (или явный --accept-manage). Подпись LXMF и MAC `accept` уже проверены в `on_accept`.
+            if !self.is_client && pair.adopt != 0 && (pair.adopt == ADOPT_FORCE || !p.has_controllers()) {
+                if p.adopt_controller(acc.pk_h, &acc.name_h, now_ms() as u64).is_err() {
+                    return false;
+                }
+                adopted = true;
             }
             p.contact_rl(&acc.pk_h, &acc.rl);
             if let Some(h) = peers::hash_of(&acc.pk_h) { p.set_contact_client(&h, acc.client); }
@@ -553,7 +609,8 @@ impl Core {
                 return false;
             }
         }
-        self.note(format!("приглашение принято: нода {} ({}) разрешает мне {}, управляет мной: {}", &hex(&pair.h)[..8], acc.name_h, peers::rights_text(acc.rights), peers::rights_text(acc.mgmt)));
+        self.note(format!("приглашение принято: нода {} ({}) разрешает мне {}{}", &hex(&pair.h)[..8], acc.name_h, peers::rights_text(acc.rights),
+            if adopted { "; он записан управляющим этой нодой (первый запуск по приглашению)" } else { "" }));
         pend.pairs[idx].state = PairState::Settled;
         pend.pairs[idx].acc = None;
         let _ = save_pending(&self.state, pend);
@@ -570,7 +627,7 @@ impl Core {
     fn send_ack(&self, pair: &Pair, hn: &[u8; 16]) {
         // ответные подсказки: мои адреса и имя едут выдавшему в том же шифрованном LXMF (для обратного дозвона); права от них не меняются
         let body = serde_json::json!({"v": 1, "op": "ack", "pid": hex(&pair.pid()), "n_nonce": hex(&pair.n_nonce), "mac2": hex(&mac(&pair.key(), &[b"ack", hn])),
-            "name": self.name(), "cl": self.consent_required, "hints": peers::balance_hints((self.hints)(), peers::MAX_HINTS)});
+            "name": self.name(), "cl": self.is_client, "hints": peers::balance_hints((self.hints)(), peers::MAX_CONTACT_HINTS)});
         self.send(lxmf_sync::TITLE_INV, Target::Hash(pair.h), serde_json::to_vec(&body).unwrap(), &format!("inv:ack:{}", hex(&pair.pid())), now_s() + 600, true);
     }
 
@@ -594,7 +651,7 @@ impl Core {
         if !mac_ok(&key, &[b"ack", &hn], &mac2) {
             return;
         }
-        let hints = clean_hints(&j["hints"]);
+        let hints = clean_hints(&j["hints"], self.is_client);
         let name: String = j["name"].as_str().unwrap_or("").chars().filter(|c| !c.is_control()).take(48).collect();
         let ok = {
             let mut p = self.peers.lock().unwrap();
@@ -634,24 +691,24 @@ impl Core {
     /// Разобрать и запомнить строку (первый старт сервера, «Вступить» на телефоне). Возвращает хеши нод. Пины пишутся только в
     /// `pending-invite.json` (0600) до полного погашения.
     pub fn join(&self, s: &str) -> Result<Vec<Hash>> {
+        self.join_stat(s).map(|r| r.0)
+    }
+
+    /// То же, что `join`, плюс число действительно добавленных пар (повторная вставка той же строки добавляет 0).
+    /// Новая строка ДОБАВЛЯЕТСЯ к незавершённой стопке: погашенные и открытые пары не теряются, живое соединение ноды не трогается.
+    pub fn join_stat(&self, s: &str) -> Result<(Vec<Hash>, usize)> {
+        self.join_adopt(s, 0)
+    }
+
+    /// `join_stat` для первого запуска сервера (`--invite-file`): пары помечаются `adopt` (`ADOPT_IF_EMPTY` / `ADOPT_FORCE`).
+    pub fn join_adopt(&self, s: &str, adopt: u8) -> Result<(Vec<Hash>, usize)> {
         let pairs = decode(s)?;
         let mut pend = self.pending.lock().unwrap();
-        if pend.pairs.len() + pairs.len() > MAX_PENDING_PAIRS {
-            bail!("слишком много неоконченных приглашений");
+        let added = merge_pairs(&mut pend, &pairs, &self.me_hash, now_ms() as u64, adopt)?;
+        if added > 0 {
+            save_pending(&self.state, &pend)?;
         }
-        if pairs.iter().any(|(h, _)| *h == self.me_hash) {
-            bail!("приглашение выпущено этой же нодой");
-        }
-        if pend.pairs.is_empty() {
-            pend.created = now_ms() as u64;
-        }
-        for (h, pin) in &pairs {
-            if !pend.pairs.iter().any(|x| x.h == *h && x.pin == *pin) {
-                pend.pairs.push(Pair::new(*h, *pin));
-            }
-        }
-        save_pending(&self.state, &pend)?;
-        Ok(pairs.iter().map(|p| p.0).collect())
+        Ok((pairs.iter().map(|p| p.0).collect(), added))
     }
 
     /// Команда `invite.redeem {hash, pin}`: знакомство нод (§2.7), та же очередь.
@@ -674,33 +731,8 @@ impl Core {
         Ok(())
     }
 
-    /// Согласие пользователя на управление (телефон). `yes=false`: пара снимается, выдавший остаётся в его таблице как `redeemed`.
-    pub fn consent(&self, h: &Hash, yes: bool) -> bool {
-        let mut pend = self.pending.lock().unwrap();
-        let Some(idx) = pend.pairs.iter().position(|x| x.h == *h && x.state == PairState::Consent) else { return false };
-        if !yes {
-            let pid = pend.pairs[idx].pid();
-            pend.pairs.remove(idx);
-            let _ = save_pending(&self.state, &pend);
-            lxmf_sync::acknowledged(&self.state, peers::lxmf_destination(h), &format!("inv:redeem:{}", hex(&pid)));
-            return true;
-        }
-        let Some(acc) = pend.pairs[idx].acc.clone() else { return false };
-        let hn = h_nonce(&pend.pairs[idx].key(), &self.me_pk, &pend.pairs[idx].n_nonce);
-        // h_nonce из accept не хранится: детерминирован ключом пина, как на стороне H (ключ пина здесь тот же)
-        let ok = self.settle(&mut pend, idx, acc, &hn);
-        drop(pend);
-        if ok { self.changed(); }
-        ok
-    }
-
     pub fn pending_view(&self) -> serde_json::Value {
-        let p = self.pending.lock().unwrap();
-        serde_json::json!({
-            "created": p.created, "expires": p.created + PENDING_TTL_MS,
-            "pairs": p.pairs.iter().map(|x| serde_json::json!({"h": hex(&x.h), "state": match x.state { PairState::None => "waiting", PairState::Consent => "consent", PairState::Settled => "done" },
-                "rights": x.acc.as_ref().map(|a| a.rights), "mgmt": x.acc.as_ref().map(|a| a.mgmt), "name": x.acc.as_ref().map(|a| a.name_h.clone())})).collect::<Vec<_>>(),
-        })
+        pending_json(&self.pending.lock().unwrap())
     }
 
     pub fn has_pending(&self) -> bool {
@@ -775,8 +807,8 @@ pub(crate) mod tests {
         Node { core, identity: id, out }
     }
 
-    pub fn issue_self(core: &Arc<Core>, rights: u16, mgmt: u16, ttl: u64) -> String {
-        core.issue_stack(&[(core.me_hash, rights, mgmt)], ttl).unwrap().0
+    pub fn issue_self(core: &Arc<Core>, rights: u16, ttl: u64) -> String {
+        core.issue_stack(&[(core.me_hash, rights)], ttl).unwrap().0
     }
 
     /// Доставляет всё из очереди `from` получателю `to` как настоящие подписанные LXMF-сообщения.
@@ -824,7 +856,7 @@ pub(crate) mod tests {
     #[test]
     fn full_redeem_accept_ack_flow_between_two_nodes() {
         let (h, n) = (node("h", false), node("n", false));
-        let s = issue_self(&h.core, peers::USE, 0, peers::INVITE_DEFAULT_MS);
+        let s = issue_self(&h.core, peers::USE, peers::INVITE_DEFAULT_MS);
         n.core.join(&s).unwrap();
         n.core.tick();
         assert_eq!(deliver(&n, &h), 1, "redeem ушёл");
@@ -838,55 +870,82 @@ pub(crate) mod tests {
         assert_eq!(st[0].state, peers::InviteState::Settled);
     }
 
-    #[test]
-    fn server_first_start_makes_issuer_controller_of_the_server() {
-        let (admin, server) = (node("admin", true), node("srv", false));
-        let s = issue_self(&admin.core, peers::USE, peers::PRESET_ADMIN, peers::INVITE_DEFAULT_MS);
-        server.core.join(&s).unwrap();
-        server.core.tick();
-        deliver(&server, &admin);
-        deliver(&admin, &server);
-        assert_eq!(server.core.peers.lock().unwrap().rights(&admin.core.me_hash), peers::PRESET_ADMIN);
-        assert_eq!(server.core.peers.lock().unwrap().controllers(), vec![admin.core.me_pk]);
-        assert_eq!(admin.core.peers.lock().unwrap().rights(&server.core.me_hash), peers::USE);
+    /// Прогнать вступление `n` -> `h` до конца (redeem, accept, ack).
+    fn run_join(n: &Node, h: &Node) {
+        n.core.tick();
+        deliver(n, h);
+        deliver(h, n);
+        deliver(n, h);
     }
 
     #[test]
-    fn phone_asks_consent_before_taking_manager_rights() {
+    fn server_first_start_makes_issuer_controller_only_by_launch_adoption() {
+        let (admin, server) = (node("admin", true), node("srv", false));
+        let s = issue_self(&admin.core, peers::USE, peers::INVITE_DEFAULT_MS);
+        server.core.join_adopt(&s, ADOPT_IF_EMPTY).unwrap();
+        run_join(&server, &admin);
+        assert_eq!(server.core.peers.lock().unwrap().rights(&admin.core.me_hash), peers::PRESET_ADMIN);
+        assert_eq!(server.core.peers.lock().unwrap().controllers(), vec![admin.core.me_pk]);
+        assert_eq!(admin.core.peers.lock().unwrap().rights(&server.core.me_hash), peers::USE, "права = только то, что принявший получил на выдавшей ноде");
+        assert!(server.core.peers.lock().unwrap().contact(&admin.core.me_hash).is_some());
+    }
+
+    #[test]
+    fn plain_join_never_makes_controller_and_managed_node_needs_force() {
+        // обычное вступление (без пометки запуска): выдавший - только контакт
+        let (admin, srv) = (node("admin2", true), node("srv5", false));
+        let s = issue_self(&admin.core, peers::USE, peers::INVITE_DEFAULT_MS);
+        srv.core.join(&s).unwrap();
+        run_join(&srv, &admin);
+        assert_eq!(srv.core.peers.lock().unwrap().rights(&admin.core.me_hash), 0);
+        assert!(srv.core.peers.lock().unwrap().controllers().is_empty());
+        // уже управляемая нода: IF_EMPTY не усыновляет, FORCE (--accept-manage) - да
+        let (a1, a2, managed) = (node("a1", true), node("a2", true), node("man", false));
+        managed.core.peers.lock().unwrap().peer_set(&peers::Actor::Local, a1.core.me_pk, peers::PRESET_ADMIN, "a1", 1, 1).unwrap();
+        managed.core.join_adopt(&issue_self(&a2.core, peers::USE, peers::INVITE_DEFAULT_MS), ADOPT_IF_EMPTY).unwrap();
+        run_join(&managed, &a2);
+        assert_eq!(managed.core.peers.lock().unwrap().rights(&a2.core.me_hash), 0, "без --accept-manage второй админ не появляется");
+        let a3 = node("a3", true);
+        managed.core.join_adopt(&issue_self(&a3.core, peers::USE, peers::INVITE_DEFAULT_MS), ADOPT_FORCE).unwrap();
+        run_join(&managed, &a3);
+        assert_eq!(managed.core.peers.lock().unwrap().rights(&a3.core.me_hash), peers::PRESET_ADMIN);
+    }
+
+    #[test]
+    fn phone_never_gives_management_even_if_pair_is_marked_adopt() {
         let (srv, phone) = (node("srv2", false), node("phone", true));
-        // сервер выпускает приглашение для телефона: mgmt (права сервера на телефоне) — управление
-        let s = issue_self(&srv.core, peers::USE, peers::PRESET_ADMIN, peers::INVITE_DEFAULT_MS);
-        phone.core.join(&s).unwrap();
-        phone.core.tick();
-        deliver(&phone, &srv);
-        deliver(&srv, &phone);
-        assert_eq!(phone.core.peers.lock().unwrap().rights(&srv.core.me_hash), 0, "до согласия управляющего нет");
-        assert!(phone.core.has_pending());
-        let view = phone.core.pending_view();
-        assert_eq!(view["pairs"][0]["state"], "consent");
-        assert!(!phone.core.consent(&[9; 16], true), "чужой хеш");
-        assert!(phone.core.consent(&srv.core.me_hash, true));
-        assert_eq!(phone.core.peers.lock().unwrap().rights(&srv.core.me_hash), peers::PRESET_ADMIN);
+        let s = issue_self(&srv.core, peers::USE, peers::INVITE_DEFAULT_MS);
+        phone.core.join_adopt(&s, ADOPT_FORCE).unwrap();
+        run_join(&phone, &srv);
+        assert_eq!(phone.core.peers.lock().unwrap().rights(&srv.core.me_hash), 0);
+        assert!(phone.core.peers.lock().unwrap().controllers().is_empty());
+        assert!(phone.core.peers.lock().unwrap().contact(&srv.core.me_hash).is_some(), "контакт есть, управления нет");
         assert!(!phone.core.has_pending());
     }
 
     #[test]
-    fn declining_consent_drops_pair_without_rights() {
-        let (srv, phone) = (node("srv3", false), node("phone3", true));
-        let s = issue_self(&srv.core, peers::USE, peers::PRESET_ADMIN, peers::INVITE_DEFAULT_MS);
+    fn forged_accept_cannot_smuggle_management() {
+        // accept с лишним полем mgmt и верной подписью пина не существует: MAC покрывает только rights и roles, поле игнорируется
+        let (srv, phone) = (node("srv6", false), node("phone6", true));
+        let s = issue_self(&srv.core, peers::USE, peers::INVITE_DEFAULT_MS);
         phone.core.join(&s).unwrap();
         phone.core.tick();
         deliver(&phone, &srv);
-        deliver(&srv, &phone);
-        assert!(phone.core.consent(&srv.core.me_hash, false));
+        let items: Vec<_> = std::mem::take(&mut *srv.out.lock().unwrap());
+        for (title, target, content, _) in items {
+            let mut j: serde_json::Value = serde_json::from_slice(&content).unwrap();
+            j["mgmt"] = peers::PRESET_ADMIN.into();
+            let m = Message::create(peers::lxmf_destination(&phone.core.me_hash), peers::lxmf_destination(&srv.core.me_hash), &srv.identity, 1.0, title, serde_json::to_vec(&j).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
+            let _ = target;
+            phone.core.on_message(&m);
+        }
         assert_eq!(phone.core.peers.lock().unwrap().rights(&srv.core.me_hash), 0);
-        assert!(phone.core.peers.lock().unwrap().contact(&srv.core.me_hash).is_none());
     }
 
     #[test]
     fn wrong_pin_gets_silence_and_bans_source_then_right_pin_after_pause_state_unchanged() {
         let (h, n) = (node("h4", false), node("n4", false));
-        let s = issue_self(&h.core, peers::USE, 0, peers::INVITE_DEFAULT_MS);
+        let s = issue_self(&h.core, peers::USE, peers::INVITE_DEFAULT_MS);
         let mut pairs = decode(&s).unwrap();
         let real = pairs[0].1;
         pairs[0].1 = [0x55; 16]; // неверный пин
@@ -908,7 +967,7 @@ pub(crate) mod tests {
     #[test]
     fn second_recipient_with_the_pin_is_denied_and_first_keeps_rights() {
         let (h, a, b) = (node("h5", false), node("a5", false), node("b5", false));
-        let s = issue_self(&h.core, peers::USE, 0, peers::INVITE_DEFAULT_MS);
+        let s = issue_self(&h.core, peers::USE, peers::INVITE_DEFAULT_MS);
         a.core.join(&s).unwrap();
         b.core.join(&s).unwrap();
         a.core.tick();
@@ -927,14 +986,14 @@ pub(crate) mod tests {
     fn forged_accept_without_pin_is_ignored() {
         let (h, n) = (node("h6", false), node("n6", false));
         let evil = node("evil", false);
-        let s = issue_self(&h.core, peers::USE, 0, peers::INVITE_DEFAULT_MS);
+        let s = issue_self(&h.core, peers::USE, peers::INVITE_DEFAULT_MS);
         n.core.join(&s).unwrap();
         let pid = decode(&s).unwrap()[0].1;
         let pid = peers::pin_id(&pid);
         let pend_nonce = n.core.pending.lock().unwrap().pairs[0].n_nonce;
         // злоумышленник знает pid и n_nonce (подслушал бы только шифротекст — но допустим), но не пин
         let body = serde_json::json!({"v":1,"op":"accept","pid":hex(&pid),"n_nonce":hex(&pend_nonce),"h_nonce":hex(&[0u8;16]),"pk_h":hex(&evil.core.me_pk),
-            "rights":peers::PRESET_ADMIN,"mgmt":peers::PRESET_ADMIN,"roles":0,"name_h":"evil","hints":[],"mac":hex(&[0u8;32])});
+            "rights":peers::PRESET_ADMIN,"roles":0,"name_h":"evil","hints":[],"mac":hex(&[0u8;32])});
         let m = Message::create(peers::lxmf_destination(&n.core.me_hash), peers::lxmf_destination(&evil.core.me_hash), &evil.identity, 1.0, lxmf_sync::TITLE_INV.to_vec(), serde_json::to_vec(&body).unwrap(), vec![], DeliveryMethod::Direct).unwrap();
         n.core.on_message(&m);
         assert!(n.core.peers.lock().unwrap().contact(&evil.core.me_hash).is_none());
@@ -967,21 +1026,22 @@ pub(crate) mod tests {
         let a_hints: Vec<String> = ["8.8.8.8:47001", "8.8.4.4:47002", "1.1.1.1:47003", "[2606:4700::1111]:47004", "10.0.0.5:47005"].iter().map(|s| s.to_string()).collect();
         let b_hints: Vec<String> = ["9.9.9.9:5001", "[2a00:1450::1]:5002", "192.168.1.9:5003"].iter().map(|s| s.to_string()).collect();
         let (a, b) = (node_h("p2p-a", false, a_hints), node_h("p2p-b", true, b_hints));
-        let s = issue_self(&a.core, peers::USE, 0, peers::INVITE_DEFAULT_MS);
+        let s = issue_self(&a.core, peers::USE, peers::INVITE_DEFAULT_MS);
         b.core.join(&s).unwrap();
         b.core.tick();
         deliver(&b, &a);
         deliver(&a, &b);
-        // B получил подсказки A: не больше трёх, IPv6 не вытеснен тремя IPv4, частный адрес отброшен фильтром получателя
+        // B (клиент) получил подсказки A: лимит контакта 6, IPv6 не вытеснен IPv4; литеральный частный адрес клиент принимает (набор
+        // решит проверка подсети в момент набора), сервер такие адреса отбрасывает (ниже, у A)
         let ha = b.core.peers.lock().unwrap().contact(&a.core.me_hash).unwrap().hints.clone();
-        assert_eq!(ha.len(), 3, "{ha:?}");
+        assert_eq!(ha.len(), 5, "{ha:?}");
         assert!(v6_of(&ha), "IPv6 сохранён при лимите: {ha:?}");
-        assert!(ha.iter().all(|h| !h.starts_with("10.")));
+        assert!(ha.iter().any(|h| h.starts_with("10.")), "клиент принимает LAN-подсказку: {ha:?}");
         deliver(&b, &a); // ack с адресами B
         // A получил контакт B для обратного дозвона; права на A не изменились, никаких they_grant/ролей не появилось
         let p = a.core.peers.lock().unwrap();
         let cb = p.contact(&b.core.me_hash).expect("контакт получателя у выдавшего");
-        assert_eq!(cb.hints, vec!["9.9.9.9:5001".to_string(), "[2a00:1450::1]:5002".to_string()], "частный 192.168.* отброшен");
+        assert_eq!(cb.hints, vec!["9.9.9.9:5001".to_string(), "[2a00:1450::1]:5002".to_string()], "сервер: частный 192.168.* отброшен");
         assert_eq!((cb.they_grant, cb.roles, cb.intro_by.as_str()), (0, 0, "invite"));
         assert!(cb.client, "B объявил себя клиентом (телефон)");
         assert_eq!(p.rights(&b.core.me_hash), peers::USE, "права B на A прежние");
@@ -990,7 +1050,7 @@ pub(crate) mod tests {
     #[test]
     fn addr_update_from_known_contact_only_changes_hints() {
         let (a, b) = (node_h("addr-a", false, vec!["8.8.8.8:1".into()]), node_h("addr-b", false, vec!["9.9.9.9:2".into()]));
-        let s = issue_self(&a.core, peers::USE, 0, peers::INVITE_DEFAULT_MS);
+        let s = issue_self(&a.core, peers::USE, peers::INVITE_DEFAULT_MS);
         b.core.join(&s).unwrap();
         b.core.tick();
         deliver(&b, &a);
@@ -1018,7 +1078,7 @@ pub(crate) mod tests {
     #[test]
     fn announce_addrs_sends_only_on_change_to_dialable_contacts() {
         let (a, b) = (node_h("an-a", false, vec!["8.8.8.8:1".into()]), node("an-b", false));
-        let s = issue_self(&a.core, peers::USE, 0, peers::INVITE_DEFAULT_MS);
+        let s = issue_self(&a.core, peers::USE, peers::INVITE_DEFAULT_MS);
         b.core.join(&s).unwrap();
         b.core.tick();
         deliver(&b, &a);
@@ -1046,5 +1106,70 @@ pub(crate) mod tests {
         let back = load_pending(&n.core.state).unwrap();
         assert_eq!(back.pairs.len(), 1);
         assert_eq!(back.pairs[0].pin, [5; 16]);
+    }
+
+    #[test]
+    fn join_appends_to_pending_without_losing_or_duplicating() {
+        let n = node("n9", false);
+        let s1 = encode(&[([8; 16], [5; 16])]).unwrap();
+        assert_eq!(n.core.join_stat(&s1).unwrap().1, 1);
+        // первая пара уже погашена и ждёт ack: вторая строка не должна её потерять
+        {
+            let mut p = n.core.pending.lock().unwrap();
+            p.pairs[0].state = PairState::Settled;
+            p.created = 1;
+        }
+        let s2 = encode(&[([9; 16], [6; 16]), ([10; 16], [7; 16])]).unwrap();
+        assert_eq!(n.core.join_stat(&s2).unwrap().1, 2);
+        {
+            let p = n.core.pending.lock().unwrap();
+            assert_eq!(p.pairs.len(), 3);
+            assert_eq!(p.pairs[0].state, PairState::Settled, "погашенная пара не сброшена");
+            assert!(p.created > 1, "срок стопки отсчитывается от последнего добавления");
+        }
+        // повтор любой из строк ничего не добавляет и не дублирует
+        assert_eq!(n.core.join_stat(&s1).unwrap().1, 0);
+        assert_eq!(n.core.join_stat(&s2).unwrap().1, 0);
+        // тот же хеш, другой пин (второе приглашение от той же ноды) - отдельная пара
+        let s3 = encode(&[([8; 16], [11; 16])]).unwrap();
+        assert_eq!(n.core.join_stat(&s3).unwrap().1, 1);
+        let back = load_pending(&n.core.state).unwrap();
+        assert_eq!(back.pairs.len(), 4);
+        assert_eq!(back.pairs[0].state, PairState::Settled);
+        assert_eq!(n.core.pending_view()["pairs"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn join_limit_counts_only_new_pairs() {
+        let mut pend = Pending::default();
+        for i in 0..MAX_PENDING_PAIRS {
+            pend.pairs.push(Pair::new([(i + 1) as u8; 16], [9; 16]));
+        }
+        let me = [0xee; 16];
+        // стопка полна: повтор имеющейся пары - не ошибка, новая пара - отказ
+        assert_eq!(merge_pairs(&mut pend, &[([1; 16], [9; 16])], &me, 5, 0).unwrap(), 0);
+        assert!(merge_pairs(&mut pend, &[([200; 16], [9; 16])], &me, 5, 0).is_err());
+        assert_eq!(pend.pairs.len(), MAX_PENDING_PAIRS);
+        assert!(merge_pairs(&mut pend, &[(me, [9; 16])], &me, 5, 0).is_err(), "собственный хеш");
+    }
+
+    #[test]
+    fn join_offline_appends_to_file_and_view_shows_it() {
+        let n = node("n10", false);
+        let st = n.core.state.clone();
+        let s1 = encode(&[([8; 16], [5; 16])]).unwrap();
+        let s2 = encode(&[([9; 16], [6; 16])]).unwrap();
+        assert_eq!(join_offline(&st, &n.core.me_hash, &s1).unwrap().1, 1);
+        assert_eq!(join_offline(&st, &n.core.me_hash, &s2).unwrap().1, 1);
+        assert_eq!(join_offline(&st, &n.core.me_hash, &s2).unwrap().1, 0);
+        assert!(join_offline(&st, &n.core.me_hash, &encode(&[(n.core.me_hash, [5; 16])]).unwrap()).is_err());
+        let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(pending_path(&st)).unwrap());
+        assert_eq!(mode & 0o777, 0o600);
+        let v = pending_view_offline(&st);
+        assert_eq!(v["pairs"].as_array().unwrap().len(), 2);
+        assert_eq!(v["pairs"][0]["state"], "waiting");
+        // нода, стартовавшая позже, подхватывает обе пары
+        let fresh = Core::new(&st, n.identity.clone(), n.core.peers.clone(), false, Box::new(Vec::new), Box::new(|| {}), Box::new(|_| {})).unwrap();
+        assert_eq!(fresh.pending_view()["pairs"].as_array().unwrap().len(), 2);
     }
 }

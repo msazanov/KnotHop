@@ -21,6 +21,7 @@ public final class NodeSettingsActivity extends Activity {
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        setTitle("Настройки ноды");
         target = getIntent().getStringExtra(EXTRA_TARGET);
         name = Rights.clip(getIntent().getStringExtra(EXTRA_NAME));
         fingerprint = getIntent().getStringExtra(EXTRA_FINGERPRINT);

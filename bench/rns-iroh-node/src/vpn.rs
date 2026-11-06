@@ -59,12 +59,9 @@ pub enum VpnCmd {
 pub struct InviteArgs {
     #[arg(long)]
     pub state: PathBuf,
-    /// что получит принявший на каждой ноде: user (USE), server, admin, число или список (USE+EXIT)
+    /// что получит принявший на выпустившей ноде: user (USE), server, admin, число или список (USE+EXIT)
     #[arg(long, default_value = "user")]
     pub rights: String,
-    /// что получит выдавший на принявшем (права управления, для первого старта сервера — admin)
-    #[arg(long, default_value = "none")]
-    pub mgmt: String,
     /// ноды, где приглашение должно быть погашено: identity-хеши (32 hex) через запятую, от 1 до 8; без списка — только эта нода
     #[arg(long, value_delimiter = ',')]
     pub nodes: Vec<String>,
@@ -340,7 +337,7 @@ fn hostname() -> String {
 }
 
 /// Глобально маршрутизируемый адрес? (не частный, не loopback, не link-local, не CGNAT, не multicast, не служебный/документационный)
-fn is_global_ip(ip: &std::net::IpAddr) -> bool {
+pub(crate) fn is_global_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v) => {
             let o = v.octets();
@@ -394,14 +391,17 @@ fn v6_in(bits: u128, net: u128, len: u32) -> bool {
 
 /// Адреса интерфейсов, по которым узла можно достать: глобальные (или любые не служебные при `allow_private`). IPv4 вперёд, не более 3.
 fn local_addrs(port: u16, allow_private: bool, skip_iface: &str) -> Vec<String> {
-    local_addrs_ports(port, port, allow_private, skip_iface)
+    local_addrs_ports(port, port, allow_private, skip_iface, false)
 }
 
 /// Как `local_addrs`, но у IPv4- и IPv6-сокета iroh могут быть разные порты (телефон биндится на случайные). Из трёх мест гарантированно
 /// есть минимум по одному адресу каждого семейства, если оба нашлись (IPv6 часто единственный прямой путь без NAT).
-fn local_addrs_ports(port4: u16, port6: u16, allow_private: bool, skip_iface: &str) -> Vec<String> {
+fn local_addrs_ports(port4: u16, port6: u16, allow_private: bool, skip_iface: &str, lan: bool) -> Vec<String> {
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
+    // локальная сеть (только клиент, подсказки известным контактам): частный IPv4 и ULA IPv6 идут после глобальных
+    let mut l4 = Vec::new();
+    let mut l6 = Vec::new();
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifap) != 0 {
@@ -421,6 +421,8 @@ fn local_addrs_ports(port4: u16, port6: u16, allow_private: bool, skip_iface: &s
                         let ok = if allow_private { !(ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()) } else { is_global_ip(&std::net::IpAddr::V4(ip)) };
                         if ok {
                             v4.push(SocketAddr::new(ip.into(), port4).to_string());
+                        } else if lan && !vpn_like_iface(&iname) && is_lan_ip(&ip.into()) {
+                            l4.push(SocketAddr::new(ip.into(), port4).to_string());
                         }
                     }
                     libc::AF_INET6 => {
@@ -428,6 +430,8 @@ fn local_addrs_ports(port4: u16, port6: u16, allow_private: bool, skip_iface: &s
                         let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
                         if is_global_ip(&std::net::IpAddr::V6(ip)) {
                             v6.push(SocketAddr::new(ip.into(), port6).to_string());
+                        } else if lan && !vpn_like_iface(&iname) && is_lan_ip(&ip.into()) {
+                            l6.push(SocketAddr::new(ip.into(), port6).to_string());
                         }
                     }
                     _ => {}
@@ -439,8 +443,124 @@ fn local_addrs_ports(port4: u16, port6: u16, allow_private: bool, skip_iface: &s
     }
     v4.dedup();
     v6.dedup();
+    l4.dedup();
+    l6.dedup();
     v4.extend(v6);
+    if lan {
+        v4.extend(l4);
+        v4.extend(l6);
+        return peers::balance_hints(v4, peers::MAX_CONTACT_HINTS);
+    }
     peers::balance_hints(v4, peers::MAX_HINTS)
+}
+
+// ------------------------------------------------------------------------------------------------ локальная сеть для P2P-контактов
+// Точечное исключение из фильтра п.5 AGENTS (ADR 0028 §2.4a): частный IPv4 и ULA IPv6 из подсказки ИЗВЕСТНОГО КОНТАКТА без ролей набираются,
+// только если (а) адрес пришёл в подписанном шифрованном LXMF (`accept`/`ack`/`addr`, `invite::clean_hints`), (б) он лежит в подсети одного
+// из моих текущих интерфейсов (не VPN, не loopback) - проверка на момент каждого набора, (в) ключ проверяется TLS iroh как всегда.
+// Общий фильтр (`resolve_addrs`, анонсы, DNS) и `KNOTHOP_ALLOW_PRIVATE_DIAL` не меняются; серверы-соседи это не используют.
+// Link-local IPv6 не поддержан: iroh при отправке теряет scope id (`canonical_addr`), адрес fe80:: был бы недостижим.
+
+/// Адрес локальной сети: частный IPv4 (RFC 1918) или ULA IPv6 (fc00::/7). CGNAT, link-local, loopback, служебные - нет.
+pub(crate) fn is_lan_ip(ip: &std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v) => v.is_private(),
+        std::net::IpAddr::V6(v) => (v.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+/// Подсказка для клиента: обычная (`sane_hint_addr`) либо литеральный `IP:порт` локальной сети. Только синтаксис; имена сюда не входят.
+pub(crate) fn sane_hint_addr_lan(a: &str) -> bool {
+    sane_hint_addr(a) || (a.len() <= 64 && a.parse::<SocketAddr>().is_ok_and(|sa| sa.port() != 0 && is_lan_ip(&sa.ip())))
+}
+
+/// Интерфейс, который никогда не считается локальной сетью: туннели и VPN (`tun*`, `wg*`, `ppp*`, `tap*`, `ipsec*`, `utun*`, `tailscale*`), loopback.
+fn vpn_like_iface(name: &str) -> bool {
+    name == "lo" || ["tun", "wg", "ppp", "tap", "ipsec", "utun", "tailscale", "dummy"].iter().any(|p| name.starts_with(p))
+}
+
+/// Адрес интерфейса: имя, IP, длина префикса, поднят ли.
+#[derive(Clone, Debug)]
+pub(crate) struct IfAddr {
+    pub name: String,
+    pub ip: std::net::IpAddr,
+    pub prefix: u8,
+    pub up: bool,
+}
+
+/// Подсети подключённых интерфейсов, пригодные как «локальная сеть»: поднятые, не loopback, не VPN, не `skip` (свой TUN), адрес сам локальный.
+pub(crate) fn lan_subnets(ifs: &[IfAddr], skip: &str) -> Vec<(std::net::IpAddr, u8)> {
+    ifs.iter().filter(|i| i.up && i.name != skip && !vpn_like_iface(&i.name) && is_lan_ip(&i.ip)).map(|i| (i.ip.to_canonical(), i.prefix)).collect()
+}
+
+fn ip_in_subnet(ip: &std::net::IpAddr, net: &std::net::IpAddr, prefix: u8) -> bool {
+    match (ip.to_canonical(), net.to_canonical()) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => prefix <= 32 && v4_in(u32::from(a), u32::from(b), prefix as u32),
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => prefix <= 128 && v6_in(u128::from(a), u128::from(b), prefix as u32),
+        _ => false,
+    }
+}
+
+/// Можно ли набрать `ip` как локальный адрес: он локальный (частный/ULA) и лежит в одной из подсетей `nets`.
+pub(crate) fn lan_reachable(ip: &std::net::IpAddr, nets: &[(std::net::IpAddr, u8)]) -> bool {
+    is_lan_ip(ip) && nets.iter().any(|(n, p)| ip_in_subnet(ip, n, *p))
+}
+
+/// Текущие адреса интерфейсов (getifaddrs) с длиной префикса.
+fn iface_addrs() -> Vec<IfAddr> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return out;
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() && !ifa.ifa_netmask.is_null() {
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy().to_string();
+                let up = ifa.ifa_flags & (libc::IFF_UP as u32) != 0;
+                match (*ifa.ifa_addr).sa_family as i32 {
+                    libc::AF_INET => {
+                        let a = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                        let m = &*(ifa.ifa_netmask as *const libc::sockaddr_in);
+                        out.push(IfAddr { name, ip: std::net::Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr)).into(), prefix: u32::from_be(m.sin_addr.s_addr).count_ones() as u8, up });
+                    }
+                    libc::AF_INET6 => {
+                        let a = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                        let m = &*(ifa.ifa_netmask as *const libc::sockaddr_in6);
+                        out.push(IfAddr { name, ip: std::net::Ipv6Addr::from(a.sin6_addr.s6_addr).into(), prefix: u128::from(std::net::Ipv6Addr::from(m.sin6_addr.s6_addr)).count_ones() as u8, up });
+                    }
+                    _ => {}
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    out
+}
+
+/// Адреса для набора контакта: обычный `resolve_addrs` плюс, если `lan` (контакт без ролей, мы клиент), литеральные адреса локальной сети
+/// из подсетей текущих интерфейсов. Выбранные LAN-адреса точечно разрешаются в фильтре исходящих iroh (`set_egress_allow`).
+async fn resolve_addrs_lan(addrs: &[String], lan: bool, peer: &[u8; 32]) -> Vec<SocketAddr> {
+    let mut out = resolve_addrs(addrs).await;
+    if !lan {
+        return out;
+    }
+    let nets = lan_subnets(&iface_addrs(), "");
+    let mut lan_ips = Vec::new();
+    for a in addrs {
+        if let Ok(sa) = a.parse::<SocketAddr>() {
+            if sa.port() != 0 && !is_global_ip(&sa.ip()) && lan_reachable(&sa.ip(), &nets) && !out.contains(&sa) {
+                lan_ips.push(sa.ip());
+                out.push(sa);
+            }
+        }
+    }
+    iroh::knothop::set_egress_allow(*peer, lan_ips);
+    out.sort_by_key(|a| (!is_global_ip(&a.ip()), a.is_ipv6()));
+    out
 }
 
 /// UDP-порты сокетов iroh (IPv4, IPv6) - для подсказок адресов клиента, который биндится на случайные порты. Нет сокета семейства - порт другого.
@@ -628,6 +748,68 @@ fn dest32(d: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ifa(name: &str, ip: &str, prefix: u8, up: bool) -> IfAddr {
+        IfAddr { name: name.into(), ip: ip.parse().unwrap(), prefix, up }
+    }
+
+    #[test]
+    fn lan_filter_accepts_own_subnet_only_and_never_vpn_loopback_or_foreign_private() {
+        let ifs = vec![
+            ifa("wlan0", "192.168.1.20", 24, true),
+            ifa("wlan0", "fd9a:1::20", 64, true),
+            ifa("wlan0", "fe80::1", 64, true),       // link-local: не локальная сеть для набора
+            ifa("lo", "127.0.0.1", 8, true),
+            ifa("tun0", "10.8.0.2", 24, true),       // VPN: его подсеть не считается
+            ifa("wg0", "10.66.0.2", 24, true),
+            ifa("rmnet0", "10.77.0.5", 24, false),   // интерфейс не поднят
+            ifa("kh0", "198.18.0.9", 15, true),      // адрес нашего туннеля вне частных диапазонов
+        ];
+        let nets = lan_subnets(&ifs, "kh0");
+        let ok = |s: &str| lan_reachable(&s.parse().unwrap(), &nets);
+        assert!(ok("192.168.1.77"), "своя подсеть");
+        assert!(ok("fd9a:1::99"), "ULA своей подсети");
+        assert!(!ok("192.168.2.77"), "чужая частная подсеть");
+        assert!(!ok("10.0.0.5"), "чужая частная");
+        assert!(!ok("127.0.0.1") && !ok("::1"), "loopback");
+        assert!(!ok("10.8.0.9") && !ok("10.66.0.9"), "подсеть VPN-интерфейса");
+        assert!(!ok("10.77.0.9"), "интерфейс не поднят");
+        assert!(!ok("fe80::5"), "link-local не набирается");
+        assert!(!ok("169.254.1.1"), "link-local IPv4");
+        assert!(!ok("8.8.8.8"), "глобальный адрес идёт обычным путём, не через LAN-исключение");
+        assert!(!ok("100.64.0.9"), "CGNAT не локальная сеть");
+        assert_eq!(nets.len(), 2);
+        // свой TUN, названный нестандартно, исключается по имени
+        let nets = lan_subnets(&[ifa("vpn7", "192.168.50.2", 24, true), ifa("wlan0", "192.168.1.20", 24, true)], "vpn7");
+        assert!(!lan_reachable(&"192.168.50.9".parse().unwrap(), &nets) && lan_reachable(&"192.168.1.9".parse().unwrap(), &nets));
+    }
+
+    #[test]
+    fn lan_hint_syntax_is_client_only_and_literal_only() {
+        for good in ["192.168.1.5:47001", "10.1.2.3:9", "[fd00::5]:47001"] {
+            assert!(sane_hint_addr_lan(good), "{good}");
+            assert!(!sane_hint_addr(good), "общий фильтр не ослаблен: {good}");
+        }
+        for bad in ["127.0.0.1:1", "[::1]:1", "169.254.1.1:1", "[fe80::1]:1", "100.64.1.1:1", "192.168.1.5:0", "0.0.0.0:5"] {
+            assert!(!sane_hint_addr_lan(bad), "{bad}");
+        }
+        assert!(sane_hint_addr_lan("8.8.8.8:1"));
+        // клиент принимает LAN-подсказку из accept, сервер - нет
+        let j = serde_json::json!(["203.0.113.5:1", "8.8.8.8:1", "192.168.1.5:47001"]);
+        assert!(crate::invite::clean_hints(&j, true).contains(&"192.168.1.5:47001".to_string()));
+        assert!(!crate::invite::clean_hints(&j, false).contains(&"192.168.1.5:47001".to_string()));
+    }
+
+    #[test]
+    fn hints_keep_one_of_each_kind_global_first() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let all = s(&["1.1.1.1:1", "2.2.2.2:1", "3.3.3.3:1", "4.4.4.4:1", "[2606::1]:1", "192.168.1.5:1", "[fd00::5]:1"]);
+        let out = peers::balance_hints(all, peers::MAX_CONTACT_HINTS);
+        assert_eq!(out.len(), 6);
+        for must in ["1.1.1.1:1", "[2606::1]:1", "192.168.1.5:1", "[fd00::5]:1"] {
+            assert!(out.contains(&must.to_string()), "{must} в {out:?}");
+        }
+    }
 
     #[test]
     fn ping_nonce_wire_is_exactly_eight_bytes() {
@@ -998,7 +1180,7 @@ mod tests {
         assert_eq!(p.invite_list().iter().filter(|i| i.state == peers::InviteState::Open && i.rights == peers::USE).count(), 1, "пин записан в peers.json");
         // чужая нода в стопке без работающего ядра: понятный отказ, ничего не пишется
         let r: serde_json::Value = serde_json::from_str(&run_cli_json(&serde_json::json!({"cmd": "issue", "nodes": [
-            {"hash": hex(&me), "rights": 1, "mgmt": 0}, {"hash": hex(&[9u8; 16]), "rights": 1, "mgmt": 0}]}).to_string(), st)).unwrap();
+            {"hash": hex(&me), "rights": 1}, {"hash": hex(&[9u8; 16]), "rights": 1}]}).to_string(), st)).unwrap();
         assert_eq!(r["ok"], false);
         assert!(r["error"].as_str().unwrap().contains("Сеть"), "{r}");
         assert_eq!(peers::Peers::load(id.public_key_bytes(), &dir).unwrap().invite_list().len(), 1);
@@ -2061,7 +2243,7 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
     // память о неработающих носителях к этому пиру (health.rs): ключ - EndpointId, не имя и не адрес
     let peer = id.to_string();
     *ctl.peer.lock().unwrap() = peer.clone();
-    let d = Dialer { ep, node, sh, label, id, book, alive, ctl, peer };
+    let d = Dialer { ep, node, sh, label, id, book, alive, ctl, peer, lan: may_die };
     let first_back: u64 = std::env::var("KNOTHOP_TCP_BACKOFF_S").ok().and_then(|v| v.parse().ok()).unwrap_or(TCP_BACK_OFF_FIRST_S);
     let mut st = DialState { back_off: first_back, first_back, ..Default::default() };
     let (sh, ctl, label, peer) = (&d.sh, &d.ctl, d.label.as_str(), d.peer.as_str());
@@ -2109,7 +2291,7 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
             st.tcp_since = None;
         }
         let cur = d.book.get();
-        let resolved = resolve_addrs(&cur).await;
+        let resolved = d.resolve().await;
         // без адресов можно дозвониться только через relay (hole punching по EndpointId); TCP-носителю нужен адрес
         let relay_only = resolved.is_empty() && RELAY_URLS.get().is_some();
         if resolved.is_empty() && !relay_only {
@@ -2294,9 +2476,15 @@ struct Dialer {
     alive: Arc<AtomicBool>,
     ctl: Arc<CarrierCtl>,
     peer: String,
+    /// контакт без ролей и мы клиент: к глобальным подсказкам добавляются адреса своей локальной сети
+    lan: bool,
 }
 
 impl Dialer {
+    async fn resolve(&self) -> Vec<SocketAddr> {
+        resolve_addrs_lan(&self.book.get(), self.lan, self.id.as_bytes()).await
+    }
+
     /// Интерфейс этого пира: живой или новый. Новый интерфейс - новая «поколение»: Link на прежнем (снятом) интерфейсе больше не годится.
     fn mux_for(&self, st: &mut DialState) -> Option<Arc<mux::Mux>> {
         if let Some(m) = st.mux.as_ref().filter(|m| !m.is_closed()) {
@@ -2349,7 +2537,7 @@ impl Dialer {
             return false;
         }
         // адреса те же, что для QUIC/TCP, и прошли тот же фильтр (глобальные, кроме KNOTHOP_ALLOW_PRIVATE_DIAL); подсказка хоста не несёт
-        let resolved = resolve_addrs(&self.book.get()).await;
+        let resolved = self.resolve().await;
         if resolved.is_empty() {
             return false;
         }
@@ -2509,7 +2697,7 @@ impl Dialer {
                         continue;
                     }
                     // потери UDP или тишина Link: подключаем TCP рядом, переключаем данные и только потом закрываем QUIC
-                    let resolved = resolve_addrs(&self.book.get()).await;
+                    let resolved = self.resolve().await;
                     match tcpc::connect(&resolved, self.ep.secret_key(), &self.id).await {
                         tcpc::Dial::Up(stream) => {
                             self.tcp_confirmed(st);
@@ -2609,7 +2797,7 @@ impl Dialer {
     /// стороны) и только после этого принимается интерфейсом носителем данных. Неудача ничего не ломает: TCP и Link не тронуты.
     async fn try_return(&self, m: &Arc<mux::Mux>) -> Result<Connection, bool> {
         let (sh, label) = (&self.sh, self.label.as_str());
-        let resolved = resolve_addrs(&self.book.get()).await;
+        let resolved = self.resolve().await;
         if resolved.is_empty() {
             return Err(true);
         }
@@ -3387,12 +3575,14 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         core.set_name(&a.name);
         core.set_rl(_reality_hint.as_ref().map_or(serde_json::Value::Null, |h| h.to_json()));
         if !invite_raw.trim().is_empty() {
-            // Повторный инвайт не должен тихо делать второго админа: при уже имеющихся управляющих нужен явный флаг (ничего не меняется).
-            if table.lock().unwrap().has_controllers() && !a.accept_manage {
-                bail!("нода уже управляется: приглашение с правами управления принимается только с --accept-manage");
-            }
-            let hs = core.join(&invite_raw).context("приглашение")?;
-            eprintln!("Приглашение принято к исполнению: нод {} (первая {}); права управления выдавшему — после погашения, см. журнал", hs.len(), hex(&hs[0]));
+            // Управление нодой - свойство запуска (ADR 0028 §2.5): выдавший станет управляющим после проверенного `accept`, если у ноды ещё
+            // нет управляющих. Повторный инвайт не должен тихо делать второго админа: у уже управляемой ноды - только с --accept-manage;
+            // без флага строка принимается как обычное вступление (контакт, без управления).
+            let managed = table.lock().unwrap().has_controllers();
+            let adopt = if a.accept_manage { invite::ADOPT_FORCE } else if managed { 0 } else { invite::ADOPT_IF_EMPTY };
+            let (hs, _) = core.join_adopt(&invite_raw, adopt).context("приглашение")?;
+            eprintln!("Приглашение принято к исполнению: нод {} (первая {}); {}", hs.len(), hex(&hs[0]),
+                match adopt { invite::ADOPT_FORCE => "выдавший станет управляющим (--accept-manage)", invite::ADOPT_IF_EMPTY => "выдавший станет управляющим нодой после погашения", _ => "нода уже управляется: управление не выдаётся без --accept-manage" });
         }
         Some(T13 { peers: table, core })
     };
@@ -4716,8 +4906,8 @@ pub fn run_admin(cmd: VpnCmd) -> Result<()> {
         VpnCmd::RulesCompile(a) => route::cmd_compile(&a.state),
         VpnCmd::List(a) => { println!("{}", serde_json::to_string_pretty(&ctl(&a.state, &serde_json::json!({"cmd": "view"}))?)?); Ok(()) }
         VpnCmd::Invite(a) => {
-            let nodes: Vec<serde_json::Value> = a.nodes.iter().map(|h| Ok(serde_json::json!({"hash": hex(&parse_hash(h)?), "rights": peers::parse_rights(&a.rights)?, "mgmt": peers::parse_rights(&a.mgmt)?}))).collect::<Result<_>>()?;
-            let v = ctl(&a.state, &serde_json::json!({"cmd": "issue", "nodes": nodes, "rights": peers::parse_rights(&a.rights)?, "mgmt": peers::parse_rights(&a.mgmt)?, "ttl_ms": a.ttl_h.clamp(1, 168) * 3600 * 1000}))?;
+            let nodes: Vec<serde_json::Value> = a.nodes.iter().map(|h| Ok(serde_json::json!({"hash": hex(&parse_hash(h)?), "rights": peers::parse_rights(&a.rights)?}))).collect::<Result<_>>()?;
+            let v = ctl(&a.state, &serde_json::json!({"cmd": "issue", "nodes": nodes, "rights": peers::parse_rights(&a.rights)?, "ttl_ms": a.ttl_h.clamp(1, 168) * 3600 * 1000}))?;
             write_secret_out(&a.out, v["invite"].as_str().unwrap_or(""))
         }
         VpnCmd::Join(a) => {
@@ -4746,8 +4936,16 @@ pub fn run_cli_json(command: &str, state_dir: &str) -> String {
     }
     let Ok(req) = serde_json::from_str::<serde_json::Value>(command) else { return fail("invalid_json") };
     let state = Path::new(state_dir);
+    if req["cmd"].as_str() == Some("init") {
+        // ключ создаётся при первом запуске приложения, а не при включении «Сети»; идемпотентно, работает и при живой ноде
+        return init_identity(state).unwrap_or_else(|e| fail(&format!("{e:#}")));
+    }
     if let Some(core) = invite::lookup(state) {
         return core.ctl(&req).to_string();
+    }
+    if req["cmd"].as_str() == Some("join") {
+        // «Сеть» выключена: пары дописываются в pending-invite.json, нода погасит их при запуске (на живую ноду пишет Core::join)
+        return offline_join(state, &req).unwrap_or_else(|e| fail(&format!("{e:#}")));
     }
     if req["cmd"].as_str() == Some("issue") {
         // «Сеть» выключена: выпустить можно всегда, но только на себе (чужим нодам «ожидай» уходит по LXMF, для этого нужна работающая нода)
@@ -4755,11 +4953,28 @@ pub fn run_cli_json(command: &str, state_dir: &str) -> String {
     }
     if req["cmd"].as_str() == Some("view") {
         return match load_identity_strict(state).and_then(|id| peers::Peers::load(id.public_key_bytes(), state)) {
-            Ok(p) => { let mut v = p.status(now_ms() as u64); v["ok"] = true.into(); v["offline"] = true.into(); v.to_string() }
+            Ok(p) => { let mut v = p.status(now_ms() as u64); v["pending"] = invite::pending_view_offline(state); v["ok"] = true.into(); v["offline"] = true.into(); v.to_string() }
             Err(e) => fail(&format!("{e:#}")),
         };
     }
     fail("нода не запущена")
+}
+
+/// Создать ключ ноды (если его ещё нет) и записать `whoami.json`; вызывается приложением при каждом запуске.
+fn init_identity(state: &Path) -> Result<String> {
+    std::fs::create_dir_all(state)?;
+    let id = load_or_create_identity(state)?;
+    let j = serde_json::json!({"hash": hex(id.hash()), "pk": hex(&id.public_key_bytes()), "ip": ip_str(client_ip(id.hash())), "prefix": client_net().1});
+    write_atomic(&state.join("whoami.json"), j.to_string().as_bytes());
+    Ok(serde_json::json!({"ok": true, "hash": hex(id.hash())}).to_string())
+}
+
+/// Вступление без запущенной ноды: дописать пары в `pending-invite.json` (0600). Ключ ноды должен уже существовать (`init`).
+fn offline_join(state: &Path, req: &serde_json::Value) -> Result<String> {
+    let id = load_identity_strict(state)?;
+    let me = peers::hash_of(&id.public_key_bytes()).context("identity")?;
+    let (hs, added) = invite::join_offline(state, &me, req["invite"].as_str().unwrap_or(""))?;
+    Ok(serde_json::json!({"ok": true, "offline": true, "added": added, "nodes": hs.iter().map(|h| hex(h)).collect::<Vec<_>>()}).to_string())
 }
 
 /// Выпуск приглашения на себе без запущенной ноды (приложение при выключенной «Сети»): пин пишется в `peers.json` этой ноды, строка
@@ -4767,10 +4982,10 @@ pub fn run_cli_json(command: &str, state_dir: &str) -> String {
 fn offline_issue(state: &Path, req: &serde_json::Value) -> Result<String> {
     let id = load_identity_strict(state)?;
     let me = peers::hash_of(&id.public_key_bytes()).context("identity")?;
-    let grants: Vec<(peers::Hash, u16, u16)> = match req["nodes"].as_array() {
+    let grants: Vec<(peers::Hash, u16)> = match req["nodes"].as_array() {
         Some(a) if !a.is_empty() => a.iter().map(|g| Ok((unhex(g["hash"].as_str().unwrap_or("")).try_into().map_err(|_| anyhow::anyhow!("nodes[]: hash"))?,
-            g["rights"].as_u64().context("nodes[]: rights")? as u16, g["mgmt"].as_u64().unwrap_or(0) as u16))).collect::<Result<_>>()?,
-        _ => vec![(me, req["rights"].as_u64().unwrap_or(peers::USE as u64) as u16, req["mgmt"].as_u64().unwrap_or(0) as u16)],
+            g["rights"].as_u64().context("nodes[]: rights")? as u16))).collect::<Result<_>>()?,
+        _ => vec![(me, req["rights"].as_u64().unwrap_or(peers::USE as u64) as u16)],
     };
     if grants.len() != 1 || grants[0].0 != me {
         bail!("нода не запущена: включите «Сеть», чтобы выпустить приглашение на другие ноды");
@@ -4779,7 +4994,7 @@ fn offline_issue(state: &Path, req: &serde_json::Value) -> Result<String> {
     let mut pin = [0u8; 16];
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut pin);
     let mut p = peers::Peers::load(id.public_key_bytes(), state)?;
-    p.invite_add(&peers::Actor::Local, peers::pin_id(&pin), peers::pin_key(&pin), grants[0].1, grants[0].2, ttl, now_ms() as u64).map_err(|e| anyhow::anyhow!("приглашение не выпущено: {e}"))?;
+    p.invite_add(&peers::Actor::Local, peers::pin_id(&pin), peers::pin_key(&pin), grants[0].1, ttl, now_ms() as u64).map_err(|e| anyhow::anyhow!("приглашение не выпущено: {e}"))?;
     p.save()?;
     let s = invite::encode(&[(me, pin)])?;
     Ok(serde_json::json!({"ok": true, "invite": s, "requests": [], "offline": true}).to_string())
@@ -4805,7 +5020,7 @@ struct CServer {
 
 /// Состояние клиента модели 0013.
 struct C13 {
-    /// таблица прав клиента (ADR 0028): управляющие (если выдавший `mgmt`), контакты с подсказками адресов и ролями нод
+    /// таблица прав клиента (ADR 0028): управляющие, контакты с подсказками адресов и ролями нод
     peers: Arc<Mutex<peers::Peers>>,
     /// единое ядро приглашений и команд (то же, что у сервера)
     core: Arc<invite::Core>,
@@ -4950,7 +5165,7 @@ impl ClientCtx {
             let state = if info.is_some() { "direct" } else if !has_addr { "no_addr" } else if dead || misses >= 2 { "unreachable" } else { "trying" };
             let rtt = info.as_ref().and_then(|i| i["rtt_ms"].as_f64());
             let name = tr.contact(&h).map(|x| x.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| self.shown_name(e));
-            Some(serde_json::json!({"d": hex(&e.dest), "id": hex(&h), "n": name, "state": state, "rtt_ms": rtt, "path": info.as_ref().and_then(|i| i["path_desc"].as_str().map(String::from)),
+            Some(serde_json::json!({"d": hex(&e.dest), "id": hex(&h), "n": name, "state": state, "rtt_ms": rtt, "path": info.as_ref().and_then(|i| i["path_desc"].as_str().map(String::from)), "lan": info.as_ref().is_some_and(|i| i["lan"].as_bool() == Some(true)),
                 "misses": misses, "they_grant": tr.contact(&h).map_or(0, |x| x.they_grant), "exit": false}))
         }).collect();
         serde_json::Value::Array(out)
@@ -5020,7 +5235,7 @@ impl ClientCtx {
                 continue;
             }
             let key: [u8; 32] = pk[32..64].try_into().unwrap();
-            let addrs: Vec<String> = peers::balance_hints(addrs.into_iter().filter(|a| sane_hint_addr(a)).collect(), peers::MAX_HINTS);
+            let addrs: Vec<String> = peers::balance_hints(addrs.into_iter().filter(|a| sane_hint_addr_lan(a)).collect(), peers::MAX_CONTACT_HINTS);
             if let Some(e) = s.iter_mut().find(|e| e.dest == dest) {
                 e.pk = Some(pk);
                 // имя, сохранённое с прошлого допуска: пока узел не отвечал в этой сессии, в записи только короткий dest
@@ -5211,7 +5426,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
         let (c1, c2) = (ctx_cell.clone(), ctx_cell.clone());
         let ports = own_ports.clone();
         let hints_fn: Box<dyn Fn() -> Vec<String> + Send + Sync> = Box::new(move || match ports.get() {
-            Some((p4, p6, tun)) => local_addrs_ports(*p4, *p6, std::env::var("KNOTHOP_ALLOW_PRIVATE_DIAL").is_ok(), tun),
+            Some((p4, p6, tun)) => local_addrs_ports(*p4, *p6, std::env::var("KNOTHOP_ALLOW_PRIVATE_DIAL").is_ok(), tun, true),
             None => vec![],
         });
         // телефон: права управления выдавшему принимаются только после явного согласия пользователя (ADR 0028 §2.4)
@@ -6468,7 +6683,9 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             *ctx.tun.client_link.write().unwrap() = None;
             *ctx.cur.lock().unwrap() = None;
             ctx.publish_service();
-            *ctx.status.lock().unwrap() = "восстанавливаю путь к выбранной ноде; другой выход не подставляется".into();
+            // выбора нет, если выходов нет вовсе (клиент только с P2P-контактами): не «восстанавливаю путь к выбранной ноде»
+            *ctx.status.lock().unwrap() = if ctx.servers.lock().unwrap().is_empty() { "Выходов пока нет".into() }
+                else { "восстанавливаю путь к выбранной ноде; другой выход не подставляется".into() };
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         };

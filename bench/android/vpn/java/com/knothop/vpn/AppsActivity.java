@@ -36,6 +36,7 @@ public final class AppsActivity extends Activity {
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
+        setTitle("Приложения");
         state = new File(getFilesDir(), "state");
         rules = AppRules.load(state);
         ScrollView scroll = new ScrollView(this);

@@ -34,18 +34,17 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 
 /**
- * KnotHop VPN. Первый запуск: вставить приглашение (спаривание). После: главный экран с карточками (состояние, граф выходов,
- * маршрутизация, администратор), закреплённый внизу переключатель режимов, шторка журнала с диагностикой (жест: удержать и протянуть
- * вверх) и обновление потягиванием вниз. Сервера, ключи и адрес берутся только из профиля.
+ * KnotHop VPN. Главный экран сразу (ключ ноды создаётся при запуске; профиля и экрана «Вход в сеть» нет - любая нода сама себе админ): карточки
+ * (состояние, граф выходов, маршрутизация, «Сеть и приглашения» с кнопкой «Вступить»), закреплённый внизу переключатель режимов, шторка журнала
+ * с диагностикой (жест: удержать и протянуть вверх) и обновление потягиванием вниз.
  */
 public class MainActivity extends Activity {
     private static final int REQ_VPN = 1;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SharedPreferences sp;
 
-    private LinearLayout pairBox, mainBox, adminBox;
-    private EditText profileField;
-    private TextView pairMsg, header, status, nodesMsg, updMsg, updView, directWarn, routingSummary, topStatus;
+    private LinearLayout mainBox, adminBox;
+    private TextView header, status, nodesMsg, updMsg, updView, directWarn, routingSummary, topStatus;
     private LinearLayout stateCard;
     /** Из status.json для верхней строки состояния: число известных нод и имя текущего выхода. */
     private int nodeCount;
@@ -64,7 +63,13 @@ public class MainActivity extends Activity {
     /** Предел длины вставляемого или открытого по ссылке приглашения (H4/O6). */
     private static final int MAX_PASTE = 4096;
     private static final String[] RIGHTS_TEXT = {"пользоваться сетью", "пропускать транзит", "быть выходом в интернет", "зачислять новых", "отзывать права", "менять настройки сети"};
-    private static final int REQ_SCAN = 4;
+    /** Нет ни одной ноды с правом выхода (по свежему статусу): отсчёт непрерывного состояния, чтобы не мигать при запуске. */
+    private long noExitsSince;
+    private TextView exitsNote;
+    private View noExitHelp;
+    /** Ожидающие погашения пары (view.pending): их число обновляет фоновый опрос. */
+    private volatile int pendWaiting, pendTotal;
+    private long pendPollAt;
     private TopologyView topo;
     private long prevTs, prevUp, prevDown;
     private double rUp, rDown;
@@ -98,45 +103,10 @@ public class MainActivity extends Activity {
             @Override public void onRefresh() { pullRefresh(); }
         });
 
-        // --- спаривание
-        pairBox = Ui.card(this);
-        pairBox.addView(Ui.titleWithHelp(this, "Вход в сеть",
-                "Ключ создаётся на этом телефоне при первом запуске. Вставьте строку приглашения или отсканируйте QR, если вас приглашают "
-                + "(приглашение одноразовое, срок задаёт приглашающий). Без приглашения вы начинаете со своей сети: сами выпускаете приглашения для серверов и пользователей."));
-        profileField = new EditText(this);
-        profileField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        profileField.setMinLines(3);
-        profileField.setGravity(Gravity.TOP);
-        profileField.setHint("строка приглашения");
-        profileField.setTextSize(11);
-        pairBox.addView(profileField, lpMatch(8));
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        Button paste = Ui.secondary(this, "Вставить", v -> {
-            ClipboardManager cb = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-            ClipData d = cb.getPrimaryClip();
-            if (d != null && d.getItemCount() > 0 && d.getItemAt(0).getText() != null) profileField.setText(d.getItemAt(0).getText());
-        });
-        Button pair = Ui.primary(this, "Войти", v -> doPair(profileField.getText().toString()));
-        pair.setFilterTouchesWhenObscured(true);   // F8
-        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        half.rightMargin = dp(8);
-        row.addView(paste, half);
-        row.addView(pair, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        pairBox.addView(row, lpMatch(8));
-        pairBox.addView(Ui.secondary(this, "Сканировать QR", v -> startActivityForResult(new Intent(this, ScanActivity.class), REQ_SCAN)), lpMatch(8));
-        LinearLayout ownRow = new LinearLayout(this);
-        ownRow.setGravity(Gravity.CENTER_VERTICAL);
-        ownRow.addView(Ui.secondary(this, "Своя сеть", v -> doPair("")), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        ownRow.addView(Ui.help(this, "Своя сеть", "Телефон становится администратором собственной сети. Для выхода в интернет нужна собственная серверная нода."), Ui.helpParams(this));
-        pairBox.addView(ownRow, lpMatch(8));
-        pairMsg = Ui.text(this, "", 13, Ui.ORANGE, false);
-        pairBox.addView(pairMsg, lpMatch(6));
-        root.addView(pairBox);
-
         // --- главный экран
         mainBox = new LinearLayout(this);
         mainBox.setOrientation(LinearLayout.VERTICAL);
+        mainBox.setVisibility(View.VISIBLE);
         updView = Ui.text(this, "Версия " + installedName() + " (" + installedCode() + ")", 11, Ui.MUTED, false);
         updView.setGravity(Gravity.CENTER);
         header = Ui.text(this, "", 13, Ui.ORANGE, false);
@@ -161,7 +131,16 @@ public class MainActivity extends Activity {
         // --- состояние
         stateCard = Ui.card(this);
         status = Ui.text(this, "", 13, Ui.MUTED, false);
-        stateCard.addView(status);
+        LinearLayout stateRow = new LinearLayout(this);
+        stateRow.setGravity(Gravity.CENTER_VERTICAL);
+        stateRow.addView(status, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        noExitHelp = Ui.help(this, "Выходов пока нет", "Ни одна известная нода не имеет права выхода (EXIT). Устройства могут быть связаны напрямую (P2P), "
+                + "но в интернет через них выйти нельзя. Чтобы появился выход, вступите по приглашению ноды-выхода («Сеть и приглашения» → «Вступить»).\n\n"
+                + "В режиме «VPN» туннель без выхода не передаёт трафик: защита от утечки (kill-switch) не ослабляется, поэтому трафик блокируется, а не идёт мимо VPN. "
+                + "Если выход не нужен, переключитесь на «Сеть»: узел работает, VPN не включён.");
+        noExitHelp.setVisibility(View.GONE);
+        stateRow.addView(noExitHelp, Ui.helpParams(this));
+        stateCard.addView(stateRow);
         mainBox.addView(stateCard, Ui.cardParams(this));
 
         // --- граф выходов
@@ -182,6 +161,9 @@ public class MainActivity extends Activity {
         topo.setOnLongPick((dest, name) -> openNodeAdmin(dest, name, ""));   // удержание: настройки ноды
         topo.setOnPhonePick(() -> startActivity(new Intent(this, NetworkActivity.class)));
         graphCard.addView(topo, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(300)));
+        exitsNote = Ui.text(this, "Нет нод с правом выхода. Вступите по приглашению.", 12, Ui.ORANGE, false);
+        exitsNote.setVisibility(View.GONE);
+        graphCard.addView(exitsNote, lpMatch(6));
         topo.setPingMode(pingBox.isChecked());
         pingBox.setOnCheckedChangeListener((v, on) -> { sp.edit().putBoolean("ping_layout", on).apply(); topo.setPingMode(on); });
         mainBox.addView(graphCard, Ui.cardParams(this));
@@ -197,14 +179,18 @@ public class MainActivity extends Activity {
         routeCard.addView(Ui.secondary(this, "Настроить", v -> startActivity(new Intent(this, RoutingActivity.class))));
         mainBox.addView(routeCard, Ui.cardParams(this));
 
-        // --- админ: приглашения. Видны только в своей сети (профиль «своя сеть»); пользователь по чужому приглашению их не видит.
+        // --- сеть и приглашения: любая нода сама себе админ, поэтому карточка видна всегда
         adminBox = Ui.card(this);
         adminBox.addView(Ui.titleWithHelp(this, "Сеть и приглашения",
                 "Выпускайте приглашения для серверов (первый запуск), пользователей и админов, знакомьте ноды друг с другом и правьте права. "
-                + "Корня нет: управлять можно теми нодами, которые приняли ваше приглашение с правами управления. VPN для этого не обязателен, достаточно включить «Сеть»."));
+                + "«Вступить» — принять чужое приглашение (можно в несколько сетей, ничего не сбрасывается). Корня нет: управлять можно теми нодами, "
+                + "которые признали вас админом (сервер при первом запуске по вашему приглашению). VPN для этого не обязателен, достаточно включить «Сеть»."));
+        Button joinBtn = Ui.secondary(this, "Вступить", v -> startActivity(new Intent(this, JoinActivity.class)));
+        joinBtn.setFilterTouchesWhenObscured(true);   // F8
+        adminBox.addView(joinBtn, lpMatch(10));
         Button inviteBtn = Ui.primary(this, "Пригласить", v -> startActivity(new Intent(this, InviteIssueActivity.class)));
         inviteBtn.setFilterTouchesWhenObscured(true);   // F8
-        adminBox.addView(inviteBtn, lpMatch(10));
+        adminBox.addView(inviteBtn, lpMatch(8));
         adminBox.addView(Ui.secondary(this, "Сеть: ноды, приглашения, права", v -> startActivity(new Intent(this, NetworkActivity.class))), lpMatch(8));
         mainBox.addView(adminBox, Ui.cardParams(this));
         mainBox.addView(updView, lpMatch(12));   // версия и результат проверки обновления: мелко внизу
@@ -259,9 +245,14 @@ public class MainActivity extends Activity {
             boolean kb = full > 0 && full - r.bottom > full * 0.15f;
             modePanel.setVisibility(kb && logConsole.isOpen() ? View.GONE : View.VISIBLE);
         });
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != 0) {
+        // Разрешение на уведомления просим один раз: повторный системный диалог при каждом запуске забирал фокус окна (на MIUI первое касание после
+        // открытия терялось - одна из гипотез, см. ModeSlider).
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != 0 && !sp.getBoolean("notif_asked", false)) {
+            sp.edit().putBoolean("notif_asked", true).apply();
             requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 2);
         }
+        // ключ ноды создаётся при запуске приложения (а не при включении «Сети»): вступление и выпуск работают сразу, при выключенной «Сети» тоже
+        new Thread(() -> Ctl.call(this, Ctl.req("init")), "knothop-init").start();
         handleLink(getIntent());
         handleLabIntent(getIntent());
         // после показа экрана, в фоновом потоке: старт приложения от сети не зависит
@@ -289,7 +280,10 @@ public class MainActivity extends Activity {
         handleLabIntent(in);
     }
 
-    /** Ссылка KnotHop://i/... (QR, открытый системной камерой): только подставляем строку в поле; зачисление начнёт сам пользователь кнопкой «Спарить». */
+    /**
+     * Ссылка knothop://i/... (QR системной камеры, сообщение): принимается всегда, в том числе на первом запуске и на уже настроенном телефоне.
+     * Показывается диалог с хешами нод, дальше вступление добавляется к уже принятым приглашениям. Пустая ссылка не принимается.
+     */
     private void handleLink(Intent in) {
         if (in == null || !Intent.ACTION_VIEW.equals(in.getAction()) || in.getData() == null) return;
         String u = in.getData().toString();
@@ -299,18 +293,12 @@ public class MainActivity extends Activity {
             android.widget.Toast.makeText(this, "Ссылка слишком длинная: такого приглашения не бывает", android.widget.Toast.LENGTH_LONG).show();
             return;
         }
-        if (sp.contains("profile")) {
-            android.widget.Toast.makeText(this, "Телефон уже настроен. Чтобы принять другое приглашение, сначала нажмите «Забыть профиль»", android.widget.Toast.LENGTH_LONG).show();
-            return;
-        }
-        profileField.setText(u);
-        pairMsg.setText("Приглашение получено. Проверьте и нажмите «Войти»");
+        JoinFlow.confirmAndJoin(this, u, null);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (!sp.contains("profile")) consentShown = "";   // профиль мог быть забыт на экране своей ноды
         topo.setActive(true);
         String updRes = sp.getString("upd_result", "");
         if (!updRes.isEmpty()) { updView.setText(updRes); sp.edit().remove("upd_result").apply(); }
@@ -318,7 +306,7 @@ public class MainActivity extends Activity {
         Util.dbg("экран открыт");
         // режим, ради которого приложение было перезапущено (NodeLauncher): запись стирается до исполнения, цикла нет
         int pm = NodeLauncher.takePending(sp);
-        if (pm != 0 && sp.contains("profile")) applyMode(pm);
+        if (pm != 0) applyMode(pm);
         ui.post(tick);
     }
 
@@ -337,7 +325,7 @@ public class MainActivity extends Activity {
         String pubList = in.getStringExtra("pub");
         if (pubList != null) sp.edit().putString("lab_pub", pubList).apply();
         String p = in.getStringExtra("profile");
-        if (p != null) doPair(p);
+        if (p != null) JoinFlow.joinNow(this, p);
         String sel = in.getStringExtra("select");
         if (sel != null) select(sel);
         // H5: имитация сбоя нативной части при активном туннеле (процесс и VpnService живы, проверяется kill-switch)
@@ -346,7 +334,7 @@ public class MainActivity extends Activity {
         }
         if (in.getBooleanExtra("stop", false)) {
             startService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_STOP));
-        } else if (in.getBooleanExtra("auto", false) && VpnService.prepare(this) == null && !active() && !NodeLauncher.needsRestart() && sp.contains("profile")) {
+        } else if (in.getBooleanExtra("auto", false) && VpnService.prepare(this) == null && !active() && !NodeLauncher.needsRestart()) {
             startForegroundService(new Intent(this, KnotHopVpnService.class).setAction(KnotHopVpnService.A_START)
                     .putExtra(KnotHopVpnService.EXTRA_ARGS, in.getStringExtra("args") == null ? "" : in.getStringExtra("args")));
         }
@@ -361,128 +349,28 @@ public class MainActivity extends Activity {
         for (String k : new String[]{"profile", "select", "auto", "stop", "pub", "bench_mb", "routing", "routing_json", "download", "native_fail"}) in.removeExtra(k);
     }
 
-    /**
-     * R-3: после завершения зачисления приглашение (и pin в нём) бессрочно не хранится. Принятое или отклонённое приглашение
-     * заменяется записью без pin, а state/profile.txt стирается. Состояние зачисления пишет нативная часть (enrollment.json).
-     */
-
-    private AlertDialog offerDialog;
-    private long consentPollAt, retireAt;
-    private String consentShown = "";
-
-    /** Строка приглашения принята к исполнению: нода гасит пары сама. Подтверждение - перечень хешей нод (ADR 0028 §2.4). */
-    private void doPair(String text) {
-        try {
-            if (text.length() > MAX_PASTE) throw new Exception("текст длиннее " + MAX_PASTE + " символов: такого приглашения не бывает");
-            Profile pr = Profile.parse(text);
-            if (pr.nodeCount == 0) { savePair(pr); return; }
-            StringBuilder m = new StringBuilder("Телефон попросит ").append(pr.nodeCount).append(" нод принять его в сеть. Пин каждой ноды знает только она; "
-                    + "приглашение одноразовое.\n\nХеши нод (сверьте с теми, что назвал приглашающий):\n");
-            for (int i = 0; i < pr.nodeCount; i++) m.append("  ").append(fp(pr.nodeHash(i))).append('\n');
-            m.append("\nПрава вам назначит каждая нода при погашении; право управлять вами (если оно есть) будет показано отдельно, до принятия.");
-            AlertDialog d = new AlertDialog.Builder(this).setTitle("Вступить в сеть?").setMessage(m.toString().trim())
-                    .setNegativeButton("Отмена", null).setPositiveButton("Вступить", (x, w) -> savePair(pr)).show();
-            d.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
-            d.getButton(DialogInterface.BUTTON_POSITIVE).setFilterTouchesWhenObscured(true);   // F8
-        } catch (Throwable e) {
-            Util.lab("PAIR FAIL " + e);
-            pairMsg.setText("Не удалось: " + e.getMessage());
-        }
-    }
-
-    private void savePair(Profile pr) {
-        consentShown = "";
-        sp.edit().putString("profile", pr.raw).apply();
-        pairMsg.setText("");
-        profileField.setText("");
-        refresh();
-    }
-
     /** Первые 16 hex хеша, группами по 4 - для сверки глазами. */
-    private static String fp(String h) {
-        return h.length() < 16 ? h : h.substring(0, 4) + " " + h.substring(4, 8) + " " + h.substring(8, 12) + " " + h.substring(12, 16);
-    }
+    private static String fp(String h) { return JoinFlow.fp(h); }
 
     /**
-     * После полного погашения строка (и пины в ней) бессрочно не хранится: профиль заменяется на «в сети», state/profile.txt стирается.
-     * Состояние погашения - в нативной части (view.pending); опрос не чаще раза в 3 с и не на главном потоке.
+     * Раз в 3 с вне главного потока: сколько пар вступления ещё ждут погашения (view.pending; при выключенной «Сети» - с диска). Нужно для
+     * подсказки «включите Сеть». Согласия на управление телефоном больше нет: вступление никому его не даёт (ADR 0028 §2.4).
      */
-    private void retirePin() {
-        String saved = sp.getString("profile", "");
-        if (saved.isEmpty() || saved.equals(Profile.ENROLLED) || System.currentTimeMillis() - retireAt < 3000 || !active()) return;
-        retireAt = System.currentTimeMillis();
-        new Thread(() -> {
-            JSONObject v = Ctl.call(this, Ctl.req("view"));
-            JSONObject pend = v.optJSONObject("pending");
-            JSONArray c = v.optJSONArray("contacts");
-            if (pend != null && pend.optJSONArray("pairs") != null && pend.optJSONArray("pairs").length() == 0 && c != null && c.length() > 0) {
-                sp.edit().putString("profile", Profile.ENROLLED).apply();
-                new File(new File(getFilesDir(), "state"), "profile.txt").delete();
-            }
-        }, "knothop-retire").start();
-    }
-
-    /**
-     * Согласие на управление (ADR 0028 §2.4): нода выдавшего сообщила, что получит права управления этим телефоном (mgmt). Диалог показывает хеш,
-     * права, которые нода даёт мне, и права, которые получает она. Без согласия управляющий не создаётся.
-     */
-    private void pollConsent() {
-        if ((offerDialog != null && offerDialog.isShowing()) || !active() || System.currentTimeMillis() - consentPollAt < 2000) return;
-        consentPollAt = System.currentTimeMillis();
+    private void pollPending() {
+        if (System.currentTimeMillis() - pendPollAt < 3000) return;
+        pendPollAt = System.currentTimeMillis();
         new Thread(() -> {
             JSONObject v = Ctl.call(this, Ctl.req("view"));
             JSONObject pend = v.optJSONObject("pending");
             JSONArray pairs = pend == null ? null : pend.optJSONArray("pairs");
-            for (int i = 0; pairs != null && i < pairs.length(); i++) {
-                JSONObject p = pairs.optJSONObject(i);
-                if (!"consent".equals(p.optString("state"))) continue;
-                String h = p.optString("h");
-                if (!h.matches("[0-9a-f]{32}") || h.equals(consentShown)) continue;
-                consentShown = h;
-                runOnUiThread(() -> showConsent(h, p.optInt("rights"), p.optInt("mgmt"), p.optString("name")));
-                return;
-            }
-        }, "knothop-consent").start();
+            int w = 0;
+            for (int i = 0; pairs != null && i < pairs.length(); i++) if ("waiting".equals(pairs.optJSONObject(i).optString("state"))) w++;
+            pendWaiting = w;
+            pendTotal = pairs == null ? 0 : pairs.length();
+        }, "knothop-pending").start();
     }
 
-    private void showConsent(String hash, int rights, int mgmt, String name) {
-        if (Util.LAB_BUILD) { answerConsent(hash, true); return; }
-        String m = "Нода " + (name.isEmpty() ? "" : name + " ") + fp(hash) + "\n\nОна разрешает вам: " + Rights.text(rights)
-                + "\nОна получит права на этот телефон: " + Rights.text(mgmt)
-                + "\n\nПринимая, вы разрешаете этой ноде управлять вашей (меняя права и приглашения).";
-        offerDialog = new AlertDialog.Builder(this).setTitle("Принять управление?").setMessage(m).setCancelable(false)
-                .setNegativeButton("Отказать", (x, w) -> answerConsent(hash, false))
-                .setPositiveButton("Принять", (x, w) -> answerConsent(hash, true)).show();
-        offerDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
-        offerDialog.getButton(DialogInterface.BUTTON_POSITIVE).setFilterTouchesWhenObscured(true);   // F8
-    }
-
-    private void answerConsent(String hash, boolean yes) {
-        new Thread(() -> {
-            try { Ctl.call(this, Ctl.req("consent").put("hash", hash).put("yes", yes)); } catch (Exception ignored) { }
-        }, "knothop-consent-answer").start();
-    }
-
-    /**
-     * Согласие новичка (ADR 0019): нативная часть получила подписанное предложение ноды и ждёт ответа в state/enroll-consent.json.
-     * Показываем корень сети, приглашающего, права и срок из подписанного предложения; pin в файл не попадает и здесь не виден.
-     */
-
-    /** Ответ нативной части: атомарно (временный файл и переименование), только для показанного предложения. */
-
-    /** Первые 16 hex identity-хеша админа, группами по 4 - для сверки глазами с ключом администратора. */
-
-    /** identity-хеш этого телефона из whoami.json (пишет нативная часть); пусто, если ключ ещё не создан. */
-
-    /**
-     * Лаборатория (интент invite): приглашение без интерфейса, строка только в logcat. В обычной сборке не вызывается:
-     * приглашения выпускает InviteActivity.
-     */
-
-    private boolean active() {
-        String p = KnotHopVpnService.phase;
-        return !"idle".equals(p) && !"error".equals(p);
-    }
+    private boolean active() { return JoinFlow.nodeActive(); }
 
     private AlertDialog nameDialog;
 
@@ -492,7 +380,6 @@ public class MainActivity extends Activity {
      */
     private void maybeAskName() {
         if (sp.getBoolean("name_asked", false) || (nameDialog != null && nameDialog.isShowing())) return;
-        if (offerDialog != null && offerDialog.isShowing()) return;
         if (!NodeName.isAuto(getFilesDir())) { sp.edit().putBoolean("name_asked", true).apply(); return; }
         nameDialog = NodeName.dialog(this, getFilesDir(), () -> sp.edit().putBoolean("name_asked", true).apply());
     }
@@ -740,13 +627,6 @@ public class MainActivity extends Activity {
             if (res == RESULT_OK) sendMode(2);
             else { pendingMode = -1; updateModePanel(); }
         }
-        if (req == REQ_SCAN && res == RESULT_OK && data != null) {
-            String t = data.getStringExtra(ScanActivity.EXTRA_TEXT);
-            if (t != null) {
-                profileField.setText(t);
-                pairMsg.setText("QR считан. Проверьте и нажмите «Войти»");
-            }
-        }
     }
 
     /** Выбор выхода: файл select в каталоге состояния читает нативная часть. Без выбора (или пока выбранный выход недоступен) нативная часть сама берёт лучший. */
@@ -869,8 +749,8 @@ public class MainActivity extends Activity {
     private final Runnable tick = new Runnable() {
         public void run() {
             refresh();
-            pollConsent();
-            if (sp.contains("profile") && !Util.LAB_BUILD) maybeAskName();
+            pollPending();
+            if (!Util.LAB_BUILD) maybeAskName();
             ui.postDelayed(this, 1000);
         }
     };
@@ -932,24 +812,13 @@ public class MainActivity extends Activity {
     }
 
     private void refresh() {
-        retirePin();
-        String saved = sp.getString("profile", "");
-        boolean paired = sp.contains("profile");   // пустая строка - тоже настроено: «своя сеть»
-        // R-10: пока видно поле ввода приглашения, окно закрыто от скриншотов, записи экрана и превью в списке задач
-        if (paired) getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
-        else getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
-        pairBox.setVisibility(paired ? View.GONE : View.VISIBLE);
-        mainBox.setVisibility(paired ? View.VISIBLE : View.GONE);
-        topStatus.setVisibility(paired ? View.VISIBLE : View.GONE);
-        if (!paired) return;
-        try {
-            Profile pr = Profile.parse(saved);
-            adminBox.setVisibility(View.VISIBLE);   // любая нода выпускает приглашения и управляет теми, кто её принял (ADR 0028)
-            if (pr.own()) showHeader("Своя сеть: выпускайте приглашения для серверов и пользователей (подробности - за значком ? в карточке «Сеть и приглашения»)", false);
-            else if (pr.enrolled || saved.equals(Profile.ENROLLED)) showHeader("Вы вступили в сеть; права вам выдали ноды при погашении приглашения", false);
-            else showHeader("Приглашение принято к исполнению. Включите «Сеть» или «VPN» внизу: телефон свяжется с нодами и погасит пары", true);
-        } catch (Throwable e) {
-            showHeader("профиль повреждён: " + e.getMessage(), true);
+        // главный экран всегда; состояния «настроен/профиль» нет. Подсказка про вступление - из ожидающих пар ядра.
+        if (pendWaiting > 0 && !active()) {
+            showHeader("Приглашение принято к исполнению (ждут нод: " + pendWaiting + "). Включите «Сеть» или «VPN» внизу: телефон свяжется с нодами и погасит пары", true);
+        } else if (pendWaiting > 0) {
+            showHeader("Погашаю приглашение: ждут ответа нод " + pendWaiting + " из " + pendTotal, false);
+        } else {
+            header.setVisibility(View.GONE);
         }
         updateModePanel();
         // Верх экрана: что происходит сейчас, активное соединение, скорость. Остальное - в журнал (консоль внизу).
@@ -973,6 +842,7 @@ public class MainActivity extends Activity {
                 if (doing == null && !st.isEmpty() && !st.startsWith("выход:")) doing = st;   // «подключаюсь к …», «выбранный выход недоступен …»
                 JSONArray exAll = j.optJSONArray("exits");
                 nodeCount = exAll == null ? 0 : exAll.length();
+                if (nodeCount > 0) noExitsSince = 0; else if (noExitsSince == 0) noExitsSince = System.currentTimeMillis();
                 P2p.Summary ps = P2p.summary(j.optJSONArray("p2p"));
                 p2pDirect = ps.direct; p2pTotal = ps.total; p2pFailed = ps.failed;
                 exitName = cur == null ? "" : TopologyView.shortName(cur.optString("n"));
@@ -989,8 +859,11 @@ public class MainActivity extends Activity {
                     conn = c.toString();
                     logChange("соединение", conn + " (носитель - открытый сокет, не путь RNS)");
                 } else if (doing == null) {
-                    doing = p2pTotal > 0 && nodeCount == 0 ? "P2P: прямая связь с " + p2pDirect + " из " + p2pTotal + " устройств. Выход в интернет возможен только через устройство с правом EXIT"
-                            : curMode() == 1 ? "Узел работает в сети. Выходы для VPN появятся, когда нода ответит" : "Ищу выход…";
+                    doing = curMode() == 1 ? "Узел работает в сети. Выходы для VPN появятся, когда нода ответит" : "Ищу выход…";
+                }
+                // выходов нет вовсе (только P2P-контакты или пустая таблица): выбора нет, «восстанавливаю путь к выбранной ноде» неверно
+                if (cur == null && noExits() && (doing == null || !doing.startsWith("Сбой"))) {
+                    doing = "Выходов пока нет" + (p2pTotal > 0 ? "\nP2P: прямая связь с " + p2pDirect + " из " + p2pTotal + " устройств" : "");
                 }
                 if (pinned.matches("[0-9a-fA-F]{32}") && (cur == null || !pinned.equalsIgnoreCase(cur.optString("d")))) logChange("выбор", "выбран вами " + pinned.substring(0, 8) + ", подключаюсь");
                 updateBenchUi(state, j, cur);
@@ -1012,6 +885,7 @@ public class MainActivity extends Activity {
             }
         } else {
             nodeCount = 0; p2pDirect = 0; p2pTotal = 0; p2pFailed = 0;
+            noExitsSince = 0;
             exitName = "";
             prevTs = 0;
             rUp = rDown = 0;
@@ -1026,6 +900,9 @@ public class MainActivity extends Activity {
         if (s.length() > 0) s.setLength(s.length() - 1);
         status.setText(s);
         status.setVisibility(s.length() == 0 ? View.GONE : View.VISIBLE);
+        boolean noEx = noExits();
+        noExitHelp.setVisibility(noEx ? View.VISIBLE : View.GONE);
+        exitsNote.setVisibility(noEx && active() ? View.VISIBLE : View.GONE);
         stateCard.setVisibility(s.length() == 0 ? View.GONE : View.VISIBLE);
         showState(doing != null && doing.startsWith("Сбой") ? doing : null);
         Util.lab("STATUS " + s.toString().replace("\n", " | "));
@@ -1033,6 +910,11 @@ public class MainActivity extends Activity {
         String[] lines = Util.mergedLog(log);
         logConsole.setLines(lines);
         if (lines.length > 0) Util.lab("LOG " + lines[lines.length - 1]);
+    }
+
+    /** Нет нод с правом выхода уже ≥10 с по свежему статусу (при запуске таблица выходов появляется не сразу). */
+    private boolean noExits() {
+        return noExitsSince != 0 && System.currentTimeMillis() - noExitsSince >= 10_000;
     }
 
     private static String nodesWord(int n) {
@@ -1060,6 +942,7 @@ public class MainActivity extends Activity {
             else if (p2pTotal > 0) { t = "Сеть: P2P " + p2pDirect + " из " + p2pTotal + (p2pFailed > 0 ? " · не удалось: " + p2pFailed : ""); col = ModeSlider.COLORS[1]; }
             else { t = "Сеть: подключаюсь…"; col = ModeSlider.COLORS[1]; }
         } else if (!exitName.isEmpty() && "up".equals(KnotHopVpnService.phase)) { t = "VPN: " + exitName; col = ModeSlider.COLORS[2]; }
+        else if (noExits()) { t = "VPN: выходов нет, трафик не идёт"; col = ModeSlider.COLORS[1]; }
         else { t = "VPN: подключаюсь…"; col = ModeSlider.COLORS[1]; }
         topStatus.setText(t);
         topStatus.setTextColor(col);

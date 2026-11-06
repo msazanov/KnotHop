@@ -28,6 +28,15 @@ final class P2p {
         return s;
     }
 
+    /** Имя контакта (если есть) и короткий хеш: «pixel  aabbccdd»; без имени - только хеш. */
+    static String label(JSONObject e) {
+        String n = Rights.clip(e.optString("n", ""));
+        String id = e.optString("id", "");
+        String h = id.length() >= 8 ? id.substring(0, 8) : "";
+        if (n.isEmpty() || "?".equals(n) || n.equals(h)) return h.isEmpty() ? "?" : h;
+        return h.isEmpty() ? n : n + "  " + h;
+    }
+
     static String name(JSONObject e) {
         String n = Rights.clip(e.optString("n", ""));
         String id = e.optString("id", "");
@@ -39,7 +48,7 @@ final class P2p {
     static String text(JSONObject e) {
         String who = name(e);
         switch (e.optString("state")) {
-            case "direct": return "Прямое соединение установлено (QUIC" + (e.isNull("rtt_ms") ? "" : ", " + Math.round(e.optDouble("rtt_ms")) + " мс") + ")";
+            case "direct": return "Прямое соединение установлено (QUIC" + (e.optBoolean("lan") ? ", локальная сеть" : "") + (e.isNull("rtt_ms") ? "" : ", " + Math.round(e.optDouble("rtt_ms")) + " мс") + ")";
             case "no_addr": return "Прямое соединение с " + who + " не удалось: нет адреса";
             case "unreachable": return "Прямое соединение с " + who + " не удалось: не отвечает: устройства за NAT, нужен узел-посредник или IPv6";
             default: return "Пробую прямое соединение с " + who + "…";
@@ -57,9 +66,9 @@ final class P2p {
     }
 
     /** Две короткие строки под узлом графа: {второй ряд, третий ряд}. */
-    static String[] graphLines(String state, double rtt) {
+    static String[] graphLines(String state, double rtt, boolean lan) {
         switch (state) {
-            case "direct": return new String[]{"прямое QUIC" + (rtt >= 0 ? ", " + Math.round(rtt) + " мс" : ""), "выход — только при EXIT"};
+            case "direct": return new String[]{"прямое QUIC" + (lan ? " (локальная сеть)" : "") + (rtt >= 0 ? ", " + Math.round(rtt) + " мс" : ""), "выход — только при EXIT"};
             case "no_addr": return new String[]{"прямое не удалось: нет адреса", ""};
             case "unreachable": return new String[]{"прямое не удалось: не отвечает", "за NAT: нужен посредник или IPv6"};
             default: return new String[]{"пробую прямое соединение…", ""};

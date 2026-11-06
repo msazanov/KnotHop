@@ -314,8 +314,29 @@ pub mod knothop {
         DROPPED.load(Relaxed)
     }
 
+    /// Exact destination IPs the application explicitly allowed per peer (LAN hints of a known contact that passed the application's
+    /// "same connected subnet" check at dial time). Not a subnet allowance: other private addresses stay blocked.
+    static ALLOW: std::sync::RwLock<Vec<([u8; 32], Vec<IpAddr>)>> = std::sync::RwLock::new(Vec::new());
+    const ALLOW_PEERS: usize = 64;
+    const ALLOW_IPS: usize = 8;
+
+    /// Replace the allowed private destinations of `peer` (empty list removes the entry). At most 64 peers and 8 addresses each.
+    pub fn set_egress_allow(peer: [u8; 32], ips: Vec<IpAddr>) {
+        let ips: Vec<IpAddr> = ips.into_iter().map(|i| i.to_canonical()).take(ALLOW_IPS).collect();
+        let Ok(mut g) = ALLOW.write() else { return };
+        g.retain(|(k, _)| *k != peer);
+        if !ips.is_empty() && g.len() < ALLOW_PEERS {
+            g.push((peer, ips));
+        }
+    }
+
+    fn allowed(ip: &IpAddr) -> bool {
+        ALLOW.read().map(|g| g.iter().any(|(_, v)| v.contains(ip))).unwrap_or(false)
+    }
+
     pub(crate) fn blocked(ip: &IpAddr) -> bool {
-        if !BLOCK.load(Relaxed) || is_global(&ip.to_canonical()) {
+        let ip = ip.to_canonical();
+        if !BLOCK.load(Relaxed) || is_global(&ip) || allowed(&ip) {
             return false;
         }
         DROPPED.fetch_add(1, Relaxed);

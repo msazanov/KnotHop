@@ -13,33 +13,34 @@ final class Rights {
         "доступ к службам самого сервера (только выдаёт админ)"};
     static final int USER = USE, SERVER = USE, ADMIN = CONFIG | ADD | REMOVE | USE;
 
-    /** Пресеты приглашения: только заполняют права; логика выпуска одна для всех (стопка пар по выбранным нодам). */
-    static final int P_SERVER = 0, P_USER = 1, P_ADMIN = 2, P_CUSTOM = 3;
-    static final String[] PRESET_NAMES = {"Сервер", "Пользователь", "Админ", "Свои"};
+    /**
+     * Пресеты приглашения: только заполняют права получателя НА ВЫПУСТИВШЕЙ НОДЕ (ADR 0028 §1.4); второго набора («управление получателем») нет.
+     * «Сервер» по правам совпадает с «Пользователем» (USE): отличие в подсказке - сервер при первом запуске по этой строке сам признаёт
+     * выдавшего админом (это свойство запуска сервера с --invite-file, а не прав в приглашении).
+     */
+    static final int P_USER = 0, P_SERVER = 1, P_ADMIN = 2, P_CUSTOM = 3;
+    static final String[] PRESET_NAMES = {"Пользователь", "Сервер", "Админ", "Свои"};
     static final String[] PRESET_HINTS = {
-        "новая нода: пользуется выбранными нодами (USE), а этот телефон получает над ней управление (CONFIG, ADD, REMOVE, USE)",
         "телефон или ПК: пользуется выбранными нодами (USE); выход в интернет — свойство самой ноды",
+        "новая нода: пользуется выбранными нодами (USE). Сервер по этой строке при первом запуске признает вас админом",
         "второй админ: CONFIG, ADD, REMOVE и USE на выбранных нодах",
         "права выставлены вручную"};
 
     private Rights() { }
 
-    /** Права получателя на выбранных нодах для пресета ({@link #P_CUSTOM}: 0 - значение остаётся ручным). */
+    /** Права получателя на выпустившей ноде для пресета ({@link #P_CUSTOM}: 0 - значение остаётся ручным). */
     static int presetRights(int preset) {
         switch (preset) {
-            case P_SERVER: return SERVER;
             case P_USER: return USER;
+            case P_SERVER: return SERVER;
             case P_ADMIN: return ADMIN;
             default: return 0;
         }
     }
 
-    /** Управление получателем для выдавшего (этот телефон): только у «Сервера». */
-    static int presetMgmt(int preset) { return preset == P_SERVER ? ADMIN : 0; }
-
-    /** Пресет, которому соответствуют права; иначе «Свои». */
-    static int presetFor(int rights, int mgmt) {
-        for (int p = P_SERVER; p <= P_ADMIN; p++) if (presetRights(p) == rights && presetMgmt(p) == mgmt) return p;
+    /** Пресет, которому соответствуют права; иначе «Свои». При равных правах («Пользователь» и «Сервер») берётся «Пользователь». */
+    static int presetFor(int rights) {
+        for (int p = P_USER; p <= P_ADMIN; p++) if (presetRights(p) == rights) return p;
         return P_CUSTOM;
     }
 

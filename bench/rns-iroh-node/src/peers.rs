@@ -46,18 +46,29 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_HINTS: usize = 3;
 const MAX_NAME: usize = 48;
 
-/// Не больше `max` адресов-подсказок с сохранением порядка, но если в списке есть и IPv4, и IPv6 - минимум по одному каждого семейства
-/// (иначе три IPv4 вытесняют глобальный IPv6, а он часто единственный путь без NAT). Имена `host:порт` идут как IPv4.
+/// Подсказок на контакт (глобальные IPv4/IPv6 и локальная сеть IPv4/ULA); у серверов и в анонсе остаётся `MAX_HINTS`.
+pub const MAX_CONTACT_HINTS: usize = 6;
+
+/// Не больше `max` адресов-подсказок с сохранением порядка, но минимум по одному адресу каждого вида (IPv4/IPv6 × глобальный/локальная
+/// сеть), если они есть: иначе три глобальных IPv4 вытесняют IPv6, а он часто единственный путь без NAT, и локальный адрес не доезжает.
+/// Имена `host:порт` идут как глобальный IPv4. Порядок отправителя сохраняется (глобальные у него первыми).
 pub fn balance_hints(list: Vec<String>, max: usize) -> Vec<String> {
-    let is6 = |a: &str| a.parse::<std::net::SocketAddr>().map(|s| s.is_ipv6()).unwrap_or(false);
+    let kind = |a: &str| -> u8 {
+        match a.parse::<std::net::SocketAddr>() {
+            Ok(s) => (s.is_ipv6() as u8) | (!crate::vpn::is_global_ip(&s.ip()) as u8) << 1,
+            Err(_) => 0,
+        }
+    };
     let mut seen = std::collections::HashSet::new();
     let list: Vec<String> = list.into_iter().filter(|a| seen.insert(a.clone())).collect();
     if list.len() <= max || max < 2 {
         return list.into_iter().take(max).collect();
     }
-    let first6 = list.iter().position(|a| is6(a));
-    let first4 = list.iter().position(|a| !is6(a));
-    let mut keep: Vec<usize> = [first4, first6].into_iter().flatten().collect();
+    let mut keep: Vec<usize> = Vec::new();
+    let mut kinds = std::collections::HashSet::new();
+    for (i, a) in list.iter().enumerate() {
+        if keep.len() < max && kinds.insert(kind(a)) { keep.push(i); }
+    }
     for i in 0..list.len() {
         if keep.len() >= max { break; }
         if !keep.contains(&i) { keep.push(i); }
@@ -237,8 +248,6 @@ pub struct Invite {
     pub key: [u8; 32],
     /// что получит принявший на этой ноде
     pub rights: u16,
-    /// что получит выдавший на принявшем
-    pub mgmt: u16,
     pub created: u64,
     pub expires: u64,
     /// `local` или hex хеша админа, сообщившего «ожидай»
@@ -280,7 +289,7 @@ pub enum Applied {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Redeem {
     /// Приглашение погашено сейчас (или повтор тем же ключом): отправить `accept`.
-    Accepted { rights: u16, mgmt: u16, name: String, fresh: bool },
+    Accepted { rights: u16, name: String, fresh: bool },
     /// Пруф верен, но пин уже погашен другим ключом.
     Used,
     /// Известный pid, неверный пруф: считается в fail2ban, состояние не меняется.
@@ -351,7 +360,7 @@ impl Peers {
         }
         for c in v["contacts"].as_array().ok_or_else(|| anyhow!("peers.json: нет contacts"))? {
             let pk = pk_of(&c["pk"])?;
-            let hints = c["hints"].as_array().map(|a| balance_hints(a.iter().filter_map(|x| x.as_str().map(String::from)).collect(), MAX_HINTS)).unwrap_or_default();
+            let hints = c["hints"].as_array().map(|a| balance_hints(a.iter().filter_map(|x| x.as_str().map(String::from)).collect(), MAX_CONTACT_HINTS)).unwrap_or_default();
             let e = Contact { pk, name: sane_name(&s(c, "name")), hints, intro_by: s(c, "intro_by"), they_grant: (c["they_grant"].as_u64().unwrap_or(0) as u16) & KNOWN, roles: (c["roles"].as_u64().unwrap_or(0) as u16) & (TRANSIT | EXIT), rl: c["rl"].clone(), at: c["at"].as_u64().unwrap_or(0), client: c["client"].as_bool().unwrap_or(false) };
             t.contacts.insert(hash_of(&pk).unwrap(), e);
         }
@@ -367,7 +376,7 @@ impl Peers {
                 _ => bail!("peers.json: state приглашения"),
             };
             let inv = Invite {
-                pid, key, rights: (i["rights"].as_u64().unwrap_or(0) as u16) & KNOWN, mgmt: (i["mgmt"].as_u64().unwrap_or(0) as u16) & KNOWN,
+                pid, key, rights: (i["rights"].as_u64().unwrap_or(0) as u16) & KNOWN,
                 created: i["created"].as_u64().unwrap_or(0), expires: i["expires"].as_u64().unwrap_or(0), issuer: s(i, "issuer"), state,
             };
             if !is_hash_str(&inv.issuer) || t.invites.insert(pid, inv).is_some() {
@@ -385,7 +394,7 @@ impl Peers {
         let peers: Vec<_> = self.peers.values().map(|p| serde_json::json!({"pk": hex(&p.pk), "rights": p.rights, "by": p.by, "seq": p.seq, "at": p.at, "name": p.name})).collect();
         let contacts: Vec<_> = self.contacts.values().map(|c| serde_json::json!({"pk": hex(&c.pk), "name": c.name, "hints": c.hints, "intro_by": c.intro_by, "they_grant": c.they_grant, "roles": c.roles, "at": c.at, "rl": c.rl, "client": c.client})).collect();
         let invites: Vec<_> = self.invites.values().map(|i| {
-            let mut j = serde_json::json!({"pid": hex(&i.pid), "key": hex(&i.key), "rights": i.rights, "mgmt": i.mgmt, "created": i.created, "expires": i.expires, "issuer": i.issuer});
+            let mut j = serde_json::json!({"pid": hex(&i.pid), "key": hex(&i.key), "rights": i.rights, "created": i.created, "expires": i.expires, "issuer": i.issuer});
             match &i.state {
                 InviteState::Open => j["state"] = "open".into(),
                 InviteState::Redeemed { pk, at } => { j["state"] = "redeemed".into(); j["pk"] = hex(pk).into(); j["rat"] = (*at).into(); }
@@ -693,27 +702,27 @@ impl Peers {
 
     /// Выпуск приглашения на этой ноде: Local — сам, иначе `invite.add` от актора с ADD/CONFIG (`rights ⊆` своих).
     /// Повтор с тем же ключом идемпотентен; тот же pid с другим ключом отвергается.
-    pub fn invite_add(&mut self, actor: &Actor, pid: Pid, key: [u8; 32], rights: u16, mgmt: u16, expires_in_ms: u64, now: u64) -> std::result::Result<Applied, Reject> {
+    pub fn invite_add(&mut self, actor: &Actor, pid: Pid, key: [u8; 32], rights: u16, expires_in_ms: u64, now: u64) -> std::result::Result<Applied, Reject> {
         let auth = self.authority(actor);
         if *actor != Actor::Local && auth & (ADD | CONFIG) == 0 {
             return Err("no_authority");
         }
         let full = *actor == Actor::Local || auth & CONFIG != 0;
-        if rights == 0 && mgmt == 0 || (rights | mgmt) & !KNOWN != 0 {
+        if rights == 0 || rights & !KNOWN != 0 {
             return Err("bad_rights");
         }
-        if !full && (rights & CONFIG_ONLY != 0 || rights & !auth != 0 || mgmt != 0) {
+        if !full && (rights & CONFIG_ONLY != 0 || rights & !auth != 0) {
             return Err("rights_exceed");
         }
         let issuer = actor.label();
         if let Some(old) = self.invites.get(&pid) {
-            return if old.key == key && old.rights == rights && old.mgmt == mgmt && old.issuer == issuer { Ok(Applied::Unchanged) } else { Err("exists") };
+            return if old.key == key && old.rights == rights && old.issuer == issuer { Ok(Applied::Unchanged) } else { Err("exists") };
         }
         if self.open_count(None) >= MAX_INVITES_OPEN || self.open_count(Some(&issuer)) >= MAX_INVITES_PER_ISSUER || self.invites.len() >= 4 * MAX_INVITES_OPEN {
             return Err("full");
         }
         let ttl = expires_in_ms.clamp(60_000, INVITE_MAX_MS);
-        self.invites.insert(pid, Invite { pid, key, rights, mgmt, created: now, expires: now + ttl, issuer, state: InviteState::Open });
+        self.invites.insert(pid, Invite { pid, key, rights, created: now, expires: now + ttl, issuer, state: InviteState::Open });
         Ok(Applied::Changed)
     }
 
@@ -754,7 +763,7 @@ impl Peers {
         }
         let name = sane_name(name);
         if same {
-            return Redeem::Accepted { rights: inv.rights, mgmt: inv.mgmt, name, fresh: false };
+            return Redeem::Accepted { rights: inv.rights, name, fresh: false };
         }
         if inv.state != InviteState::Open {
             return Redeem::Used;
@@ -781,7 +790,7 @@ impl Peers {
             return Redeem::Silent;
         }
         self.bump();
-        Redeem::Accepted { rights: inv.rights, mgmt: inv.mgmt, name, fresh: true }
+        Redeem::Accepted { rights: inv.rights, name, fresh: true }
     }
 
     /// `ack` получателя: погашено полностью. Возвращает, изменилось ли состояние.
@@ -828,7 +837,7 @@ impl Peers {
         let client = old.is_some_and(|o| o.client);
         let name = sane_name(name);
         let name = if name.is_empty() { old.map(|o| o.name.clone()).unwrap_or_default() } else { name };
-        let hints = if hints.is_empty() { old.map(|o| o.hints.clone()).unwrap_or_default() } else { balance_hints(hints, MAX_HINTS) };
+        let hints = if hints.is_empty() { old.map(|o| o.hints.clone()).unwrap_or_default() } else { balance_hints(hints, MAX_CONTACT_HINTS) };
         let intro_by = old.filter(|o| o.intro_by != "invite" && intro_by == "invite").map_or(intro_by.to_string(), |o| o.intro_by.clone());
         self.contacts.insert(h, Contact { pk, name, hints, intro_by, they_grant: they_grant & KNOWN, roles: roles & (TRANSIT | EXIT), at: now, rl, client });
         Ok(())
@@ -849,7 +858,7 @@ impl Peers {
 
     /// Новые адреса-подсказки известного контакта (сообщение `addr`). false - контакта нет, список пуст или не изменился.
     pub fn contact_set_hints(&mut self, h: &Hash, hints: Vec<String>) -> bool {
-        let hints = balance_hints(hints, MAX_HINTS);
+        let hints = balance_hints(hints, MAX_CONTACT_HINTS);
         match self.contacts.get_mut(h) {
             Some(c) if !hints.is_empty() && c.hints != hints => { c.hints = hints; true }
             _ => false,
@@ -861,21 +870,25 @@ impl Peers {
         self.contacts.remove(h).is_some()
     }
 
-    /// Результат погашения у ПОЛУЧАТЕЛЯ (`accept` проверен): контакт и, если `mgmt != 0`, управляющий — выдавший.
     /// Запомнить подсказку REALITY контакта. Ограничена по размеру; нет контакта или слишком большая — ничего не меняется.
     pub fn contact_rl(&mut self, pk: &Pk, rl: &serde_json::Value) {
         if rl.is_null() || rl.to_string().len() > 256 { return; }
         if let Some(c) = hash_of(pk).and_then(|h| self.contacts.get_mut(&h)) { c.rl = rl.clone(); }
     }
 
-    pub fn accepted(&mut self, pk_h: Pk, name: &str, hints: Vec<String>, they_grant: u16, roles: u16, mgmt: u16, now: u64) -> std::result::Result<(), Reject> {
+    /// Результат погашения у ПОЛУЧАТЕЛЯ (`accept` проверен): только контакт. Телефон и клиент никому управления собой не дают.
+    /// Управляющий появляется лишь через `adopt_controller` (сервер, первый запуск с `--invite-file`).
+    pub fn accepted(&mut self, pk_h: Pk, name: &str, hints: Vec<String>, they_grant: u16, roles: u16, now: u64) -> std::result::Result<(), Reject> {
+        self.contact_set(pk_h, name, hints, "invite", they_grant, roles, now)
+    }
+
+    /// Сервер при первом запуске по приглашению: выдавший становится управляющим (`PRESET_ADMIN`). Вызывает только `invite::settle`
+    /// после проверки подписи LXMF и MAC `accept`, и только для пар, помеченных при `--invite-file`.
+    pub fn adopt_controller(&mut self, pk_h: Pk, name: &str, now: u64) -> std::result::Result<(), Reject> {
         let h = hash_of(&pk_h).ok_or("bad_target")?;
-        self.contact_set(pk_h, name, hints, "invite", they_grant, roles, now)?;
-        if mgmt != 0 {
-            let seq = self.peers.get(&h).map_or(now, |o| o.seq + 1).max(now);
-            self.peers.insert(h, Peer { pk: pk_h, rights: mgmt & KNOWN, by: "invite:accept".into(), seq, at: now, name: sane_name(name) });
-            self.bump();
-        }
+        let seq = self.peers.get(&h).map_or(now, |o| o.seq + 1).max(now);
+        self.peers.insert(h, Peer { pk: pk_h, rights: PRESET_ADMIN & KNOWN, by: "invite:accept".into(), seq, at: now, name: sane_name(name) });
+        self.bump();
         Ok(())
     }
 
@@ -888,7 +901,7 @@ impl Peers {
             "controllers": self.controllers().iter().filter_map(|p| hash_of(p)).map(|h| hex(&h)).collect::<Vec<_>>(),
             "peers": list(&|_| true),
             "invites": self.invites.values().map(|i| serde_json::json!({
-                "pid": hex(&i.pid), "rights": i.rights, "mgmt": i.mgmt, "expires": i.expires, "issuer": i.issuer, "left_s": i.expires.saturating_sub(now) / 1000,
+                "pid": hex(&i.pid), "rights": i.rights, "expires": i.expires, "issuer": i.issuer, "left_s": i.expires.saturating_sub(now) / 1000,
                 "state": match &i.state { InviteState::Open => "open", InviteState::Redeemed { .. } => "redeemed", InviteState::Settled => "settled", InviteState::Cancelled => "cancelled", InviteState::Expired => "expired" },
                 "by": match &i.state { InviteState::Redeemed { pk, .. } => hash_of(pk).map(|h| hex(&h)), _ => None },
             })).collect::<Vec<_>>(),
@@ -926,7 +939,7 @@ mod tests {
     fn open_invite(t: &mut Peers, rights: u16) -> ([u8; 16], Pid) {
         let pin = [7u8; 16];
         let pid = pin_id(&pin);
-        t.invite_add(&Actor::Local, pid, pin_key(&pin), rights, 0, INVITE_DEFAULT_MS, T0).unwrap();
+        t.invite_add(&Actor::Local, pid, pin_key(&pin), rights, INVITE_DEFAULT_MS, T0).unwrap();
         (pin, pid)
     }
     fn good(pin: [u8; 16]) -> impl FnOnce(&[u8; 32]) -> bool {
@@ -971,9 +984,9 @@ mod tests {
         let (pin, pid) = open_invite(&mut t, USE | EXIT);
         let (_, n) = ident();
         let r = t.redeem(&pid, &n, "phone", T0 + 1, good(pin));
-        assert_eq!(r, Redeem::Accepted { rights: USE | EXIT, mgmt: 0, name: "phone".into(), fresh: true });
+        assert_eq!(r, Redeem::Accepted { rights: USE | EXIT, name: "phone".into(), fresh: true });
         assert_eq!(t.rights(&hh(&n)), USE | EXIT);
-        assert_eq!(t.redeem(&pid, &n, "phone", T0 + 2, good(pin)), Redeem::Accepted { rights: USE | EXIT, mgmt: 0, name: "phone".into(), fresh: false });
+        assert_eq!(t.redeem(&pid, &n, "phone", T0 + 2, good(pin)), Redeem::Accepted { rights: USE | EXIT, name: "phone".into(), fresh: false });
         assert!(t.invite_settle(&pid, &n));
         assert_eq!(t.invite(&pid).unwrap().state, InviteState::Settled);
     }
@@ -995,7 +1008,7 @@ mod tests {
         let t = Arc::new(Mutex::new(t));
         let pin = [9u8; 16];
         let pid = pin_id(&pin);
-        t.lock().unwrap().invite_add(&Actor::Local, pid, pin_key(&pin), USE, 0, INVITE_DEFAULT_MS, T0).unwrap();
+        t.lock().unwrap().invite_add(&Actor::Local, pid, pin_key(&pin), USE, INVITE_DEFAULT_MS, T0).unwrap();
         let wins = Arc::new(AtomicU64::new(0));
         let hs: Vec<_> = (0..16).map(|_| {
             let (t, wins) = (t.clone(), wins.clone());
@@ -1249,17 +1262,17 @@ mod tests {
         let a = Actor::Peer(hh(&adder));
         for i in 0..MAX_INVITES_PER_ISSUER {
             let pid = [i as u8 + 1; 8];
-            t.invite_add(&a, pid, [1; 32], USE, 0, 1000, T0).unwrap();
+            t.invite_add(&a, pid, [1; 32], USE, 1000, T0).unwrap();
         }
-        assert_eq!(t.invite_add(&a, [99; 8], [1; 32], USE, 0, 1000, T0), Err("full"));
+        assert_eq!(t.invite_add(&a, [99; 8], [1; 32], USE, 1000, T0), Err("full"));
         for k in 0..(MAX_INVITES_OPEN / MAX_INVITES_PER_ISSUER - 1) {
             let (_, more) = ident();
             t.peer_set(&Actor::Local, more, USE | ADD, "", T0, T0).unwrap();
             for i in 0..MAX_INVITES_PER_ISSUER {
-                t.invite_add(&Actor::Peer(hh(&more)), [(100 + k * 20 + i) as u8; 8], [1; 32], USE, 0, 1000, T0).unwrap();
+                t.invite_add(&Actor::Peer(hh(&more)), [(100 + k * 20 + i) as u8; 8], [1; 32], USE, 1000, T0).unwrap();
             }
         }
-        assert_eq!(t.invite_add(&Actor::Local, [250; 8], [1; 32], USE, 0, 1000, T0), Err("full"));
+        assert_eq!(t.invite_add(&Actor::Local, [250; 8], [1; 32], USE, 1000, T0), Err("full"));
     }
 
     #[test]
@@ -1268,14 +1281,13 @@ mod tests {
         let (_, adder) = ident();
         t.peer_set(&Actor::Local, adder, USE | ADD, "", T0, T0).unwrap();
         let a = Actor::Peer(hh(&adder));
-        assert_eq!(t.invite_add(&a, [1; 8], [1; 32], USE | EXIT, 0, 1000, T0), Err("rights_exceed"));
-        assert_eq!(t.invite_add(&a, [1; 8], [1; 32], USE, USE, 1000, T0), Err("rights_exceed"), "mgmt только Local/CONFIG");
-        assert_eq!(t.invite_add(&a, [1; 8], [1; 32], USE, 0, u64::MAX, T0), Ok(Applied::Changed));
+        assert_eq!(t.invite_add(&a, [1; 8], [1; 32], USE | EXIT, 1000, T0), Err("rights_exceed"));
+        assert_eq!(t.invite_add(&a, [1; 8], [1; 32], USE, u64::MAX, T0), Ok(Applied::Changed));
         assert_eq!(t.invite([1; 8].as_ref().try_into().as_ref().unwrap()).unwrap().expires, T0 + INVITE_MAX_MS);
-        assert_eq!(t.invite_add(&a, [1; 8], [1; 32], USE, 0, 1000, T0), Ok(Applied::Unchanged), "повтор команды идемпотентен");
-        assert_eq!(t.invite_add(&a, [1; 8], [2; 32], USE, 0, 1000, T0), Err("exists"), "тот же pid, другой ключ");
+        assert_eq!(t.invite_add(&a, [1; 8], [1; 32], USE, 1000, T0), Ok(Applied::Unchanged), "повтор команды идемпотентен");
+        assert_eq!(t.invite_add(&a, [1; 8], [2; 32], USE, 1000, T0), Err("exists"), "тот же pid, другой ключ");
         let (_, stranger) = ident();
-        assert_eq!(t.invite_add(&Actor::Peer(hh(&stranger)), [2; 8], [1; 32], USE, 0, 1000, T0), Err("no_authority"));
+        assert_eq!(t.invite_add(&Actor::Peer(hh(&stranger)), [2; 8], [1; 32], USE, 1000, T0), Err("no_authority"));
         // отмена: выдавший или CONFIG
         assert_eq!(t.invite_cancel(&Actor::Peer(hh(&stranger)), &[1; 8]), Err("no_authority"));
         assert_eq!(t.invite_cancel(&a, &[1; 8]), Ok(Applied::Changed));
@@ -1327,10 +1339,12 @@ mod tests {
     }
 
     #[test]
-    fn contact_removal_keeps_what_i_granted_and_accepted_makes_issuer_controller() {
+    fn contact_removal_keeps_what_i_granted_and_adopt_makes_issuer_controller() {
         let (mut t, _) = table();
         let (_, h) = ident();
-        t.accepted(h, "srv", vec![], USE, EXIT, PRESET_ADMIN, T0).unwrap();
+        t.accepted(h, "srv", vec![], USE, EXIT, T0).unwrap();
+        assert_eq!(t.rights(&hh(&h)), 0, "accepted сам управления не даёт");
+        t.adopt_controller(h, "srv", T0).unwrap();
         assert_eq!(t.rights(&hh(&h)), PRESET_ADMIN, "выдавший управляет принявшим");
         assert_eq!(t.contact(&hh(&h)).unwrap().they_grant, USE);
         assert_eq!(t.contact(&hh(&h)).unwrap().roles, EXIT);

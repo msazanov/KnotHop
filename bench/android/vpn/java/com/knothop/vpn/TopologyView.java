@@ -43,6 +43,7 @@ final class TopologyView extends View {
         String rules = "", extraVia = "";
         boolean extraLink, extraFlow, extraPathKnown;
         int ra;                         // сколько выходов сообщают, что видят узел живым соседом
+        boolean p2pLan;                 // прямой путь идёт по локальной сети
         String p2p = "";                // P2P-контакт без ролей: direct | no_addr | unreachable | trying, "" - обычная нода
         String vis = "", nh = "";       // путь RNS (R8): direct | via | none, "" - поля нет; nh - dest следующего хопа при via, "" - неизвестно
         float x, y;
@@ -74,6 +75,8 @@ final class TopologyView extends View {
     private static final long SETTLE_MS = 8000;
     private String layoutKey = "";
     private boolean active = true;
+    /** Узел выключен (status «idle»): на пустом графе пишем это, а не «ждём таблицу». */
+    private boolean idle;
     private String phoneLabel = "";
     private boolean up;
     private double phoneRtt = -1;
@@ -165,6 +168,7 @@ final class TopologyView extends View {
     void update(JSONObject st) {
         List<Node> fresh = new ArrayList<>();
         up = "up".equals(st.optString("state"));
+        idle = "idle".equals(st.optString("state"));
         phoneLabel = st.optString("ip", "");
         JSONObject cur = st.optJSONObject("current");
         viaDest = cur != null && !cur.isNull("via") ? cur.optString("via", "") : "";
@@ -227,6 +231,7 @@ final class TopologyView extends View {
             n.name = P2p.name(e);
             n.dest = e.optString("d");
             n.p2p = e.optString("state", "trying");
+            n.p2pLan = e.optBoolean("lan", false);
             n.state = "p2p";
             boolean direct = "direct".equals(n.p2p);
             n.visible = direct;
@@ -675,7 +680,7 @@ final class TopologyView extends View {
             else if (n.visible) { l2 = "носитель " + carrierName(n.carrier); if (n.hops >= 0) l3 = "путь RNS " + n.hops + " хоп"; }
             else l2 = n.ra > 0 ? "видят другие узлы" : "нет свежих данных";
             if (n.extraLink) l2 = n.extraFlow ? "трафик по правилам" : "дополнительный Link";
-            if (!n.p2p.isEmpty()) { String[] pl = P2p.graphLines(n.p2p, n.rtt); l2 = pl[0]; l3 = pl[1]; }
+            if (!n.p2p.isEmpty()) { String[] pl = P2p.graphLines(n.p2p, n.rtt, n.p2pLan); l2 = pl[0]; l3 = pl[1]; }
             if (!n.rules.isEmpty()) l3 = n.rules + (n.extraLink || isCur ? "" : " · ожидает Link");
             t.setTextSize(11 * d); h.setTextSize(11 * d);
             h.setTextAlign(Paint.Align.CENTER);
@@ -705,7 +710,11 @@ final class TopologyView extends View {
         if (ns.isEmpty()) {
             t.setColor(Ui.ink(getContext(), 0xFF888888));
             t.setTextSize(13 * d);
-            c.drawText("ждём таблицу выходов…", px, py + 70 * d, t);
+            // не «ждём таблицу выходов…» бесконечно: узел выключен либо нод с правом выхода нет
+            String m1 = idle ? "Узел выключен: включите «Сеть» внизу" : "Нет нод с правом выхода",
+                    m2 = idle ? null : "Вступите по приглашению";
+            c.drawText(m1, px, py + 70 * d, t);
+            if (m2 != null) c.drawText(m2, px, py + 88 * d, t);
         }
         if (animate && active) postInvalidateDelayed(33); else lastFrame = 0;
     }

@@ -9,27 +9,20 @@ import java.util.Arrays;
 /**
  * Строка приглашения ADR 0028 §2.1: base64url без «=» и без префикса, тело ver(1)=1 | n(1)=1..8 | n x [хеш ноды(16) | pin(16)] | ck(4),
  * ck = sha256("knothop-invite-v5" + тело)[..4]. Права, срок и ключи в строке не лежат. Пины нативная часть читает сама; здесь только разбор,
- * число нод и проверка опечаток. Старые форматы (kh-, khs-) не принимаются.
+ * число нод и проверка опечаток. Состояния «настроен/своя сеть» нет. Старые форматы (kh-, khs-) не принимаются.
  */
 final class Profile {
     final String raw;
     /** Число нод приглашения (1..8). */
     int nodeCount;
-    /** Приглашение уже погашено и стёрто: профиль «в сети». */
-    boolean enrolled;
 
-    /** Пустой профиль = «своя сеть»: приглашения нет, телефон сам выпускает приглашения. */
-    static final String OWN = "own";
-    /** Погашено полностью (pin больше нигде не хранится). */
-    static final String ENROLLED = "enrolled";
     /** Ссылка из QR/обёртки ОС: knothop://i/<строка>. */
     static final String LINK = "knothop://i/";
     static final int MAX_CHARS = 4096;
 
-    boolean own() { return raw.isEmpty() && !enrolled; }
-
     private Profile(String raw) { this.raw = raw; }
 
+    /** Разобрать строку или ссылку приглашения. Пустая строка и пустая ссылка `knothop://i/` - не приглашение (своей сети тоже нет: любая нода сама себе админ). */
     static Profile parse(String text) throws Exception {
         if (text.length() > MAX_CHARS) throw new Exception("приглашение слишком длинное");
         StringBuilder sb = new StringBuilder();
@@ -39,12 +32,7 @@ final class Profile {
         }
         String s = sb.toString();
         if (s.startsWith(LINK)) s = s.substring(LINK.length());
-        if (s.isEmpty() || s.equals(OWN)) return new Profile("");
-        if (s.equals(ENROLLED)) {
-            Profile pr = new Profile("");
-            pr.enrolled = true;
-            return pr;
-        }
+        if (s.isEmpty()) throw new Exception("пустое приглашение");
         if (s.startsWith("kh-") || s.startsWith("khs-")) throw new Exception("старый формат приглашения (kh-/khs-) больше не поддерживается: нужно новое");
         return parseInvite(s);
     }

@@ -32,6 +32,7 @@
         </activity>
         <activity android:name=".RestartActivity" android:process=":restart" android:exported="false" android:theme="@style/Theme.KnotHop.Restart" android:excludeFromRecents="true" android:taskAffinity="" android:noHistory="true" />
         <activity android:name=".RoutingActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />
+        <activity android:name=".JoinActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />
         <activity android:name=".InviteIssueActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />
         <activity android:name=".NetworkActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />
         <activity android:name=".AppsActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />

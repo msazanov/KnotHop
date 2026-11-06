@@ -1086,9 +1086,12 @@ pub fn path_json(conn: &Connection, via: Option<Key>) -> serde_json::Value {
             _ => "other",
         })
         .collect();
+    // выбранный путь IP по адресу не из глобальной сети - локальная сеть (P2P между контактами, ADR 0028 §2.4a)
+    let lan = matches!(sel.as_ref().map(|p| p.remote_addr().clone()), Some(T::Ip(sa)) if crate::vpn::is_lan_ip(&sa.ip()));
     let st = conn.stats();
     let via = if kind == "mesh" { via.map(|k| k[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()) } else { None };
     let path_desc = match kind {
+        "direct" if lan => "прямой (локальная сеть)".to_string(),
         "direct" => "прямой (IP)".to_string(),
         "mesh" => via.as_ref().map(|v| format!("mesh через {v}")).unwrap_or_else(|| "mesh".to_string()),
         "relay" => "relay".to_string(),
@@ -1112,7 +1115,7 @@ pub fn path_json(conn: &Connection, via: Option<Key>) -> serde_json::Value {
         "paths_detail": paths_detail,
         "kind": kind,
         "connection_id": conn.stable_id(),
-        "via": via, "path_desc": path_desc,
+        "via": via, "path_desc": path_desc, "lan": lan,
         "rtt_ms": sel.as_ref().map(|p| (p.rtt().as_secs_f64() * 1000.0 * 100.0).round() / 100.0),
         "backup": backups, "lost_packets": st.lost_packets, "paths": paths.len(),
         "max_datagram_size": conn.max_datagram_size(),

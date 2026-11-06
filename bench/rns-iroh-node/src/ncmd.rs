@@ -133,7 +133,7 @@ impl Core {
                     None => OpResult::rej("bad_args"),
                 },
                 "invite.add" => match (unhex(op["pid"].as_str().unwrap_or("")).try_into(), unhex(op["key"].as_str().unwrap_or("")).try_into(), op["rights"].as_u64()) {
-                    (Ok(pid), Ok(key), Some(r)) => p.invite_add(actor, pid, key, r as u16, op["mgmt"].as_u64().unwrap_or(0) as u16, op["expires_ms"].as_u64().unwrap_or(peers::INVITE_DEFAULT_MS), now)
+                    (Ok(pid), Ok(key), Some(r)) => p.invite_add(actor, pid, key, r as u16, op["expires_ms"].as_u64().unwrap_or(peers::INVITE_DEFAULT_MS), now)
                         .map(OpResult::ok).unwrap_or_else(OpResult::rej),
                     _ => OpResult::rej("bad_args"),
                 },
@@ -440,18 +440,18 @@ impl Core {
 
     // -------------------------------------------------------------------------------------------- админ: выпуск и знакомство
 
-    /// Приглашение-стопка для получателя по нодам `grants` (хеш, права на ноде, права выдавшего на получателе). Для чужих нод
+    /// Приглашение-стопка для получателя по нодам `grants` (хеш, права принявшего на этой ноде). Для чужих нод
     /// уходит `invite.add` («ожидай»); получатель может гасить сразу — нода, не получившая команду, подождёт повтор.
-    pub fn issue_stack(&self, grants: &[(Hash, u16, u16)], ttl_ms: u64) -> Result<(String, Vec<(Hash, String)>)> {
+    pub fn issue_stack(&self, grants: &[(Hash, u16)], ttl_ms: u64) -> Result<(String, Vec<(Hash, String)>)> {
         if grants.is_empty() || grants.len() > crate::invite::MAX_PAIRS {
             bail!("приглашение: от 1 до {} нод", crate::invite::MAX_PAIRS);
         }
         let mut pairs = Vec::new();
         let mut rids = Vec::new();
-        for (h, rights, mgmt) in grants {
+        for (h, rights) in grants {
             let mut pin = [0u8; 16];
             rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut pin);
-            let op = serde_json::json!({"op": "invite.add", "pid": hex(&peers::pin_id(&pin)), "key": hex(&peers::pin_key(&pin)), "rights": rights, "mgmt": mgmt, "expires_ms": ttl_ms});
+            let op = serde_json::json!({"op": "invite.add", "pid": hex(&peers::pin_id(&pin)), "key": hex(&peers::pin_key(&pin)), "rights": rights, "expires_ms": ttl_ms});
             let rid = self.submit(*h, vec![op], MAX_EXP_S)?;
             if *h == self.me_hash {
                 let st = self.cmd.outbox.lock().unwrap().get(&rid).map(|c| c.state.clone()).unwrap_or_default();
@@ -476,7 +476,7 @@ impl Core {
             for b in nodes.iter().filter(|b| *b != a) {
                 let mut pin = [0u8; 16];
                 rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut pin);
-                per.get_mut(a).unwrap().push(serde_json::json!({"op": "invite.add", "pid": hex(&peers::pin_id(&pin)), "key": hex(&peers::pin_key(&pin)), "rights": rights, "mgmt": 0, "expires_ms": ttl_ms}));
+                per.get_mut(a).unwrap().push(serde_json::json!({"op": "invite.add", "pid": hex(&peers::pin_id(&pin)), "key": hex(&peers::pin_key(&pin)), "rights": rights, "expires_ms": ttl_ms}));
                 per.get_mut(b).unwrap().push(serde_json::json!({"op": "invite.redeem", "hash": hex(a), "pin": hex(&pin)}));
             }
         }
@@ -512,8 +512,8 @@ impl Core {
 
 // ------------------------------------------------------------------------------------------------ локальный владелец
 
-fn grant_arg(j: &serde_json::Value) -> Option<(Hash, u16, u16)> {
-    Some((unhex(j["hash"].as_str()?).try_into().ok()?, j["rights"].as_u64()? as u16, j["mgmt"].as_u64().unwrap_or(0) as u16))
+fn grant_arg(j: &serde_json::Value) -> Option<(Hash, u16)> {
+    Some((unhex(j["hash"].as_str()?).try_into().ok()?, j["rights"].as_u64()? as u16))
 }
 
 impl Core {
@@ -531,9 +531,9 @@ impl Core {
                 serde_json::json!({"requestid": rid, "state": ob.get(&rid).map(|c| c.state.clone()), "results": ob.get(&rid).map(|c| c.results.clone())})
             }
             "issue" => {
-                let grants: Vec<(Hash, u16, u16)> = match req["nodes"].as_array() {
+                let grants: Vec<(Hash, u16)> = match req["nodes"].as_array() {
                     Some(a) if !a.is_empty() => a.iter().map(|g| grant_arg(g).ok_or_else(|| anyhow!("nodes[]: hash,rights"))).collect::<Result<_>>()?,
-                    _ => vec![(self.me_hash, req["rights"].as_u64().unwrap_or(peers::USE as u64) as u16, req["mgmt"].as_u64().unwrap_or(0) as u16)],
+                    _ => vec![(self.me_hash, req["rights"].as_u64().unwrap_or(peers::USE as u64) as u16)],
                 };
                 let (s, rids) = self.issue_stack(&grants, ttl_ms)?;
                 serde_json::json!({"invite": s, "requests": rids.iter().map(|(h, r)| serde_json::json!({"hash": hex(h), "requestid": r})).collect::<Vec<_>>()})
@@ -545,13 +545,9 @@ impl Core {
                 serde_json::json!({"requests": rids.iter().map(|(h, r)| serde_json::json!({"hash": hex(h), "requestid": r})).collect::<Vec<_>>()})
             }
             "join" => {
-                let hs = self.join(req["invite"].as_str().unwrap_or(""))?;
+                let (hs, added) = self.join_stat(req["invite"].as_str().unwrap_or(""))?;
                 self.tick();
-                serde_json::json!({"nodes": hs.iter().map(|h| hex(h)).collect::<Vec<_>>()})
-            }
-            "consent" => {
-                let h: Hash = unhex(req["hash"].as_str().unwrap_or("")).try_into().map_err(|_| anyhow!("hash"))?;
-                serde_json::json!({"done": self.consent(&h, req["yes"].as_bool().unwrap_or(false))})
+                serde_json::json!({"nodes": hs.iter().map(|h| hex(h)).collect::<Vec<_>>(), "added": added})
             }
             "contact_remove" => {
                 let h: Hash = unhex(req["hash"].as_str().unwrap_or("")).try_into().map_err(|_| anyhow!("hash"))?;
@@ -621,8 +617,8 @@ mod tests {
     /// A (админ с CONFIG на S) и сервер S.
     fn pair() -> (crate::invite::tests::Node, crate::invite::tests::Node) {
         let (a, s) = (node("adm", true), node("srv", false));
-        let str_ = issue_self(&a.core, USE, peers::PRESET_ADMIN, peers::INVITE_DEFAULT_MS);
-        s.core.join(&str_).unwrap();
+        let str_ = issue_self(&a.core, USE, peers::INVITE_DEFAULT_MS);
+        s.core.join_adopt(&str_, crate::invite::ADOPT_IF_EMPTY).unwrap();
         s.core.tick();
         deliver(&s, &a);
         deliver(&a, &s);
@@ -718,7 +714,7 @@ mod tests {
         let (a, s) = pair();
         let user = node("phone-user", true);
         // админ выпускает стопку: на себе и на S (S получает invite.add)
-        let (string, rids) = a.core.issue_stack(&[(a.core.me_hash, USE, 0), (s.core.me_hash, USE, 0)], peers::INVITE_DEFAULT_MS).unwrap();
+        let (string, rids) = a.core.issue_stack(&[(a.core.me_hash, USE), (s.core.me_hash, USE)], peers::INVITE_DEFAULT_MS).unwrap();
         assert_eq!(rids.len(), 2);
         deliver(&a, &s);
         deliver(&s, &a);
@@ -739,13 +735,13 @@ mod tests {
     fn ctl_issue_works_for_own_node_alone_and_mixed_with_managed_and_foreign_limits() {
         let (a, s) = pair();
         // только своя нода (нет других узлов): применяется сразу, строка из одной пары
-        let r = a.core.ctl(&serde_json::json!({"cmd": "issue", "nodes": [{"hash": hex(&a.core.me_hash), "rights": USE, "mgmt": 0}]}));
+        let r = a.core.ctl(&serde_json::json!({"cmd": "issue", "nodes": [{"hash": hex(&a.core.me_hash), "rights": USE}]}));
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(crate::invite::decode(r["invite"].as_str().unwrap()).unwrap().len(), 1);
         assert_eq!(a.core.peers.lock().unwrap().invite_list().iter().filter(|i| i.state == peers::InviteState::Open).count(), 1);
         // смесь: своя + управляемая S, у каждой свой пин; для S уходит «ожидай»
         let r = a.core.ctl(&serde_json::json!({"cmd": "issue", "nodes": [
-            {"hash": hex(&a.core.me_hash), "rights": USE, "mgmt": 0}, {"hash": hex(&s.core.me_hash), "rights": USE, "mgmt": 0}]}));
+            {"hash": hex(&a.core.me_hash), "rights": USE}, {"hash": hex(&s.core.me_hash), "rights": USE}]}));
         assert_eq!(r["ok"], true, "{r}");
         let pairs = crate::invite::decode(r["invite"].as_str().unwrap()).unwrap();
         assert_eq!(pairs.len(), 2);
@@ -756,7 +752,7 @@ mod tests {
         s.out.lock().unwrap().clear();
         let adder = node("adder2", false);
         s.core.peers.lock().unwrap().peer_set(&Actor::Local, adder.core.me_pk, USE | peers::ADD, "ad", 5, 5).unwrap();
-        let rid = adder.core.submit(s.core.me_hash, vec![serde_json::json!({"op": "invite.add", "pid": hex(&[1u8; 8]), "key": hex(&[2u8; 32]), "rights": peers::CONFIG | USE, "mgmt": 0})], 3600).unwrap();
+        let rid = adder.core.submit(s.core.me_hash, vec![serde_json::json!({"op": "invite.add", "pid": hex(&[1u8; 8]), "key": hex(&[2u8; 32]), "rights": peers::CONFIG | USE})], 3600).unwrap();
         deliver(&adder, &s);
         let out = std::mem::take(&mut *s.out.lock().unwrap());
         let rep: serde_json::Value = serde_json::from_slice(&out[0].2).unwrap();
@@ -769,8 +765,8 @@ mod tests {
         let adm = node("adm2", true);
         let srv: Vec<_> = (0..3).map(|i| node(&format!("s{i}"), false)).collect();
         for s in &srv {
-            let st = issue_self(&adm.core, USE, peers::PRESET_ADMIN, peers::INVITE_DEFAULT_MS);
-            s.core.join(&st).unwrap();
+            let st = issue_self(&adm.core, USE, peers::INVITE_DEFAULT_MS);
+            s.core.join_adopt(&st, crate::invite::ADOPT_IF_EMPTY).unwrap();
             s.core.tick();
             deliver(s, &adm);
             deliver(&adm, s);

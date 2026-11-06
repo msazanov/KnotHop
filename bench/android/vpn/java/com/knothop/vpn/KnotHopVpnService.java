@@ -151,11 +151,8 @@ public class KnotHopVpnService extends VpnService {
         try {
             migrateLegacyRoutingBeforeNative();
             RoutingCfg.ensureDefaults(state);
-            Profile prof = Profile.parse(getSharedPreferences("p", MODE_PRIVATE).getString("profile", ""));
-            File pf = new File(state, "profile.txt");
-            Files.write(pf.toPath(), prof.raw.getBytes(StandardCharsets.UTF_8));
-            pf.setReadable(false, false);
-            pf.setReadable(true, true);
+            // приглашения живут в ядре (pending-invite.json, 0600), не в приложении; остатки прежней схемы (строка с пинами) стираем
+            new File(state, "profile.txt").delete();
             String tunIp;
             String clientArgs;
                 // 0013: ключ клиента создаёт нативная часть сама (identity.key в state), адрес в туннеле выводится из него
@@ -167,7 +164,7 @@ public class KnotHopVpnService extends VpnService {
                 // лаборатория: подмена списка публичных узлов (хаб в LAN), чтобы стенд не нагружал настоящую публичную RNS
                 String labPub = Util.LAB_BUILD ? getSharedPreferences("p", MODE_PRIVATE).getString("lab_pub", "") : "";
                 Files.write(pub.toPath(), (labPub.isEmpty() ? Util.PUBLIC_RNS : labPub + "\n").getBytes(StandardCharsets.UTF_8));
-                clientArgs = "--invite-file " + pf.getAbsolutePath() + " --public-rns-file " + pub.getAbsolutePath();
+                clientArgs = "--public-rns-file " + pub.getAbsolutePath();
 
             synchronized (this) {
                 if (watchSession != session) return;
@@ -658,7 +655,7 @@ public class KnotHopVpnService extends VpnService {
 
     /** Профиль (ключ клиента) не оставляем на диске. */
     private void dropProfile() {
-        try { if (state != null) new File(state, "profile.txt").delete(); } catch (Throwable ignored) { }
+        try { if (state != null) new File(state, "profile.txt").delete(); } catch (Throwable ignored) { }   // остаток прежней схемы
     }
 
     private synchronized void stopVpn() {

@@ -42,6 +42,7 @@ public final class NetworkActivity extends Activity {
         box.setPadding(Ui.dp(this, 16), Ui.dp(this, 20), Ui.dp(this, 16), Ui.dp(this, 24));
         scroll.addView(box);
         setContentView(scroll);
+        setTitle("Сеть");
     }
 
     @Override protected void onResume() { super.onResume(); ui.post(tick); }
@@ -97,6 +98,12 @@ public final class NetworkActivity extends Activity {
         return hash.substring(0, 8);
     }
 
+    /** Имя контакта, если оно есть, и короткий хеш («pixel  aabbccdd»); без имени - один хеш, без дубля. */
+    private String label(String hash, JSONArray contacts) {
+        String n = nameOf(hash, contacts), h = hash.substring(0, 8);
+        return n.equals(h) ? h : n + "  " + h;
+    }
+
     private void renderNodes(Map<String, Boolean> keep) {
         LinearLayout card = Ui.card(this);
         card.addView(Ui.titleWithHelp(this, "Ноды",
@@ -120,7 +127,7 @@ public final class NetworkActivity extends Activity {
             CheckBox cb = new CheckBox(this);
             cb.setTextColor(Ui.TEXT);
             long ageS = entry == null ? -1 : Math.max(0, System.currentTimeMillis() / 1000 - entry.optLong("at"));
-            cb.setText(nameOf(h, contacts) + "  " + h.substring(0, 8) + "\n" + Rights.roles(roles) + (st == null ? "  ·  статуса нет" : "  ·  статус " + age(ageS) + " назад"));
+            cb.setText(label(h, contacts) + "\n" + Rights.roles(roles) + (st == null ? "  ·  статуса нет" : "  ·  статус " + age(ageS) + " назад"));
             cb.setChecked(Boolean.TRUE.equals(keep.get(h)));
             picked.put(h, cb);
             card.addView(cb);
@@ -158,7 +165,7 @@ public final class NetworkActivity extends Activity {
             JSONObject e = p2p.optJSONObject(i);
             if (e == null) continue;
             String id = e.optString("id", "");
-            card.addView(Ui.text(this, P2p.name(e) + (id.length() >= 8 ? "  " + id.substring(0, 8) : ""), 14, Ui.TEXT, true));
+            card.addView(Ui.text(this, P2p.label(e), 14, Ui.TEXT, true));
             card.addView(Ui.text(this, P2p.text(e), 12, "direct".equals(e.optString("state")) ? Ui.GREEN : P2p.failed(e) ? Ui.ORANGE : Ui.MUTED, false));
             String cap = P2p.capability(e);
             if (!cap.isEmpty()) card.addView(Ui.muted(this, cap));
@@ -243,16 +250,25 @@ public final class NetworkActivity extends Activity {
     private void renderInvites() {
         LinearLayout card = Ui.card(this);
         card.addView(Ui.titleWithHelp(this, "Приглашения",
-                "Открытые и выданные приглашения на ваших нодах и на этом телефоне. «Выдано» - кто-то уже погасил: проверьте его хеш и при необходимости отзовите права. "
-                + "Команды выпуска ждут в очереди, пока нода не подтвердит."));
-        int n = 0;
-        n += addInvites(card, "этот телефон", view.optJSONArray("invites"));
-        JSONObject nodes = managed();
+                "Открытые - ещё не погашены: любой, у кого есть строка, может её использовать. Выданные - кто-то уже погасил: проверьте его хеш и при необходимости "
+                + "отзовите права. Команды выпуска ждут в очереди, пока нода не подтвердит."));
         JSONArray contacts = view.optJSONArray("contacts");
+        List<String> open = new ArrayList<>(), issued = new ArrayList<>();
+        collectInvites(open, issued, "этот телефон", view.optJSONArray("invites"), contacts);
+        JSONObject nodes = managed();
         for (java.util.Iterator<String> it = nodes.keys(); it.hasNext(); ) {
             String h = it.next();
             JSONObject st = nodes.optJSONObject(h).optJSONObject("status");
-            if (st != null) n += addInvites(card, nameOf(h, contacts), st.optJSONArray("invites"));
+            if (st != null) collectInvites(open, issued, label(h, contacts), st.optJSONArray("invites"), contacts);
+        }
+        if (!open.isEmpty()) {
+            card.addView(Ui.text(this, "Открытые: " + open.size(), 13, Ui.TEXT, true));
+            for (String l : open) card.addView(Ui.text(this, "• " + l, 12, Ui.TEXT, false));
+        }
+        if (!issued.isEmpty()) {
+            LinearLayout.LayoutParams gp = Ui.cardParams(this);
+            card.addView(Ui.text(this, "Выданные (погашены): " + issued.size(), 13, Ui.TEXT, true), open.isEmpty() ? new LinearLayout.LayoutParams(-1, -2) : gp);
+            for (String l : issued) card.addView(Ui.text(this, "• " + l, 12, Ui.MUTED, false));
         }
         JSONArray ob = view.optJSONArray("outbox");
         int pending = 0;
@@ -260,8 +276,12 @@ public final class NetworkActivity extends Activity {
         if (pending > 0) card.addView(Ui.text(this, "Команд ждёт подтверждения нод: " + pending, 12, Ui.ORANGE, false));
         JSONObject pend = view.optJSONObject("pending");
         JSONArray pairs = pend == null ? null : pend.optJSONArray("pairs");
-        if (pairs != null && pairs.length() > 0) card.addView(Ui.text(this, "Моё вступление: пар погашено " + done(pairs) + " из " + pairs.length() + " (ждёт анонсов нод)", 12, Ui.ORANGE, false));
-        if (n == 0 && pending == 0) card.addView(Ui.muted(this, "Приглашений нет."));
+        if (pairs != null && pairs.length() > 0) {
+            StringBuilder who = new StringBuilder();
+            for (int i = 0; i < pairs.length(); i++) who.append(i == 0 ? "" : ", ").append(label(pairs.optJSONObject(i).optString("h", "00000000"), contacts));
+            card.addView(Ui.text(this, "Моё вступление: пар погашено " + done(pairs) + " из " + pairs.length() + " (ждёт анонсов нод): " + who, 12, Ui.ORANGE, false));
+        }
+        if (open.isEmpty() && issued.isEmpty() && pending == 0 && (pairs == null || pairs.length() == 0)) card.addView(Ui.muted(this, "Приглашений нет."));
         box.addView(card, Ui.cardParams(this));
     }
 
@@ -271,19 +291,21 @@ public final class NetworkActivity extends Activity {
         return d;
     }
 
-    private int addInvites(LinearLayout card, String where, JSONArray inv) {
-        int n = 0;
+    /** Приглашения одной ноды: открытые («где: осталось, права») и выданные («где: кому - имя и хеш, права»). */
+    private void collectInvites(List<String> open, List<String> issued, String where, JSONArray inv, JSONArray contacts) {
         for (int i = 0; inv != null && i < inv.length(); i++) {
             JSONObject x = inv.optJSONObject(i);
+            if (x == null) continue;
             String st = x.optString("state");
             if (!"open".equals(st) && !"redeemed".equals(st) && !"settled".equals(st)) continue;
-            n++;
-            String by = x.optString("by", "null");
-            String line = where + ": " + ("open".equals(st) ? "открыто, осталось " + age(x.optLong("left_s")) : "выдано" + (by.length() >= 8 && !"null".equals(by) ? " узлу " + by.substring(0, 8) : ""))
-                    + "  ·  " + Rights.text(x.optInt("rights"));
-            card.addView(Ui.text(this, line, 12, "open".equals(st) ? Ui.TEXT : Ui.MUTED, false));
+            String rights = "  ·  права принявшего: " + Rights.text(x.optInt("rights"));
+            if ("open".equals(st)) {
+                open.add(where + ": осталось " + age(x.optLong("left_s")) + rights);
+            } else {
+                String by = x.optString("by", "null");
+                issued.add(where + ": " + (by.length() >= 8 && !"null".equals(by) ? "принял " + label(by, contacts) : "принято") + rights);
+            }
         }
-        return n;
     }
 
     private void renderAdmins() {

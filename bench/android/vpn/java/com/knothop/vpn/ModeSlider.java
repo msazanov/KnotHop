@@ -16,6 +16,15 @@ import android.view.animation.DecelerateInterpolator;
  * Переключатель режимов «Откл. / Сеть / VPN»: дорожка с тремя точками притяжения и ручкой, которая плавно переезжает и меняет цвет
  * (серый - оранжевый - зелёный). Работает и тапом по позиции (на MIUI свайп по SeekBar не срабатывает, а тап - да), и перетаскиванием.
  * Собственная отрисовка и обработка касаний: никаких SeekBar. Дорожка отстоит от краёв не меньше чем на 28 dp (жесты системы у края).
+ *
+ * Первое касание после открытия на MIUI (2409BRN2CG, 2510DRA23E) терялось, на Honor - нет. Разбор по коду (06.11): ползунок лежит в панели
+ * ВНЕ PullScrollView и шторки журнала (соседи в общем LinearLayout), requestDisallowIntercept безвреден, getWidth к первому касанию уже
+ * известен, таймер {@code setMode} лишь возвращает ручку на фактический режим и выбор не сбрасывает. Единственная причина в коде, способная
+ * молча съесть ровно первое касание, - {@code setFilterTouchesWhenObscured(true)} (защита от подмены касаний, F8): MIUI держит поверх окна
+ * приложения свои накладки (индикатор жестов, плашки), и пока окно «перекрыто», система выбрасывает касание до {@link #onTouchEvent}.
+ * Это ГИПОТЕЗА, на устройстве не проверена. Защиту не снимаем (тапджекинг мог бы выключить VPN), но теперь отброшенное касание видно:
+ * пользователь получает подсказку, а при включённой отладке счётчик и флаги события пишутся в журнал, чтобы следующий прогон на MIUI
+ * показал причину. Вторая правка: разрешение на уведомления просится один раз, а не при каждом запуске (системный диалог забирал фокус окна).
  */
 final class ModeSlider extends View {
     interface Listener { void onSelected(int mode); }
@@ -35,6 +44,25 @@ final class ModeSlider extends View {
     private ValueAnimator anim;
     private Listener listener;
     private int lastStep;
+
+    private int downs, dropped;
+    private long lastNotice;
+
+    /** Счётчики касаний для журнала отладки: всего ACTION_DOWN дошло до View / отброшено системой как «окно перекрыто». */
+    @Override
+    public boolean onFilterTouchEventForSecurity(MotionEvent e) {
+        boolean ok = super.onFilterTouchEventForSecurity(e);
+        if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+            if (ok) downs++; else dropped++;
+            Util.dbg("ползунок: касание " + (ok ? "принято" : "ОТБРОШЕНО (окно перекрыто другим окном)") + ", flags=0x" + Integer.toHexString(e.getFlags())
+                    + ", принято " + downs + ", отброшено " + dropped);
+            if (!ok && System.currentTimeMillis() - lastNotice > 3000) {
+                lastNotice = System.currentTimeMillis();
+                android.widget.Toast.makeText(getContext(), "Касание не принято: поверх приложения другое окно. Повторите", android.widget.Toast.LENGTH_SHORT).show();
+            }
+        }
+        return ok;
+    }
 
     ModeSlider(Context c) {
         super(c);
