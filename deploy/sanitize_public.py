@@ -83,7 +83,7 @@ def should_exclude(rel: Path) -> bool:
         return True
     if rel.name in {"identity.key", "group.key", "trust.json", "peers.json", "pending-invite.json", "cmd-journal.json", "cmd-outbox.json", "status-cache.json", "node.json", "known_hosts", "enroll-join.json"}:
         return True
-    if rel.name.startswith("invite") or rel.name.endswith(".profile"):
+    if (rel.name.startswith("invite") and rel.as_posix() != "bench/rns-iroh-node/src/invite.rs") or rel.name.endswith(".profile"):
         return True
     lower = rel.name.lower()
     if lower in {"awg.md", "dockerfile.awg", "benchmarks-awg.md"}:
