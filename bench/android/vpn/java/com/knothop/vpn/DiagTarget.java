@@ -48,6 +48,13 @@ final class DiagTarget {
         return (ip & mask(len)) == (net & mask(len));
     }
 
+    /** В include-режиме Builder добавляет не только выбранные подсети, но и служебные /32. */
+    static boolean included(long ip, List<String> routes) {
+        for (String c : routes) if (contains(c, ip)) return true;
+        for (String c : INCLUDE_EXTRA) if (contains(c, ip)) return true;
+        return false;
+    }
+
     /** Список «мимо VPN» без адреса диагностики: накрывающая подсеть заменяется соседними блоками (не больше 32), остальные не меняются. */
     static List<String> carveOut(List<String> cidrs) { return carveOut(cidrs, parseIp(HOST)); }
 
@@ -76,9 +83,7 @@ final class DiagTarget {
             for (String c : excluded) if (contains(c, ip)) return false;
             return true;
         }
-        for (String c : include) if (contains(c, ip)) return true;
-        for (String c : INCLUDE_EXTRA) if (contains(c, ip)) return true;
-        return false;
+        return included(ip, include);
     }
 
     /** Разбор ответа /cdn-cgi/trace (строки key=value): [0] - ip, [1] - loc (код страны), пустые строки, если полей нет. */

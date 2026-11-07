@@ -429,9 +429,8 @@ public class KnotHopVpnService extends VpnService {
             boolean inc;
             synchronized (service) { ex = service.includeMode ? service.includeRoutes : service.excludedRoutes; inc = service.includeMode; }
             if (inc) {
-                // в туннеле только перечисленные подсети: остальные адреса идут напрямую
-                for (String c : ex) if (inNet(ip, c)) return false;
-                return true;
+                // Builder добавляет INCLUDE_EXTRA сверх includeRoutes: DNS и диагностика тоже в туннеле.
+                return !DiagTarget.included(ip, ex);
             }
             for (String c : ex) {
                 try {
@@ -444,16 +443,6 @@ public class KnotHopVpnService extends VpnService {
                 } catch (Throwable ignored) { }
             }
             return false;
-        }
-        private static boolean inNet(long ip, String c) {
-            try {
-                String[] pr = c.split("/");
-                byte[] n = InetAddress.getByName(pr[0]).getAddress();
-                int len = Integer.parseInt(pr[1]);
-                long net = ((n[0] & 0xffL) << 24) | ((n[1] & 0xffL) << 16) | ((n[2] & 0xffL) << 8) | (n[3] & 0xffL);
-                long mask = len == 0 ? 0 : (0xffffffffL << (32 - len)) & 0xffffffffL;
-                return (ip & mask) == (net & mask);
-            } catch (Throwable ignored) { return false; }
         }
         boolean valid() {
             synchronized (service) {

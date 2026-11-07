@@ -471,8 +471,8 @@ final class TopologyView extends View {
         p.setStyle(Paint.Style.FILL);
         p.setColor(col);
         c.drawCircle(cx, cy, r, p);
-        String s = badgeOf(n.name);
-        boolean emoji = !leadingEmoji(n.name.trim()).isEmpty();
+        String s = n.p2p.isEmpty() ? badgeOf(n.name) : "📱";
+        boolean emoji = !n.p2p.isEmpty() || !leadingEmoji(n.name.trim()).isEmpty();
         Paint b = new Paint(Paint.ANTI_ALIAS_FLAG);
         b.setTextAlign(Paint.Align.CENTER);
         b.setTextSize(r * (emoji ? 1.0f : 0.78f));
@@ -489,7 +489,7 @@ final class TopologyView extends View {
 
     /** Подпись под кружком: имя узла. */
     static String labelOf(Node n) {
-        return plainName(n.name);
+        return n.p2p.isEmpty() ? plainName(n.name) : "устройство " + plainName(n.name);
     }
 
     /** Имя не длиннее 18 знаков (по символам Unicode, эмодзи не рвём). */

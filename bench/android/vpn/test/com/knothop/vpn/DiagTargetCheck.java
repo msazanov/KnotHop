@@ -50,6 +50,9 @@ public final class DiagTargetCheck {
         // include-режим: адрес всегда добавляется отдельным /32
         check(DiagTarget.routedToTunnel(false, new ArrayList<String>(), new ArrayList<String>()), "include с пустым списком: /32 диагностики есть");
         check(Arrays.asList(DiagTarget.INCLUDE_EXTRA).contains("1.0.0.1/32"), "INCLUDE_EXTRA содержит 1.0.0.1/32");
+        check(DiagTarget.included(diag, Arrays.asList("91.108.4.0/22")), "проверка SpeedPath видит дополнительный маршрут диагностики");
+        check(DiagTarget.included(DiagTarget.parseIp("8.8.8.8"), new ArrayList<String>()), "проверка SpeedPath видит DNS-маршрут");
+        check(!DiagTarget.included(DiagTarget.parseIp("9.9.9.9"), new ArrayList<String>()), "посторонний адрес не считается включённым");
 
         // разбор trace
         String[] t = DiagTarget.parseTrace("fl=1\nh=1.0.0.1\nip=203.0.113.7\nloc=DE\ncolo=FRA\n");

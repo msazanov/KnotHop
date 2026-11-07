@@ -263,6 +263,11 @@ fn norm_name(name: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// Имя контакта — только подсказка для отображения, не свидетельство роли или права.
+fn contact_name_or_dest(name: &str, dest: &[u8; 16]) -> String {
+    norm_name(name).unwrap_or_else(|| hex(dest)[..8].to_string())
+}
+
 /// Имя клиента для сети: заданное пользователем (оболочка кладёт state/node-name.txt), иначе «телефон-XXXXXX» по хешу identity.
 /// Имя раздаёт сам узел (клиент сообщает его выходу в T_USE, выход передаёт дальше в T_NBRS); приглашение его не переносит.
 fn client_display_name(identity: &Identity, state: &Path) -> String {
@@ -999,6 +1004,9 @@ mod tests {
         assert_eq!(norm_name("🇫🇮 Хельсинки").as_deref(), Some("🇫🇮 Хельсинки"));
         assert_eq!(norm_name("  \n\t "), None);
         assert_eq!(norm_name(&"я".repeat(80)).unwrap().chars().count(), 32);
+        assert_eq!(contact_name_or_dest("🇫🇮 Финляндия", &[0x8a; 16]), "🇫🇮 Финляндия");
+        assert_eq!(contact_name_or_dest(" \n\t", &[0x8a; 16]), "8a8a8a8a");
+        assert_eq!(contact_name_or_dest("  A\u{202e}B  ", &[0x8a; 16]), "AB");
     }
 
     #[test]
@@ -5238,7 +5246,7 @@ impl ClientCtx {
 
     fn refresh_servers13(&self) {
         let Some(c) = &self.c13 else { return };
-        let mut want: Vec<([u8; 64], Vec<String>)> = Vec::new();
+        let mut want: Vec<([u8; 64], Vec<String>, String)> = Vec::new();
         {
             let tr = c.peers.lock().unwrap();
             // подсказки REALITY из accept: нужны, когда UDP и TCP к выходу уже закрыты
@@ -5256,14 +5264,14 @@ impl ClientCtx {
             // и получатель), набирается как обычный пир и без ролей. Выходом он от этого не становится: `exit_eligible` требует роль EXIT.
             for c in tr.contact_list() {
                 if c.pk != tr.me_pk && !want.iter().any(|w| w.0 == c.pk) && trusted_intro(&c) && (c.they_grant & peers::USE != 0 || tr.rights_pk(&c.pk) != 0) {
-                    want.push((c.pk, c.hints.clone()));
+                    want.push((c.pk, c.hints.clone(), c.name.clone()));
                 }
             }
         }
         let mut s = self.servers.lock().unwrap();
         let keep: HashSet<[u8; 64]> = want.iter().map(|w| w.0).collect();
         s.retain(|e| e.pk.map(|p| keep.contains(&p)).unwrap_or(true));
-        for (pk, addrs) in want {
+        for (pk, addrs, contact_name) in want {
             let dest = dest_from_pub_tag(&pk, T13_TAG);
             if dest == [0u8; 16] {
                 continue;
@@ -5275,9 +5283,7 @@ impl ClientCtx {
                 // имя, сохранённое с прошлого допуска: пока узел не отвечал в этой сессии, в записи только короткий dest
                 if e.name == "?" || e.name == hex(&dest)[..8] {
                     let known = self.names.lock().unwrap().get(&dest).cloned();
-                    if let Some(n) = known {
-                        e.name = n;
-                    }
+                    e.name = known.unwrap_or_else(|| contact_name_or_dest(&contact_name, &dest));
                 }
                 if !addrs.is_empty() && e.addrs != addrs {
                     // новые подсказки (сообщение `addr` или повторный accept): диалер читает их на каждой попытке, смена его будит
@@ -5285,7 +5291,7 @@ impl ClientCtx {
                     self.book_for(&dest).set(addrs);
                 }
             } else if s.len() < 32 {
-                let name = self.names.lock().unwrap().get(&dest).cloned().unwrap_or_else(|| hex(&dest)[..8].to_string());
+                let name = self.names.lock().unwrap().get(&dest).cloned().unwrap_or_else(|| contact_name_or_dest(&contact_name, &dest));
                 s.push(CServer { dest, key, name, ep: hex(&key), addrs, hops: None, rtt_ms: None,
                     state: "seen".into(), seen: Instant::now(), pinned: true, pk: Some(pk) });
             }
