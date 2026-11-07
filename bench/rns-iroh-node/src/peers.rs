@@ -856,6 +856,14 @@ impl Peers {
         }
     }
 
+    /// Подсказка от самой ноды о правах на ней; окончательный допуск решает нода.
+    pub fn set_contact_grant(&mut self, h: &Hash, rights: u16) -> bool {
+        match self.contacts.get_mut(h) {
+            Some(c) if c.they_grant != rights & KNOWN => { c.they_grant = rights & KNOWN; true }
+            _ => false,
+        }
+    }
+
     /// Новые адреса-подсказки известного контакта (сообщение `addr`). false - контакта нет, список пуст или не изменился.
     pub fn contact_set_hints(&mut self, h: &Hash, hints: Vec<String>) -> bool {
         let hints = balance_hints(hints, MAX_CONTACT_HINTS);

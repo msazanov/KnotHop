@@ -625,9 +625,11 @@ impl Core {
     }
 
     fn send_ack(&self, pair: &Pair, hn: &[u8; 16]) {
-        // ответные подсказки: мои адреса и имя едут выдавшему в том же шифрованном LXMF (для обратного дозвона); права от них не меняются
+        // Подписанный LXMF от получателя сообщает только подсказки о его собственных ролях и правах выдавшего на нём.
+        // Окончательный допуск по-прежнему решается получателем по его таблице при подключении.
+        let (grant, roles) = { let p = self.peers.lock().unwrap(); (p.rights(&pair.h), p.roles()) };
         let body = serde_json::json!({"v": 1, "op": "ack", "pid": hex(&pair.pid()), "n_nonce": hex(&pair.n_nonce), "mac2": hex(&mac(&pair.key(), &[b"ack", hn])),
-            "name": self.name(), "cl": self.is_client, "hints": peers::balance_hints((self.hints)(), peers::MAX_CONTACT_HINTS)});
+            "name": self.name(), "cl": self.is_client, "grant": grant, "roles": roles, "hints": peers::balance_hints((self.hints)(), peers::MAX_CONTACT_HINTS)});
         self.send(lxmf_sync::TITLE_INV, Target::Hash(pair.h), serde_json::to_vec(&body).unwrap(), &format!("inv:ack:{}", hex(&pair.pid())), now_s() + 600, true);
     }
 
@@ -653,6 +655,9 @@ impl Core {
         }
         let hints = clean_hints(&j["hints"], self.is_client);
         let name: String = j["name"].as_str().unwrap_or("").chars().filter(|c| !c.is_control()).take(48).collect();
+        // Поля - только от подписавшего ack получателя, после проверки подписи и MAC. Старый ack без полей не выдаёт прав.
+        let grant = j["grant"].as_u64().and_then(|v| u16::try_from(v).ok()).unwrap_or(0) & peers::KNOWN;
+        let roles = j["roles"].as_u64().and_then(|v| u16::try_from(v).ok()).unwrap_or(0) & (peers::TRANSIT | peers::EXIT);
         let ok = {
             let mut p = self.peers.lock().unwrap();
             let r = p.invite_settle(&pid, &pk);
@@ -660,7 +665,7 @@ impl Core {
             // сохраняет свои they_grant/роли, обновляются только адреса
             if r {
                 if let Some(h) = peers::hash_of(&pk) {
-                    if p.contact(&h).is_some() { p.contact_set_hints(&h, hints); } else { let _ = p.contact_set(pk, &name, hints, "invite", 0, 0, now_ms() as u64); }
+                    if p.contact(&h).is_some() { p.contact_set_hints(&h, hints); } else { let _ = p.contact_set(pk, &name, hints, "invite", grant, roles, now_ms() as u64); }
                     p.set_contact_client(&h, j["cl"].as_bool().unwrap_or(false));
                 }
             }

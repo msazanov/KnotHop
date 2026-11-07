@@ -321,9 +321,18 @@ impl Core {
         self.cmd.nodes.lock().unwrap().contains_key(&hex(h))
     }
 
-    /// Роли ноды (TRANSIT/EXIT) из её собственного статуса обновляют контакт: по ним выбираются PN и выходы (подсказка, не полномочие).
+    /// Только подписанный статус самой ноды: роли и явно присутствующая запись о нас — подсказки, не полномочия.
     fn note_roles(&self, h: &Hash, status: &serde_json::Value) {
+        if status["me"].as_str() != Some(hex(h).as_str()) { return; }
         let roles = (if status["transit_enabled"].as_bool() == Some(true) { peers::TRANSIT } else { 0 }) | (if status["exit_enabled"].as_bool() == Some(true) { peers::EXIT } else { 0 });
+        // Страницы усечены: отсутствие записи не означает отзыв. Дубликаты и некорректные права игнорируются.
+        let my_hash = hex(&self.me_hash);
+        let grant = status["peers"].as_array().and_then(|entries| {
+            let mut mine = entries.iter().filter(|p| p["hash"].as_str() == Some(my_hash.as_str()));
+            let one = mine.next()?;
+            if mine.next().is_some() { return None; }
+            one["rights"].as_u64().and_then(|v| u16::try_from(v).ok()).map(|v| v & peers::KNOWN)
+        });
         let mut p = self.peers.lock().unwrap();
         // нода, которой я управляю, но ещё не «знаком» (контакта нет): заводим контакт без прав для меня, чтобы роли годились для выбора PN
         let mut created = false;
@@ -332,7 +341,9 @@ impl Core {
                 created = p.contact_set(pe.pk, &pe.name, vec![], "local", 0, roles, now_ms() as u64).is_ok();
             }
         }
-        if (p.set_contact_roles(h, roles) || created) && p.save().is_ok() {
+        let mut changed = p.set_contact_roles(h, roles) || created;
+        if let Some(rights) = grant { changed |= p.set_contact_grant(h, rights); }
+        if changed && p.save().is_ok() {
             drop(p);
             self.changed();
         }
@@ -643,6 +654,38 @@ mod tests {
         assert_eq!(deliver(&s, &a), 2);
         assert_eq!(outbox_state(&a, &rid), "applied");
         assert_eq!(a.core.peers.lock().unwrap().contact(&s.core.me_hash).unwrap().roles, peers::TRANSIT | peers::EXIT, "роли контакта обновлены из статуса ноды");
+        assert_eq!(a.core.peers.lock().unwrap().contact(&s.core.me_hash).unwrap().they_grant, peers::PRESET_ADMIN, "подписанный статус сообщает права администратора на ноде");
+    }
+
+    #[test]
+    fn server_join_ack_reports_own_grant_and_roles() {
+        let (a, s) = (node("ack-admin", true), node("ack-exit", false));
+        s.core.peers.lock().unwrap().set_config(&Actor::Local, Some(true), Some(true)).unwrap();
+        let invite = issue_self(&a.core, USE, peers::INVITE_DEFAULT_MS);
+        s.core.join_adopt(&invite, crate::invite::ADOPT_IF_EMPTY).unwrap();
+        s.core.tick();
+        deliver(&s, &a);
+        deliver(&a, &s);
+        deliver(&s, &a);
+        let p = a.core.peers.lock().unwrap();
+        let contact = p.contact(&s.core.me_hash).unwrap();
+        assert_eq!(contact.they_grant, peers::PRESET_ADMIN);
+        assert_eq!(contact.roles, peers::TRANSIT | peers::EXIT);
+    }
+
+    #[test]
+    fn status_only_updates_explicit_own_grant() {
+        let (a, s) = pair();
+        let status = |entries: serde_json::Value| serde_json::json!({"me": hex(&s.core.me_hash), "transit_enabled": true, "exit_enabled": true, "peers": entries});
+        let mine = hex(&a.core.me_hash);
+        a.core.note_roles(&s.core.me_hash, &status(serde_json::json!([{"hash": mine, "rights": USE}])));
+        assert_eq!(a.core.peers.lock().unwrap().contact(&s.core.me_hash).unwrap().they_grant, USE);
+        a.core.note_roles(&s.core.me_hash, &status(serde_json::json!([])));
+        a.core.note_roles(&s.core.me_hash, &status(serde_json::json!([{"hash": mine, "rights": 0}, {"hash": mine, "rights": USE}])));
+        a.core.note_roles(&s.core.me_hash, &serde_json::json!({"me": hex(&a.core.me_hash), "peers": [{"hash": mine, "rights": 0}]}));
+        assert_eq!(a.core.peers.lock().unwrap().contact(&s.core.me_hash).unwrap().they_grant, USE);
+        a.core.note_roles(&s.core.me_hash, &status(serde_json::json!([{"hash": mine, "rights": 0}])));
+        assert_eq!(a.core.peers.lock().unwrap().contact(&s.core.me_hash).unwrap().they_grant, 0);
     }
 
     #[test]
