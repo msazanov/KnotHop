@@ -6109,7 +6109,7 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
     let used_iface = ctx.node.engine().get_path_clone(&dest).map(|p| p.interface_index);
     if let Some(p) = ctx.node.engine().get_path_clone(&dest) {
         let iface = ctx.node.engine().interface_stats().iter().find(|i| i.interface_id.0 == p.interface_index).map(|i| i.name.clone()).unwrap_or_default();
-        ctx.sh.note(format!("путь к {}: {} хоп, интерфейс {}, транспорт {}", cand.name, p.hops, iface,
+        ctx.sh.note(format!("путь к {}: промежуточных нод RNS {}, интерфейс {}, транспорт {}", cand.name, p.hops.saturating_sub(1), iface,
             p.next_hop.map(|h| hex(&h)[..8].to_string()).unwrap_or_else(|| "—".into())));
     }
     let handle = ctx.node.connect_with_key_cipher(&dest, &cand.key, cipher).await?;
@@ -6251,7 +6251,7 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
             None => anyhow::anyhow!(why),
         });
     }
-    ctx.sh.note(format!("выход {} принял клиента за {} мс (хопов {:?})", cand.name, t0.elapsed().as_millis(), ctx.node.hops_to(&dest)));
+    ctx.sh.note(format!("выход {} принял клиента за {} мс (промежуточных нод RNS {:?})", cand.name, t0.elapsed().as_millis(), ctx.node.hops_to(&dest).map(|h| h.saturating_sub(1))));
     ctx.node.engine().with_link_mut(&id, |l| l.set_keepalive_override(Some(CLIENT_KEEPALIVE_S)));
     ctx.remember_rns_rtt(cand.dest, &id);
     // Прямой канал VPN-данных к этому выходу: после AUTH_OK и проверки EXIT. Ключ - `cand.key`: именно им Link проверил подпись ответчика

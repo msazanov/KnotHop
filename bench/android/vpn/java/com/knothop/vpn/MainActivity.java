@@ -71,6 +71,8 @@ public class MainActivity extends Activity {
     private volatile int pendWaiting, pendTotal;
     private long pendPollAt;
     private TopologyView topo;
+    private LinearLayout nodeRows;
+    private String nodeRowsKey = "";
     private long prevTs, prevUp, prevDown;
     private double rUp, rDown;
 
@@ -146,8 +148,9 @@ public class MainActivity extends Activity {
         // --- граф выходов
         LinearLayout graphCard = Ui.card(this);
         LinearLayout gh = Ui.titleWithHelp(this, "Выходы",
-                "Граф сети: ваш телефон в центре, вокруг ноды. Тап по ноде — сделать её выходом по умолчанию (повторный тап возвращает автоматический выбор). "
-                + "Удержание — настройки ноды, удержание на телефоне — права и имя. «По пингу»: чем меньше пинг, тем ближе нода.");
+                "Граф сети: телефон в центре, ноды пронумерованы как в списке ниже. Нажмите на выход в списке или на графе, чтобы выбрать его; повторное нажатие возвращает автовыбор. "
+                + "Удержание выхода открывает его настройки, удержание телефона — экран сети. «По пингу»: чем меньше пинг, тем ближе нода. "
+                + "Линии показывают только известные участки пути и наблюдаемые связи, но не подтверждают доступность VPN. Подробности появляются при включённой отладке.");
         View sp1 = new View(this);
         gh.addView(sp1, new LinearLayout.LayoutParams(0, 1, 1f));
         android.widget.CheckBox pingBox = new android.widget.CheckBox(this);
@@ -161,6 +164,9 @@ public class MainActivity extends Activity {
         topo.setOnLongPick((dest, name) -> openNodeAdmin(dest, name, ""));   // удержание: настройки ноды
         topo.setOnPhonePick(() -> startActivity(new Intent(this, NetworkActivity.class)));
         graphCard.addView(topo, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(300)));
+        nodeRows = new LinearLayout(this);
+        nodeRows.setOrientation(LinearLayout.VERTICAL);
+        graphCard.addView(nodeRows, lpMatch(8));
         exitsNote = Ui.text(this, "Нет нод с правом выхода. Вступите по приглашению.", 12, Ui.ORANGE, false);
         exitsNote.setVisibility(View.GONE);
         graphCard.addView(exitsNote, lpMatch(6));
@@ -855,7 +861,7 @@ public class MainActivity extends Activity {
                         for (int q = 0; exs != null && q < exs.length(); q++) if (vd.equals(exs.optJSONObject(q).optString("d"))) vn = TopologyView.shortName(exs.optJSONObject(q).optString("n"));
                         c.append("  через ").append(vn);
                     }
-                    c.append("  · ").append(TopologyView.carrierName(cur.optString("carrier")));
+                    if (Util.debug) c.append("  · ").append(TopologyView.carrierName(cur.optString("carrier")));
                     conn = c.toString();
                     logChange("соединение", conn + " (носитель - открытый сокет, не путь RNS)");
                 } else if (doing == null) {
@@ -890,6 +896,8 @@ public class MainActivity extends Activity {
             prevTs = 0;
             rUp = rDown = 0;
             try { topo.update(new JSONObject("{\"state\":\"idle\",\"ip\":\"\"}")); } catch (Exception ignored) { }
+            nodeRows.removeAllViews();
+            nodeRowsKey = "";
             updateBenchUi(state, null, null);
             if (doing == null) doing = "idle".equals(phase) ? "" : "Запускаюсь…";
         }
@@ -1000,10 +1008,57 @@ public class MainActivity extends Activity {
 
     private final java.util.Set<String> logSeen = new java.util.HashSet<>();
 
-    /** Узлы выходов нужны правилам маршрутизации (имена, назначения); сам список на экране убран: ноды выбираются тапом по графу. */
+    /** Нумерованный список повторяет порядок графа и остаётся читаемым при тесном расположении узлов. */
     private void buildList(JSONObject j) {
         JSONArray ex = j.optJSONArray("exits");
         if (ex != null) RoutingCfg.cacheNodes(getFilesDir(), ex);
+        JSONArray p2p = j.optJSONArray("p2p");
+        String selected = j.optString("selected", "");
+        JSONObject cur = j.optJSONObject("current");
+        String activeDest = cur == null ? "" : cur.optString("d", "");
+        java.util.List<String> labels = new java.util.ArrayList<>();
+        java.util.List<String> dests = new java.util.ArrayList<>();
+        java.util.List<String> names = new java.util.ArrayList<>();
+        for (int i = 0; ex != null && i < ex.length(); i++) {
+            JSONObject e = ex.optJSONObject(i);
+            if (e == null) continue;
+            String dest = e.optString("d", ""), name = TopologyView.shortName(e.optString("n", "?"));
+            String state = dest.equals(activeDest) ? "связь установлена" : "fail".equals(e.optString("lk")) ? "нет связи" : "доступность неизвестна";
+            String detail = "";
+            if (Util.debug) {
+                String vis = e.optString("vis", "none"), carrier = TopologyView.carrierName(e.optString("c", "none"));
+                detail = "\nПуть RNS: " + ("direct".equals(vis) ? "прямой" : "via".equals(vis) ? "через транзит" : "нет данных") + " · носитель " + carrier;
+                JSONObject quic = dest.equals(activeDest) && cur != null ? cur.optJSONObject("quic") : null;
+                boolean meshPath = quic != null && "mesh".equals(quic.optString("kind"));
+                if (meshPath) detail += " · транзит mesh: число прыжков неизвестно";
+                else if (!e.isNull("h")) detail += " · промежуточных нод RNS: " + TopologyView.intermediateHops(e.optInt("h", 0));
+                if (!e.isNull("r") && e.optDouble("r", -1) > 0) detail += " · RTT " + Math.round(e.optDouble("r")) + " мс";
+                if (!e.isNull("why") && !e.optString("why").isEmpty()) detail += "\n" + TopologyView.whyText(e.optString("why"));
+            }
+            labels.add((labels.size() + 1) + ". " + name + (dest.equalsIgnoreCase(selected) ? " ★" : "") + " — " + state + detail);
+            dests.add(dest); names.add(name);
+        }
+        for (int i = 0; p2p != null && i < p2p.length(); i++) {
+            JSONObject e = p2p.optJSONObject(i);
+            if (e == null) continue;
+            String name = P2p.name(e), state = e.optString("state", "trying");
+            String simple = P2p.connected(state) ? "связь установлена" : P2p.failed(e) ? "нет связи" : "подключается";
+            labels.add((labels.size() + 1) + ". Устройство " + name + " — " + simple + (Util.debug ? "\n" + P2p.text(e) : ""));
+            dests.add(""); names.add(name);
+        }
+        String key = labels.toString() + dests.toString();
+        if (key.equals(nodeRowsKey)) return;
+        nodeRowsKey = key;
+        nodeRows.removeAllViews();
+        for (int i = 0; i < labels.size(); i++) {
+            final String dest = dests.get(i), name = names.get(i);
+            Button row = Ui.secondary(this, labels.get(i), v -> {
+                if (dest.isEmpty()) startActivity(new Intent(this, NetworkActivity.class));
+                else toggleDefaultExit(dest, name);
+            });
+            if (!dest.isEmpty()) row.setOnLongClickListener(v -> { openNodeAdmin(dest, name, ""); return true; });
+            nodeRows.addView(row, lpMatch(4));
+        }
     }
 
     private boolean usersBusy;

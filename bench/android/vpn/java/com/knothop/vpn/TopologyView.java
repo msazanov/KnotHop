@@ -60,7 +60,6 @@ final class TopologyView extends View {
 
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint t = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint edgeHalo = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final List<Node> nodes = new ArrayList<>();
     private final List<Edge> edges = new ArrayList<>();
     private final Map<String, Long> extraPackets = new HashMap<>(), extraActiveUntil = new HashMap<>();
@@ -77,10 +76,9 @@ final class TopologyView extends View {
     private boolean active = true;
     /** Узел выключен (status «idle»): на пустом графе пишем это, а не «ждём таблицу». */
     private boolean idle;
-    private String phoneLabel = "";
     private boolean up;
-    private double phoneRtt = -1;
     private String viaDest = "";
+    private String currentQuicKind = "";
     private OnPick onPick;
     private OnLongPick onLongPick;
     private Runnable onPhonePick;
@@ -93,7 +91,11 @@ final class TopologyView extends View {
     private float downX, downY;
     private long lastTapMs, lastPosLog;
     private final Runnable longPress = () -> {
-        if (!dragged && dragNode != null && onLongPick != null) {
+        if (!dragged && dragNode != null && !dragNode.p2p.isEmpty() && onPhonePick != null) {
+            longPicked = true;
+            Ui.click(this);
+            onPhonePick.run();
+        } else if (!dragged && dragNode != null && onLongPick != null) {
             longPicked = true;
             Ui.click(this);
             onLongPick.pick(dragNode.dest, dragNode.name);
@@ -112,14 +114,6 @@ final class TopologyView extends View {
 
     void setOnPick(OnPick o) { onPick = o; }
 
-    private void edgeText(Canvas canvas, String label, float x, float y) {
-        edgeHalo.set(t);
-        edgeHalo.setStyle(Paint.Style.STROKE);
-        edgeHalo.setStrokeWidth(3.5f * d);
-        edgeHalo.setColor(Ui.CARD);
-        canvas.drawText(label,x,y,edgeHalo);
-        canvas.drawText(label,x,y,t);
-    }
     void setOnLongPick(OnLongPick o) { onLongPick = o; }
     /** Тап или долгий тап по своему телефону (в центре графа): экран «Моя нода». */
     void setOnPhonePick(Runnable r) { onPhonePick = r; }
@@ -169,10 +163,10 @@ final class TopologyView extends View {
         List<Node> fresh = new ArrayList<>();
         up = "up".equals(st.optString("state"));
         idle = "idle".equals(st.optString("state"));
-        phoneLabel = st.optString("ip", "");
         JSONObject cur = st.optJSONObject("current");
         viaDest = cur != null && !cur.isNull("via") ? cur.optString("via", "") : "";
-        phoneRtt = cur != null && !cur.isNull("rtt_ms") ? cur.optDouble("rtt_ms", -1) : -1;
+        JSONObject quic = cur == null ? null : cur.optJSONObject("quic");
+        currentQuicKind = quic == null ? "" : quic.optString("kind", "none");
         JSONArray ex = st.optJSONArray("exits");
         JSONObject routing = st.optJSONObject("routing");
         JSONArray extras = routing == null ? null : routing.optJSONArray("extras");
@@ -279,6 +273,11 @@ final class TopologyView extends View {
     /** Подпись носителя: TCP/QUIC - это открытый сокет до узла, не рабочий путь RNS. */
     static String carrierName(String c) {
         return "tcp".equals(c) ? "TCP" : "quic".equals(c) ? "QUIC" : "—";
+    }
+
+    /** RNS считает конечную ноду; для пользователя прямой путь — ноль промежуточных узлов. */
+    static int intermediateHops(int rnsHops) {
+        return Math.max(0, rnsHops - 1);
     }
 
     /** Причина отказа Link: короткая, одна строка (≤ 40 знаков). */
@@ -551,7 +550,6 @@ final class TopologyView extends View {
                     p.setStrokeWidth((1.6f + 2.2f * (1 - pingNorm(e.rtt))) * d);
                 }
                 c.drawLine(na.x, na.y, nb.x, nb.y, p);
-                if (e.rtt > 0) edgeText(c, Math.round(e.rtt) + " мс", (na.x + nb.x) / 2, (na.y + nb.y) / 2 - 3 * d);
             }
             t.setTextSize(10 * d);
         }
@@ -563,18 +561,14 @@ final class TopologyView extends View {
                 if (n == cur || n == via || !"up".equals(n.state)) continue;
                 p.setColor(GraphColors.mesh(Ui.dark(getContext())));
                 c.drawPath(curve(cur.x, cur.y, n.x, n.y, 0.22f), p);
-                if (n.rtt > 0) {
-                    t.setColor(Ui.ink(getContext(), 0xFF3478C6));
-                    edgeText(c, "+" + Math.round(n.rtt) + " мс", (cur.x + n.x) / 2 + (n.y - cur.y) * 0.11f, (cur.y + n.y) / 2 - (n.x - cur.x) * 0.11f);
-                }
             }
         }
-        // узлы с путём RNS через транзит (vis via): подвешены тонкой пунктирной линией к своей nh, от телефона линии нет
+        // RNS сообщает только первый узел; ребро до выхода известно лишь для пути с одной промежуточной нодой.
         p.setStrokeWidth(1.2f * d);
         p.setPathEffect(new DashPathEffect(new float[]{5 * d, 5 * d}, 0));
         p.setColor(GraphColors.idle(Ui.dark(getContext())));
         for (Node n : ns) {
-            if (!"via".equals(n.vis) || "current".equals(n.state) || n.nh.isEmpty() || n.nh.equals(n.dest)) continue;
+            if (!"via".equals(n.vis) || n.hops != 2 || "current".equals(n.state) || n.nh.isEmpty() || n.nh.equals(n.dest)) continue;
             Node hop = byDest.get(n.nh);
             if (hop != null) c.drawLine(hop.x, hop.y, n.x, n.y, p);
         }
@@ -586,20 +580,12 @@ final class TopologyView extends View {
                 p.setStrokeWidth(4.5f * d);
                 p.setPathEffect(null);
                 p.setColor(up ? GraphColors.active(Ui.dark(getContext())) : Ui.warn(getContext()));
+                // current.via относится к выбранному пути данных; RNS nh может быть другим.
                 Node hop = via;
-                if ("via".equals(n.vis) && !n.nh.isEmpty() && !n.nh.equals(n.dest) && byDest.containsKey(n.nh)) hop = byDest.get(n.nh);
                 if (hop != null) {
                     c.drawLine(px, py, hop.x, hop.y, p);
-                    c.drawLine(hop.x, hop.y, n.x, n.y, p);
-                    t.setColor(Ui.green(getContext()));
-                    edgeText(c, "через " + shortName(hop.name), (hop.x + n.x) / 2, (hop.y + n.y) / 2 - 8 * d);
-                    String s = ("tcp".equals(n.carrier) ? "TCP " : "") + (phoneRtt >= 0 ? Math.round(phoneRtt) + " мс" : "");
-                    edgeText(c, s, (px + hop.x) / 2, (py + hop.y) / 2 - 8 * d);
-                } else if (!"via".equals(n.vis)) {
+                } else if ("direct".equals(currentQuicKind)) {
                     c.drawLine(px, py, n.x, n.y, p);
-                    t.setColor(Ui.green(getContext()));
-                    String s = ("tcp".equals(n.carrier) ? "TCP " : "") + (phoneRtt >= 0 ? Math.round(phoneRtt) + " мс" : "");
-                    edgeText(c, s, (px + n.x) / 2, (py + n.y) / 2 - 8 * d);
                 }
             } else if (n.extraLink && n.extraPathKnown) {
                 p.setStrokeWidth((n.extraFlow ? 4f : 2.5f) * d);
@@ -615,12 +601,6 @@ final class TopologyView extends View {
                 p.setColor(pingMode ? GraphColors.ping(Ui.dark(getContext()), pingColor(n.rtt, 0xFF)) : GraphColors.idle(Ui.dark(getContext())));
                 if (pingMode) p.setStrokeWidth((1f + 2.5f * (1 - pingNorm(n.rtt))) * d);
                 c.drawLine(px, py, n.x, n.y, p);
-                if (pingMode && n.rtt > 0) {
-                    t.setColor(Ui.ink(getContext(), 0xFF444444));
-                    t.setTextSize(8.5f * d);
-                    edgeText(c, Math.round(n.rtt) + " мс", (px + n.x) / 2, (py + n.y) / 2 - 4 * d);
-                    t.setTextSize(10 * d);
-                }
                 p.setPathEffect(null);
             }
         }
@@ -639,12 +619,10 @@ final class TopologyView extends View {
         ph.setTextSize(40 * d);
         Paint.FontMetrics fm = ph.getFontMetrics();
         c.drawText("\uD83D\uDCF1", px, py - (fm.ascent + fm.descent) / 2f, ph);
-        t.setColor(Ui.ink(getContext(), 0xFF444444));
-        t.setTextSize(10 * d);
-        c.drawText(phoneLabel, px, py + 44 * d, t);
 
         // узлы
-        for (Node n : ns) {
+        for (int idx = 0; idx < ns.size(); idx++) {
+            Node n = ns.get(idx);
             boolean isCur = "current".equals(n.state);
             if (isCur) {
                 p.setStyle(Paint.Style.STROKE);
@@ -663,39 +641,16 @@ final class TopologyView extends View {
             p.setStrokeWidth((isCur ? 3 : 1.5f) * d);
             p.setColor(isCur || n.isVia ? Ui.green(getContext()) : Ui.ink(getContext(), 0xFF444444));
             c.drawCircle(n.x, n.y, r, p);
-        }
-        // Подписи поверх кружков и линий с подложкой под текущую тему.
-        Paint h = new Paint(t);
-        h.setStyle(Paint.Style.STROKE);
-        h.setStrokeWidth(3.2f * d);
-        h.setColor((Ui.CARD & 0xFFFFFF) | 0xDD000000);
-        for (Node n : ns) {
-            boolean isCur = "current".equals(n.state);
-            String l1 = labelOf(n);
-            // Local reachability and neighbour observations are separate; neither missing data nor local failure means global death.
-            String l2, l3 = null;
-            if ("fail".equals(n.lk)) { l2 = "мой Link недоступен"; l3 = n.why; }
-            else if ("none".equals(n.vis)) l2 = n.ra > 0 ? "видят другие узлы" : n.visible ? "носитель есть, пути нет" : "нет свежих данных";
-            else if ("via".equals(n.vis)) { l2 = "через транзит"; if (n.hops >= 0) l3 = "путь RNS " + n.hops + " хоп"; }
-            else if (n.isVia) l2 = "транзит";
-            else if (n.visible) { l2 = "носитель " + carrierName(n.carrier); if (n.hops >= 0) l3 = "путь RNS " + n.hops + " хоп"; }
-            else l2 = n.ra > 0 ? "видят другие узлы" : "нет свежих данных";
-            if (n.extraLink) l2 = n.extraFlow ? "трафик по правилам" : "дополнительный Link";
-            if (!n.p2p.isEmpty()) { String[] pl = P2p.graphLines(n.p2p, n.rtt, n.p2pLan); l2 = pl[0]; l3 = pl[1]; }
-            if (!n.rules.isEmpty()) l3 = n.rules + (n.extraLink || isCur ? "" : " · ожидает Link");
-            t.setTextSize(11 * d); h.setTextSize(11 * d);
-            h.setTextAlign(Paint.Align.CENTER);
-            c.drawText(l1, n.x, n.y + r + 14 * d, h);
-            t.setColor(isCur ? Ui.green(getContext()) : Ui.fg(getContext()));
-            c.drawText(l1, n.x, n.y + r + 14 * d, t);
-            t.setTextSize(9.5f * d); h.setTextSize(9.5f * d);
-            c.drawText(l2, n.x, n.y + r + 26 * d, h);
-            t.setColor(Ui.ink(getContext(), "fail".equals(n.lk) ? 0xFF999999 : 0xFF666666));
-            c.drawText(l2, n.x, n.y + r + 26 * d, t);
-            if (l3 != null && !l3.isEmpty()) {
-                c.drawText(l3, n.x, n.y + r + 38 * d, h);
-                c.drawText(l3, n.x, n.y + r + 38 * d, t);
-            }
+            // Номер связывает кружок с читаемой строкой ниже; длинного текста поверх соседей нет.
+            float bx = n.x + r * 0.72f, by = n.y - r * 0.72f;
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(Ui.CARD);
+            c.drawCircle(bx, by, 9 * d, p);
+            t.setColor(Ui.fg(getContext()));
+            t.setTextSize(10 * d);
+            t.setTextAlign(Paint.Align.CENTER);
+            Paint.FontMetrics nm = t.getFontMetrics();
+            c.drawText(Integer.toString(idx + 1), bx, by - (nm.ascent + nm.descent) / 2f, t);
         }
         if (Util.LAB_BUILD && System.currentTimeMillis() - lastPosLog > 700 && !ns.isEmpty()) {   // для стенда: координаты узлов на экране
             lastPosLog = System.currentTimeMillis();
@@ -786,7 +741,10 @@ final class TopologyView extends View {
                 if (!wasDrag && !longPicked && !slid) {
                     Node n;
                     synchronized (nodes) { n = hit(x, y); }
-                    if (n != null && onPick != null) {
+                    if (n != null && !n.p2p.isEmpty() && onPhonePick != null) {
+                        Ui.tick(this);
+                        onPhonePick.run();
+                    } else if (n != null && onPick != null) {
                         Ui.tick(this);
                         onPick.pick(n.dest, n.name);
                     } else if (n == null && hitPhone(x, y)) {
