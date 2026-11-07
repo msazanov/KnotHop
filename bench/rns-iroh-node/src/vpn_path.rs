@@ -56,6 +56,12 @@ pub(super) fn acceptable(iface: Option<usize>, allowed: &[usize], avoid: Option<
     iface.map(|i| Some(i) != avoid && allowed.contains(&i)).unwrap_or(false)
 }
 
+/// Ищем через все свои допустимые носители одним ограниченным запросом: наличие
+/// прямого интерфейса ещё не доказывает доставку данных через него.
+pub(super) fn discovery_ifaces(ours: &[usize], avoid: Option<usize>) -> Vec<usize> {
+    ours.iter().copied().filter(|i| Some(*i) != avoid).collect()
+}
+
 /// Modern exits need authorization, not a warm path cache. Legacy eligibility stays unchanged.
 pub(super) fn eligible(modern_authorized: Option<bool>, legacy_reachable: bool, lost: bool) -> bool {
     !lost && modern_authorized.unwrap_or(legacy_reachable)
@@ -119,6 +125,13 @@ impl ExitBackoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_uses_neighbors_even_with_a_direct_carrier() {
+        assert_eq!(discovery_ifaces(&[3, 7, 9], None), vec![3, 7, 9]);
+        assert_eq!(discovery_ifaces(&[3, 7, 9], Some(3)), vec![7, 9]);
+        assert!(discovery_ifaces(&[3], Some(3)).is_empty());
+    }
 
     #[test]
     fn exit_backoff_doubles_caps_and_does_not_reset_when_pause_expires() {

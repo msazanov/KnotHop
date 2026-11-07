@@ -6010,7 +6010,7 @@ fn out_carrier_iface(node: &Arc<Node>, label: &str) -> Option<usize> {
 
 /// Единый порядок выбора пути - одинаковый для ноды (сосед) и для клиента (выход):
 /// 1) прямой путь (1 хоп) по нашему носителю - предпочтение RNS path discovery (не пользовательский рейтинг выходов);
-/// 2) если к пиру есть наш носитель, но прямой путь ещё не найден - ждём его, спрашивая путь только по этому носителю;
+/// 2) если к пиру есть наш носитель, но прямой путь ещё не найден - кратко ждём его, запрашивая путь через все свои носители;
 /// 3) иначе - транзит через наши ноды (любой путь по нашим носителям).
 /// Публичный RNS - только координация (поиск), носителем VPN-данных он не бывает.
 /// Носители и интерфейс носителя к пиру пересчитываются на каждой итерации: носитель, поднявшийся во время ожидания,
@@ -6047,10 +6047,9 @@ async fn wait_our_path(node: &Arc<Node>, gate: &path::PathGate, dest: &Destinati
                     node.engine().remove_path(dest);
                 }
             }
-            let ifs: Vec<usize> = match carrier {
-                Some(c) => vec![c],
-                None => ours.clone(),
-            };
+            // Один rate-limited запрос по всем своим носителям. Прямой интерфейс
+            // может отвечать на handshake, но не пропускать данные из-за DPI.
+            let ifs = path::discovery_ifaces(&ours, avoid);
             if !ifs.is_empty() && p.request_due(now) {
                 let _ = node.engine().request_path_on(dest, &ifs).await;
             }
@@ -6308,7 +6307,7 @@ const MESH_DIAL_MAX: usize = 2;
 /// Адрес выхода - mesh плюс проверенные подсказки IP выхода (книга адресов, прошедшая фильтр `resolve_addrs`): IP достижим - соединение сразу идёт прямым
 /// путём, mesh остаётся тёплым запасным (правка iroh 1); недостижим - рукопожатие идёт по mesh. Только mesh было нельзя: без relay/QAD iroh не знает публичного
 /// адреса выхода за NAT (облачная ВМ с частным адресом на интерфейсе), NAT traversal поверх mesh нечем и апгрейд на IP не происходит (W138, `nat_exit_behind_1to1_*`).
-/// Если соединение осталось на mesh, а прямой путь стал достижим (проба IP), оно закрывается и набирается заново с подсказками (бэкофф 30..300 с).
+/// Если соединение осталось на mesh, рукопожатие по IP не повод разрывать его: проверка объёма прямого пути ещё не реализована.
 /// Дальше Link/dataplane к выходу идут по этому соединению. Повторы с задержкой 2..60 с, пока выход остаётся текущим.
 fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
     let Some(m) = mesh::global() else { return };
@@ -6360,56 +6359,11 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
                     ctx.sh.note(format!("mesh: сквозное QUIC к {name} установлено за {} мс", t0.elapsed().as_millis()));
                     wait = 2;
                     drop(ctx);
-                    // соединение на mesh, а прямой путь достижим: переподключиться с подсказками IP
-                    let (mut gap, mut mesh_since) = (30u64, Instant::now());
-                    loop {
-                        tokio::select! {
-                            _ = conn.closed() => break,
-                            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
-                        }
-                        if !mesh::selected_is_mesh(&conn) {
-                            (gap, mesh_since) = (30, Instant::now());
-                            continue;
-                        }
-                        if mesh_since.elapsed() < Duration::from_secs(gap) {
-                            continue;
-                        }
-                        let Some(ctx) = weak.upgrade() else { break };
-                        // прямой путь уже помечен заблокированным (QUIC и TCP): повторная проверка IP только рвала бы рабочий mesh
-                        if endpoint_peer_id(&key).is_some_and(|p| ctx.sh.health.blocked_for(&p).is_some()) {
-                            mesh_since = Instant::now();
-                            continue;
-                        }
-                        let hints = mesh_hints(&ctx, &dest, &fallback).await;
-                        let mut reachable = false;
-                        if !hints.is_empty() {
-                            if let Ok(id) = iroh::EndpointId::from_bytes(&key) {
-                                let mut probe = EndpointAddr::new(id);
-                                for a in &hints {
-                                    probe = probe.with_ip_addr(*a);
-                                }
-                                if let Ok(Ok(pc)) = tokio::time::timeout(Duration::from_secs(6), ctx.ep.connect(probe, ALPN)).await {
-                                    // iroh подмешивает известные пути пира, в том числе mesh: рукопожатие могло пройти по mesh, а не по IP.
-                                    // «Достижим» - только если IP-путь реально выбран (IP первичен в MeshBackupSelector, когда у него есть RTT).
-                                    for _ in 0..8 {
-                                        if pc.paths().iter().any(|p| p.is_selected() && matches!(p.remote_addr(), iroh::TransportAddr::Ip(_))) {
-                                            reachable = true;
-                                            break;
-                                        }
-                                        tokio::time::sleep(Duration::from_millis(250)).await;
-                                    }
-                                    pc.close(0u32.into(), b"probe");
-                                }
-                            }
-                        }
-                        if reachable && mesh::selected_is_mesh(&conn) {
-                            ctx.sh.note(format!("mesh: к {name} прямой путь достижим, соединение осталось на mesh - переподключаюсь с подсказками IP"));
-                            conn.close(0u32.into(), b"mesh to direct");
-                            break;
-                        }
-                        gap = (gap * 2).min(300);
-                        mesh_since = Instant::now();
-                    }
+                    // Рукопожатие и выбор IP-пути не доказывают доставку данных: DPI может
+                    // пропускать их, но блокировать поток. Не разрываем рабочий mesh ради
+                    // такого кандидата. Автоматическая миграция внутри iroh здесь не меняется;
+                    // проверка >1 МБ и управление всеми переходами требуют отдельной реализации.
+                    conn.closed().await;
                     mx.close();
                 }
                 _ => {

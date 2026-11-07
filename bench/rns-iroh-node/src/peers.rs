@@ -1432,7 +1432,9 @@ mod tests {
         let (_, mut other) = ident();
         other[32..40].copy_from_slice(&id);
         other[63] = key[31] ^ 1;
-        t.contact_set(other, "", vec![], "local", USE, EXIT, T0).unwrap();
+        // Синтетический префикс может не кодировать валидную точку Ed25519;
+        // проверяем именно коллизию кэша, как соседний тест с `peers`.
+        t.contacts.insert([7; 16], Contact { pk: other, name: String::new(), hints: vec![], intro_by: "local".into(), they_grant: USE, roles: EXIT, at: T0, rl: serde_json::Value::Null, client: false });
         assert_eq!(t.local_key_for_id8(&id), None);
         assert_eq!(t.client_mesh_source_for_id8(&id), None);
     }

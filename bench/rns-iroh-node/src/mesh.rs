@@ -69,6 +69,9 @@ const DELIVER_QUEUE: usize = 2048;
 /// Срок жизни записи обратной таблицы и её размер.
 const REV_TTL: Duration = Duration::from_secs(60);
 const REV_MAX: usize = 1024;
+/// Одно соседское уведомление о недостижимости на пару в секунду, ограниченная память.
+const UNREACH_INTERVAL: Duration = Duration::from_secs(1);
+const UNREACH_MAX: usize = 1024;
 /// Кэш решений политики: верно - 5 с (отзыв прав действует с такой задержкой), неверно - 2 с.
 const AUTH_TTL_OK: Duration = Duration::from_secs(5);
 const AUTH_TTL_NO: Duration = Duration::from_secs(2);
@@ -136,6 +139,10 @@ pub struct Counters {
     pub rev_learned: AtomicU64,
     /// запись обратной таблицы не заменена: прежний сосед жив, а новый не источник
     pub rev_conflict: AtomicU64,
+    /// Соседские уведомления об отказе и реально снятые обратные пути.
+    pub unreach_sent: AtomicU64,
+    pub unreach_received: AtomicU64,
+    pub unreach_removed: AtomicU64,
     /// мой id8 совпал с другим известным ключом или не разрешился в мой ключ: локально не доставляем
     pub drop_id_ambiguous: AtomicU64,
     /// хоп из кэша оказался соединением, идущим по mesh
@@ -199,6 +206,7 @@ pub struct Mesh {
     pair_buckets: Mutex<HashMap<(Key, Key), Bucket>>,
     auth: Mutex<HashMap<(Key, Key, Key), (bool, Instant)>>,
     rev: Mutex<HashMap<Key, (Key, Instant)>>,
+    unreach_sent: Mutex<HashMap<(Key, Key), Instant>>,
     /// кэш маршрутов RNS (путь меняется редко, а запрос таблицы путей дорог): 2 с
     routes: Mutex<HashMap<Key, (Option<Key>, Instant)>>,
     /// Следующий хоп для исходящих кадров (poll_send читает ТОЛЬКО его: poll_send вызывается под замком QUIC-соединения, а разрешение хопа берёт замки
@@ -270,6 +278,7 @@ impl Mesh {
             pair_buckets: Default::default(),
             auth: Default::default(),
             rev: Default::default(),
+            unreach_sent: Default::default(),
             routes: Default::default(),
             hops: Default::default(),
             ids: Default::default(),
@@ -451,7 +460,7 @@ impl Mesh {
             "drop_rate_neighbor": c.drop_rate_neighbor.load(Relaxed), "drop_rate_pair": c.drop_rate_pair.load(Relaxed),
             "drop_no_route": c.drop_no_route.load(Relaxed), "drop_no_quic": c.drop_no_quic.load(Relaxed), "drop_mtu": c.drop_mtu.load(Relaxed),
             "drop_send_err": c.drop_send_err.load(Relaxed), "rev_learned": c.rev_learned.load(Relaxed),
-            "rev_conflict": c.rev_conflict.load(Relaxed), "drop_id_ambiguous": c.drop_id_ambiguous.load(Relaxed), "drop_recursion": c.drop_recursion.load(Relaxed),
+            "rev_conflict": c.rev_conflict.load(Relaxed), "unreach_sent": c.unreach_sent.load(Relaxed), "unreach_received": c.unreach_received.load(Relaxed), "unreach_removed": c.unreach_removed.load(Relaxed), "drop_id_ambiguous": c.drop_id_ambiguous.load(Relaxed), "drop_recursion": c.drop_recursion.load(Relaxed),
             "e2e_overflow": c.e2e_overflow.load(Relaxed), "drop_queue_full": c.drop_queue_full.load(Relaxed), "alt_hops": c.alt_hops.load(Relaxed), "gen_resets": c.gen_resets.load(Relaxed),
             "egress_blocked": iroh::knothop::blocked_egress(), "rev_size": self.rev.lock().unwrap().len(), "e2e_conns": self.e2e.lock().unwrap().ids.len(),
         })
@@ -589,6 +598,42 @@ impl Mesh {
         }
     }
 
+    /// Ошибка маршрута направляется только непосредственному соседу, от которого
+    /// пришёл разрешённый к пересылке кадр; ответ меньше исходного кадра.
+    fn send_unreachable(&self, now: Instant, prev: &Key, dst: &Key) {
+        let Some(conn) = self.carrier(prev) else { return };
+        let mut sent = self.unreach_sent.lock().unwrap();
+        if sent.get(&(*prev, *dst)).is_some_and(|t| now.saturating_duration_since(*t) < UNREACH_INTERVAL) { return; }
+        if sent.len() >= UNREACH_MAX {
+            sent.retain(|_, t| now.saturating_duration_since(*t) < UNREACH_INTERVAL);
+            if sent.len() >= UNREACH_MAX { return; }
+        }
+        sent.insert((*prev, *dst), now);
+        drop(sent);
+        let mut b = BytesMut::with_capacity(10);
+        b.extend_from_slice(&[TAG, 0]);
+        b.extend_from_slice(&id_of(dst));
+        if conn.send_datagram(b.freeze()).is_ok() { self.c.unreach_sent.fetch_add(1, Relaxed); }
+    }
+
+    /// Отзыв обратного пути возможен только от TLS-аутентифицированного соседа,
+    /// через которого именно эта запись была выучена. Уведомление не создаёт и
+    /// не переназначает путь и не действует на другой/более новый транзит.
+    fn accept_unreachable(&self, now: Instant, prev: &Key, id: &Id, policy: &dyn Policy) {
+        self.c.unreach_received.fetch_add(1, Relaxed);
+        if !self.cached(now, (*prev, [0; 32], [0; 32]), || policy.holds_rights(prev)) ||
+            !self.cached(now, (*prev, [1; 32], [0; 32]), || policy.is_transit(prev)) { return; }
+        let Some(dst) = self.local_source_key(now, id, policy) else { return };
+        let removed = {
+            let mut rev = self.rev.lock().unwrap();
+            if rev.get(&dst).is_some_and(|(via, _)| via == prev) { rev.remove(&dst); true } else { false }
+        };
+        if removed {
+            self.c.unreach_removed.fetch_add(1, Relaxed);
+            self.hops.lock().unwrap().remove(&dst);
+        }
+    }
+
     /// Живой QUIC-носитель к ключу, который может быть соседом mesh: соединение, идущее по mesh, не годится (см. `rides_mesh`).
     fn carrier(&self, key: &Key) -> Option<Connection> {
         (self.carriers)(key).filter(|c| !self.rides_mesh(c))
@@ -662,14 +707,17 @@ impl Mesh {
         }
         // Нет ни прямого носителя, ни маршрута RNS через наш QUIC-носитель, ни обратной записи (прямой путь к выходу закрыт, путь RNS идёт через TCP
         // публичного хаба): первым хопом берём транзит с живым QUIC. Это подсказка, не право: пересылку разрешает сам транзит (`may_forward`).
-        match self.next_hop_via(now, dst, policy) {
-            Some(k) => Some(k),
-            None => {
-                let k = self.alt_transit(dst, policy)?;
-                self.c.alt_hops.fetch_add(1, Relaxed);
-                Some(k)
-            }
+        let routed = self.next_hop_via(now, dst, policy);
+        if routed.is_some_and(|k| self.neighbor(&k).is_ok()) {
+            return routed;
         }
+        if let Some(k) = self.alt_transit(dst, policy) {
+            self.c.alt_hops.fetch_add(1, Relaxed);
+            return Some(k);
+        }
+        // Сохраняем диагностическую причину (нет QUIC / слишком мал MTU),
+        // когда подходящего запасного транзита тоже нет.
+        routed
     }
 
     /// Следующая попытка соединения с `dst` идёт через другой транзит (после неудачи; сдвиг в списке кандидатов `alt_transit`).
@@ -687,7 +735,7 @@ impl Mesh {
     /// Альтернативный транзит к `dst`: узел с правом TRANSIT, не `dst`, с живым QUIC-носителем вне mesh; выбор стабилен (меньший `k xor dst`).
     /// Знания о том, видит ли транзит само `dst`, нет: если он `dst` не достаёт, он кадры отбросит, и путь не подтвердится (запасным он не станет).
     fn alt_transit(&self, dst: &Key, policy: &dyn Policy) -> Option<Key> {
-        let mut c: Vec<Key> = policy.transit_candidates().into_iter().filter(|k| k != dst && k != &self.me && self.carrier(k).is_some()).collect();
+        let mut c: Vec<Key> = policy.transit_candidates().into_iter().filter(|k| k != dst && k != &self.me && self.neighbor(k).is_ok()).collect();
         c.sort_by_key(|k| {
             let mut x = [0u8; 8];
             for i in 0..8 {
@@ -729,7 +777,7 @@ impl Mesh {
             c.drop_disabled.fetch_add(1, Relaxed);
             return;
         }
-        if d.len() < HDR || d[0] != TAG {
+        if d.len() < 2 || d[0] != TAG {
             c.drop_malformed.fetch_add(1, Relaxed);
             return;
         }
@@ -738,6 +786,20 @@ impl Mesh {
             return;
         };
         self.sync_gen(policy.as_ref());
+        if d[1] == 0 && d.len() == 10 {
+            let now = Instant::now();
+            if self.rate_neighbor(now, prev) {
+                let id: Id = d[2..10].try_into().unwrap();
+                self.accept_unreachable(now, prev, &id, policy.as_ref());
+            } else {
+                c.drop_rate_neighbor.fetch_add(1, Relaxed);
+            }
+            return;
+        }
+        if d.len() < HDR {
+            c.drop_malformed.fetch_add(1, Relaxed);
+            return;
+        }
         let ttl = d[1];
         if ttl == 0 || ttl > MAX_TTL {
             // отправитель не ставит больше MAX_TTL: такой кадр либо чужой, либо зацикливается
@@ -812,16 +874,19 @@ impl Mesh {
         }
         let Some(next) = self.next_hop(now, &dst, policy.as_ref()) else {
             c.drop_no_route.fetch_add(1, Relaxed);
+            self.send_unreachable(now, prev, &dst);
             return;
         };
         if &next == prev {
             c.drop_uturn.fetch_add(1, Relaxed);
+            self.send_unreachable(now, prev, &dst);
             return;
         }
         let conn = match self.neighbor(&next) {
             Ok(x) => x,
             Err(e) => {
                 self.count_nbr_err(e);
+                self.send_unreachable(now, prev, &dst);
                 return;
             }
         };
@@ -835,8 +900,12 @@ impl Mesh {
                     self.learn(now, &src, prev);
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 c.drop_send_err.fetch_add(1, Relaxed);
+                // Размер отдельного пакета не доказывает отказ маршрута.
+                if matches!(e, iroh::endpoint::SendDatagramError::ConnectionLost(_)) {
+                    self.send_unreachable(now, prev, &dst);
+                }
             }
         }
     }

@@ -308,6 +308,50 @@ pub fn echo_matches(d: &[u8], idx: u8, nonce: u64, len: usize) -> bool {
     d.len() == len.max(HEAD) && d[..8] == MAGIC && d[8] == KIND_ECHO && d[9] == idx && d[10..18] == nonce.to_le_bytes() && d[HEAD..] == build(idx, nonce, len)[HEAD..]
 }
 
+/// Подтверждение полезных байтов только уникальными полными эхами собственных запросов.
+/// Запрос и ответ одного эха доказывают доставку одинакового объёма в обе стороны.
+/// Привязка этого счётчика к неизменному физическому пути остаётся за вызывающим кодом.
+#[derive(Debug)]
+pub struct BulkReceipts {
+    nonce: u64,
+    len: usize,
+    sent: usize,
+    got: Vec<bool>,
+    payload_bytes: usize,
+}
+
+impl BulkReceipts {
+    pub fn new(nonce: u64, len: usize, count: usize) -> Option<Self> {
+        if !(HEAD + 1..=MAX_LEN).contains(&len) || count == 0 || count > 2048 {
+            return None;
+        }
+        Some(Self { nonce, len, sent: 0, got: vec![false; count], payload_bytes: 0 })
+    }
+
+    pub fn next_request(&self) -> Option<Vec<u8>> {
+        (self.sent < self.got.len()).then(|| build(self.sent as u8, self.nonce ^ self.sent as u64, self.len))
+    }
+
+    /// Вызывать только после успешной постановки именно этого запроса в отправку.
+    pub fn sent(&mut self) { self.sent = (self.sent + 1).min(self.got.len()); }
+
+    pub fn accept(&mut self, d: &[u8]) {
+        if d.len() != self.len || d.len() < HEAD || d[..8] != MAGIC || d[8] != KIND_ECHO { return; }
+        let mut n = [0; 8];
+        n.copy_from_slice(&d[10..18]);
+        let seq = u64::from_le_bytes(n) ^ self.nonce;
+        let Ok(i) = usize::try_from(seq) else { return };
+        if i >= self.sent || i >= self.got.len() || self.got[i] || !echo_matches(d, i as u8, self.nonce ^ seq, self.len) { return; }
+        self.got[i] = true;
+        self.payload_bytes += self.len - HEAD;
+    }
+
+    pub fn payload_bytes(&self) -> usize { self.payload_bytes }
+
+    /// 1 MiB не проходит: требуется строго больше.
+    pub fn passed(&self) -> bool { self.payload_bytes > 1024 * 1024 }
+}
+
 /// Прогнать зонд по ещё не привязанному к RNS соединению. Чётные запросы короткие, нечётные близки к MAX_LEN (ограничены `max_datagram_size`).
 pub async fn run(conn: &Connection, nonce: u64) -> ProbeStats {
     let big = conn.max_datagram_size().map(|m| m.min(MAX_LEN)).unwrap_or(SMALL_LEN).max(SMALL_LEN);
@@ -371,6 +415,42 @@ fn take_echo(b: &[u8], nonce: u64, lens: &[usize], got: &mut [bool], st: &mut Pr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_receipts_count_only_unique_complete_sent_payload() {
+        let mut b = BulkReceipts::new(0x1938, MAX_LEN, 1024).unwrap();
+        let request = b.next_request().unwrap();
+        let mut echo = request.clone();
+        echo[8] = KIND_ECHO;
+        b.accept(&echo);
+        assert_eq!(b.payload_bytes(), 0, "неотправленное эхо не считается");
+        b.sent();
+        b.accept(&request);
+        b.accept(&echo[..echo.len() - 1]);
+        assert_eq!(b.payload_bytes(), 0);
+        b.accept(&echo);
+        b.accept(&echo);
+        assert_eq!(b.payload_bytes(), MAX_LEN - HEAD, "повтор не увеличивает счётчик");
+        while b.next_request().is_some() {
+            let mut e = b.next_request().unwrap();
+            b.sent();
+            e[8] = KIND_ECHO;
+            b.accept(&e);
+        }
+        assert_eq!(b.payload_bytes(), 1024 * (MAX_LEN - HEAD));
+        assert!(b.passed());
+    }
+
+    #[test]
+    fn bulk_receipts_require_strictly_more_than_one_mib() {
+        let mut b = BulkReceipts::new(1, MAX_LEN, 1024).unwrap();
+        b.payload_bytes = 1024 * 1024;
+        assert!(!b.passed());
+        b.payload_bytes += 1;
+        assert!(b.passed());
+        assert!(BulkReceipts::new(1, HEAD, 1).is_none());
+        assert!(BulkReceipts::new(1, MAX_LEN, 2049).is_none());
+    }
 
     fn ep(n: u8) -> [u8; 32] {
         [n; 32]

@@ -69,6 +69,9 @@ struct Node {
     e2e: tokio::sync::Mutex<mpsc::UnboundedReceiver<Connection>>,
     /// транзит заметил открытый текст (проверка прозрачности)
     saw_plain: Arc<AtomicBool>,
+    /// Только локальный тест: потерять каждую N-ю входящую mesh-датаграмму.
+    drop_every: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl Node {
@@ -96,6 +99,22 @@ async fn node_with(selector: bool) -> Node {
 }
 
 async fn node_bound(selector: bool, bind: std::net::IpAddr) -> Node {
+    node_bound_mode(selector, bind, false).await
+}
+
+#[derive(Debug)]
+struct ForceMeshSelector;
+impl PathSelector for ForceMeshSelector {
+    fn select(&self, ctx: &PathSelectionContext<'_>) -> PathSelection {
+        let mut selection = PathSelection::none();
+        if let Some(p) = ctx.paths().find(|p| matches!(p.network_path().addr_kind(), AddrKind::Custom(id) if id == MESH_ID)) {
+            selection.set(&p);
+        }
+        selection
+    }
+}
+
+async fn node_bound_mode(selector: bool, bind: std::net::IpAddr, force_mesh: bool) -> Node {
     let sk = SecretKey::generate();
     let me = *sk.public().as_bytes();
     let nbrs: Nbrs = Default::default();
@@ -110,20 +129,22 @@ async fn node_bound(selector: bool, bind: std::net::IpAddr) -> Node {
         .bind_addr(SocketAddr::new(bind, 0))
         .unwrap();
     if selector {
-        b = b.add_custom_transport(mesh.transport()).path_selector(Arc::new(MeshBackupSelector));
+        b = b.add_custom_transport(mesh.transport());
+        b = if force_mesh { b.path_selector(Arc::new(ForceMeshSelector)) } else { b.path_selector(Arc::new(MeshBackupSelector)) };
     }
     let ep = b.bind().await.unwrap();
     let (tx, rx) = mpsc::unbounded_channel();
     let saw_plain = Arc::new(AtomicBool::new(false));
-    let n = Node { ep: ep.clone(), mesh: mesh.clone(), pol, nbrs, e2e: tokio::sync::Mutex::new(rx), saw_plain: saw_plain.clone() };
+    let n = Node { ep: ep.clone(), mesh: mesh.clone(), pol, nbrs, e2e: tokio::sync::Mutex::new(rx), saw_plain: saw_plain.clone(), drop_every: Arc::default(), dropped: Arc::default() };
     let (nbrs2, mesh2) = (n.nbrs.clone(), mesh.clone());
+    let (drop_every, dropped) = (n.drop_every.clone(), n.dropped.clone());
     tokio::spawn(async move {
         while let Some(inc) = ep.accept().await {
-            let (tx, nbrs, mesh, sp) = (tx.clone(), nbrs2.clone(), mesh2.clone(), saw_plain.clone());
+            let (tx, nbrs, mesh, sp, every, drops) = (tx.clone(), nbrs2.clone(), mesh2.clone(), saw_plain.clone(), drop_every.clone(), dropped.clone());
             tokio::spawn(async move {
                 let Ok(conn) = inc.await else { return };
                 if conn.alpn() == NBR {
-                    add_nbr(&nbrs, &mesh, conn, sp);
+                    add_nbr(&nbrs, &mesh, conn, sp, every, drops);
                 } else {
                     if matches!(conn.paths().iter().next().map(|p| p.remote_addr().clone()), Some(TransportAddr::Custom(_))) {
                         mesh.mark_e2e(&conn);
@@ -136,15 +157,19 @@ async fn node_bound(selector: bool, bind: std::net::IpAddr) -> Node {
     n
 }
 
-fn add_nbr(nbrs: &Nbrs, mesh: &Arc<Mesh>, conn: Connection, sp: Arc<AtomicBool>) {
+fn add_nbr(nbrs: &Nbrs, mesh: &Arc<Mesh>, conn: Connection, sp: Arc<AtomicBool>, every: Arc<AtomicU64>, dropped: Arc<AtomicU64>) {
     nbrs.write().unwrap().insert(*conn.remote_id().as_bytes(), conn.clone());
     let mesh = mesh.clone();
     tokio::spawn(async move {
+        let mut seen = 0u64;
         while let Ok(d) = conn.read_datagram().await {
             if d.windows(MARKER.len()).any(|w| w == MARKER) {
                 sp.store(true, Relaxed);
             }
             if d.first() == Some(&TAG) {
+                seen += 1;
+                let n = every.load(Relaxed);
+                if n > 0 && seen % n == 0 { dropped.fetch_add(1, Relaxed); continue; }
                 mesh.on_datagram(&conn, &d);
             }
         }
@@ -158,7 +183,7 @@ fn ip(n: &Node) -> SocketAddr {
 /// Соседская связь a -> b по IP; обе стороны получают друг друга в таблицу носителей.
 async fn link(a: &Node, b: &Node) {
     let conn = a.ep.connect(EndpointAddr::new(b.ep.id()).with_ip_addr(ip(b)), NBR).await.unwrap();
-    add_nbr(&a.nbrs, &a.mesh, conn, a.saw_plain.clone());
+    add_nbr(&a.nbrs, &a.mesh, conn, a.saw_plain.clone(), a.drop_every.clone(), a.dropped.clone());
     let t = Instant::now();
     while !b.nbrs.read().unwrap().contains_key(&a.id()) {
         assert!(t.elapsed() < Duration::from_secs(5));
@@ -181,7 +206,7 @@ async fn e2e_connect(a: &Node, e: &Node) -> (Connection, Connection) {
     (c.expect("connect timed out").expect("connect failed"), s)
 }
 
-async fn echo(a: &Connection, e: &Connection) {
+async fn stream_echo(a: &Connection, e: &Connection) {
     let (mut s, mut r) = a.open_bi().await.unwrap();
     s.write_all(MARKER).await.unwrap();
     s.finish().unwrap();
@@ -190,6 +215,10 @@ async fn echo(a: &Connection, e: &Connection) {
     es.write_all(b"pong-stream").await.unwrap();
     es.finish().unwrap();
     assert_eq!(r.read_to_end(1024).await.unwrap(), b"pong-stream");
+}
+
+async fn echo(a: &Connection, e: &Connection) {
+    stream_echo(a, e).await;
     let mut dg = MARKER.to_vec();
     dg.extend_from_slice(b"-dgram");
     a.send_datagram(Bytes::from(dg.clone())).unwrap();
@@ -305,6 +334,75 @@ async fn failed_attempt_rotates_alt_transit() {
     }
     assert!(ok.is_some(), "после ротации соединение поднялось через транзит, который видит выход");
     assert!(t2.mesh.c.fwd.load(Relaxed) > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_rns_hop_falls_back_to_live_transit() {
+    let (a, stale, live, e) = (node().await, node().await, node().await, node().await);
+    link(&a, &stale).await;
+    link(&a, &live).await;
+    link(&live, &e).await;
+    allow_all(&[&a, &stale, &live, &e]);
+    stale.set_transit(true);
+    live.set_transit(true);
+    route(&a, &e, &stale);
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(stale.id()));
+    // RNS ещё не удалил путь, но соседский QUIC-носитель уже пропал.
+    a.nbrs.write().unwrap().remove(&stale.id());
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(live.id()), "устаревший RNS hop не должен блокировать альтернативу");
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    tokio::time::timeout(Duration::from_secs(15), stream_echo(&ca, &ce)).await.expect("резервный путь должен передать поток в обе стороны");
+    assert!(live.mesh.c.fwd.load(Relaxed) > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn established_mesh_survives_lost_transit_without_reconnect() {
+    let (a, t1, t2, e) = (node_bound_mode(true, [127, 0, 0, 1].into(), true).await, node().await, node().await, node_bound_mode(true, [127, 0, 0, 1].into(), true).await);
+    link(&a, &t1).await;
+    link(&a, &t2).await;
+    link(&t1, &e).await;
+    link(&t2, &e).await;
+    allow_all(&[&a, &t1, &t2, &e]);
+    t1.set_transit(true);
+    t2.set_transit(true);
+    route(&a, &e, &t1);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    echo(&ca, &ce).await;
+    assert!(mesh_selected(&ca), "испытание должно идти через mesh, а не прямой IP");
+    assert!(mesh_selected(&ce), "обратное направление тоже должно идти через mesh");
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t1.id()));
+    let old = a.nbrs.write().unwrap().remove(&t1.id()).expect("старый транзит");
+    old.close(0u32.into(), b"test transit failure");
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t2.id()));
+    let result = tokio::time::timeout(Duration::from_secs(12), echo(&ca, &ce)).await;
+    if result.is_err() {
+        eprintln!("client={}; t1={}; t2={}; exit={}", a.mesh.stats(), t1.mesh.stats(), t2.mesh.stats(), e.mesh.stats());
+        eprintln!("exit_reverse_to_client={:?}", e.mesh.rev.lock().unwrap().get(&a.id()).map(|(k, _)| if *k == t1.id() { "old" } else if *k == t2.id() { "new" } else { "other" }));
+    }
+    result.expect("действующее сквозное QUIC должно продолжить обмен через другой транзит");
+    assert!(mesh_selected(&ca) && mesh_selected(&ce), "после переключения оба направления должны остаться на mesh");
+    assert!(t2.mesh.c.fwd.load(Relaxed) > 0);
+    assert!(t1.mesh.c.unreach_sent.load(Relaxed) > 0, "старый транзит сообщил об отказе");
+    assert!(e.mesh.c.unreach_removed.load(Relaxed) > 0, "выход снял устаревшую обратную запись");
+    // После смены транзита теряем каждую десятую входящую mesh-датаграмму на t2.
+    // Проверяем надёжный сквозной поток, а не требуем доставки каждой QUIC DATAGRAM.
+    t2.drop_every.store(10, Relaxed);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for _ in 0..20 {
+            let (mut tx, mut rx) = ca.open_bi().await.unwrap();
+            tx.write_all(MARKER).await.unwrap();
+            tx.finish().unwrap();
+            let (mut etx, mut erx) = ce.accept_bi().await.unwrap();
+            assert_eq!(erx.read_to_end(1024).await.unwrap(), MARKER);
+            etx.write_all(b"loss-survived").await.unwrap();
+            etx.finish().unwrap();
+            assert_eq!(rx.read_to_end(1024).await.unwrap(), b"loss-survived");
+        }
+    }).await.expect("надёжный поток должен пережить потери на новом транзите");
+    assert!(t2.dropped.load(Relaxed) > 0, "проверка должна действительно отбросить датаграммы");
 }
 
 async fn denied(setup: impl FnOnce(&Node, &Node, &Node)) -> (Node, Node, Node) {
@@ -586,6 +684,43 @@ fn ordinary_neighbor_cannot_poison_reverse_table() {
     m2.on_frame(&c, &frame(8, &dst, &x, b"x"));
     assert_eq!(m2.c.drop_policy.load(Relaxed) + m2.c.drop_no_quic.load(Relaxed), 1);
     assert_eq!(m2.rev.lock().unwrap().len(), 0, "ничего не выучено до успешной пересылки");
+}
+
+#[test]
+fn unreachable_notice_only_withdraws_sender_owned_reverse_route() {
+    let (m, p) = bare(false);
+    let old = *SecretKey::generate().public().as_bytes();
+    let other = *SecretKey::generate().public().as_bytes();
+    let src = *SecretKey::generate().public().as_bytes();
+    p.rights.lock().unwrap().extend([old, other, src]);
+    TRANSIT_KEYS.lock().unwrap().extend([old, other]);
+    let now = Instant::now();
+    m.rev.lock().unwrap().insert(src, (old, now));
+    let mut notice = vec![TAG, 0];
+    notice.extend_from_slice(&id_of(&src));
+    let notice = Bytes::from(notice);
+    m.on_frame(&other, &notice);
+    assert_eq!(m.rev.lock().unwrap().get(&src).map(|x| x.0), Some(old), "посторонний транзит не отзывает чужой маршрут");
+    TRANSIT_KEYS.lock().unwrap().remove(&old);
+    m.on_frame(&old, &notice);
+    assert_eq!(m.rev.lock().unwrap().get(&src).map(|x| x.0), Some(old), "сосед без TRANSIT не может отзывать обратный маршрут");
+    TRANSIT_KEYS.lock().unwrap().insert(old);
+    p.bump();
+    m.sync_gen(p.as_ref());
+    m.rev.lock().unwrap().insert(src, (old, now));
+    m.on_frame(&old, &notice);
+    assert!(!m.rev.lock().unwrap().contains_key(&src));
+    m.rev.lock().unwrap().insert(src, (other, now));
+    m.on_frame(&old, &notice);
+    assert_eq!(m.rev.lock().unwrap().get(&src).map(|x| x.0), Some(other), "задержанный отказ старого транзита не портит новый путь");
+    p.rights.lock().unwrap().remove(&other);
+    p.bump();
+    m.sync_gen(p.as_ref());
+    m.rev.lock().unwrap().insert(src, (other, now));
+    m.on_frame(&other, &notice);
+    assert_eq!(m.rev.lock().unwrap().get(&src).map(|x| x.0), Some(other), "отозванный сосед не может менять маршруты");
+    TRANSIT_KEYS.lock().unwrap().remove(&old);
+    TRANSIT_KEYS.lock().unwrap().remove(&other);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1341,9 +1476,9 @@ async fn nat_run(one_to_one: bool, hint: bool, late_hint: bool) -> Option<Durati
     let e_pub = pub_addr(&e, "93.184.216.10");
     // соседские связи по IP: A -> T (через NAT), T -> E (публично)
     let conn = a.ep.connect(EndpointAddr::new(t.ep.id()).with_ip_addr(pub_addr(&t, "93.184.216.11")), NBR).await.unwrap();
-    add_nbr(&a.nbrs, &a.mesh, conn, a.saw_plain.clone());
+    add_nbr(&a.nbrs, &a.mesh, conn, a.saw_plain.clone(), a.drop_every.clone(), a.dropped.clone());
     let conn = t.ep.connect(EndpointAddr::new(e.ep.id()).with_ip_addr(e_pub), NBR).await.unwrap();
-    add_nbr(&t.nbrs, &t.mesh, conn, t.saw_plain.clone());
+    add_nbr(&t.nbrs, &t.mesh, conn, t.saw_plain.clone(), t.drop_every.clone(), t.dropped.clone());
     let w = Instant::now();
     while !(t.nbrs.read().unwrap().contains_key(&a.id()) && e.nbrs.read().unwrap().contains_key(&t.id())) {
         assert!(w.elapsed() < Duration::from_secs(5));
