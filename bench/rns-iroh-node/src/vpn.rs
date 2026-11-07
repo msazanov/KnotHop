@@ -1411,13 +1411,13 @@ impl mesh::Policy for MeshPolicy {
     }
 
     fn holds_rights(&self, key: &[u8; 32]) -> bool {
-        self.peers.lock().unwrap().knows_key(key)
+        self.peers.lock().unwrap().mesh_knows_key(key)
     }
 
     /// Сосед годится как следующий хоп, если он сам объявил роль транзита (контакт с `TRANSIT`) и нам известен.
     fn is_transit(&self, key: &[u8; 32]) -> bool {
         let p = self.peers.lock().unwrap();
-        p.knows_key(key) && p.roles_of_key(key) & peers::TRANSIT != 0
+        p.mesh_knows_key(key) && p.roles_of_key(key) & peers::TRANSIT != 0
     }
 
     fn generation(&self) -> u64 {
@@ -1426,11 +1426,20 @@ impl mesh::Policy for MeshPolicy {
 
     fn transit_candidates(&self) -> Vec<[u8; 32]> {
         let p = self.peers.lock().unwrap();
-        p.contact_list().into_iter().filter(|c| c.roles & peers::TRANSIT != 0).map(|c| peers::key_of(&c.pk)).collect()
+        p.contact_list().into_iter().filter(|c| c.roles & peers::TRANSIT != 0 && p.mesh_knows_key(&peers::key_of(&c.pk))).map(|c| peers::key_of(&c.pk)).collect()
     }
 
     fn key_for_id(&self, id: &[u8; 8]) -> Option<[u8; 32]> {
         self.peers.lock().unwrap().key_for_id8(id)
+    }
+
+    fn local_key_for_id(&self, id: &[u8; 8]) -> Option<[u8; 32]> {
+        self.peers.lock().unwrap().local_key_for_id8(id)
+    }
+
+    fn local_source_key_for_id(&self, id: &[u8; 8]) -> Option<[u8; 32]> {
+        let p = self.peers.lock().unwrap();
+        if self.client { p.client_mesh_source_for_id8(id) } else { p.key_for_id8(id) }
     }
 
     /// Сосед по таблице путей RNS: назначение узла (из его публичного ключа) -> интерфейс пути -> мультиплексор -> ключ рабочего QUIC-носителя.

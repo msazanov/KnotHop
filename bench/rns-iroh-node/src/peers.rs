@@ -522,6 +522,15 @@ impl Peers {
         self.key_holds_any(key) || self.contacts.values().any(|c| &key_of(&c.pk) == key)
     }
 
+    /// Местный получатель mesh: отозванный ключ не может вернуться через запись contact.
+    pub fn mesh_knows_key(&self, key: &[u8; 32]) -> bool {
+        if self.peers.values().any(|p| p.rights == 0 && &key_of(&p.pk) == key) { return false; }
+        self.key_holds_any(key) || self.contacts.values().any(|c| {
+            let trusted = c.intro_by == "invite" || c.intro_by == "local" || c.intro_by.len() == 32;
+            &key_of(&c.pk) == key && trusted && c.they_grant & USE != 0
+        })
+    }
+
     /// Роли ноды по ключу iroh из её собственных сведений (`accept`): подсказка выбора транзита/выхода, не полномочие.
     pub fn roles_of_key(&self, key: &[u8; 32]) -> u16 {
         self.contacts.values().find(|c| &key_of(&c.pk) == key).map_or(0, |c| c.roles)
@@ -536,6 +545,41 @@ impl Peers {
                 if found.is_some() {
                     return None;
                 }
+                found = Some(k);
+            }
+        }
+        found
+    }
+
+    /// Только для проверки местного назначения mesh, не для разрешения источника или выдачи прав.
+    /// Собственная identity не хранится в peers; живая коллизия префикса всё равно fail-closed.
+    pub fn local_key_for_id8(&self, id: &[u8; 8]) -> Option<[u8; 32]> {
+        let own = key_of(&self.me_pk);
+        if &own[..8] != id {
+            return None;
+        }
+        let peers = self.live().map(|p| key_of(&p.pk));
+        let contacts = self.contacts.values().map(|c| key_of(&c.pk)).filter(|k| self.mesh_knows_key(k));
+        if peers.chain(contacts).any(|k| &k[..8] == id && k != own) {
+            return None;
+        }
+        Some(own)
+    }
+
+    /// Источник кадра, адресованного клиенту: живой peer либо проверенный контакт,
+    /// который разрешил нам USE. Только для конца сквозного QUIC, не для транзита.
+    pub fn client_mesh_source_for_id8(&self, id: &[u8; 8]) -> Option<[u8; 32]> {
+        if &key_of(&self.me_pk)[..8] == id { return None; }
+        let mut found = None;
+        let keys = self.live().map(|p| key_of(&p.pk)).filter(|k| self.mesh_knows_key(k)).chain(self.contacts.iter().filter_map(|(_, c)| {
+            let trusted = c.intro_by == "invite" || c.intro_by == "local" || c.intro_by.len() == 32;
+            let key = key_of(&c.pk);
+            let revoked = self.peers.values().any(|p| p.rights == 0 && key_of(&p.pk) == key);
+            (trusted && !revoked && c.they_grant & USE != 0).then_some(key)
+        }));
+        for k in keys {
+            if &k[..8] == id && found != Some(k) {
+                if found.is_some() { return None; }
                 found = Some(k);
             }
         }
@@ -839,7 +883,9 @@ impl Peers {
         let name = if name.is_empty() { old.map(|o| o.name.clone()).unwrap_or_default() } else { name };
         let hints = if hints.is_empty() { old.map(|o| o.hints.clone()).unwrap_or_default() } else { balance_hints(hints, MAX_CONTACT_HINTS) };
         let intro_by = old.filter(|o| o.intro_by != "invite" && intro_by == "invite").map_or(intro_by.to_string(), |o| o.intro_by.clone());
+        let auth_changed = old.is_none_or(|o| o.pk != pk || o.intro_by != intro_by || o.they_grant != they_grant & KNOWN || o.roles != roles & (TRANSIT | EXIT));
         self.contacts.insert(h, Contact { pk, name, hints, intro_by, they_grant: they_grant & KNOWN, roles: roles & (TRANSIT | EXIT), at: now, rl, client });
+        if auth_changed { self.bump(); }
         Ok(())
     }
 
@@ -850,18 +896,22 @@ impl Peers {
 
     /// Роли контакта по его собственному статусу; false - контакта нет или роли не изменились.
     pub fn set_contact_roles(&mut self, h: &Hash, roles: u16) -> bool {
-        match self.contacts.get_mut(h) {
+        let changed = match self.contacts.get_mut(h) {
             Some(c) if c.roles != roles & (TRANSIT | EXIT) => { c.roles = roles & (TRANSIT | EXIT); true }
             _ => false,
-        }
+        };
+        if changed { self.bump(); }
+        changed
     }
 
     /// Подсказка от самой ноды о правах на ней; окончательный допуск решает нода.
     pub fn set_contact_grant(&mut self, h: &Hash, rights: u16) -> bool {
-        match self.contacts.get_mut(h) {
+        let changed = match self.contacts.get_mut(h) {
             Some(c) if c.they_grant != rights & KNOWN => { c.they_grant = rights & KNOWN; true }
             _ => false,
-        }
+        };
+        if changed { self.bump(); }
+        changed
     }
 
     /// Новые адреса-подсказки известного контакта (сообщение `addr`). false - контакта нет, список пуст или не изменился.
@@ -875,7 +925,9 @@ impl Peers {
 
     /// Убрать контакт: только подсказки и выбор, `peers` (что разрешено ему) не меняется (ADR §1.3).
     pub fn contact_remove(&mut self, h: &Hash) -> bool {
-        self.contacts.remove(h).is_some()
+        let changed = self.contacts.remove(h).is_some();
+        if changed { self.bump(); }
+        changed
     }
 
     /// Запомнить подсказку REALITY контакта. Ограничена по размеру; нет контакта или слишком большая — ничего не меняется.
@@ -1344,6 +1396,74 @@ mod tests {
         assert_eq!(t.pk_for_key(&k), Some(a));
         t.peer_remove(&Actor::Local, &hh(&a), T0 + 1, T0 + 1).unwrap();
         assert_eq!(t.key_for_id8(&k[..8].try_into().unwrap()), None);
+    }
+
+    #[test]
+    fn key_for_id8_resolves_self_without_granting_rights() {
+        let (t, me) = table();
+        let key = key_of(&me);
+        let id = key[..8].try_into().unwrap();
+        assert_eq!(t.local_key_for_id8(&id), Some(key));
+        assert_eq!(t.key_for_id8(&id), None, "свой ключ не становится допустимым источником");
+        assert!(!t.key_holds_any(&key), "распознавание себя не выдаёт права");
+        assert!(!t.mesh_forward(&key, &key, &key));
+    }
+
+    #[test]
+    fn key_for_id8_rejects_live_collision_with_self_but_ignores_revoked() {
+        let (mut t, me) = table();
+        let key = key_of(&me);
+        let id: [u8; 8] = key[..8].try_into().unwrap();
+        let (_, mut other) = ident();
+        // Синтетическая коллизия: только проверка разрешения префикса, не пригодный ключ для связи.
+        other[32..40].copy_from_slice(&id);
+        other[63] = key[31] ^ 1;
+        t.peers.insert([7; 16], Peer { pk: other, rights: USE, by: "local".into(), seq: 1, at: 1, name: String::new() });
+        assert_eq!(t.local_key_for_id8(&id), None, "живую коллизию нельзя разрешать в свой ключ");
+        t.peers.get_mut(&[7; 16]).unwrap().rights = 0;
+        assert_eq!(t.local_key_for_id8(&id), Some(key), "отозванный ключ не участвует в разрешении");
+    }
+
+    #[test]
+    fn local_mesh_id_rejects_collision_with_known_contact() {
+        let (mut t, me) = table();
+        let key = key_of(&me);
+        let id: [u8; 8] = key[..8].try_into().unwrap();
+        let (_, mut other) = ident();
+        other[32..40].copy_from_slice(&id);
+        other[63] = key[31] ^ 1;
+        t.contact_set(other, "", vec![], "local", USE, EXIT, T0).unwrap();
+        assert_eq!(t.local_key_for_id8(&id), None);
+        assert_eq!(t.client_mesh_source_for_id8(&id), None);
+    }
+
+    #[test]
+    fn client_mesh_source_requires_trusted_contact_and_respects_revocation() {
+        let (mut t, me) = table();
+        let (_, remote) = ident();
+        let key = key_of(&remote);
+        let id = key[..8].try_into().unwrap();
+        let hash = hh(&remote);
+        t.accepted(remote, "", vec![], USE, EXIT, T0).unwrap();
+        assert_eq!(t.key_for_id8(&id), None, "контакт не получает права транзита");
+        assert_eq!(t.client_mesh_source_for_id8(&id), Some(key));
+        assert!(t.mesh_knows_key(&key));
+        let g = t.generation();
+        let before = g.load(Ordering::SeqCst);
+        assert!(t.set_contact_grant(&hash, 0));
+        assert!(g.load(Ordering::SeqCst) > before, "отзыв подсказки инвалидирует кэш");
+        assert_eq!(t.client_mesh_source_for_id8(&id), None);
+        assert!(t.set_contact_grant(&hash, USE));
+        t.peer_set(&Actor::Local, remote, USE, "", T0, T0).unwrap();
+        t.peer_remove(&Actor::Local, &hash, T0 + 1, T0 + 1).unwrap();
+        assert_eq!(t.client_mesh_source_for_id8(&id), None, "контакт не обходит локальный отзыв");
+        assert!(!t.mesh_knows_key(&key), "контакт не обходит отзыв соседа");
+        let own_id = key_of(&me)[..8].try_into().unwrap();
+        assert_eq!(t.client_mesh_source_for_id8(&own_id), None, "свой id — не удалённый источник");
+        let (_, untrusted) = ident();
+        t.contact_set(untrusted, "", vec![], "untrusted", USE, EXIT, T0).unwrap();
+        let untrusted_id = key_of(&untrusted)[..8].try_into().unwrap();
+        assert_eq!(t.client_mesh_source_for_id8(&untrusted_id), None);
     }
 
     #[test]

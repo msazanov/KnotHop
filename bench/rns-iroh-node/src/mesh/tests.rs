@@ -654,6 +654,179 @@ fn ambiguous_own_id8_is_not_delivered() {
     assert_eq!((m.c.drop_id_ambiguous.load(Relaxed), m.c.delivered.load(Relaxed)), (1, 0));
 }
 
+/// Использует реальную rootless-таблицу как MeshPolicy: собственная identity не находится в peers.
+#[test]
+fn local_delivery_with_real_peers_keeps_source_and_revocation_checks() {
+    use crate::peers::{self, Actor, Peers};
+    use leviculum_std::api::Identity;
+
+    struct TablePolicy(Mutex<Peers>);
+    impl Policy for TablePolicy {
+        fn may_forward(&self, p: &Key, s: &Key, d: &Key) -> bool { self.0.lock().unwrap().mesh_forward(p, s, d) }
+        fn holds_rights(&self, k: &Key) -> bool { self.0.lock().unwrap().knows_key(k) }
+        fn is_transit(&self, k: &Key) -> bool { self.0.lock().unwrap().roles_of_key(k) & peers::TRANSIT != 0 }
+        fn transit_candidates(&self) -> Vec<Key> { vec![] }
+        fn generation(&self) -> u64 { self.0.lock().unwrap().generation().load(Relaxed) }
+        fn route(&self, _: &Key) -> Option<Key> { None }
+        fn key_for_id(&self, id: &Id) -> Option<Key> { self.0.lock().unwrap().key_for_id8(id) }
+        fn local_key_for_id(&self, id: &Id) -> Option<Key> { self.0.lock().unwrap().local_key_for_id8(id) }
+    }
+
+    let me_pk = Identity::generate(&mut rand_core::OsRng).public_key_bytes();
+    let src_pk = Identity::generate(&mut rand_core::OsRng).public_key_bytes();
+    let (me, src) = (peers::key_of(&me_pk), peers::key_of(&src_pk));
+    let mut table = Peers::new(me_pk, None);
+    table.peer_set(&Actor::Local, src_pk, peers::USE, "", 1_000, 1_000).unwrap();
+    let p = Arc::new(TablePolicy(Mutex::new(table)));
+    let m = Mesh::with_carriers(me, true, Arc::new(|_| None));
+    m.set_policy(p.clone());
+    m.on_frame(&src, &frame(8, &me, &src, b"test"));
+    assert_eq!(m.c.delivered.load(Relaxed), 1, "известный сосед доставляет локальному ключу без self-peer");
+    m.on_frame(&src, &frame(8, &me, &me, b"spoof"));
+    assert_eq!(m.c.drop_unknown_key.load(Relaxed), 1, "свой ключ не разрешается как источник");
+    let hash = peers::hash_of(&src_pk).unwrap();
+    p.0.lock().unwrap().peer_remove(&Actor::Local, &hash, 1_001, 1_001).unwrap();
+    m.on_frame(&src, &frame(8, &me, &src, b"revoked"));
+    assert_eq!(m.c.delivered.load(Relaxed), 1, "отзыв не должен доставлять новые кадры");
+}
+
+#[test]
+fn client_contact_delivery_respects_cache_invalidation_and_no_forwarding() {
+    use crate::peers::{self, Actor, Peers};
+    use leviculum_std::api::Identity;
+    struct ClientPolicy(Mutex<Peers>);
+    impl Policy for ClientPolicy {
+        fn may_forward(&self, _: &Key, _: &Key, _: &Key) -> bool { false }
+        fn holds_rights(&self, k: &Key) -> bool { self.0.lock().unwrap().mesh_knows_key(k) }
+        fn is_transit(&self, k: &Key) -> bool {
+            let t = self.0.lock().unwrap();
+            t.mesh_knows_key(k) && t.roles_of_key(k) & peers::TRANSIT != 0
+        }
+        fn transit_candidates(&self) -> Vec<Key> { vec![] }
+        fn generation(&self) -> u64 { self.0.lock().unwrap().generation().load(Relaxed) }
+        fn route(&self, _: &Key) -> Option<Key> { None }
+        fn key_for_id(&self, id: &Id) -> Option<Key> { self.0.lock().unwrap().key_for_id8(id) }
+        fn local_key_for_id(&self, id: &Id) -> Option<Key> { self.0.lock().unwrap().local_key_for_id8(id) }
+        fn local_source_key_for_id(&self, id: &Id) -> Option<Key> { self.0.lock().unwrap().client_mesh_source_for_id8(id) }
+    }
+    let identity = || Identity::generate(&mut rand_core::OsRng).public_key_bytes();
+    let (me_pk, transit_pk, exit_pk, unknown_pk) = (identity(), identity(), identity(), identity());
+    let (me, transit, exit, unknown) = (peers::key_of(&me_pk), peers::key_of(&transit_pk), peers::key_of(&exit_pk), peers::key_of(&unknown_pk));
+    let mut table = Peers::new(me_pk, None);
+    table.accepted(transit_pk, "", vec![], peers::USE, peers::TRANSIT, 1_000).unwrap();
+    table.accepted(exit_pk, "", vec![], peers::USE, peers::EXIT, 1_000).unwrap();
+    let policy = Arc::new(ClientPolicy(Mutex::new(table)));
+    let mesh = Mesh::with_carriers(me, true, Arc::new(|_| None));
+    mesh.set_policy(policy.clone());
+    mesh.on_frame(&transit, &frame(8, &me, &exit, b"first"));
+    assert_eq!(mesh.c.delivered.load(Relaxed), 1);
+    mesh.on_frame(&transit, &frame(8, &me, &unknown, b"unknown"));
+    mesh.on_frame(&transit, &frame(8, &exit, &exit, b"forward"));
+    assert_eq!(mesh.c.delivered.load(Relaxed), 1);
+    assert_eq!(mesh.c.fwd.load(Relaxed), 0);
+    let hash = peers::hash_of(&exit_pk).unwrap();
+    assert!(policy.0.lock().unwrap().set_contact_grant(&hash, 0));
+    mesh.on_frame(&transit, &frame(8, &me, &exit, b"no-grant"));
+    assert_eq!(mesh.c.delivered.load(Relaxed), 1, "смена контакта инвалидирует кэш источника");
+    {
+        let mut t = policy.0.lock().unwrap();
+        assert!(t.set_contact_grant(&hash, peers::USE));
+        t.peer_set(&Actor::Local, exit_pk, peers::USE, "", 1_000, 1_000).unwrap();
+        t.peer_remove(&Actor::Local, &hash, 1_001, 1_001).unwrap();
+    }
+    mesh.on_frame(&transit, &frame(8, &me, &exit, b"revoked"));
+    assert_eq!(mesh.c.delivered.load(Relaxed), 1, "отозванный peer не возвращается через contact");
+}
+
+/// Микроизмерение только горячего кэша разрешения источника; это не скорость VPN.
+#[test]
+#[ignore = "ручное микроизмерение overhead"]
+fn local_source_cache_overhead() {
+    use std::hint::black_box;
+    let (mesh, policy) = bare(true);
+    let source = [42; 32];
+    let id = id_of(&source);
+    policy.rights.lock().unwrap().insert(source);
+    let now = Instant::now();
+    assert_eq!(mesh.key_of(now, &id, policy.as_ref()), Some(source));
+    assert_eq!(mesh.local_source_key(now, &id, policy.as_ref()), Some(source));
+    const N: usize = 1_000_000;
+    for _ in 0..3 {
+        let start = Instant::now();
+        for _ in 0..N { black_box(mesh.key_of(now, black_box(&id), policy.as_ref())); }
+        let old = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..N { black_box(mesh.local_source_key(now, black_box(&id), policy.as_ref())); }
+        let new = start.elapsed();
+        println!("source-cache N={N} baseline_ns={:.1} new_ns={:.1}", old.as_nanos() as f64 / N as f64, new.as_nanos() as f64 / N as f64);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rootless_tables_without_self_peer_complete_mesh_quic() {
+    use crate::peers::{self, Actor, Peers};
+    struct TablePolicy { table: Mutex<Peers>, routes: HashMap<Key, Key>, client: bool }
+    impl Policy for TablePolicy {
+        fn may_forward(&self, p: &Key, s: &Key, d: &Key) -> bool { self.table.lock().unwrap().mesh_forward(p, s, d) }
+        fn holds_rights(&self, k: &Key) -> bool { self.table.lock().unwrap().mesh_knows_key(k) }
+        fn is_transit(&self, k: &Key) -> bool {
+            let t = self.table.lock().unwrap();
+            t.mesh_knows_key(k) && t.roles_of_key(k) & peers::TRANSIT != 0
+        }
+        fn transit_candidates(&self) -> Vec<Key> {
+            self.table.lock().unwrap().contact_list().into_iter()
+                .filter(|c| c.roles & peers::TRANSIT != 0).map(|c| peers::key_of(&c.pk)).collect()
+        }
+        fn generation(&self) -> u64 { self.table.lock().unwrap().generation().load(Relaxed) }
+        fn route(&self, dst: &Key) -> Option<Key> { self.routes.get(dst).copied() }
+        fn key_for_id(&self, id: &Id) -> Option<Key> { self.table.lock().unwrap().key_for_id8(id) }
+        fn local_key_for_id(&self, id: &Id) -> Option<Key> { self.table.lock().unwrap().local_key_for_id8(id) }
+        fn local_source_key_for_id(&self, id: &Id) -> Option<Key> {
+            let t = self.table.lock().unwrap();
+            if self.client { t.client_mesh_source_for_id8(id) } else { t.key_for_id8(id) }
+        }
+    }
+    fn pk(n: &Node) -> peers::Pk {
+        let mut pk = [7u8; 64];
+        pk[32..].copy_from_slice(&n.id());
+        pk
+    }
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    for n in [&a, &t, &e] {
+        let mut table = Peers::new(pk(n), None);
+        for other in [&a, &t, &e] {
+            if n.id() != other.id() {
+                if n.id() == a.id() {
+                    // Телефон вступил по приглашению: серверы — контакты, не держатели прав на телефоне.
+                    let roles = if other.id() == t.id() { peers::TRANSIT } else { peers::EXIT };
+                    table.accepted(pk(other), "", vec![], peers::USE, roles, 1_000).unwrap();
+                } else {
+                    table.peer_set(&Actor::Local, pk(other), peers::USE, "", 1_000, 1_000).unwrap();
+                }
+            }
+        }
+        if n.id() != t.id() {
+            table.accepted(pk(&t), "", vec![], peers::USE, peers::TRANSIT, 1_000).unwrap();
+        } else {
+            table.set_config(&Actor::Local, Some(true), None).unwrap();
+        }
+        assert_eq!(table.key_for_id8(&id_of(&n.id())), None, "своего ключа в peers нет");
+        let mut routes = HashMap::new();
+        if n.id() == a.id() { routes.insert(e.id(), t.id()); }
+        n.mesh.set_policy(Arc::new(TablePolicy { table: Mutex::new(table), routes, client: n.id() == a.id() }));
+    }
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert_eq!(ca.remote_id().as_bytes(), &e.id(), "TLS клиента доказывает ключ выхода");
+    assert_eq!(ce.remote_id().as_bytes(), &a.id(), "TLS выхода доказывает ключ клиента");
+    echo(&ca, &ce).await;
+    assert!(t.mesh.c.fwd.load(Relaxed) > 0);
+    assert!(e.mesh.c.delivered.load(Relaxed) > 0);
+    assert_eq!(e.mesh.c.drop_id_ambiguous.load(Relaxed), 0);
+    assert!(!t.saw_plain.load(Relaxed), "транзит не видит открытый текст");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_hop_cache_never_sends_into_a_connection_that_rides_mesh() {
     let (a, t, e) = (node().await, node().await, node().await);

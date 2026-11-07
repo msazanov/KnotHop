@@ -102,6 +102,10 @@ pub trait Policy: Send + Sync {
     fn route(&self, dst: &Key) -> Option<Key>;
     /// Полный ключ по 8-байтному id среди ключей, известных хранилищу доверия (любой держатель прав или якорь). Неизвестный id - None.
     fn key_for_id(&self, id: &Id) -> Option<Key>;
+    /// Проверка именно местного назначения; она не меняет правила разрешения источников.
+    fn local_key_for_id(&self, id: &Id) -> Option<Key> { self.key_for_id(id) }
+    /// Источник кадра для конечного получателя; транзит всегда использует key_for_id.
+    fn local_source_key_for_id(&self, id: &Id) -> Option<Key> { self.key_for_id(id) }
 }
 
 #[derive(Default)]
@@ -201,6 +205,8 @@ pub struct Mesh {
     /// мультиплексоров и Trust - обратный порядок замков у `Mux::send` дал бы взаимную блокировку). Заполняют `warm`/`prepare` и поток-разрешитель.
     hops: Mutex<HashMap<Key, HopEntry>>,
     ids: Mutex<HashMap<Id, (Option<Key>, Instant)>>,
+    local_sources: Mutex<HashMap<Id, (Option<Key>, u64, Instant)>>,
+    local_id: Mutex<Option<(Option<Key>, u64, Instant)>>,
     ride_cache: Mutex<HashMap<usize, (bool, Instant)>>,
     /// сдвиг выбора альтернативного транзита по назначению (растёт после неудачной попытки соединения)
     alt_rot: Mutex<HashMap<Key, u32>>,
@@ -267,6 +273,8 @@ impl Mesh {
             routes: Default::default(),
             hops: Default::default(),
             ids: Default::default(),
+            local_sources: Default::default(),
+            local_id: Default::default(),
             ride_cache: Default::default(),
             alt_rot: Default::default(),
             hop_pending: Default::default(),
@@ -423,6 +431,8 @@ impl Mesh {
         if self.seen_gen.swap(g, Relaxed) != g {
             self.auth.lock().unwrap().clear();
             self.ids.lock().unwrap().clear();
+            self.local_sources.lock().unwrap().clear();
+            *self.local_id.lock().unwrap() = None;
             self.routes.lock().unwrap().clear();
             self.hops.lock().unwrap().clear();
             self.rev.lock().unwrap().clear();
@@ -519,6 +529,38 @@ impl Mesh {
         if c.len() < 1024 {
             c.insert(*id, (k, now + if k.is_some() { Duration::from_secs(30) } else { Duration::from_secs(5) }));
         }
+        k
+    }
+
+    /// Отдельный кэш для своего назначения: не добавляем собственный ключ в кэш источников.
+    fn local_key(&self, now: Instant, policy: &dyn Policy) -> Option<Key> {
+        let generation = policy.generation();
+        {
+            let c = self.local_id.lock().unwrap();
+            if let Some((k, g, until)) = *c {
+                if g == generation && until > now { return k; }
+            }
+        }
+        let k = policy.local_key_for_id(&id_of(&self.me));
+        // Изменение прав во время разрешения нельзя закэшировать под новым поколением.
+        if policy.generation() != generation { return None; }
+        *self.local_id.lock().unwrap() = Some((k, generation, now + if k.is_some() { Duration::from_secs(30) } else { Duration::from_secs(5) }));
+        k
+    }
+
+    fn local_source_key(&self, now: Instant, id: &Id, policy: &dyn Policy) -> Option<Key> {
+        let generation = policy.generation();
+        {
+            let c = self.local_sources.lock().unwrap();
+            if let Some((k, g, until)) = c.get(id) {
+                if *g == generation && *until > now { return *k; }
+            }
+        }
+        let k = policy.local_source_key_for_id(id);
+        if policy.generation() != generation { return None; }
+        let mut c = self.local_sources.lock().unwrap();
+        if c.len() >= 1024 { c.retain(|_, (_, _, until)| *until > now); }
+        if c.len() < 1024 { c.insert(*id, (k, generation, now + if k.is_some() { Duration::from_secs(30) } else { Duration::from_secs(5) })); }
         k
     }
 
@@ -709,13 +751,15 @@ impl Mesh {
         }
         let dst_id: Id = d[2..10].try_into().unwrap();
         let src_id: Id = d[10..18].try_into().unwrap();
-        let Some(src) = self.key_of(now, &src_id, policy.as_ref()) else {
+        let is_local = dst_id == id_of(&self.me);
+        let source = if is_local { self.local_source_key(now, &src_id, policy.as_ref()) } else { self.key_of(now, &src_id, policy.as_ref()) };
+        let Some(src) = source else {
             c.drop_unknown_key.fetch_add(1, Relaxed);
             return;
         };
-        if dst_id == id_of(&self.me) {
+        if is_local {
             // последний хоп. Мой id8 обязан однозначно разрешаться в мой ключ
-            if self.key_of(now, &dst_id, policy.as_ref()) != Some(self.me) {
+            if self.local_key(now, policy.as_ref()) != Some(self.me) {
                 c.drop_id_ambiguous.fetch_add(1, Relaxed);
                 return;
             }
