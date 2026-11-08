@@ -27,6 +27,109 @@ const GRACE_IDLE: Duration = Duration::from_secs(2);
 /// Не больше стольких носителей одного пира одновременно (рабочий + кандидат).
 const MAX_CARRIERS: usize = 3;
 
+/// Best-effort diagnostic classification only; never used for authorization or
+/// routing. Reject short/noncanonical inputs before looking at untrusted bytes.
+fn link_wire_marker(packet: &[u8]) -> Option<(&'static str, [u8; 4])> {
+    use sha2::{Digest, Sha256};
+    let flags = *packet.first()?;
+    let start = if flags & 0x40 != 0 { 18 } else { 2 };
+    let context = *packet.get(start + 16)?;
+    match flags & 3 {
+        2 if packet.len() >= start + 16 + 1 + 64 => {
+            let mut hash = Sha256::new();
+            hash.update([flags & 0x0f]);
+            hash.update(&packet[start..start + 16 + 1 + 64]);
+            let digest = hash.finalize();
+            Some(("request", digest[..4].try_into().ok()?))
+        }
+        3 if context == 0xff && packet.len() >= start + 16 + 1 + 96 => {
+            Some(("proof", packet[start..start + 4].try_into().ok()?))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct LinkTraceBudget {
+    seen: std::collections::HashMap<([u8; 4], usize), Instant>,
+    recent: std::collections::VecDeque<Instant>,
+}
+
+impl LinkTraceBudget {
+    fn allow(&mut self, marker: [u8; 4], stage: usize, now: Instant) -> bool {
+        const WINDOW: Duration = Duration::from_secs(1);
+        self.recent.retain(|t| now.saturating_duration_since(*t) < WINDOW);
+        self.seen.retain(|_, t| now.saturating_duration_since(*t) < WINDOW);
+        if self.recent.len() >= 32 || self.seen.len() >= 128 || self.seen.contains_key(&(marker, stage)) {
+            return false;
+        }
+        self.seen.insert((marker, stage), now);
+        self.recent.push_back(now);
+        true
+    }
+}
+
+/// Opt-in diagnostics only. Missing entries cannot prove loss: the bounded
+/// global budget can suppress entries during a flood.
+fn trace_link(sh: &Weak<Shared>, iface: &str, direction: &str, packet: &[u8], path_kind: impl FnOnce() -> &'static str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static BUDGET: std::sync::OnceLock<Mutex<LinkTraceBudget>> = std::sync::OnceLock::new();
+    // Android has an existing user-controlled diagnostics switch, but cannot
+    // receive an environment variable in the ordinary signed APK. Check the
+    // live flag as well as the explicit server/lab opt-in so disabling debug
+    // also stops tracing without a process restart.
+    if !crate::debug() && !*ENABLED.get_or_init(|| std::env::var("KNOTHOP_LINK_TRACE").as_deref() == Ok("1")) { return; }
+    let Some((kind, marker)) = link_wire_marker(packet) else { return };
+    let index = usize::from(kind == "proof") * 2 + usize::from(direction == "rx");
+    if !BUDGET.get_or_init(Default::default).lock().unwrap().allow(marker, index, Instant::now()) { return; }
+    if let Some(sh) = sh.upgrade() {
+        sh.note(format!("RNS trace {direction} {kind} {:02x}{:02x}{:02x}{:02x} iface={iface} path={} (sampled)", marker[0], marker[1], marker[2], marker[3], path_kind()));
+    }
+}
+
+#[cfg(test)]
+mod link_wire_marker_tests {
+    use super::{link_wire_marker, LinkTraceBudget};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn competing_links_do_not_hide_each_other_and_budget_is_bounded() {
+        let mut budget = LinkTraceBudget::default();
+        let t = Instant::now();
+        assert!(budget.allow([1; 4], 1, t));
+        assert!(budget.allow([2; 4], 1, t + Duration::from_millis(181)));
+        assert!(!budget.allow([1; 4], 1, t + Duration::from_millis(181)));
+        assert!(budget.allow([1; 4], 3, t + Duration::from_millis(181)));
+        for i in 3..32 { assert!(budget.allow([i; 4], 1, t + Duration::from_millis(181))); }
+        assert!(!budget.allow([99; 4], 1, t + Duration::from_millis(181)));
+        assert!(budget.allow([1; 4], 1, t + Duration::from_millis(1200)));
+    }
+
+    #[test]
+    fn matches_request_and_proof_without_transport_header_or_signalling() {
+        let mut request = vec![0x02, 0];
+        request.extend_from_slice(&[0x12; 16]);
+        request.push(0);
+        request.extend_from_slice(&[0x34; 64]);
+        let (_, marker) = link_wire_marker(&request).unwrap();
+        let mut forwarded = vec![0x42, 1];
+        forwarded.extend_from_slice(&[0x56; 16]);
+        forwarded.extend_from_slice(&request[2..]);
+        forwarded.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(link_wire_marker(&forwarded), Some(("request", marker)));
+        let mut proof = vec![0x0f, 0];
+        proof.extend_from_slice(&marker);
+        proof.extend_from_slice(&[0; 12]);
+        proof.push(0xff);
+        proof.extend_from_slice(&[0; 96]);
+        assert_eq!(link_wire_marker(&proof), Some(("proof", marker)));
+        assert_eq!(link_wire_marker(&proof[..18]), None);
+        proof[18] = 0;
+        assert_eq!(link_wire_marker(&proof), None);
+        assert_eq!(link_wire_marker(&[]), None);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Quic,
@@ -73,6 +176,7 @@ pub fn by_name(name: &str) -> Option<Arc<Mux>> {
 
 pub struct Mux {
     pub name: String,
+    trace_sh: Weak<Shared>,
     follow: bool,
     st: Mutex<St>,
     /// носитель, на который идут данные (0 - нет)
@@ -98,6 +202,7 @@ impl Mux {
         let (closed, mut closed_rx) = tokio::sync::watch::channel(false);
         let m = Arc::new(Mux {
             name: name.clone(),
+            trace_sh: Arc::downgrade(sh),
             follow,
             st: Mutex::new(St { cars: Vec::new(), next: 1, empty_epoch: 0, empty_since: Some(Instant::now()) }),
             send_on: AtomicU64::new(0),
@@ -265,17 +370,19 @@ impl Mux {
         let id = self.send_on.load(Relaxed);
         let st = self.st.lock().unwrap();
         let Some(c) = st.cars.iter().find(|c| c.id == id).or_else(|| st.cars.first()) else { return };
-        match &c.tx {
+        let queued = match &c.tx {
             Tx::Quic(conn) => {
                 // слишком большая датаграмма или обрыв - потеря одного пакета; обрыв заметит `closed()`
-                let _ = conn.send_datagram(bytes::Bytes::copy_from_slice(packet));
+                conn.send_datagram(bytes::Bytes::copy_from_slice(packet)).is_ok()
             }
             Tx::Tcp(tx) => {
                 if packet.len() <= tcp_max_frame() {
-                    let _ = tx.try_send(packet.to_vec());
-                }
+                    tx.try_send(packet.to_vec()).is_ok()
+                } else { false }
             }
-        }
+        };
+        drop(st);
+        if queued { trace_link(&self.trace_sh, &self.name, "tx-queued", packet, || "not-observed"); }
         self.tx_pkts.fetch_add(1, Relaxed);
     }
 
@@ -381,6 +488,7 @@ impl MuxSource {
                 match &mut self.srcs[i] {
                     Src::Tcp { id, rx } => match rx.poll_recv(cx) {
                         Poll::Ready(Some(p)) => {
+                            trace_link(&mux.trace_sh, &mux.name, "rx", &p, || "tcp");
                             got = Some(Ev::Pkt(*id, p));
                         }
                         Poll::Ready(None) => gone = Some(*id),
@@ -432,6 +540,12 @@ impl MuxSource {
                                         continue;
                                     }
                                     filter.delivered();
+                                    trace_link(&mux.trace_sh, &mux.name, "rx", &b, || {
+                                        conn.paths().iter().find(|p| p.id() == path_id).map(|p| {
+                                            if mesh::is_mesh_addr(p.remote_addr()) { "mesh" }
+                                            else if p.is_ip() { "ip" } else { "other" }
+                                        }).unwrap_or("unknown")
+                                    });
                                     got = Some(Ev::Pkt(*id, b.to_vec()));
                                 }
                                 Poll::Ready(None) => gone = Some(*id),

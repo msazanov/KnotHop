@@ -79,12 +79,31 @@ BASE = SUBNET.rsplit(".", 1)[0]   # первые три октета подсе�
 HUB_IP, SITE_IP = f"{BASE}.10", f"{BASE}.50"
 # LAB13_CPUSETS="имя=cpu,имя=cpu": закрепление контейнеров за ядрами (замеры на 1 ядро); LAB13_DEBUG=0: без KNOTHOP_DEBUG
 CPUSETS = dict(x.split("=", 1) for x in os.environ.get("LAB13_CPUSETS", "").split(",") if "=" in x)
+# Opt-in isolation for the rootless scenario, which otherwise uses bare names.
+# Map only Docker container arguments, never command text or unrelated names.
+ISOLATED_ROOTLESS = sys.argv[1:2] == ["rootless"] and os.environ.get("LAB13_ISOLATED") == "1"
+ROOTLESS_NAMES = frozenset(("adm", "s1", "s2", "s3", "cl", "bad", "c1", "c2"))
+if ISOLATED_ROOTLESS and (not PREFIX or not re.fullmatch(r"[a-z][a-z0-9-]{2,24}", PREFIX)):
+    sys.exit("LAB13_ISOLATED=1 требует уникальный LAB13_PREFIX (3–25 строчных символов)")
 CLIENT_NET = "198.18.0.0/15"
 PHONE_PORT = 47011
 HUB_LAN_PORT = 4243   # хаб «публичной RNS» на LAN-адресе ноутбука (для телефона)
 
 
 def sh(*a, check=True):
+    if ISOLATED_ROOTLESS and len(a) >= 3 and a[0] == "docker":
+        a = list(a)
+        if a[1] in ("exec", "inspect", "start", "stop", "restart", "rm", "logs"):
+            # `exec` may itself contain arguments named like a node: map only
+            # the container position, never its command arguments.
+            indices = [2] if a[1] in ("exec", "start", "logs") else [len(a) - 1]
+            for i in indices:
+                if i < len(a) and a[i] in ROOTLESS_NAMES:
+                    a[i] = f"{PREFIX}-{a[i]}"
+        elif a[1] == "run" and "--name" in a:
+            i = a.index("--name") + 1
+            if i < len(a) and a[i] in ROOTLESS_NAMES:
+                a[i] = f"{PREFIX}-{a[i]}"
     r = subprocess.run(a, capture_output=True, text=True)
     if check and r.returncode:
         sys.exit(f"{' '.join(a[:5])}...: {(r.stderr or r.stdout).strip()[-600:]}")
@@ -107,11 +126,13 @@ def next_ip():
 
 
 def run(name, ip, cmd, state, extra=(), net=None, private_dial=True):
-    sh("docker", "rm", "-f", name, check=False)
+    if not ISOLATED_ROOTLESS:
+        sh("docker", "rm", "-f", name, check=False)
     debug = ("-e", "KNOTHOP_DEBUG=1") if os.environ.get("LAB13_DEBUG", "1") != "0" else ()
     cpus = ("--cpuset-cpus", CPUSETS[name]) if name in CPUSETS else ()
+    trace = ("-e", "KNOTHOP_LINK_TRACE=1") if ISOLATED_ROOTLESS and os.environ.get("KNOTHOP_LINK_TRACE") == "1" else ()
     sh("docker", "run", "-d", "--name", name, "--hostname", name, "--network", net or NET, "--ip", ip, "--cap-add", "NET_ADMIN", "--device", "/dev/net/tun",
-       "--sysctl", "net.ipv4.ip_forward=1", *debug, *cpus, *(("-e", "KNOTHOP_ALLOW_PRIVATE_DIAL=1") if private_dial else ()), "-e", "KNOTHOP_TCP_BACKOFF_S=30",
+       "--sysctl", "net.ipv4.ip_forward=1", *debug, *trace, *cpus, *(("-e", "KNOTHOP_ALLOW_PRIVATE_DIAL=1") if private_dial else ()), "-e", "KNOTHOP_TCP_BACKOFF_S=30",
        "-v", f"{BIN}:/usr/local/bin/knothopd:ro", "-v", f"{HERE}:/lab:ro", "-v", f"{state}:/state", *extra, "--entrypoint", "sh", IMAGE, "-c", cmd)
 
 
@@ -1165,9 +1186,17 @@ def cmd_rootless(a):
     t_all = time.time()
     if not BIN.exists():
         sys.exit(f"нет {BIN}: bash bench/cargo_fork.sh rns-iroh-node build --offline --locked --bin knothopd")
-    cmd_down(a)
+    if ISOLATED_ROOTLESS:
+        if LAB.exists() or sh("docker", "network", "inspect", NET, check=False).returncode == 0:
+            sys.exit("изолированный rootless требует новый каталог и новую сеть; существующее состояние не удаляется")
+        names = [f"{PREFIX}-{n}" for n in ROOTLESS_NAMES] + [HUB_NAME, SITE_NAME]
+        if any(sh("docker", "inspect", name, check=False).returncode == 0 for name in names):
+            sys.exit("изолированный rootless требует уникальные имена контейнеров; существующие не удаляются")
+    else:
+        cmd_down(a)
     shutil_rmtree = __import__("shutil").rmtree
-    shutil_rmtree(LAB, ignore_errors=True)
+    if not ISOLATED_ROOTLESS:
+        shutil_rmtree(LAB, ignore_errors=True)
     sh("docker", "network", "create", "--subnet", SUBNET, NET)
     hub = state_dir("hub")
     run(HUB_NAME, HUB_IP, "exec knothopd hub --state /state --port 47000 --tcp-port 4242", hub)
@@ -1267,6 +1296,39 @@ def cmd_rootless(a):
     cs = json.loads(sh("docker", "exec", "cl", "cat", "/state/status.json").stdout)
     res["bypass_current"] = cs.get("current")
     res["transit_status"] = {n: json.loads(sh("docker", "exec", n, "cat", "/state/status.json").stdout).get("clients") for n in ("s2", "s3")}
+    if ISOLATED_ROOTLESS and os.environ.get("LAB13_TRACE_POLICY") == "1":
+        # Force a fresh Link without restarting the established mesh carrier.
+        # This runs only in the disposable, namespaced laboratory; restore even
+        # if observation of the disabled state times out.
+        print("trace-policy: disabling isolated exit with direct path blocked", flush=True)
+        try:
+            kd("adm", "peers", "config", "--state", "/state", "--target", hs["s1"], "--exit", "false")
+            wait_until(lambda: view("s1").get("exit_enabled") is False, 60, "s1 exit отключён")
+            time.sleep(5)
+        finally:
+            kd("adm", "peers", "config", "--state", "/state", "--target", hs["s1"], "--exit", "true")
+        wait_until(lambda: view("s1").get("exit_enabled") is True, 60, "s1 exit восстановлен")
+        wait_until(lambda: curl_exit("cl", 4) == "s1", 180, "выход вернулся после разрешения")
+        res["trace_policy_exit_restored"] = True
+        print(json.dumps(res, ensure_ascii=False, indent=1), flush=True)
+        return
+    if ISOLATED_ROOTLESS and os.environ.get("LAB13_TRACE_MESH") == "1":
+        # Leave the direct block in place while restarting only this isolated
+        # exit. This forces a fresh Link and gives the trace a real opportunity
+        # to observe request/proof on the mesh path, not merely a migrated Link.
+        print("trace-mesh: restarting isolated exit with direct path blocked", flush=True)
+        t_restart = time.time()
+        sh("docker", "restart", "s1")
+        wait_until(lambda: curl_exit("cl", 4) == "s1", 180, "выход вернулся при заблокированном прямом пути")
+        cs = json.loads(sh("docker", "exec", "cl", "cat", "/state/status.json").stdout)
+        current = cs.get("current") or {}
+        quic = current.get("quic") or {}
+        res["trace_mesh_restart_s"] = round(time.time() - t_restart, 1)
+        res["trace_mesh_current_kind"] = quic.get("kind")
+        if quic.get("kind") != "mesh":
+            sys.exit("trace-mesh: трафик восстановился, но выбранный путь не подтверждён как mesh")
+        print(json.dumps(res, ensure_ascii=False, indent=1), flush=True)
+        return
     # 7. снятие USE у клиента на выходе → доступ потерян
     sh("docker", "exec", "cl", "sh", "-c", f"iptables -D OUTPUT -d {srv['s1']['ip']} -j DROP; iptables -D INPUT -s {srv['s1']['ip']} -j DROP")
     kd("adm", "peers", "remove", "--state", "/state", "--target", hs["s1"], "--hash", cl)
@@ -1313,7 +1375,7 @@ def cmd_rootless(a):
     res["times"] = T
     res["nodes"] = {n: v["hash"][:8] for n, v in srv.items()}
     print(json.dumps(res, ensure_ascii=False, indent=1))
-    if not a.keep:
+    if not a.keep and not ISOLATED_ROOTLESS:
         cmd_down(a)
 
 

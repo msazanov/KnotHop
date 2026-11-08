@@ -3780,6 +3780,10 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
 
 fn vpn_incoming_destination(ours: &[u8;16], target: &DestinationHash) -> bool { target.as_bytes() == ours }
 
+// Bounded diagnostics for inbound VPN Link events. A remote peer can trigger
+// these, so logging must stay rate-limited even during an unauthenticated flood.
+static LAST_INBOUND_LINK_DIAG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::EventReceiver) {
     while let Some(ev) = events.recv().await {
         match ev {
@@ -3790,6 +3794,11 @@ async fn node_events(ctx: Arc<NodeCtx>, mut events: leviculum_std::driver::Event
                 if !is_initiator && !vpn_incoming_destination(&ctx.my_dest, &destination_hash) { continue; }
                 ctx.sh.established.lock().unwrap().insert(hex(link_id.as_bytes()));
                 if !is_initiator {
+                    let now = now_ms() as u64;
+                    let last = LAST_INBOUND_LINK_DIAG_MS.load(Relaxed);
+                    if now.saturating_sub(last) >= 1000 && LAST_INBOUND_LINK_DIAG_MS.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
+                        ctx.sh.note(format!("входящий Link {}: событие RNS установлено", &hex(link_id.as_bytes())[..8]));
+                    }
                     if crate::debug() {
                         ctx.sh.note(format!("входящий Link {}", &hex(link_id.as_bytes())[..8]));
                     }
@@ -6131,11 +6140,15 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
     let handle = ctx.node.connect_with_key_cipher(&dest, &cand.key, cipher).await?;
     let id = *handle.link_id();
     let k = hex(id.as_bytes());
+    // Only an opaque, truncated Link identifier: no identity, address or packet
+    // contents. Correlates this attempt with the responder's Link event without
+    // treating an opened carrier as proof of an established Link.
+    ctx.sh.note(format!("Link попытка {}: запрос передан RNS", &k[..8]));
     let t = Instant::now();
     while !ctx.sh.established.lock().unwrap().contains(&k) {
         if ctx.sh.closed.lock().unwrap().contains_key(&k) || t.elapsed() > Duration::from_secs(est_s) {
             let _ = ctx.node.engine().close_link(&id).await;
-            let why = format!("link до {} не установился", cand.name);
+            let why = format!("link до {} не установился ({})", cand.name, &k[..8]);
             return Err(match used_iface {
                 Some(iface) => anyhow::Error::new(path::FailedPath { iface, why }),
                 None => anyhow::anyhow!(why),
@@ -6143,6 +6156,7 @@ async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Optio
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    ctx.sh.note(format!("Link попытка {}: установлен за {} мс", &k[..8], t.elapsed().as_millis()));
     // Проверка attached interface закрывает гонку изменения таблицы во время connect. У инициатора интерфейс
     // известен только после proof (у ожидающего Link он None), поэтому проверяем установленный Link.
     if !path::acceptable(ctx.node.engine().with_link(&id, |s| s.attached_interface()).flatten(), &allowed(), avoid_iface) {
