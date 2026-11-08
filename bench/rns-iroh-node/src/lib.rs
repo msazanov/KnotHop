@@ -1113,6 +1113,9 @@ async fn accept_loop_with(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, admit:
                     return;
                 };
                 if mux.add_quic(conn.clone(), false, mux::owner_key(ip, &key)).is_some() {
+                    if let Some(m) = mesh::global() {
+                        m.register_migratable(&conn);
+                    }
                     let _ = conn.closed().await;
                 } else {
                     conn.close(0u32.into(), b"too many carriers");

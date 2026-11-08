@@ -4,11 +4,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub(super) const REQUEST_INTERVAL: Duration = Duration::from_secs(20);
+const MAX_DESTS: usize = 256;
+const MAX_IFACES: usize = 64;
 
 #[derive(Default)]
 struct Entry {
     pending: bool,
-    last: Option<Instant>,
+    asked: HashMap<usize, Instant>,
 }
 
 #[derive(Default)]
@@ -24,7 +26,13 @@ impl PathGate {
     /// Dropping the lease (including cancellation) releases ownership, not the rate limit.
     pub(super) fn begin(&self, dest: [u8; 16], now: Instant) -> Option<Pending<'_>> {
         let mut entries = self.0.lock().unwrap();
-        entries.retain(|_, e| e.pending || e.last.map(|t| now.saturating_duration_since(t) < REQUEST_INTERVAL).unwrap_or(false));
+        for e in entries.values_mut() {
+            e.asked.retain(|_, t| now.saturating_duration_since(*t) < REQUEST_INTERVAL);
+        }
+        entries.retain(|_, e| e.pending || !e.asked.is_empty());
+        if !entries.contains_key(&dest) && entries.len() >= MAX_DESTS {
+            return None;
+        }
         let e = entries.entry(dest).or_default();
         if e.pending { return None; }
         e.pending = true;
@@ -33,16 +41,35 @@ impl PathGate {
 }
 
 impl Pending<'_> {
+    /// Interfaces from `ifs` whose 20 s discovery budget is due. Newly connected
+    /// neighbor carriers are queried immediately without re-querying interfaces
+    /// that were already asked seconds ago.
+    pub(super) fn due_ifaces(&self, ifs: &[usize], now: Instant) -> Vec<usize> {
+        let mut entries = self.gate.0.lock().unwrap();
+        let Some(e) = entries.get_mut(&self.dest) else { return Vec::new() };
+        e.asked.retain(|_, t| now.saturating_duration_since(*t) < REQUEST_INTERVAL);
+        let mut out = Vec::new();
+        for &iface in ifs {
+            if out.contains(&iface) {
+                continue;
+            }
+            if e.asked.get(&iface).is_some_and(|t| now.saturating_duration_since(*t) < REQUEST_INTERVAL) {
+                continue;
+            }
+            if !e.asked.contains_key(&iface) && e.asked.len() >= MAX_IFACES {
+                continue;
+            }
+            e.asked.insert(iface, now);
+            out.push(iface);
+        }
+        out
+    }
+
     /// Reserve a request timestamp BEFORE awaiting dispatch. Call only with nonempty egress.
     /// Applies to ordinary and forced requests, across all interface scopes.
+    #[cfg(test)]
     pub(super) fn request_due(&self, now: Instant) -> bool {
-        let mut entries = self.gate.0.lock().unwrap();
-        let e = entries.get_mut(&self.dest).unwrap();
-        if e.last.map(|t| now.saturating_duration_since(t) < REQUEST_INTERVAL).unwrap_or(false) {
-            return false;
-        }
-        e.last = Some(now);
-        true
+        !self.due_ifaces(&[0], now).is_empty()
     }
 }
 
@@ -206,6 +233,19 @@ mod tests {
         let t = Instant::now();
         drop(gate.begin([1; 16], t).unwrap());
         assert!(gate.begin([1; 16], t).unwrap().request_due(t));
+    }
+
+    #[test]
+    fn newly_connected_interfaces_are_queried_without_waiting_twenty_seconds() {
+        let gate = PathGate::default();
+        let t = Instant::now();
+        let p = gate.begin([9; 16], t).unwrap();
+        assert_eq!(p.due_ifaces(&[1], t), vec![1]);
+        // Через 300 мс поднялись ещё два соседа: опрашиваются только они, а 1 ждёт 20 с.
+        assert_eq!(p.due_ifaces(&[1, 2, 3], t + Duration::from_millis(300)), vec![2, 3]);
+        assert!(p.due_ifaces(&[1, 2, 3], t + Duration::from_secs(5)).is_empty());
+        assert_eq!(p.due_ifaces(&[1, 2], t + REQUEST_INTERVAL), vec![1]);
+        assert_eq!(p.due_ifaces(&[1, 2], t + REQUEST_INTERVAL + Duration::from_millis(300)), vec![2]);
     }
 
     #[test]

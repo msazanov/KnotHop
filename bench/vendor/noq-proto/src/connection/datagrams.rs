@@ -4,7 +4,7 @@ use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, trace};
 
-use super::Connection;
+use super::{Connection, PathId};
 use crate::{
     FrameStats, TransportError,
     connection::PacketBuilder,
@@ -17,6 +17,30 @@ pub struct Datagrams<'a> {
 }
 
 impl Datagrams<'_> {
+    /// KnotHop: queue a datagram for exactly one already validated path. It is
+    /// never redirected to another path; queue and congestion limits still apply.
+    pub fn send_on_path(&mut self, path_id: PathId, data: Bytes) -> Result<(), SendDatagramError> {
+        if self.conn.config.datagram_receive_buffer_size.is_none() {
+            return Err(SendDatagramError::Disabled);
+        }
+        let max = self.max_size().ok_or(SendDatagramError::UnsupportedByPeer)?;
+        if data.len() > max.min(self.conn.config.datagram_send_buffer_size) {
+            return Err(SendDatagramError::TooLarge);
+        }
+        if self.conn.is_handshaking() || self.conn.abandoned_paths.contains(&path_id)
+            || !self.conn.paths.get(&path_id).is_some_and(|p| p.data.validated)
+            || !self.conn.remote_cids.contains_key(&path_id)
+            || self.conn.datagrams.pinned.len() >= 32
+            || !self.conn.datagrams.has_send_buffer_space(data.len(), self.conn.config.datagram_send_buffer_size) {
+            return Err(SendDatagramError::Blocked(data));
+        }
+        let path_max = (self.conn.path_data(path_id).current_mtu() as usize)
+            .saturating_sub(self.conn.predict_1rtt_overhead_no_pn() + Datagram::SIZE_BOUND);
+        if data.len() > path_max { return Err(SendDatagramError::TooLarge); }
+        self.conn.datagrams.outgoing_total += data.len();
+        self.conn.datagrams.pinned.push_back((path_id, Datagram { data }));
+        Ok(())
+    }
     /// Queue an unreliable, unordered datagram for immediate transmission
     ///
     /// If `drop` is true, previously queued datagrams which are still unsent may be discarded to
@@ -149,6 +173,12 @@ impl Datagrams<'_> {
         self.conn.datagrams.recv()
     }
 
+    /// KnotHop: получить датаграмму вместе с идентификатором QUIC-пути, на
+    /// котором она прошла аутентификацию. Не выводит путь из выбранного адреса.
+    pub fn recv_with_path(&mut self) -> Option<(Bytes, PathId)> {
+        self.conn.datagrams.recv_with_path()
+    }
+
     /// Drain up to `out.len()` buffered datagrams into `out`, in arrival order.
     ///
     /// This is the batch analogue of [`Self::recv`]: a single call takes many
@@ -179,8 +209,10 @@ pub(super) struct DatagramState {
     /// Number of bytes of datagrams that have been received by the local transport but not
     /// delivered to the application
     pub(super) recv_buffered: usize,
-    pub(super) incoming: VecDeque<Datagram>,
+    pub(super) incoming: VecDeque<(Datagram, PathId)>,
     pub(super) outgoing: VecDeque<Datagram>,
+    /// Bounded path-specific control/probe queue; never falls back to a different path.
+    pub(super) pinned: VecDeque<(PathId, Datagram)>,
     pub(super) outgoing_total: usize,
     pub(super) send_blocked: bool,
 }
@@ -198,6 +230,7 @@ impl DatagramState {
     pub(super) fn received(
         &mut self,
         datagram: Datagram,
+        path_id: PathId,
         window: &Option<usize>,
     ) -> Result<bool, TransportError> {
         let window = match window {
@@ -220,14 +253,18 @@ impl DatagramState {
         }
 
         self.recv_buffered += datagram.data.len();
-        self.incoming.push_back(datagram);
+        self.incoming.push_back((datagram, path_id));
         Ok(was_empty)
     }
 
     fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) {
         while !self.has_send_buffer_space(datagram_len, send_buffer_size) {
-            let Some(prev) = self.outgoing.pop_front() else {
-                break;
+            let prev = match self.outgoing.pop_front() {
+                Some(datagram) => datagram,
+                None => match self.pinned.pop_front() {
+                    Some((_, datagram)) => datagram,
+                    None => break,
+                },
             };
             trace!(len = prev.data.len(), "dropping outgoing datagram");
             self.outgoing_total -= prev.data.len();
@@ -264,7 +301,43 @@ impl DatagramState {
             }
             result
         });
+        self.pinned.retain(|(_, datagram)| {
+            if datagram.data.len() <= max_payload { return true; }
+            self.outgoing_total -= datagram.data.len();
+            self.mtu_drops = self.mtu_drops.saturating_add(1);
+            dropped_any = true;
+            false
+        });
         dropped_any
+    }
+
+    pub(super) fn drop_pinned_path(&mut self, path_id: PathId) {
+        self.pinned.retain(|(id, datagram)| {
+            if *id != path_id { return true; }
+            self.outgoing_total -= datagram.data.len();
+            false
+        });
+    }
+
+    pub(super) fn drop_pinned_oversized(&mut self, path_id: PathId, max_payload: usize) {
+        self.pinned.retain(|(id, datagram)| {
+            if *id != path_id || datagram.data.len() <= max_payload { return true; }
+            self.outgoing_total -= datagram.data.len();
+            self.mtu_drops = self.mtu_drops.saturating_add(1);
+            false
+        });
+    }
+
+    pub(super) fn pinned_ready(&self, path_id: PathId, max_size: usize) -> bool {
+        self.pinned.iter().any(|(id, d)| *id == path_id && d.size(true) <= max_size)
+    }
+
+    pub(super) fn write_pinned(&mut self, path_id: PathId, buf: &mut PacketBuilder<'_, '_>, stat: &mut FrameStats) -> bool {
+        let Some(index) = self.pinned.iter().position(|(id, d)| *id == path_id && d.size(true) <= buf.frame_space_remaining()) else { return false };
+        let (_, datagram) = self.pinned.remove(index).expect("index obtained from queue");
+        self.outgoing_total -= datagram.data.len();
+        buf.write_frame(datagram, stat);
+        true
     }
 
     /// Attempt to write a datagram frame into `buf`, consuming it from `self.outgoing`
@@ -291,9 +364,14 @@ impl DatagramState {
     }
 
     pub(super) fn recv(&mut self) -> Option<Bytes> {
-        let x = self.incoming.pop_front()?.data;
+        self.recv_with_path().map(|(data, _)| data)
+    }
+
+    fn recv_with_path(&mut self) -> Option<(Bytes, PathId)> {
+        let (datagram, path) = self.incoming.pop_front()?;
+        let x = datagram.data;
         self.recv_buffered -= x.len();
-        Some(x)
+        Some((x, path))
     }
 
     /// Drain up to `out.len()` buffered datagrams into `out`, in arrival order.
@@ -303,7 +381,7 @@ impl DatagramState {
     pub(super) fn recv_many(&mut self, out: &mut [Bytes]) -> usize {
         let n = out.len().min(self.incoming.len());
         let mut received_bytes = 0;
-        for (i, d) in self.incoming.drain(..n).enumerate() {
+        for (i, (d, _)) in self.incoming.drain(..n).enumerate() {
             received_bytes += d.data.len();
             out[i] = d.data;
         }

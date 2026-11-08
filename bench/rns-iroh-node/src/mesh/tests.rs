@@ -130,7 +130,7 @@ async fn node_bound_mode(selector: bool, bind: std::net::IpAddr, force_mesh: boo
         .unwrap();
     if selector {
         b = b.add_custom_transport(mesh.transport());
-        b = if force_mesh { b.path_selector(Arc::new(ForceMeshSelector)) } else { b.path_selector(Arc::new(MeshBackupSelector)) };
+        b = if force_mesh { b.path_selector(Arc::new(ForceMeshSelector)) } else { b.path_selector(mesh.selector()) };
     }
     let ep = b.bind().await.unwrap();
     let (tx, rx) = mpsc::unbounded_channel();
@@ -255,6 +255,22 @@ fn bare(transit: bool) -> (Arc<Mesh>, Arc<TP>) {
 }
 
 // ---------------------------------------------------------------- сквозное соединение
+
+#[test]
+fn stall_watch_requires_unanswered_traffic_and_respects_rtt() {
+    let now = Instant::now();
+    let mut watch = StallWatch::default();
+    assert!(!watch.observe(now, 10, 20, Duration::from_secs(2)));
+    // Долгий простой не превращается в застой при первом новом пакете.
+    let resumed = now + Duration::from_secs(60);
+    assert!(!watch.observe(resumed, 10, 21, Duration::from_secs(2)));
+    assert!(!watch.observe(resumed + Duration::from_secs(5), 10, 22, Duration::from_secs(2)));
+    assert!(watch.observe(resumed + Duration::from_secs(6), 10, 22, Duration::from_secs(2)));
+    // Аутентифицированный ответ сбрасывает ожидание, даже если после него
+    // проходит много времени без исходящего трафика.
+    assert!(!watch.observe(resumed + Duration::from_secs(7), 11, 22, Duration::from_secs(2)));
+    assert!(!watch.observe(resumed + Duration::from_secs(100), 11, 22, Duration::from_secs(2)));
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_hop_handshake_stream_and_datagrams_transit_sees_only_ciphertext() {
@@ -405,6 +421,194 @@ async fn established_mesh_survives_lost_transit_without_reconnect() {
     assert!(t2.dropped.load(Relaxed) > 0, "проверка должна действительно отбросить датаграммы");
 }
 
+/// Носитель к транзиту жив и успешно принимает пакеты, но DPI/сеть их теряет
+/// после приёма: это не `ConnectionLost` и не должно держать tunnel навсегда.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "требуется отдельный netns с разрешённым iptables"]
+async fn established_mesh_recovers_from_silent_transit_blackhole() {
+    let me_ns = std::fs::read_link("/proc/self/ns/net").unwrap();
+    let host_ns = std::env::var("KNOTHOP_TEST_HOST_NETNS").expect("передайте inode сетевого пространства хоста до unshare");
+    assert_ne!(me_ns.to_string_lossy(), host_ns, "правила разрешены только в отдельном netns");
+    let (a, t1, t2, e) = (node_bound_mode(true, [127, 0, 0, 1].into(), true).await, node().await, node().await, node_bound_mode(true, [127, 0, 0, 1].into(), true).await);
+    link(&a, &t1).await;
+    link(&a, &t2).await;
+    link(&t1, &e).await;
+    link(&t2, &e).await;
+    allow_all(&[&a, &t1, &t2, &e]);
+    t1.set_transit(true);
+    t2.set_transit(true);
+    route(&a, &e, &t1);
+    // Запретить только прямые UDP-пакеты endpoint A ↔ E в приватном netns,
+    // иначе iroh может обойти поломанный mesh обычным loopback-IP.
+    for aa in a.ep.bound_sockets() {
+        for ee in e.ep.bound_sockets() {
+            if aa.is_ipv4() != ee.is_ipv4() { continue; }
+            let tool = if aa.is_ipv4() { "iptables" } else { "ip6tables" };
+            let (ap, ep) = (aa.port().to_string(), ee.port().to_string());
+            for (src, dst) in [(&ap, &ep), (&ep, &ap)] {
+                assert!(std::process::Command::new(tool).args(["-I", "OUTPUT", "-p", "udp", "--sport", src, "--dport", dst, "-j", "DROP"]).status().unwrap().success());
+            }
+        }
+    }
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert!(a.mesh.mark_e2e(&ca));
+    assert!(e.mesh.mark_e2e(&ce));
+    stream_echo(&ca, &ce).await;
+    assert!(mesh_selected(&ca) && mesh_selected(&ce));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let before_a = a.mesh.c.tx.load(Relaxed);
+    let before_e = e.mesh.c.delivered.load(Relaxed);
+    let before_t1 = t1.mesh.c.fwd.load(Relaxed);
+    t1.drop_every.store(1, Relaxed);
+    // RNS продолжает указывать на старого соседа: хоп должен сменить сторожок.
+    tokio::spawn(a.mesh.clone().watch_mesh_stall(ca.clone()));
+    tokio::task::yield_now().await;
+    let result = tokio::time::timeout(Duration::from_secs(20), stream_echo(&ca, &ce)).await;
+    eprintln!("blackhole_dropped={}, second_transit_fwd={}, exit_conflicts={}", t1.dropped.load(Relaxed), t2.mesh.c.fwd.load(Relaxed), e.mesh.c.rev_conflict.load(Relaxed));
+    eprintln!("a_tx_delta={}, t1_fwd_delta={}, exit_delivered_delta={}, a_paths={:?}, exit_paths={:?}",
+        a.mesh.c.tx.load(Relaxed).saturating_sub(before_a), t1.mesh.c.fwd.load(Relaxed).saturating_sub(before_t1),
+        e.mesh.c.delivered.load(Relaxed).saturating_sub(before_e),
+        ca.paths().iter().map(|p| (p.remote_addr().clone(), p.is_selected(), p.stats().udp_tx.datagrams, p.stats().udp_rx.datagrams)).collect::<Vec<_>>(),
+        ce.paths().iter().map(|p| (p.remote_addr().clone(), p.is_selected(), p.stats().udp_tx.datagrams, p.stats().udp_rx.datagrams)).collect::<Vec<_>>());
+    eprintln!("a_hop_new={}, e_hop_new={}, e_verified_new={}, a_forced_new={}",
+        a.mesh.hop_peer(&e.id()) == Some(t2.id()), e.mesh.hop_peer(&a.id()) == Some(t2.id()),
+        e.mesh.verified_rev.lock().unwrap().get(&a.id()).is_some_and(|(via, _)| *via == t2.id()),
+        a.mesh.stall_hops.lock().unwrap().get(&e.id()) == Some(&t2.id()));
+    assert!(t1.dropped.load(Relaxed) > 0, "должна быть реальная потеря кадров");
+    result.expect("сквозной поток должен восстановиться через второй транзит при молчаливой потере");
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t2.id()));
+    assert!(mesh_selected(&ca) && mesh_selected(&ce), "прямой IP не должен подменить проверку mesh");
+    assert!(t2.mesh.c.fwd.load(Relaxed) > 0);
+    // После миграции транзит продолжает терять каждую десятую входящую
+    // mesh-датаграмму. Проверяем несколько потоков в обе стороны, не только
+    // сам факт открытия соединения или ответ на маленький зонд.
+    t2.drop_every.store(10, Relaxed);
+    let dropped_before = t2.dropped.load(Relaxed);
+    tokio::time::timeout(Duration::from_secs(45), async {
+        for _ in 0..20 { stream_echo(&ca, &ce).await; }
+    }).await.expect("после смены транзита потоки должны пережить потери");
+    let loss = t2.dropped.load(Relaxed) - dropped_before;
+    eprintln!("post_migration_exchanges=20, second_transit_dropped={loss}");
+    assert!(loss > 0, "проверка должна действительно потерять датаграммы");
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t2.id()));
+    assert!(mesh_selected(&ca) && mesh_selected(&ce));
+    let before = ca.paths().iter().find(|p| p.is_selected()).unwrap().stats();
+    let started = Instant::now();
+    const BULK: usize = 1_200_000;
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let (mut tx, mut rx) = ca.open_bi().await.unwrap();
+        let client = async {
+            tx.write_all(&vec![0x5a; BULK]).await.unwrap();
+            tx.finish().unwrap();
+            let response = rx.read_to_end(BULK + 1).await.unwrap();
+            assert_eq!(response.len(), BULK);
+            assert!(response.iter().all(|&b| b == 0xa5));
+        };
+        let server = async {
+            let (mut tx, mut rx) = ce.accept_bi().await.unwrap();
+            let request = rx.read_to_end(BULK + 1).await.unwrap();
+            assert_eq!(request.len(), BULK);
+            assert!(request.iter().all(|&b| b == 0x5a));
+            tx.write_all(&vec![0xa5; BULK]).await.unwrap();
+            tx.finish().unwrap();
+        };
+        tokio::join!(client, server);
+    }).await.expect("двусторонняя передача после миграции должна пережить потери");
+    let after = ca.paths().iter().find(|p| p.is_selected()).unwrap().stats();
+    eprintln!("bulk_up={BULK}, bulk_down={BULK}, duration_ms={}, e2e_udp_tx_bytes={}, e2e_udp_rx_bytes={}, second_transit_drops_total={}",
+        started.elapsed().as_millis(), after.udp_tx.bytes.saturating_sub(before.udp_tx.bytes),
+        after.udp_rx.bytes.saturating_sub(before.udp_rx.bytes), t2.dropped.load(Relaxed));
+    assert!(mesh_selected(&ca) && mesh_selected(&ce));
+    // Учёт исходящих UDP каждого конца двух соседских соединений: каждый
+    // переданный байт на обоих участках считается один раз, включая ACK.
+    let carriers: Vec<Connection> = [(&a, &t2), (&t2, &a), (&t2, &e), (&e, &t2)].into_iter()
+        .map(|(n, peer)| n.nbrs.read().unwrap().get(&peer.id()).unwrap().clone()).collect();
+    let before_carriers: Vec<_> = carriers.iter().map(|c| c.stats().udp_tx).collect();
+    let drop_start = t2.dropped.load(Relaxed);
+    let started = Instant::now();
+    let mut rounds = 0u64;
+    const CHUNK: usize = 262_144;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while started.elapsed() < Duration::from_secs(30) {
+            let (mut tx, mut rx) = ca.open_bi().await.unwrap();
+            let client = async {
+                tx.write_all(&vec![0x5a; CHUNK]).await.unwrap();
+                tx.finish().unwrap();
+                let data = rx.read_to_end(CHUNK + 1).await.unwrap();
+                assert_eq!(data.len(), CHUNK);
+                assert!(data.iter().all(|&b| b == 0xa5));
+            };
+            let server = async {
+                let (mut tx, mut rx) = ce.accept_bi().await.unwrap();
+                let data = rx.read_to_end(CHUNK + 1).await.unwrap();
+                assert_eq!(data.len(), CHUNK);
+                assert!(data.iter().all(|&b| b == 0x5a));
+                tx.write_all(&vec![0xa5; CHUNK]).await.unwrap();
+                tx.finish().unwrap();
+            };
+            tokio::join!(client, server);
+            rounds += 1;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }).await.expect("длительная передача через новый транзит при потерях");
+    let (mut udp_bytes, mut udp_datagrams) = (0u64, 0u64);
+    for (conn, before) in carriers.iter().zip(before_carriers) {
+        let after = conn.stats().udp_tx;
+        udp_bytes += after.bytes.saturating_sub(before.bytes);
+        udp_datagrams += after.datagrams.saturating_sub(before.datagrams);
+    }
+    eprintln!("sustained_seconds={:.2}, rounds={rounds}, payload_each_direction={}, carrier_udp_tx_bytes={udp_bytes}, carrier_udp_tx_datagrams={udp_datagrams}, transit_drops={}",
+        started.elapsed().as_secs_f64(), rounds * CHUNK as u64, t2.dropped.load(Relaxed) - drop_start);
+    assert!(rounds > 0 && t2.dropped.load(Relaxed) > drop_start);
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t2.id()));
+    assert!(mesh_selected(&ca) && mesh_selected(&ce));
+
+    // Отзыв во время настоящей передачи по тому же сквозному QUIC. После
+    // отзыва не считаем уже поставленные в очереди байты доказательством утечки:
+    // проверяем отказ новых входящих кадров и отсутствие маршрута на выходе.
+    t2.drop_every.store(0, Relaxed);
+    let ca_load = ca.clone();
+    let ce_load = ce.clone();
+    let completed = Arc::new(AtomicU64::new(0));
+    let completed_task = completed.clone();
+    let load = tokio::spawn(async move {
+        loop {
+            let Ok((mut tx, mut rx)) = ca_load.open_bi().await else { break };
+            let client = async {
+                tx.write_all(&vec![0x35; 65_536]).await?;
+                tx.finish()?;
+                rx.read_to_end(65_537).await.map_err(|_| io::Error::other("read failed"))
+            };
+            let server = async {
+                let (mut tx, mut rx) = ce_load.accept_bi().await.map_err(|_| io::Error::other("accept failed"))?;
+                let data = rx.read_to_end(65_537).await.map_err(|_| io::Error::other("read failed"))?;
+                tx.write_all(&data).await?;
+                tx.finish()?;
+                Ok::<(), io::Error>(())
+            };
+            let (c, s) = tokio::join!(client, server);
+            if !matches!(c, Ok(ref data) if data.len() == 65_536) || s.is_err() { break; }
+            completed_task.fetch_add(1, Relaxed);
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while completed.load(Relaxed) < 3 { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.expect("перед отзывом нагрузка должна реально передавать данные");
+    e.pol.rights.lock().unwrap().remove(&t2.id());
+    e.pol.bump();
+    let denied_before = e.mesh.c.drop_policy.load(Relaxed);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while e.mesh.c.drop_policy.load(Relaxed) == denied_before { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.expect("после отзыва выход должен отвергать входящие mesh-кадры");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    e.mesh.sync_gen(e.pol.as_ref());
+    assert!(e.mesh.verified_rev.lock().unwrap().get(&a.id()).is_none());
+    assert_ne!(e.mesh.next_hop_origin(Instant::now(), &a.id(), e.pol.as_ref()), Some(t2.id()));
+    eprintln!("revoke_under_load_completed_before_or_during={}, dropped_after_revoke={}", completed.load(Relaxed), e.mesh.c.drop_policy.load(Relaxed) - denied_before);
+    load.abort();
+    let _ = load.await;
+}
+
 async fn denied(setup: impl FnOnce(&Node, &Node, &Node)) -> (Node, Node, Node) {
     let (a, t, e) = (node().await, node().await, node().await);
     link(&a, &t).await;
@@ -476,9 +680,9 @@ async fn narrow_neighbor_datagram_is_not_used() {
     assert!(a.mesh.c.drop_mtu.load(Relaxed) > 0);
 }
 
-/// Поднятое по mesh соединение: iroh находит прямой адрес сам (NAT traversal поверх mesh) и переходит на IP; mesh остаётся запасным путём.
+/// Обнаруженный IP остаётся кандидатом, пока его объём не подтверждён.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn upgrades_to_ip_and_keeps_mesh_as_backup() {
+async fn discovered_ip_does_not_displace_working_mesh_without_bulk_proof() {
     let (a, t, e) = (node().await, node().await, node().await);
     link(&a, &t).await;
     link(&t, &e).await;
@@ -488,19 +692,289 @@ async fn upgrades_to_ip_and_keeps_mesh_as_backup() {
     let (ca, ce) = e2e_connect(&a, &e).await;
     echo(&ca, &ce).await;
     let t0 = Instant::now();
-    while mesh_selected(&ca) && t0.elapsed() < Duration::from_secs(15) {
+    while !ca.paths().iter().any(|p| matches!(p.remote_addr(), TransportAddr::Ip(_))) && t0.elapsed() < Duration::from_secs(15) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(!mesh_selected(&ca), "выбран прямой IP-путь: {:?}", ca.paths().iter().map(|p| p.remote_addr().clone()).collect::<Vec<_>>());
-    let custom = ca.paths().iter().filter(|p| matches!(p.remote_addr(), TransportAddr::Custom(_))).count();
-    assert_eq!(custom, 1, "mesh-путь остаётся открытым как запасной");
+    assert!(ca.paths().iter().any(|p| matches!(p.remote_addr(), TransportAddr::Ip(_))), "прямой кандидат должен быть найден");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(mesh_selected(&ca), "неподтверждённый IP не должен вытеснить mesh");
     echo(&ca, &ce).await;
 }
 
-/// Живой пилот 03.11 (v0.1.34): соединение, начатое по mesh, под потоком данных не должно раскачиваться между IP и mesh.
+/// IP-only подсказка не изолирует путь нового соединения: iroh хранит пути
+/// на уровне пира и может открыть известный custom-адрес как запасной.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ip_only_dial_to_known_mesh_peer_is_not_proof_of_direct_only() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    let (existing, exit_existing) = e2e_connect(&a, &e).await;
+    stream_echo(&existing, &exit_existing).await;
+    let direct_hint = EndpointAddr::new(e.ep.id()).with_ip_addr(ip(&e));
+    let (candidate, exit_candidate) = tokio::join!(
+        a.ep.connect(direct_hint, ALPN),
+        async { tokio::time::timeout(Duration::from_secs(10), e.e2e.lock().await.recv()).await.unwrap().unwrap() }
+    );
+    let candidate = candidate.unwrap();
+    assert_ne!(existing.stable_id(), candidate.stable_id());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !candidate.paths().iter().any(|p| is_mesh_addr(p.remote_addr())) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.expect("известный mesh может появиться на IP-only кандидате");
+    stream_echo(&candidate, &exit_candidate).await;
+    assert!(candidate.paths().iter().any(|p| is_mesh_addr(p.remote_addr())));
+}
+
+/// Проба прямого канала: VPN остаётся на mesh, а закреплённая датаграмма идёт
+/// только по найденному IP-пути и принимается выходом именно по нему.
+/// Прямой путь подтверждается параллельно работающему транзиту только передачей >1 МиБ
+/// именно по IP-пути; при имитации DPI (обрыв на ~150 КБ) транзит не прерывается и IP не выбирается.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_direct_bulk_proof_requires_over_one_mib_and_keeps_mesh_until_proven() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    stream_echo(&ca, &ce).await;
+    let ip_path = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(p) = ca.paths().iter().find(|p| p.is_ip()) {
+                if let TransportAddr::Ip(sa) = p.remote_addr() {
+                    return (p.id(), *sa);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.expect("прямой кандидат должен появиться");
+    assert!(mesh_selected(&ca), "до >1 МиБ трафик остаётся на mesh");
+
+    // 1) Имитируем DPI, режущий прямой поток после ~150 КБ: проверка обязана вернуть None, mesh не тронут.
+    let cut_after = Arc::new(AtomicU64::new(130));
+    let cut_srv = cut_after.clone();
+    let ce_srv = ce.clone();
+    let ca_cli = ca.clone();
+    let cli_rx = tokio::spawn(async move {
+        let mut filter = crate::qprobe::Filter::new();
+        while let Ok((b, pid)) = ca_cli.read_datagram_with_path().await {
+            let _ = filter.intercept_on_path(&ca_cli, pid, &b);
+        }
+    });
+    let srv_rx = tokio::spawn(async move {
+        let mut filter = crate::qprobe::Filter::new();
+        let mut echoed = 0u64;
+        while let Ok((b, pid)) = ce_srv.read_datagram_with_path().await {
+            if b.len() == crate::qprobe::HEAD && b[..8] == crate::qprobe::MAGIC && b[8] == crate::qprobe::KIND_BGREQ {
+                assert!(ce_srv.paths().iter().any(|p| p.id() == pid && p.is_ip()), "запрос bulk обязан прийти по IP");
+                let status = match crate::qprobe::grants().grant_bulk_path(&ce_srv, pid, [0x44; 32], Instant::now()) {
+                    Ok(()) => 0,
+                    Err(d) => d.code(),
+                };
+                let _ = ce_srv.send_datagram_on_path(pid, Bytes::from(crate::qprobe::grant_reply(status, &b[10..18])));
+                echoed = 0;
+                continue;
+            }
+            let cap = cut_srv.load(Relaxed);
+            if cap > 0 && echoed >= cap {
+                continue;
+            }
+            if filter.intercept_on_path(&ce_srv, pid, &b) {
+                echoed += 1;
+            }
+        }
+    });
+    assert!(crate::qprobe::run_bulk_on_path(&ca, ip_path.0, 0x1111).await.is_none(), "DPI-обрезка на ~150 КБ не должна подтверждать прямой путь");
+    assert!(!a.mesh.is_direct_confirmed(&ip_path.1));
+    assert!(mesh_selected(&ca), "при неуспехе прямой пробы VPN остаётся на mesh");
+    stream_echo(&ca, &ce).await;
+
+    // 2) Полный проход >1 МиБ по прямому IP без потерь на mesh: прямой адрес подтверждается и выбирается, mesh остаётся запасным.
+    // Сбрасываем кулдаун в новом окне для другого nonce? Нет: выдача на сервере ограничена GRANT_INTERVAL; проверим полный прогон на свежем узле E2.
+    cli_rx.abort();
+    srv_rx.abort();
+    ca.close(0u32.into(), b"done");
+
+    let (a2, e2) = (node().await, node().await);
+    link(&a2, &t).await;
+    link(&t, &e2).await;
+    allow_all(&[&a2, &t, &e2]);
+    route(&a2, &e2, &t);
+    let (ca2, ce2) = e2e_connect(&a2, &e2).await;
+    stream_echo(&ca2, &ce2).await;
+    let ca2_cli = ca2.clone();
+    let cli_rx2 = tokio::spawn(async move {
+        let mut filter = crate::qprobe::Filter::new();
+        while let Ok((b, pid)) = ca2_cli.read_datagram_with_path().await {
+            let _ = filter.intercept_on_path(&ca2_cli, pid, &b);
+        }
+    });
+    let ce2_srv = ce2.clone();
+    let srv_rx2 = tokio::spawn(async move {
+        let mut filter = crate::qprobe::Filter::new();
+        while let Ok((b, pid)) = ce2_srv.read_datagram_with_path().await {
+            if b.len() == crate::qprobe::HEAD && b[..8] == crate::qprobe::MAGIC && b[8] == crate::qprobe::KIND_BGREQ {
+                assert!(ce2_srv.paths().iter().any(|p| p.id() == pid && p.is_ip()));
+                let status = match crate::qprobe::grants().grant_bulk_path(&ce2_srv, pid, [0x77; 32], Instant::now()) {
+                    Ok(()) => 0,
+                    Err(d) => d.code(),
+                };
+                let _ = ce2_srv.send_datagram_on_path(pid, Bytes::from(crate::qprobe::grant_reply(status, &b[10..18])));
+                continue;
+            }
+            let _ = filter.intercept_on_path(&ce2_srv, pid, &b);
+        }
+    });
+    let mesh_dgram_before = ca2.paths().iter().find(|p| is_mesh_addr(p.remote_addr()))
+        .map(|p| (p.stats().frame_tx.datagram, p.stats().frame_rx.datagram)).unwrap();
+    tokio::spawn(a2.mesh.clone().watch_mesh_stall(ca2.clone()));
+    tokio::spawn(a2.mesh.clone().watch_direct_upgrade(ca2.clone()));
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while mesh_selected(&ca2) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.expect("после >1 МиБ по прямому IP соединение должно перейти на прямой путь");
+    let mesh_dgram_after = ca2.paths().iter().find(|p| is_mesh_addr(p.remote_addr()))
+        .map(|p| (p.stats().frame_tx.datagram, p.stats().frame_rx.datagram)).unwrap();
+    assert_eq!(mesh_dgram_after, mesh_dgram_before, "ни одна датаграмма объёмной пробы не должна идти через mesh");
+    let ip_st = ca2.paths().iter().find(|p| p.is_selected() && p.is_ip()).expect("выбран прямой IP").stats();
+    assert!(ip_st.udp_tx.bytes > 1024 * 1024 && ip_st.udp_rx.bytes > 1024 * 1024,
+        "прямой путь обязан реально передать >1 МиБ в каждую сторону: tx={}, rx={}", ip_st.udp_tx.bytes, ip_st.udp_rx.bytes);
+    assert_eq!(ca2.paths().iter().filter(|p| is_mesh_addr(p.remote_addr())).count(), 1, "mesh остаётся тёплым запасным");
+    stream_echo(&ca2, &ce2).await;
+    cli_rx2.abort();
+    srv_rx2.abort();
+    ca2.close(0u32.into(), b"done");
+    ce2.close(0u32.into(), b"done");
+    ce.close(0u32.into(), b"done");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_probe_crosses_direct_path_while_mesh_keeps_traffic() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    stream_echo(&ca, &ce).await;
+    let ip_path = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(id) = ca.paths().iter().find(|p| matches!(p.remote_addr(), TransportAddr::Ip(_))).map(|p| p.id()) {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.expect("прямой кандидат должен появиться");
+    assert!(mesh_selected(&ca), "VPN остаётся на mesh");
+    // Путь мог ещё не пройти валидацию: ждём готовности, не подменяя путь.
+    let fwd_before = t.mesh.c.fwd.load(Relaxed);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !ca.send_datagram_on_path(ip_path, Bytes::from_static(b"direct-probe")).unwrap() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.expect("валидированный IP-путь должен принять пробу");
+    let (data, path) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (d, p) = ce.read_datagram_with_path().await.unwrap();
+            if &d[..] == b"direct-probe" { return (d, p); }
+        }
+    }).await.unwrap();
+    assert_eq!(&data[..], b"direct-probe");
+    assert!(ce.paths().iter().any(|p| p.id() == path && matches!(p.remote_addr(), TransportAddr::Ip(_))),
+        "выход принял пробу по IP-пути, а не через транзит");
+    assert!(mesh_selected(&ca), "проба не переключила VPN на непроверенный IP");
+    eprintln!("transit_fwd_during_probe={}", t.mesh.c.fwd.load(Relaxed) - fwd_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn received_datagram_reports_actual_mesh_path_end_to_end() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert!(mesh_selected(&ca));
+    ca.send_datagram(Bytes::from_static(b"path-evidence")).unwrap();
+    let (data, path) = tokio::time::timeout(Duration::from_secs(5), ce.read_datagram_with_path()).await.unwrap().unwrap();
+    assert_eq!(&data[..], b"path-evidence");
+    assert!(ce.paths().iter().any(|p| p.id() == path && is_mesh_addr(p.remote_addr())),
+        "путь принятой датаграммы должен быть реальным mesh, не оценкой по выбранному пути");
+    assert!(t.mesh.c.fwd.load(Relaxed) > 0);
+}
+
+/// Прямой путь ещё не прошёл bulk-проверку: добровольно на него не переходим,
+/// но при полном отказе единственного транзита аварийный fallback не должен
+/// удерживать трафик на мёртвом mesh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dead_mesh_can_fail_over_to_unconfirmed_direct_emergency_path() {
+    if std::env::var_os("KH_PATH_TRACE").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("noq_proto::connection=trace,rns_iroh_node::mesh::tests=info")
+            .try_init();
+    }
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    stream_echo(&ca, &ce).await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !ca.paths().iter().any(|p| matches!(p.remote_addr(), TransportAddr::Ip(_))) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.expect("должен появиться прямой резерв");
+    assert!(mesh_selected(&ca), "живой mesh не должен вытесняться малым зондом");
+    t.drop_every.store(1, Relaxed);
+    let started = Instant::now();
+    tracing::info!("test blackhole enabled");
+    let monitor_conn = ca.clone();
+    let monitor = tokio::spawn(async move {
+        let t0 = Instant::now();
+        loop {
+            let paths: Vec<_> = monitor_conn.paths().iter().map(|p| {
+                let s = p.stats();
+                (if matches!(p.remote_addr(), TransportAddr::Ip(_)) { "ip" } else { "mesh" }, p.is_selected(),
+                 s.frame_tx.ack_eliciting_progress(), s.frame_rx.authenticated_progress(), s.udp_tx.datagrams, s.udp_rx.datagrams)
+            }).collect();
+            eprintln!("fallback_trace_ms={} paths={paths:?}", t0.elapsed().as_millis());
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    let stream = async {
+        let (mut tx, mut rx) = ca.open_bi().await.unwrap();
+        tx.write_all(MARKER).await.unwrap();
+        tx.finish().unwrap();
+        let (mut etx, mut erx) = ce.accept_bi().await.unwrap();
+        assert_eq!(erx.read_to_end(1024).await.unwrap(), MARKER);
+        tracing::info!(elapsed_ms = started.elapsed().as_millis(), "test request received");
+        eprintln!("emergency_request_received_ms={}", started.elapsed().as_millis());
+        etx.write_all(b"pong-stream").await.unwrap();
+        etx.finish().unwrap();
+        assert_eq!(rx.read_to_end(1024).await.unwrap(), b"pong-stream");
+    };
+    tokio::time::timeout(Duration::from_secs(25), stream).await
+        .expect("после отказа mesh данные должны пройти по прямому аварийному пути");
+    monitor.abort();
+    assert!(t.dropped.load(Relaxed) > 0, "отказ транзита должен действительно отбросить кадры");
+    assert!(ca.paths().iter().any(|p| p.is_selected() && matches!(p.remote_addr(), TransportAddr::Ip(_))), "после отказа должен быть выбран IP");
+    eprintln!("emergency_fallback_ms={}, blackhole_dropped={}", started.elapsed().as_millis(), t.dropped.load(Relaxed));
+}
+
+/// Соединение, начатое по mesh, не должно переходить на непроверенный IP под потоком.
 /// В multipath подтверждения пакетов пути X могут идти по пути Y; сторожок не должен принимать это за застой X.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mesh_started_connection_stays_on_ip_under_traffic() {
+async fn mesh_started_connection_stays_on_mesh_under_traffic_without_bulk_proof() {
     let (a, t, e) = (node().await, node().await, node().await);
     link(&a, &t).await;
     link(&t, &e).await;
@@ -509,11 +983,7 @@ async fn mesh_started_connection_stays_on_ip_under_traffic() {
     route(&a, &e, &t);
     let (ca, ce) = e2e_connect(&a, &e).await;
     echo(&ca, &ce).await;
-    let t0 = Instant::now();
-    while mesh_selected(&ca) && t0.elapsed() < Duration::from_secs(15) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(!mesh_selected(&ca), "сначала переход на IP");
+    assert!(mesh_selected(&ca), "сначала используется mesh");
     // поток в обе стороны: A->E датаграммы, E отвечает эхом (как TCP: данные + обратный трафик)
     let echo_task = tokio::spawn({
         let ce = ce.clone();
@@ -533,7 +1003,7 @@ async fn mesh_started_connection_stays_on_ip_under_traffic() {
             got
         }
     });
-    let (start, mut switches, mut last_mesh, mut mesh_samples, mut samples) = (Instant::now(), 0, false, 0, 0);
+    let (start, mut switches, mut last_mesh, mut mesh_samples, mut samples) = (Instant::now(), 0, true, 0, 0);
     let mut seq = 0u32;
     while start.elapsed() < Duration::from_secs(20) {
         let _ = ca.send_datagram(Bytes::from(seq.to_be_bytes().to_vec()));
@@ -557,7 +1027,8 @@ async fn mesh_started_connection_stays_on_ip_under_traffic() {
         last = *t;
     }
     println!("[mesh-start] sent={seq} echoed={} switches={switches} mesh_samples={mesh_samples}/{samples} worst_gap={worst:?}", got.len());
-    assert!(switches <= 1 && mesh_samples * 20 <= samples, "раскачка IP<->mesh: switches={switches}, на mesh {mesh_samples}/{samples}");
+    assert_eq!(switches, 0, "непроверенный IP не должен вытеснить работающий mesh");
+    assert_eq!(mesh_samples, samples);
     assert!(worst < Duration::from_millis(500), "провал доставки {worst:?}");
 }
 
@@ -963,6 +1434,121 @@ async fn rootless_tables_without_self_peer_complete_mesh_quic() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_transit_during_incoming_frame_and_migration_load_fails_closed() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert!(e.mesh.mark_e2e(&ce));
+    let mut secret = [0u8; 32];
+    ca.export_keying_material(&mut secret, migration::LABEL, b"").unwrap();
+    let (src, dst, via) = (a.id(), e.id(), t.id());
+    let proof = Bytes::from(migration::encode(&secret, &src, &dst, &via, 1).unwrap());
+    e.mesh.on_frame(&via, &proof);
+    assert!(e.mesh.verified_rev.lock().unwrap().contains_key(&src));
+    let m = e.mesh.clone();
+    let running = Arc::new(AtomicBool::new(true));
+    let running_task = running.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let load = tokio::spawn(async move {
+        let packet = frame(MAX_TTL, &dst, &src, b"untrusted-test-ciphertext");
+        let mut ready = Some(ready_tx);
+        let mut seq = 2;
+        while running_task.load(Relaxed) {
+            m.on_frame(&via, &packet);
+            let p = Bytes::from(migration::encode(&secret, &src, &dst, &via, seq).unwrap());
+            m.on_frame(&via, &p);
+            seq += 1;
+            if let Some(tx) = ready.take() { let _ = tx.send(()); }
+            tokio::task::yield_now().await;
+        }
+    });
+    ready_rx.await.unwrap();
+    e.pol.rights.lock().unwrap().remove(&via);
+    e.pol.bump();
+    e.mesh.sync_gen(e.pol.as_ref());
+    let denied = e.mesh.c.drop_policy.load(Relaxed);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while e.mesh.c.drop_policy.load(Relaxed) == denied { tokio::task::yield_now().await; }
+    }).await.expect("кадры от отозванного транзита должны отвергаться");
+    running.store(false, Relaxed);
+    load.await.unwrap();
+    e.mesh.sync_gen(e.pol.as_ref());
+    assert!(e.mesh.verified_rev.lock().unwrap().get(&src).is_none());
+    assert_ne!(e.mesh.next_hop_origin(Instant::now(), &src, e.pol.as_ref()), Some(via));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_proof_is_sent_and_forwarded_over_neighbor_quic() {
+    let (a, old, new, e) = (node().await, node().await, node().await, node().await);
+    link(&a, &old).await;
+    link(&old, &e).await;
+    link(&a, &new).await;
+    link(&new, &e).await;
+    allow_all(&[&a, &old, &new, &e]);
+    old.set_transit(true);
+    new.set_transit(true);
+    route(&a, &e, &old);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert!(a.mesh.mark_e2e(&ca));
+    assert!(e.mesh.mark_e2e(&ce));
+    let carrier = a.nbrs.read().unwrap().get(&new.id()).cloned().unwrap();
+    a.mesh.send_migration(&e.id(), &new.id(), &carrier);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if e.mesh.verified_rev.lock().unwrap().get(&a.id()).is_some_and(|(via, _)| *via == new.id()) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("migration proof not delivered");
+    assert_eq!(e.mesh.next_hop_origin(Instant::now(), &a.id(), e.pol.as_ref()), Some(new.id()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_receiver_requires_session_mac_transit_and_fresh_sequence() {
+    let (a, old, new, e) = (node().await, node().await, node().await, node().await);
+    link(&a, &old).await;
+    link(&old, &e).await;
+    link(&new, &e).await;
+    allow_all(&[&a, &old, &new, &e]);
+    old.set_transit(true);
+    new.set_transit(true);
+    route(&a, &e, &old);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert!(e.mesh.mark_e2e(&ce));
+    e.mesh.sync_gen(e.pol.as_ref());
+    let mut secret = [0u8; 32];
+    ca.export_keying_material(&mut secret, migration::LABEL, b"").unwrap();
+    let proof = Bytes::from(migration::encode(&secret, &a.id(), &e.id(), &new.id(), 1).unwrap());
+    // Другой сосед не может присвоить предназначенное новому транзиту доказательство.
+    e.mesh.on_frame(&old.id(), &proof);
+    assert!(e.mesh.verified_rev.lock().unwrap().get(&a.id()).is_none());
+    e.mesh.on_frame(&new.id(), &proof);
+    assert_eq!(e.mesh.verified_rev.lock().unwrap().get(&a.id()).copied(), Some((new.id(), ce.stable_id())));
+    assert_eq!(e.mesh.next_hop_origin(Instant::now(), &a.id(), e.pol.as_ref()), Some(new.id()));
+    // Отзыв транзита сбрасывает подтверждённый маршрут при новом поколении
+    // прав, даже если сквозное TLS-соединение ещё открыто.
+    e.pol.rights.lock().unwrap().remove(&new.id());
+    e.pol.bump();
+    e.mesh.sync_gen(e.pol.as_ref());
+    assert!(e.mesh.verified_rev.lock().unwrap().get(&a.id()).is_none());
+    assert_ne!(e.mesh.next_hop_origin(Instant::now(), &a.id(), e.pol.as_ref()), Some(new.id()));
+    e.pol.rights.lock().unwrap().insert(new.id());
+    e.pol.bump();
+    e.mesh.sync_gen(e.pol.as_ref());
+    // Повтор после удаления маршрута не создаёт его снова.
+    e.mesh.verified_rev.lock().unwrap().remove(&a.id());
+    e.mesh.on_frame(&new.id(), &proof);
+    assert!(e.mesh.verified_rev.lock().unwrap().get(&a.id()).is_none());
+    new.set_transit(false);
+    let next = Bytes::from(migration::encode(&secret, &a.id(), &e.id(), &new.id(), 2).unwrap());
+    e.mesh.on_frame(&new.id(), &next);
+    assert!(e.mesh.verified_rev.lock().unwrap().get(&a.id()).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_hop_cache_never_sends_into_a_connection_that_rides_mesh() {
     let (a, t, e) = (node().await, node().await, node().await);
     link(&a, &t).await;
@@ -1095,9 +1681,38 @@ async fn second_connection_to_mesh_peer_rides_mesh_and_is_not_a_neighbor() {
     // и ни одно из них не используется как сосед для кадров mesh
     a.nbrs.write().unwrap().insert(e.id(), c2.clone());
     a.mesh.warm(&e.id());
+    let cached = {
+        let hops = a.mesh.hops.lock().unwrap();
+        match hops.get(&e.id()).map(|h| &h.res) {
+            Some(Ok(h)) if h.peer == t.id() => "transit",
+            Some(Ok(_)) => "other",
+            Some(Err(HopErr::NoRoute)) => "no_route",
+            Some(Err(HopErr::NoQuic)) => "no_quic",
+            Some(Err(HopErr::TooSmall)) => "too_small",
+            None => "missing",
+        }
+    };
     let before = a.mesh.c.tx.load(Relaxed);
     a.mesh.send_payload(&e.id(), b"x");
-    assert_eq!(a.mesh.c.tx.load(Relaxed), before + 1, "кадр уходит через T, а не в соединение к E: {}", a.mesh.stats());
+    let cached_after = {
+        let hops = a.mesh.hops.lock().unwrap();
+        match hops.get(&e.id()).map(|h| &h.res) {
+            Some(Ok(h)) if h.peer == t.id() => "transit",
+            Some(Ok(_)) => "other",
+            Some(Err(HopErr::NoRoute)) => "no_route",
+            Some(Err(HopErr::NoQuic)) => "no_quic",
+            Some(Err(HopErr::TooSmall)) => "too_small",
+            None => "missing",
+        }
+    };
+    let t_conn = a.nbrs.read().unwrap().get(&t.id()).cloned().unwrap();
+    let t_paths: Vec<_> = t_conn.paths().iter().map(|p| (p.is_selected(), p.stats().current_mtu, p.stats().rtt)).collect();
+    assert_eq!(cached, "transit", "в кэше должен быть транзит, а не сквозной QUIC к выходу");
+    // Счётчик общий: параллельное рукопожатие может отправить дополнительные
+    // кадры между чтением `before` и проверкой, поэтому ровно +1 не гарантировано.
+    assert!(a.mesh.c.tx.load(Relaxed) > before,
+        "кадр уходит через T, а не в соединение к E: {}; cached={cached}, cached_after={cached_after}, neighbor_max_datagram={:?}, required={}, neighbor_paths={t_paths:?}",
+        a.mesh.stats(), t_conn.max_datagram_size(), a.mesh.min_nbr_dgram.load(Relaxed));
 }
 
 /// Патч iroh (`bench/vendor/iroh/PATCH.md`): при соединении с IP-адресом И mesh-адресом mesh-путь открывается тёплым запасным (Backup), IP выбран основным.

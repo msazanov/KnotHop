@@ -328,12 +328,12 @@ impl PacketSink for MuxSink {
     }
 }
 
-/// Ожидание следующей датаграммы: живёт между опросами, иначе waker нигде не остаётся зарегистрированным и приём идёт лишь по случайным пробуждениям.
-type DgFut = std::pin::Pin<Box<dyn Future<Output = Option<bytes::Bytes>> + Send>>;
+/// Ожидание следующей датаграммы и её аутентифицированного QUIC-пути: живёт между опросами, иначе waker нигде не остаётся зарегистрированным.
+type DgFut = std::pin::Pin<Box<dyn Future<Output = Option<(bytes::Bytes, iroh::endpoint::PathId)>> + Send>>;
 
 fn read_dg(conn: &Connection) -> DgFut {
     let c = conn.clone();
-    Box::pin(async move { c.read_datagram().await.ok() })
+    Box::pin(async move { c.read_datagram_with_path().await.ok() })
 }
 
 enum Src {
@@ -390,7 +390,7 @@ impl MuxSource {
                         // магические датаграммы зонда съедаем здесь и читаем дальше; бюджет `ate` не даёт им занять исполнителя
                         loop {
                             match fut.as_mut().poll(cx) {
-                                Poll::Ready(Some(b)) => {
+                                Poll::Ready(Some((b, path_id))) => {
                                     *fut = read_dg(conn);
                                     if dataplane::is_tag(&b) {
                                         // VPN-данные прямого канала: в RNS не идут никогда; ключ пира - только из TLS соединения
@@ -417,14 +417,14 @@ impl MuxSource {
                                         continue;
                                     }
                                     if is_grant_req(&b) {
-                                        answer_grant(&mux, *id, conn, filter, owner, &b);
+                                        answer_grant(&mux, *id, conn, path_id, filter, owner, &b);
                                         if filter.ate() {
                                             yielded = true;
                                             break;
                                         }
                                         continue;
                                     }
-                                    if filter.intercept(conn, &b) {
+                                    if filter.intercept_on_path(conn, path_id, &b) {
                                         if filter.ate() {
                                             yielded = true;
                                             break;
@@ -484,15 +484,36 @@ impl PacketSource for MuxSource {
 }
 
 fn is_grant_req(b: &[u8]) -> bool {
-    b.len() == qprobe::HEAD && b[..8] == qprobe::MAGIC && b[8] == qprobe::KIND_GREQ
+    b.len() == qprobe::HEAD && b[..8] == qprobe::MAGIC && matches!(b[8], qprobe::KIND_GREQ | qprobe::KIND_BGREQ)
 }
 
-/// Запрос разрешения на зонд QUIC по самой датаграммной связи кандидата (возврат TCP -> QUIC). Разрешение выдаётся только соединению, рядом с
-/// которым у того же ключа iroh уже есть другой носитель (то есть возвращается пир с работающей связью), и в пределах общих лимитов `qprobe::Grants`.
-/// Ответ - одна датаграмма `MAGIC | 'H' | status | nonce`; потеря запроса или ответа - обычный отказ, клиент повторит позже.
-fn answer_grant(mux: &Mux, id: u64, conn: &Connection, filter: &mut qprobe::Filter, owner: &[u8; 32], req: &[u8]) {
+/// Запрос разрешения на зонд QUIC по самой датаграммной связи кандидата (`'G'`: возврат TCP -> QUIC) или на объёмную >1 МиБ проверку
+/// прямого IP-пути уже установленного соединения (`'B'`, параллельно работающему транзиту). Для `'B'` запрос обязан прийти именно по IP-пути,
+/// рядом с которым есть действующий носитель/путь, а ответ уходит закреплённой отправкой по тому же `path_id`.
+fn answer_grant(mux: &Mux, id: u64, conn: &Connection, path_id: iroh::endpoint::PathId, filter: &mut qprobe::Filter, owner: &[u8; 32], req: &[u8]) {
     let now = Instant::now();
     if !filter.rate_ok(now) {
+        return;
+    }
+    if req[8] == qprobe::KIND_BGREQ {
+        let direct_ip = conn.paths().iter()
+            .find(|p| p.id() == path_id && p.is_ip())
+            .and_then(|p| match p.remote_addr() {
+                iroh::TransportAddr::Ip(sa) => Some(sa.ip()),
+                _ => None,
+            });
+        let has_active_tunnel = mux.has_other(id) || conn.paths().iter().count() >= 2;
+        let status = match direct_ip {
+            Some(ip) if has_active_tunnel => {
+                let real_owner = owner_key(Some(ip), conn.remote_id().as_bytes());
+                match qprobe::grants().grant_bulk_path(conn, path_id, real_owner, now) {
+                    Ok(()) => 0,
+                    Err(d) => d.code(),
+                }
+            }
+            _ => qprobe::DENY_NO_CARRIER,
+        };
+        let _ = conn.send_datagram_on_path(path_id, bytes::Bytes::from(qprobe::grant_reply(status, &req[10..18])));
         return;
     }
     let status = if !mux.has_other(id) {

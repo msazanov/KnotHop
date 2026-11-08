@@ -919,6 +919,12 @@ impl<T: ConnectionState> Connection<T> {
         self.inner.read_datagram()
     }
 
+    /// Receives a datagram and the authenticated QUIC path on which it arrived.
+    /// This consumes the same queue as `read_datagram`.
+    pub async fn read_datagram_with_path(&self) -> Result<(Bytes, PathId), ConnectionError> {
+        self.inner.read_datagram_with_path().await
+    }
+
     /// Receives a batch of application datagrams into `out`, in arrival order.
     ///
     /// This is the batch analogue of [`read_datagram()`](Self::read_datagram). The returned
@@ -994,6 +1000,12 @@ impl<T: ConnectionState> Connection<T> {
     #[inline]
     pub fn send_datagram(&self, data: Bytes) -> Result<(), SendDatagramError> {
         self.inner.send_datagram(data)
+    }
+
+    /// Sends a datagram only on the given QUIC path; it is never redirected.
+    /// `Ok(false)` means the path is not ready and nothing was queued.
+    pub fn send_datagram_on_path(&self, path: PathId, data: Bytes) -> Result<bool, SendDatagramError> {
+        self.inner.send_datagram_on_path(path, data)
     }
 
     /// Transmits many unreliable, unordered application datagrams in a single call.

@@ -1350,7 +1350,7 @@ async fn start_base(role: &str, state: &Path, transport: bool, port: Option<u16>
     }
     let mut eb = Endpoint::builder(presets::Minimal).secret_key(key).alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled);
     if mesh_inst.enabled() {
-        eb = eb.add_custom_transport(mesh_inst.transport()).path_selector(Arc::new(mesh::MeshBackupSelector));
+        eb = eb.add_custom_transport(mesh_inst.transport()).path_selector(mesh_inst.selector());
     }
     // REALITY - последний уровень запасного пути (reality_carrier.rs). KNOTHOP_REALITY=0: транспорт на endpoint не ставится, дозвона и сервера нет
     if std::env::var("KNOTHOP_REALITY").map(|v| v.trim() != "0").unwrap_or(true) {
@@ -2357,6 +2357,11 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                         conn.close(0u32.into(), b"too many carriers");
                         d.book.pause(Duration::from_secs(2)).await;
                         continue;
+                    }
+                    if let Some(mm) = mesh::global().filter(|mm| mm.enabled()) {
+                        mm.register_migratable(&conn);
+                        tokio::spawn(mm.clone().watch_mesh_stall(conn.clone()));
+                        tokio::spawn(mm.clone().watch_direct_upgrade(conn.clone()));
                     }
                     ctl.set_mode("quic");
                     d.session(&mut st, Cur::Quic(conn), m).await;
@@ -5666,8 +5671,9 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
                         continue;   // путь уже прямой
                     }
                     let Some(lease) = c2.path_gate.begin(sv.dest, Instant::now()) else { continue };
-                    if lease.request_due(Instant::now()) {
-                        let _ = c2.node.engine().request_path_on(&dh, &[own]).await;
+                    let due = lease.due_ifaces(&[own], Instant::now());
+                    if !due.is_empty() {
+                        let _ = c2.node.engine().request_path_on(&dh, &due).await;
                         asked.insert(sv.dest, Instant::now());
                     }
                 }
@@ -6047,11 +6053,12 @@ async fn wait_our_path(node: &Arc<Node>, gate: &path::PathGate, dest: &Destinati
                     node.engine().remove_path(dest);
                 }
             }
-            // Один rate-limited запрос по всем своим носителям. Прямой интерфейс
-            // может отвечать на handshake, но не пропускать данные из-за DPI.
+            // Один rate-limited запрос на каждый наш носитель: вновь подключившиеся
+            // соседи опрашиваются сразу, не дожидаясь истечения 20 с от первого.
             let ifs = path::discovery_ifaces(&ours, avoid);
-            if !ifs.is_empty() && p.request_due(now) {
-                let _ = node.engine().request_path_on(dest, &ifs).await;
+            let due = p.due_ifaces(&ifs, now);
+            if !due.is_empty() {
+                let _ = node.engine().request_path_on(dest, &due).await;
             }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -6059,7 +6066,7 @@ async fn wait_our_path(node: &Arc<Node>, gate: &path::PathGate, dest: &Destinati
     any_our_path(node, dest, &ours_now(), avoid)
 }
 
-/// Один владелец discovery, не более одного scoped forced-запроса за 20 с.
+/// Один владелец discovery, не более одного scoped forced-запроса на интерфейс за 20 с.
 /// Другие задачи только наблюдают таблицу. Нет предпочтений по хопам/RTT: путь выбирает RNS.
 async fn wait_scoped_path(node: &Arc<Node>, gate: &path::PathGate, dest: &DestinationHash,
     allowed: impl Fn() -> Vec<usize>, avoid: Option<usize>, secs: u64) {
@@ -6076,8 +6083,9 @@ async fn wait_scoped_path(node: &Arc<Node>, gate: &path::PathGate, dest: &Destin
             if node.engine().get_path_clone(dest).is_some() {
                 node.engine().remove_path(dest);
             }
-            if !ifs.is_empty() && p.request_due(Instant::now()) {
-                let _ = node.engine().request_path_on(dest, &ifs).await;
+            let due = p.due_ifaces(&ifs, Instant::now());
+            if !due.is_empty() {
+                let _ = node.engine().request_path_on(dest, &due).await;
             }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -6174,6 +6182,8 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     if blocked {
         let ok = mesh_first(ctx, cand).await;
         ctx.sh.note(format!("{}: прямой путь заблокирован, mesh-носитель до Link {}", cand.name, if ok { "готов" } else { "не поднялся" }));
+    } else if mesh_first_eligible(ctx, cand) {
+        mesh_carrier(ctx, cand);
     }
     let (id, handle) = match open_link(ctx, cand, avoid_iface).await {
         Ok(v) => v,
@@ -6329,6 +6339,7 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
     tokio::spawn(async move {
         let mut wait = 2u64;
         let mut first = true;
+        let mut tried_in_round = 0usize;
         loop {
             let Some(ctx) = weak.upgrade() else { break };
             // при первой попытке `cur` ещё не записан (connect_exit не вернулся)
@@ -6344,13 +6355,15 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
                 let c = ctx.ep.connect_with_opts(addr, ALPN, iroh::endpoint::ConnectOptions::new().with_transport_config(cfg)).await.ok()?;
                 c.await.ok()
             };
-            match tokio::time::timeout(Duration::from_secs(12), attempt).await {
+            match tokio::time::timeout(Duration::from_secs(4), attempt).await {
                 Ok(Some(conn)) => {
                     // не удалось пометить сквозным - соединение закрываем: непомеченное могло бы стать «соседом» mesh
                     if !m.mark_e2e(&conn) {
                         conn.close(0u32.into(), b"mesh table full");
                         break;
                     }
+                    tokio::spawn(m.clone().watch_mesh_stall(conn.clone()));
+                    tokio::spawn(m.clone().watch_direct_upgrade(conn.clone()));
                     let Ok(mx) = mux::Mux::new(&ctx.node, &ctx.sh, mux::next_name("iroh-dg-out", &mesh_label(&key)), false) else { conn.close(0u32.into(), b"no interface"); break };
                     if mx.add_quic(conn.clone(), true, key).is_none() {
                         conn.close(0u32.into(), b"too many carriers");
@@ -6358,21 +6371,27 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
                     }
                     ctx.sh.note(format!("mesh: сквозное QUIC к {name} установлено за {} мс", t0.elapsed().as_millis()));
                     wait = 2;
+                    tried_in_round = 0;
                     drop(ctx);
-                    // Рукопожатие и выбор IP-пути не доказывают доставку данных: DPI может
-                    // пропускать их, но блокировать поток. Не разрываем рабочий mesh ради
-                    // такого кандидата. Автоматическая миграция внутри iroh здесь не меняется;
-                    // проверка >1 МБ и управление всеми переходами требуют отдельной реализации.
                     conn.closed().await;
                     mx.close();
                 }
                 _ => {
-                    // следующая попытка идёт через другой транзит: выбранный мог не видеть выход
+                    // следующая попытка сразу идёт через другой живой транзит, не тратя 2..60 с до обхода всех кандидатов
                     m.rotate_alt(&key);
-                    ctx.sh.note(format!("mesh: к {name} не соединилось, повтор через {wait} с"));
-                    drop(ctx);
-                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                    wait = (wait * 2).min(60);
+                    tried_in_round += 1;
+                    let total_transits = m.live_transit_count(&key).max(1);
+                    if tried_in_round < total_transits {
+                        first = true;
+                        drop(ctx);
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    } else {
+                        tried_in_round = 0;
+                        ctx.sh.note(format!("mesh: к {name} не соединилось, повтор через {wait} с"));
+                        drop(ctx);
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        wait = (wait * 2).min(30);
+                    }
                 }
             }
         }

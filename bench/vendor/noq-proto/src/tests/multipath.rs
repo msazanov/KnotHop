@@ -83,6 +83,104 @@ fn non_zero_length_cids() {
 }
 
 #[test]
+fn knothop_stall_recovery_rejects_last_or_available_path() {
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let now = std::time::Instant::now();
+    // Нельзя трогать выбранный путь или последний путь соединения.
+    assert_eq!(pair.conn_mut(Client).knothop_recover_stalled_path(PathId::ZERO, now), 0);
+    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup).unwrap();
+    assert_eq!(pair.conn_mut(Client).knothop_recover_stalled_path(PathId::ZERO, now), 0);
+    assert!(!pair.is_closed(Client));
+}
+
+#[test]
+fn datagram_receive_reports_authenticated_path_after_route_switch() -> TestResult {
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let server_addr = pair.routes.public_server_addr();
+    let second = pair.open_path(Client, FourTuple::from_remote(server_addr), PathStatus::Backup)?;
+    pair.drive();
+    pair.datagrams(Client).send(bytes::Bytes::from_static(b"old-route"), false)?;
+    pair.drive();
+    let (data, path) = pair.datagrams(Server).recv_with_path().unwrap();
+    assert_eq!(data.as_ref(), b"old-route");
+    assert_eq!(path, PathId::ZERO);
+    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Client, second, PathStatus::Available)?;
+    pair.datagrams(Client).send(bytes::Bytes::from_static(b"new-route"), false)?;
+    pair.drive();
+    let (data, path) = pair.datagrams(Server).recv_with_path().unwrap();
+    assert_eq!(data.as_ref(), b"new-route");
+    assert_eq!(path, second);
+    Ok(())
+}
+
+#[test]
+fn pinned_probe_uses_backup_without_redirecting_application_datagrams() -> TestResult {
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let server_addr = pair.routes.public_server_addr();
+    let backup = pair.open_path(Client, FourTuple::from_remote(server_addr), PathStatus::Backup)?;
+    pair.drive();
+    pair.datagrams(Client).send(bytes::Bytes::from_static(b"vpn"), false)?;
+    pair.datagrams(Client).send_on_path(backup, bytes::Bytes::from_static(b"probe"))?;
+    pair.drive();
+    let mut received = Vec::new();
+    while let Some((data, path)) = pair.datagrams(Server).recv_with_path() { received.push((data, path)); }
+    assert!(received.iter().any(|(d, p)| &d[..] == b"vpn" && *p == PathId::ZERO));
+    assert!(received.iter().any(|(d, p)| &d[..] == b"probe" && *p == backup));
+    assert_eq!(pair.path_status(Client, PathId::ZERO)?, PathStatus::Available);
+    assert_eq!(pair.path_status(Client, backup)?, PathStatus::Backup);
+
+    // Если путь закрыли до передачи пробы, она не должна «успешно» уйти
+    // обычной очередью через оставшийся маршрут.
+    pair.datagrams(Client).send_on_path(backup, bytes::Bytes::from_static(b"must-drop"))?;
+    pair.close_path(Client, backup, 0u8.into())?;
+    pair.datagrams(Client).send(bytes::Bytes::from_static(b"still-vpn"), false)?;
+    pair.drive();
+    let mut received = Vec::new();
+    while let Some((data, path)) = pair.datagrams(Server).recv_with_path() { received.push((data, path)); }
+    assert!(received.iter().any(|(d, p)| &d[..] == b"still-vpn" && *p == PathId::ZERO));
+    assert!(!received.iter().any(|(d, _)| &d[..] == b"must-drop"));
+    Ok(())
+}
+
+#[test]
+fn knothop_stall_recovery_survives_late_original_packet_and_ack() -> TestResult {
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let server_addr = pair.routes.public_server_addr();
+    let backup = pair.open_path(Client, FourTuple::from_remote(server_addr), PathStatus::Backup)?;
+    pair.drive();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let msg = b"delayed-original-after-stall-recovery";
+    pair.send_stream(Client, stream).write(msg).unwrap();
+    pair.send_stream(Client, stream).finish().unwrap();
+    // Отправляем старый пакет в очередь сети, но сервер его пока не читает.
+    pair.drive_client();
+    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Client, backup, PathStatus::Available)?;
+    let now = pair.time;
+    let recovered = pair.conn_mut(Client).knothop_recover_stalled_path(PathId::ZERO, now);
+    assert!(recovered > 0, "тест обязан переочередить реально отправленный пакет");
+    assert_eq!(pair.conn_mut(Client).knothop_recover_stalled_path(PathId::ZERO, now), 0,
+        "повторный вызов не переочередивает тот же пакет повторно");
+    // Старый пакет уже в очереди, новый также уходит в сеть: сервер и ACK
+    // обрабатывают обе копии, как при ложном срабатывании сторожка.
+    pair.drive_client();
+    pair.drive();
+    assert!(!pair.is_closed(Client) && !pair.is_closed(Server));
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+    let mut recv = pair.recv_stream(Server, stream);
+    let mut chunks = recv.read(true).unwrap();
+    let mut received = Vec::new();
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) { received.extend_from_slice(&chunk.bytes); }
+    let _ = chunks.finalize();
+    assert_eq!(received, msg, "повтор не должен дублировать данные приложения");
+    assert!(pair.path_status(Client, PathId::ZERO).is_ok(), "старый путь остаётся открытым");
+    Ok(())
+}
+
+#[test]
 fn path_acks() {
     let _guard = subscribe();
     let mut pair = ConnPair::builder().enable_multipath().connect();

@@ -34,6 +34,8 @@ use iroh::endpoint::transports::{
 use iroh_base::CustomAddr;
 use tokio::sync::mpsc;
 
+mod migration;
+
 /// Идентификатор транспорта (не из реестра iroh; значение произвольное, одинаковое на всех узлах).
 pub const MESH_ID: u64 = 0x4B48_4D53;
 /// Метка датаграммы mesh в соседском QUIC. Бит 0x80 выставлен, как у 0xFE (`dataplane::TAG`) и 0xFF (магия `qprobe`): с RNS-пакетами нашего интерфейса не пересекается.
@@ -85,6 +87,7 @@ const HOP_MAX: usize = 256;
 const E2E_MAX: usize = 256;
 const BUCKET_MAX_NBR: usize = 256;
 const BUCKET_MAX_PAIR: usize = 1024;
+
 
 pub type Key = [u8; 32];
 
@@ -204,8 +207,13 @@ pub struct Mesh {
     limits: Mutex<Limits>,
     nbr_buckets: Mutex<HashMap<Key, Bucket>>,
     pair_buckets: Mutex<HashMap<(Key, Key), Bucket>>,
+    migration_buckets: Mutex<HashMap<Key, Bucket>>,
+    migration_sent: Mutex<HashMap<(Key, Key), Instant>>,
     auth: Mutex<HashMap<(Key, Key, Key), (bool, Instant)>>,
     rev: Mutex<HashMap<Key, (Key, Instant)>>,
+    /// Подтверждённый сквозной TLS миграционный маршрут: действует только
+    /// пока живо соответствующее соединение и не сменилось поколение прав.
+    verified_rev: Mutex<HashMap<Key, (Key, usize)>>,
     unreach_sent: Mutex<HashMap<(Key, Key), Instant>>,
     /// кэш маршрутов RNS (путь меняется редко, а запрос таблицы путей дорог): 2 с
     routes: Mutex<HashMap<Key, (Option<Key>, Instant)>>,
@@ -218,6 +226,9 @@ pub struct Mesh {
     ride_cache: Mutex<HashMap<usize, (bool, Instant)>>,
     /// сдвиг выбора альтернативного транзита по назначению (растёт после неудачной попытки соединения)
     alt_rot: Mutex<HashMap<Key, u32>>,
+    stall_hops: Mutex<HashMap<Key, Key>>,
+    /// Прямые адреса выходов, реально подтверждённые двусторонней передачей >1 МиБ через этот конкретный IP-путь.
+    confirmed_direct: Mutex<HashMap<std::net::SocketAddr, Instant>>,
     hop_pending: Mutex<std::collections::HashSet<Key>>,
     hop_req: Mutex<std::sync::mpsc::Sender<Key>>,
     /// очередь исходящих кадров: poll_send работает под замком QUIC-соединения, а `send_datagram` хопа берёт замок ДРУГОГО соединения; чтобы вложенные замки
@@ -229,6 +240,7 @@ pub struct Mesh {
     /// поколение прав, на котором получены кэши auth/ids/routes/hops/rev
     seen_gen: AtomicU64,
     min_nbr_dgram: AtomicU64,
+    migration_seq: AtomicU64,
     pub c: Counters,
     rx_tx: mpsc::Sender<(Bytes, Key)>,
     rx: Mutex<Option<mpsc::Receiver<(Bytes, Key)>>>,
@@ -276,8 +288,11 @@ impl Mesh {
             limits: Mutex::new(Limits::default()),
             nbr_buckets: Default::default(),
             pair_buckets: Default::default(),
+            migration_buckets: Default::default(),
+            migration_sent: Default::default(),
             auth: Default::default(),
             rev: Default::default(),
+            verified_rev: Default::default(),
             unreach_sent: Default::default(),
             routes: Default::default(),
             hops: Default::default(),
@@ -286,6 +301,8 @@ impl Mesh {
             local_id: Default::default(),
             ride_cache: Default::default(),
             alt_rot: Default::default(),
+            stall_hops: Default::default(),
+            confirmed_direct: Default::default(),
             hop_pending: Default::default(),
             hop_req: Mutex::new(hop_tx),
             txq,
@@ -293,6 +310,7 @@ impl Mesh {
             e2e_max: AtomicU64::new(E2E_MAX as u64),
             seen_gen: AtomicU64::new(0),
             min_nbr_dgram: AtomicU64::new((QUIC_MIN_UDP + HDR) as u64),
+            migration_seq: AtomicU64::new(0),
             c: Counters::default(),
             rx_tx,
             rx: Mutex::new(Some(rx)),
@@ -370,6 +388,69 @@ impl Mesh {
         Arc::new(MeshTransport(self.clone()))
     }
 
+    pub fn selector(self: &Arc<Self>) -> Arc<MeshBackupSelector> {
+        Arc::new(MeshBackupSelector(Some(Arc::downgrade(self))))
+    }
+
+    pub fn confirm_direct(&self, addr: std::net::SocketAddr) {
+        const TTL: Duration = Duration::from_secs(30 * 60);
+        let addr = std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port());
+        let now = Instant::now();
+        let mut m = self.confirmed_direct.lock().unwrap();
+        if !m.contains_key(&addr) && m.len() >= 256 {
+            m.retain(|_, t| now.saturating_duration_since(*t) < TTL);
+            if m.len() >= 256 {
+                return;
+            }
+        }
+        m.insert(addr, now);
+    }
+
+    pub fn revoke_direct(&self, addr: &std::net::SocketAddr) {
+        let addr = std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port());
+        self.confirmed_direct.lock().unwrap().remove(&addr);
+    }
+
+    pub fn is_direct_confirmed(&self, addr: &std::net::SocketAddr) -> bool {
+        const TTL: Duration = Duration::from_secs(30 * 60);
+        let addr = std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port());
+        let now = Instant::now();
+        let mut m = self.confirmed_direct.lock().unwrap();
+        match m.get(&addr).copied() {
+            Some(t) if now.saturating_duration_since(t) < TTL => true,
+            Some(_) => {
+                m.remove(&addr);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Зарегистрировать соединение для аутентифицированной миграции транзита (`e2e.conns`), не помечая его
+    /// навсегда сквозным (`e2e.ids`): пока соединение идёт прямым IP-путём, оно остаётся обычным носителем,
+    /// но при переходе на тёплый запасной mesh-путь поддерживает смену транзита с TLS-exporter MAC.
+    pub fn register_migratable(self: &Arc<Self>, conn: &Connection) {
+        let id = conn.stable_id();
+        let max = (self.e2e_max.load(Relaxed) as usize).saturating_mul(2).max(E2E_MAX);
+        {
+            let mut e = self.e2e.lock().unwrap();
+            if e.conns.contains_key(&id) || e.conns.len() >= max {
+                return;
+            }
+            e.conns.insert(id, (conn.clone(), migration::ReplayGuard::default()));
+        }
+        let (m, c) = (self.clone(), conn.clone());
+        tokio::spawn(async move {
+            let _ = c.closed().await;
+            {
+                let mut e = m.e2e.lock().unwrap();
+                e.ids.remove(&id);
+                e.conns.remove(&id);
+            }
+            m.verified_rev.lock().unwrap().retain(|_, (_, sid)| *sid != id);
+        });
+    }
+
     /// Пометить соединение как сквозное (начато по mesh). Оно не может быть соседом: кадры mesh по нему не шлём и не принимаем.
     /// false - таблица заполнена: вызывающий ОБЯЗАН закрыть соединение (непомеченное могло бы стать «соседом»).
     pub fn mark_e2e(self: &Arc<Self>, conn: &Connection) -> bool {
@@ -384,12 +465,18 @@ impl Mesh {
                     return false;
                 }
                 e.ids.insert(id);
+                e.conns.insert(id, (conn.clone(), migration::ReplayGuard::default()));
             }
         }
         let (m, c) = (self.clone(), conn.clone());
         tokio::spawn(async move {
             let _ = c.closed().await;
-            m.e2e.lock().unwrap().ids.remove(&id);
+            {
+                let mut e = m.e2e.lock().unwrap();
+                e.ids.remove(&id);
+                e.conns.remove(&id);
+            }
+            m.verified_rev.lock().unwrap().retain(|_, (_, sid)| *sid != id);
         });
         true
     }
@@ -445,6 +532,8 @@ impl Mesh {
             self.routes.lock().unwrap().clear();
             self.hops.lock().unwrap().clear();
             self.rev.lock().unwrap().clear();
+            self.verified_rev.lock().unwrap().clear();
+            self.stall_hops.lock().unwrap().clear();
             self.c.gen_resets.fetch_add(1, Relaxed);
         }
     }
@@ -504,6 +593,16 @@ impl Mesh {
             }
         }
         m.entry(*prev).or_insert(Bucket { tokens: l.nbr_burst, last: now }).take(now, l.nbr_rate, l.nbr_burst)
+    }
+
+    /// Миграция проверяет MAC: отдельный небольшой бюджет до криптографии.
+    fn rate_migration(&self, now: Instant, prev: &Key) -> bool {
+        let mut m = self.migration_buckets.lock().unwrap();
+        if !m.contains_key(prev) && m.len() >= BUCKET_MAX_NBR {
+            m.retain(|_, b| now.saturating_duration_since(b.last) < Duration::from_secs(30));
+            if m.len() >= BUCKET_MAX_NBR { return false; }
+        }
+        m.entry(*prev).or_insert(Bucket { tokens: 4.0, last: now }).take(now, 2.0, 4.0)
     }
 
     fn rate_pair(&self, now: Instant, src: &Key, dst: &Key) -> bool {
@@ -634,6 +733,78 @@ impl Mesh {
         }
     }
 
+    /// Доказательство приходит от последнего TLS-аутентифицированного соседа.
+    /// Оно не заменяет проверок прав и действительно только для живого e2e TLS.
+    fn accept_migration(&self, now: Instant, prev: &Key, d: &[u8], policy: &dyn Policy) {
+        if !self.rate_migration(now, prev) || d.len() != migration::LEN { return; }
+        if d[3..11] != id_of(&self.me) || self.local_key(now, policy) != Some(self.me) { return; }
+        let src_id: Id = match d[11..19].try_into() { Ok(id) => id, Err(_) => return };
+        let Some(src) = self.local_source_key(now, &src_id, policy) else { return };
+        let generation = policy.generation();
+        if src == self.me || src == *prev || !policy.holds_rights(&src)
+            || !policy.holds_rights(prev) || !policy.is_transit(prev) { return; }
+        // Exporter берёт замок QUIC: нельзя держать e2e при обращении к нему,
+        // поскольку poll_send под замком QUIC проверяет e2e.
+        let connections: Vec<_> = self.e2e.lock().unwrap().conns.iter()
+            .map(|(sid, (conn, _))| (*sid, conn.clone())).collect();
+        for (sid, conn) in connections {
+            if conn.remote_id().as_bytes() != &src || conn.close_reason().is_some() { continue; }
+            let mut key = [0u8; 32];
+            if conn.export_keying_material(&mut key, migration::LABEL, b"").is_err() { continue; }
+            let mut e = self.e2e.lock().unwrap();
+            let Some((_, replay)) = e.conns.get_mut(&sid) else { continue };
+            if !replay.accept(&key, &src, &self.me, prev, d) { continue; }
+            if policy.generation() != generation { return; }
+            let mut verified = self.verified_rev.lock().unwrap();
+            if !verified.contains_key(&src) && verified.len() >= E2E_MAX { return; }
+            verified.insert(src, (*prev, sid));
+            drop(verified);
+            drop(e);
+            self.hops.lock().unwrap().remove(&src);
+            return;
+        }
+    }
+
+    /// Только один транзит: источник и назначение — непосредственные соседи.
+    /// Транзит не может изменить доказательство и не устанавливает маршрут.
+    fn forward_migration(&self, now: Instant, prev: &Key, d: &Bytes, policy: &dyn Policy) {
+        if !self.rate_migration(now, prev) || d.len() != migration::LEN || d[19..27] != id_of(&self.me) { return; }
+        let src_id: Id = d[11..19].try_into().unwrap();
+        let dst_id: Id = d[3..11].try_into().unwrap();
+        let Some(src) = self.key_of(now, &src_id, policy) else { return };
+        let Some(dst) = self.key_of(now, &dst_id, policy) else { return };
+        if &src != prev || dst == src || dst == self.me || !policy.may_forward(prev, &src, &dst) { return; }
+        if let Some(conn) = self.carrier(&dst) {
+            let _ = conn.send_datagram(d.clone());
+        }
+    }
+
+    /// Вызывается вне poll_send и вне замков QUIC. Экспортёр и счётчик
+    /// принадлежат сквозному соединению; размер/частота сообщений ограничены.
+    fn send_migration(&self, dst: &Key, via: &Key, carrier: &Connection) {
+        if via == dst { return; }
+        let now = Instant::now();
+        {
+            let mut sent = self.migration_sent.lock().unwrap();
+            if sent.get(&(*dst, *via)).is_some_and(|t| now.saturating_duration_since(*t) < Duration::from_secs(1)) { return; }
+            if sent.len() >= E2E_MAX {
+                sent.retain(|_, t| now.saturating_duration_since(*t) < Duration::from_secs(30));
+                if sent.len() >= E2E_MAX && !sent.contains_key(&(*dst, *via)) { return; }
+            }
+            sent.insert((*dst, *via), now);
+        }
+        let connections: Vec<_> = self.e2e.lock().unwrap().conns.values().map(|(c, _)| c.clone()).collect();
+        for conn in connections {
+            if conn.remote_id().as_bytes() != dst || conn.close_reason().is_some() { continue; }
+            let mut key = [0u8; 32];
+            if conn.export_keying_material(&mut key, migration::LABEL, b"").is_err() { continue; }
+            let Ok(seq) = self.migration_seq.fetch_update(Relaxed, Relaxed, |n| n.checked_add(1)) else { return };
+            if let Some(proof) = migration::encode(&key, &self.me, dst, via, seq + 1) {
+                let _ = carrier.send_datagram(Bytes::from(proof));
+            }
+        }
+    }
+
     /// Живой QUIC-носитель к ключу, который может быть соседом mesh: соединение, идущее по mesh, не годится (см. `rides_mesh`).
     fn carrier(&self, key: &Key) -> Option<Connection> {
         (self.carriers)(key).filter(|c| !self.rides_mesh(c))
@@ -645,7 +816,8 @@ impl Mesh {
             None => Err(NbrErr::NoQuic),
             Some(c) => {
                 let need = self.min_nbr_dgram.load(Relaxed) as usize;
-                if c.max_datagram_size().unwrap_or(0) < need {
+                let available = c.max_datagram_size().unwrap_or(0);
+                if available < need {
                     Err(NbrErr::TooSmall)
                 } else {
                     Ok(c)
@@ -700,6 +872,20 @@ impl Mesh {
     /// Следующий хоп для СВОИХ кадров (poll_send). Если до `dst` есть прямой носитель (путь IP), mesh - запасной путь и обязан идти МИМО него: через
     /// альтернативный транзит (`alt_transit`). Иначе - путь RNS или обратная таблица, как при пересылке.
     fn next_hop_origin(&self, now: Instant, dst: &Key, policy: &dyn Policy) -> Option<Key> {
+        // Локальное решение о застое важнее старого подтверждения от пира:
+        // иначе подтверждённый, но замолчавший хоп отменял бы переключение.
+        let forced = self.stall_hops.lock().unwrap().get(dst).copied();
+        if let Some(via) = forced {
+            if policy.is_transit(&via) && policy.holds_rights(&via) && self.neighbor(&via).is_ok() { return Some(via); }
+        }
+        let verified = self.verified_rev.lock().unwrap().get(dst).copied();
+        if let Some((via, sid)) = verified {
+            let live = self.e2e.lock().unwrap().conns.contains_key(&sid);
+            if live && policy.holds_rights(dst)
+                && policy.holds_rights(&via) && policy.is_transit(&via) && self.neighbor(&via).is_ok() {
+                return Some(via);
+            }
+        }
         if self.carrier(dst).is_some() {
             let k = self.alt_transit(dst, policy)?;
             self.c.alt_hops.fetch_add(1, Relaxed);
@@ -730,6 +916,139 @@ impl Mesh {
         *e = e.wrapping_add(1);
         drop(r);
         self.hops.lock().unwrap().remove(dst);
+    }
+
+    /// Число живых транзитных соседей к `dst` прямо сейчас (для быстрого перебора без лишнего ожидания).
+    pub fn live_transit_count(&self, dst: &Key) -> usize {
+        let Some(policy) = self.policy() else { return 0 };
+        let mut c: Vec<Key> = policy.transit_candidates().into_iter()
+            .filter(|k| k != dst && k != &self.me && policy.holds_rights(k) && policy.is_transit(k) && self.neighbor(k).is_ok())
+            .collect();
+        c.sort();
+        c.dedup();
+        c.len()
+    }
+
+    /// Выбор другого доступного первого хопа после застоя; RNS-маршрут остаётся
+    /// подсказкой, но не должен немедленно вернуть нас на тот же чёрный ход.
+    /// Перебор круговой (`alt_rot`), чтобы при 3+ транзитах не зациклиться между двумя.
+    fn rotate_stalled(&self, dst: &Key) -> bool {
+        let Some(policy) = self.policy() else { return false };
+        self.sync_gen(policy.as_ref());
+        let old = self.hop_peer(dst);
+        let mut candidates: Vec<_> = policy.transit_candidates().into_iter()
+            .filter(|k| k != dst && k != &self.me && Some(*k) != old
+                && policy.holds_rights(k) && policy.is_transit(k) && self.neighbor(k).is_ok())
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        if candidates.is_empty() { return false; }
+        let idx = {
+            let mut r = self.alt_rot.lock().unwrap();
+            if r.len() >= 64 && !r.contains_key(dst) { r.clear(); }
+            let e = r.entry(*dst).or_insert(0);
+            let cur = *e as usize;
+            *e = e.wrapping_add(1);
+            cur
+        };
+        let via = candidates[idx % candidates.len()];
+        let mut forced = self.stall_hops.lock().unwrap();
+        if forced.len() >= HOP_MAX && !forced.contains_key(dst) { return false; }
+        forced.insert(*dst, via);
+        drop(forced);
+        self.hops.lock().unwrap().remove(dst);
+        self.warm(dst);
+        true
+    }
+
+    /// Запускается только инициатором сквозного соединения, не транзитом.
+    /// Бездействие без отправленных ack-eliciting кадров не считается застоем.
+    /// Также отзывает подтверждение прямого IP, если сторожок iroh увёл трафик обратно на mesh.
+    pub async fn watch_mesh_stall(self: Arc<Self>, conn: Connection) {
+        let dst = *conn.remote_id().as_bytes();
+        let mut watch = StallWatch::default();
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        let mut retry_until: Option<Instant> = None;
+        let mut retry_at = Instant::now();
+        let mut selected_ip: Option<std::net::SocketAddr> = None;
+        loop {
+            tick.tick().await;
+            if conn.close_reason().is_some() { break; }
+            let now = Instant::now();
+            if retry_until.is_some_and(|until| now < until) {
+                if now >= retry_at {
+                    self.warm(&dst);
+                    retry_at = now + Duration::from_secs(1);
+                }
+            } else {
+                retry_until = None;
+            }
+            let paths = conn.paths();
+            if let Some(sa) = paths.iter().find(|p| p.is_selected()).and_then(|p| match p.remote_addr() {
+                iroh::TransportAddr::Ip(sa) => Some(*sa),
+                _ => None,
+            }) {
+                selected_ip = Some(sa);
+            }
+            let sample = paths.iter().find(|p| p.is_selected() && is_mesh_addr(p.remote_addr()))
+                .map(|p| p.stats());
+            let Some(st) = sample else { watch = StallWatch::default(); continue };
+            if let Some(sa) = selected_ip.take() {
+                // Трафик шёл напрямую по IP, но сторожок увёл соединение на mesh (DPI или обрыв):
+                // прямому адресу требуется повторная проверка >1 МиБ перед следующим возвратом.
+                self.revoke_direct(&sa);
+            }
+            if watch.observe(now, st.frame_rx.authenticated_progress(), st.frame_tx.ack_eliciting_progress(), st.rtt) && retry_until.is_none() {
+                let rotated = self.rotate_stalled(&dst);
+                if rotated {
+                    retry_until = Some(now + Duration::from_secs(6));
+                    retry_at = now + Duration::from_secs(1);
+                }
+                #[cfg(test)]
+                eprintln!("mesh watchdog: rotate={rotated}, rx={}, tx={}, rtt_ms={}", st.frame_rx.authenticated_progress(), st.frame_tx.ack_eliciting_progress(), st.rtt.as_millis());
+                #[cfg(not(test))]
+                let _ = rotated;
+                watch = StallWatch::default();
+            }
+        }
+    }
+
+    /// Фоновая проверка прямого IP-кандидата объёмом >1 МиБ параллельно работающему транзиту (`mesh`).
+    /// Пока проверка не прошла, выбранный путь не переключается и VPN-трафик продолжает идти через транзит.
+    pub async fn watch_direct_upgrade(self: Arc<Self>, conn: Connection) {
+        let mut backoff = Duration::from_secs(30);
+        let mut next_try = Instant::now() + Duration::from_millis(400);
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if conn.close_reason().is_some() { break; }
+            if Instant::now() < next_try { continue; }
+            let paths = conn.paths();
+            if !paths.iter().any(|p| p.is_selected() && is_mesh_addr(p.remote_addr())) {
+                continue;
+            }
+            let candidate = paths.iter().find_map(|p| match p.remote_addr() {
+                iroh::TransportAddr::Ip(sa) if !self.is_direct_confirmed(sa) => Some((p.id(), *sa)),
+                _ => None,
+            });
+            let Some((path_id, sa)) = candidate else { continue };
+            let nonce = {
+                use rand_core::RngCore as _;
+                rand_core::OsRng.next_u64()
+            };
+            if crate::qprobe::run_bulk_on_path(&conn, path_id, nonce).await.is_some() {
+                self.confirm_direct(sa);
+                backoff = Duration::from_secs(30);
+                next_try = Instant::now() + backoff;
+                for p in conn.paths().iter() {
+                    if p.id() == path_id {
+                        let _ = p.ping();
+                    }
+                }
+            } else {
+                next_try = Instant::now() + backoff;
+                backoff = (backoff * 2).min(Duration::from_secs(300));
+            }
+        }
     }
 
     /// Альтернативный транзит к `dst`: узел с правом TRANSIT, не `dst`, с живым QUIC-носителем вне mesh; выбор стабилен (меньший `k xor dst`).
@@ -786,6 +1105,15 @@ impl Mesh {
             return;
         };
         self.sync_gen(policy.as_ref());
+        if d.len() == migration::LEN && d[..3] == [TAG, 0, migration::KIND] {
+            let now = Instant::now();
+            if d[3..11] == id_of(&self.me) {
+                self.accept_migration(now, prev, d, policy.as_ref());
+            } else {
+                self.forward_migration(now, prev, d, policy.as_ref());
+            }
+            return;
+        }
         if d[1] == 0 && d.len() == 10 {
             let now = Instant::now();
             if self.rate_neighbor(now, prev) {
@@ -933,7 +1261,10 @@ impl Mesh {
                 return;
             }
         }
+        let proof_hop = res.as_ref().ok().cloned();
         h.insert(*dst, HopEntry { res, at: now });
+        drop(h);
+        if let Some(hop) = proof_hop { self.send_migration(dst, &hop.peer, &hop.conn); }
     }
 
     fn warm_if_stale(&self, now: Instant, dst: &Key) {
@@ -1036,10 +1367,34 @@ struct HopEntry {
     at: Instant,
 }
 
+#[derive(Default)]
+struct StallWatch {
+    last_rx: Option<u64>,
+    tx_baseline: u64,
+    pending_since: Option<Instant>,
+}
+
+impl StallWatch {
+    fn observe(&mut self, now: Instant, rx: u64, tx: u64, rtt: Duration) -> bool {
+        if self.last_rx != Some(rx) {
+            self.last_rx = Some(rx);
+            self.tx_baseline = tx;
+            self.pending_since = None;
+            return false;
+        }
+        if tx > self.tx_baseline && self.pending_since.is_none() { self.pending_since = Some(now); }
+        self.pending_since.is_some_and(|since| now.saturating_duration_since(since) >= Duration::from_secs(3).max(rtt.saturating_mul(3)))
+            && tx.saturating_sub(self.tx_baseline) >= 2
+    }
+}
+
 /// Сквозные соединения, начатые по mesh (помечены `mark_e2e`): они не соседи.
 #[derive(Default)]
 struct E2e {
     ids: std::collections::HashSet<usize>,
+    /// TLS-сессия и последний принятый монотонный счётчик: replay отвергается
+    /// в пределах сессии; после закрытия её exporter становится недействителен.
+    conns: HashMap<usize, (Connection, migration::ReplayGuard)>,
 }
 
 enum NbrErr {
@@ -1133,9 +1488,10 @@ impl CustomSender for MeshSender {
 
 // -------------------------------------------------------------------- выбор пути
 
-/// IP - основной путь, mesh и relay - запасные (`Backup`); внутри уровня меньший RTT с гистерезисом 5 мс, у IPv6 преимущество 3 мс (как у выбора iroh по умолчанию).
+/// IP - основной путь при начальном выборе; работающий mesh уступает место IP
+/// только после фактической двусторонней передачи >1 МиБ через этот конкретный IP-адрес.
 #[derive(Debug, Default)]
-pub struct MeshBackupSelector;
+pub struct MeshBackupSelector(Option<std::sync::Weak<Mesh>>);
 
 fn sort_key(p: &PathSelectionData<'_>) -> Option<(u8, i128)> {
     let rtt = p.stats()?.rtt.as_nanos() as i128;
@@ -1161,6 +1517,23 @@ impl PathSelector for MeshBackupSelector {
             }
         }
         let mut sel = PathSelection::none();
+        // Наличие пути, handshake, RTT и малые зонды не доказывают передачу
+        // данных через этот IP: переход с рабочего mesh разрешён только для
+        // адреса, подтверждённого передачей >1 МиБ. Аварийный watchdog при
+        // отказе текущего пути остаётся прежним.
+        let current_mesh = cur.is_some_and(|p| matches!(p.remote(), iroh::endpoint::transports::Addr::Custom(ref c) if c.id() == MESH_ID));
+        if current_mesh && cur_key.is_some() {
+            let mesh = self.0.as_ref().and_then(|w| w.upgrade()).or_else(|| GLOBAL.get().cloned());
+            let confirmed_ip = best.as_ref().is_some_and(|(bp, _)| match bp.network_path() {
+                iroh::endpoint::transports::FourTuple::Ip { remote, .. } => {
+                    mesh.as_ref().is_some_and(|m| m.is_direct_confirmed(remote))
+                }
+                _ => false,
+            });
+            if !confirmed_ip {
+                return sel;
+            }
+        }
         let Some((bp, bk)) = best else { return sel };
         match cur_key {
             None => sel.set(&bp),

@@ -853,8 +853,9 @@ impl RemoteStateActor {
         if let Some(stall) = path_stall() {
             // (addr, stalled, healthy-as-backup, receiving, rtt)
             let mut seen: Vec<(transports::FourTuple, bool, bool, bool, Duration)> = Vec::new();
-            let mut quiet: Vec<(transports::FourTuple, bool)> = Vec::new();
-            for conn_state in self.connections.values_mut() {
+            // (addr, is_quiet, need_probe_ping, conn_id, path_id)
+            let mut quiet: Vec<(transports::FourTuple, bool, bool, ConnId, PathId)> = Vec::new();
+            for (conn_id, conn_state) in self.connections.iter_mut() {
                 let Some(conn) = conn_state.handle.upgrade() else { continue };
                 let ids: Vec<PathId> = conn_state.paths.keys().copied().collect();
                 conn_state.watch.retain(|id, _| ids.contains(id));
@@ -889,25 +890,39 @@ impl RemoteStateActor {
                     let stalled = waiting >= thr && tx.saturating_sub(w.tx_at_rx_change) >= 2;
                     // Keep observing outstanding traffic until the stall decision.
                     // A missing send in just one 100 ms tick is not an idle connection.
-                    active |= !stalled && tx.saturating_sub(w.tx_at_rx_change) >= 2;
+                    active |= !stalled && tx.saturating_sub(w.tx_at_rx_change) >= 1;
                     // (addr, stalled, fresh-as-backup, receiving, rtt); an idle backup path may
                     // have received nothing authenticated for a long time and is still usable.
                     seen.push((addr.clone(), stalled, rx > 0 && silent < ALT_FRESH && !stalled, rx > 0 && silent < thr, st.rtt));
-                    // Silent although we keep sending on it (ACK-only counts here): only meaningful
-                    // when the same peer is heard on another path at the same time (see below).
-                    quiet.push((addr.clone(), silent >= thr && st.udp_tx.datagrams.saturating_sub(w.udp_tx_at_rx_change) >= 2));
+                    // Silent although we keep sending ACK-only packets on it while another path
+                    // is receiving: ACK-only packets elicit no reply in QUIC, so first send one
+                    // PING (`need_probe`) and only declare `sel_quiet` if that PING goes unanswered
+                    // for `thr`. Prevents false failover when probing a Backup path.
+                    let ack_only_quiet = silent >= thr && st.udp_tx.datagrams.saturating_sub(w.udp_tx_at_rx_change) >= 2;
+                    let probe_unanswered = tx > w.tx_at_rx_change && waiting >= thr;
+                    quiet.push((addr.clone(), ack_only_quiet && probe_unanswered, ack_only_quiet && tx == w.tx_at_rx_change, *conn_id, *path_id));
                 }
             }
-            // The peer is reachable on another path while the selected one stays silent although
-            // used: the selected path is dead in at least one direction. This also covers the
-            // passive side that only ACKs (it sends nothing ack-eliciting), and cannot fire while
-            // the whole connection is idle or the network is down.
             let other_receiving = |sel: &transports::FourTuple| seen.iter().any(|s| &s.0 != sel && s.3);
+            if let Some(sel) = self.state.selected_path.as_ref() {
+                if other_receiving(sel) {
+                    for (addr, _, need_ping, cid, pid) in &quiet {
+                        if addr == sel && *need_ping {
+                            if let Some(conn) = self.connections.get(cid).and_then(|c| c.handle.upgrade()) {
+                                if let Some(p) = conn.path(*pid) {
+                                    let _ = p.ping();
+                                    active = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let sel_quiet = self
                 .state
                 .selected_path
                 .as_ref()
-                .is_some_and(|sel| quiet.iter().any(|(a, q)| a == sel && *q) && other_receiving(sel));
+                .is_some_and(|sel| quiet.iter().any(|(a, q, ..)| a == sel && *q) && other_receiving(sel));
             // recovery: a suspect path that receives again (or is gone) is reconsidered
             let before = self.state.suspect.len();
             // A suspect is cleared only by authenticated receive on that 4-tuple or after
@@ -945,11 +960,24 @@ impl RemoteStateActor {
                         stalled = %sel,
                         backup = %alt,
                     );
-                    self.state.suspect.push((sel, now));
+                    self.state.suspect.push((sel.clone(), now));
                     self.state.selected_path = Some(alt);
                     self.apply_selected_path();
+                    // Only the watchdog's explicit stall decision reaches this
+                    // path. Keep the old path warm, but requeue its outstanding
+                    // data after the replacement has become Available.
+                    for state in self.connections.values() {
+                        let Some(conn) = state.handle.upgrade() else { continue };
+                        for (id, addr) in &state.paths {
+                            if addr == &sel {
+                                if let Some(path) = conn.path(*id) {
+                                    path.knothop_recover_stalled();
+                                }
+                            }
+                        }
+                    }
                 }
-            } else if recovered {
+            } else {
                 self.select_path();
             }
         }

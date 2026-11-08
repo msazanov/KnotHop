@@ -30,4 +30,5 @@ panic = "unwind"
 # см. bench/vendor/iroh/PATCH.md
 [patch.crates-io]
 iroh = { path = "../../vendor/iroh" }
+noq = { path = "../../vendor/noq" }
 noq-proto = { path = "../../vendor/noq-proto" }

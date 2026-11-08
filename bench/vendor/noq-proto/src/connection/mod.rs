@@ -673,6 +673,9 @@ impl Connection {
     fn abandon_path(&mut self, now: Instant, path_id: PathId, reason: PathAbandonReason) {
         trace!(%path_id, ?reason, "abandoning path");
 
+        // Path-pinned datagrams must be discarded, never sent via a fallback.
+        self.datagrams.drop_pinned_path(path_id);
+
         let pending_space = &mut self.spaces[SpaceId::Data].pending;
         // Send PATH_ABANDON
         pending_space
@@ -834,6 +837,36 @@ impl Connection {
             None => path.local_status(),
         };
         Ok(prev)
+    }
+
+    /// KnotHop: после подтверждённого локальным сторожком застоя переочередить
+    /// неподтверждённые данные конкретного запасного пути, не закрывая путь.
+    /// Вызывающий обязан сначала выбрать другой открытый путь и ограничить
+    /// частоту вызовов. Это не меняет лимиты/бюджеты повторов QUIC.
+    ///
+    /// Возвращает число обработанных пакетов. Если нет multipath, старый путь
+    /// не Backup или нет другого Available пути — ничего не меняет.
+    pub fn knothop_recover_stalled_path(&mut self, path_id: PathId, now: Instant) -> usize {
+        if !self.is_multipath_negotiated() || self.abandoned_paths.contains(&path_id)
+            || self.path(path_id).is_none_or(|p| p.local_status() != PathStatus::Backup)
+            || !self.paths.keys().any(|id| *id != path_id && !self.abandoned_paths.contains(id)
+                && self.path(*id).is_some_and(|p| p.local_status() == PathStatus::Available)) {
+            return 0;
+        }
+        // MTU-зонд принадлежит конкретному пути и не является данными потока;
+        // оставляем его штатному обработчику обнаружения потерь.
+        let mtu_probe = self.path_data(path_id).mtud.in_flight_mtu_probe();
+        let mut bytes = 0u64;
+        let lost: Vec<_> = self.spaces[SpaceId::Data].for_path(path_id).sent_packets.iter()
+            .filter(|(pn, _)| Some(*pn) != mtu_probe)
+            .map(|(pn, info)| { bytes += info.size as u64; pn })
+            .collect();
+        let count = lost.len();
+        if count > 0 {
+            self.handle_lost_packets(SpaceId::Data, path_id, now, lost, None, Duration::ZERO, false, bytes);
+            self.set_loss_detection_timer(now, path_id);
+        }
+        count
     }
 
     /// Returns the remote path status
@@ -1088,6 +1121,11 @@ impl Connection {
 
         let mut next_path_id = self.paths.first_entry().map(|e| *e.key());
         while let Some(path_id) = next_path_id {
+            if !self.datagrams.pinned.is_empty() {
+                let limit = (self.path_data(path_id).current_mtu() as usize)
+                    .saturating_sub(self.predict_1rtt_overhead_no_pn() + Datagram::SIZE_BOUND);
+                self.datagrams.drop_pinned_oversized(path_id, limit);
+            }
             if !connection_close_pending
                 && let Some(transmit) = self.poll_transmit_off_path(now, buf, path_id)
             {
@@ -5259,7 +5297,7 @@ impl Connection {
                 Frame::Datagram(datagram) => {
                     if self
                         .datagrams
-                        .received(datagram, &self.config.datagram_receive_buffer_size)?
+                        .received(datagram, path_id, &self.config.datagram_receive_buffer_size)?
                     {
                         self.events.push_back(Event::DatagramReceived);
                     }
@@ -6538,6 +6576,18 @@ impl Connection {
 
         // DATAGRAM
         let mut sent_datagrams = false;
+        // Dedicated, bounded control datagrams may use a validated Backup
+        // path without sending any ordinary application traffic on that path.
+        while !scheduling_info.is_abandoned
+            && self.paths.get(&path_id).is_some_and(|p| p.data.validated)
+            && self.remote_cids.contains_key(&path_id)
+            && builder.frame_space_remaining() > Datagram::SIZE_BOUND
+            && space_id == SpaceId::Data
+            && self.crypto_state.has_keys(EncryptionLevel::OneRtt)
+        {
+            if !self.datagrams.write_pinned(path_id, builder, stats) { break; }
+            sent_datagrams = true;
+        }
         while !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && builder.frame_space_remaining() > Datagram::SIZE_BOUND
@@ -6984,7 +7034,10 @@ impl Connection {
     /// may need to be sent.
     fn can_send_1rtt(&self, path_id: PathId, max_size: usize) -> SendableFrames {
         let network_path = self.path_data(path_id).network_path;
-        let space_specific = self
+        let pinned = self.crypto_state.has_keys(EncryptionLevel::OneRtt)
+            && self.path_data(path_id).validated && !self.abandoned_paths.contains(&path_id)
+            && self.remote_cids.contains_key(&path_id) && self.datagrams.pinned_ready(path_id, max_size);
+        let space_specific = pinned || self
             .paths
             .get(&path_id)
             .is_some_and(|path| path.data.pending_challenge || !path.data.pending.is_empty())
@@ -6994,7 +7047,7 @@ impl Connection {
                 .is_some_and(|pns| pns.pending_path_responses.has_pending_on_path(network_path));
 
         // Stream control frames are checked in PacketSpace::can_send, only check data here.
-        let other = self.streams.can_send_stream_data()
+        let other = pinned || self.streams.can_send_stream_data()
             || self
                 .datagrams
                 .outgoing

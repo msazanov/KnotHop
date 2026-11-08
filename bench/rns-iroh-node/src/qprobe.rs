@@ -23,6 +23,8 @@ pub const KIND_REQ: u8 = b'Q';
 pub const KIND_ECHO: u8 = b'E';
 /// запрос и ответ разрешения на зонд по самой датаграммной связи кандидата
 pub const KIND_GREQ: u8 = b'G';
+/// запрос разрешения на полноразмерную (>1 МиБ) проверку прямого пути
+pub const KIND_BGREQ: u8 = b'B';
 pub const KIND_GREP: u8 = b'H';
 /// статус ответа: у пира нет другого носителя, разрешение не положено (коды `Deny` - 1 и 2)
 pub const DENY_NO_CARRIER: u8 = 3;
@@ -35,16 +37,24 @@ pub const PROBE_COUNT: u8 = 8;
 pub const PROBE_MIN_OK: u8 = 7;
 const SMALL_LEN: usize = 40;
 const SPACING: Duration = Duration::from_millis(25);
+const BULK_SPACING: Duration = Duration::from_micros(1500);
 const REPLY_WAIT: Duration = Duration::from_millis(1500);
+const BULK_REPLY_WAIT: Duration = Duration::from_secs(4);
 
 /// Срок действия разрешения и бюджет эха на одно разрешение.
 pub const GRANT_TTL: Duration = Duration::from_secs(10);
-const GRANT_PKTS: u8 = 16;
+pub const BULK_GRANT_TTL: Duration = Duration::from_secs(20);
+const GRANT_PKTS: u16 = 16;
 const GRANT_BYTES: u32 = 16 * 1280;
+pub const BULK_GRANT_PKTS: u16 = 1024;
+const BULK_GRANT_BYTES: u32 = 1024 * (MAX_LEN as u32);
 /// Не чаще одного разрешения за этот срок на допущенного пира (по ключу RNS) и на ключ iroh; расписание возврата (>= 120 с) заведомо реже.
 pub const GRANT_INTERVAL: Duration = Duration::from_secs(30);
+/// Объёмная проверка не должна обходить частотный лимит обычного зонда.
+pub const BULK_GRANT_INTERVAL: Duration = GRANT_INTERVAL;
 /// Одновременных разрешений и выданных за минуту на весь узел.
 const MAX_LIVE: usize = 8;
+const MAX_BULK_LIVE: usize = 2;
 const MAX_PER_MINUTE: usize = 12;
 /// Память «когда выдавали» ограничена: старее этого забывается, число записей не больше MAX_MEMORY.
 const MEMORY: Duration = Duration::from_secs(120);
@@ -53,9 +63,10 @@ const MAX_MEMORY: usize = 256;
 /// Сколько датаграмм с магическим префиксом приёмный фильтр съедает за один вызов `try_recv` / между уступками исполнителю в `recv` (QAB-M5).
 /// Дальше `try_recv` возвращает управление, а `recv` делает `yield_now`: поток magic не удерживает ни опрос, ни выбор исходящей очереди/останова.
 pub const WORK_BUDGET: u32 = 16;
-/// Магических датаграмм в секунду на соединение, которые вообще доходят до `Grants::echo`: остальные отбрасываются счётчиком, без блокировки и разбора.
-/// Честный зонд шлёт 8 за ~0,2 с. Лимит действует и на соединения без разрешения (пред-допусковые), и на мусор с магическим префиксом.
+/// Магических датаграмм в секунду на соединение без bulk-разрешения: остальные отбрасываются счётчиком, без блокировки и разбора.
 pub const MAGIC_RATE: u32 = 128;
+/// Для соединения с действующим bulk-разрешением допускается поток >1 МиБ за ~1,5-2 с (строго 1:1 эхо в пределах бюджета `BULK_GRANT_PKTS`).
+pub const BULK_MAGIC_RATE: u32 = 1024;
 
 pub static GRANTED: AtomicU64 = AtomicU64::new(0);
 pub static DENIED: AtomicU64 = AtomicU64::new(0);
@@ -85,8 +96,35 @@ impl Deny {
 
 struct Grant {
     expires: Instant,
-    pkts: u8,
+    pkts: u16,
     bytes: u32,
+    bulk: bool,
+    /// Только bulk: идентификатор конкретного живого TLS-соединения и прямого QUIC-пути.
+    session: Option<(usize, iroh::endpoint::PathId)>,
+    /// Удержание ограниченного по TTL соединения исключает повторное
+    /// использование stable_id новым сеансом, пока разрешение не истекло.
+    _session_pin: Option<Connection>,
+}
+
+/// Ожидающие на клиенте bulk-проверки по `(stable_id соединения, PathId прямого пути)`.
+static BULK_WAITERS: OnceLock<Mutex<HashMap<(usize, iroh::endpoint::PathId), tokio::sync::mpsc::Sender<Vec<u8>>>>> = OnceLock::new();
+const MAX_BULK_WAITERS: usize = 8;
+
+fn bulk_waiters() -> &'static Mutex<HashMap<(usize, iroh::endpoint::PathId), tokio::sync::mpsc::Sender<Vec<u8>>>> {
+    BULK_WAITERS.get_or_init(Default::default)
+}
+
+/// Передать входящую магическую датаграмму ожидающей клиентской bulk-проверке ТОЛЬКО если совпали и соединение, и `PathId`.
+pub fn deliver_bulk_reply(sid: usize, path: iroh::endpoint::PathId, datagram: &[u8]) -> bool {
+    if datagram.len() < HEAD || datagram[..8] != MAGIC || !matches!(datagram[8], KIND_GREP | KIND_ECHO) {
+        return false;
+    }
+    let tx = bulk_waiters().lock().unwrap().get(&(sid, path)).cloned();
+    if let Some(tx) = tx {
+        let _ = tx.try_send(datagram.to_vec());
+        return true;
+    }
+    false
 }
 
 #[derive(Default)]
@@ -105,23 +143,48 @@ impl Grants {
     /// `ep` - ключ iroh соединения зонда, `owner` - по чему считается частота выдач (для узла - адрес источника, `mux::owner_key`: смена ключа лимит не обходит).
     /// Вызывать только когда у этого ключа уже есть другой носитель (`mux.rs`), без await под guard.
     pub fn grant(&self, ep: [u8; 32], owner: [u8; 32], now: Instant) -> Result<(), Deny> {
+        self.grant_kind(ep, owner, None, None, now)
+    }
+
+    /// Выдающий обязан предварительно проверить права и действующий резервный
+    /// носитель. Ключ, соединение и прямой `PathId` берутся только из TLS/QUIC.
+    pub fn grant_bulk(&self, conn: &Connection, owner: [u8; 32], now: Instant) -> Result<(), Deny> {
+        self.grant_bulk_path(conn, iroh::endpoint::PathId::ZERO, owner, now)
+    }
+
+    pub fn grant_bulk_path(&self, conn: &Connection, path: iroh::endpoint::PathId, owner: [u8; 32], now: Instant) -> Result<(), Deny> {
+        if conn.close_reason().is_some() { return Err(Deny::Busy); }
+        self.grant_kind(*conn.remote_id().as_bytes(), owner, Some((conn.stable_id(), path)), Some(conn.clone()), now)
+    }
+
+    fn grant_kind(&self, ep: [u8; 32], owner: [u8; 32], session: Option<(usize, iroh::endpoint::PathId)>, pin: Option<Connection>, now: Instant) -> Result<(), Deny> {
+        let bulk = session.is_some();
         let mut g = self.0.lock().unwrap();
-        g.live.retain(|_, v| v.expires > now);
+        g.live.retain(|_, v| {
+            v.expires > now && v.pkts > 0 && v._session_pin.as_ref().is_none_or(|c| c.close_reason().is_none())
+        });
         g.by_ep.retain(|_, t| now.saturating_duration_since(*t) < MEMORY);
         g.by_owner.retain(|_, t| now.saturating_duration_since(*t) < MEMORY);
         while g.minute.front().is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(60)) {
             g.minute.pop_front();
         }
-        let recent = |t: Option<&Instant>| t.is_some_and(|t| now.saturating_duration_since(*t) < GRANT_INTERVAL);
+        let min_gap = if bulk { BULK_GRANT_INTERVAL } else { GRANT_INTERVAL };
+        let recent = |t: Option<&Instant>| t.is_some_and(|t| now.saturating_duration_since(*t) < min_gap);
         if recent(g.by_ep.get(&ep)) || recent(g.by_owner.get(&owner)) {
             DENIED.fetch_add(1, Relaxed);
             return Err(Deny::TooSoon);
         }
-        if g.live.len() >= MAX_LIVE || g.minute.len() >= MAX_PER_MINUTE || g.by_ep.len() >= MAX_MEMORY || g.by_owner.len() >= MAX_MEMORY {
+        let bulk_live = g.live.values().filter(|v| v.bulk).count();
+        if g.live.len() >= MAX_LIVE || (bulk && bulk_live >= MAX_BULK_LIVE) || g.minute.len() >= MAX_PER_MINUTE || g.by_ep.len() >= MAX_MEMORY || g.by_owner.len() >= MAX_MEMORY {
             DENIED.fetch_add(1, Relaxed);
             return Err(Deny::Busy);
         }
-        g.live.insert(ep, Grant { expires: now + GRANT_TTL, pkts: GRANT_PKTS, bytes: GRANT_BYTES });
+        let (ttl, pkts, bytes) = if bulk {
+            (BULK_GRANT_TTL, BULK_GRANT_PKTS, BULK_GRANT_BYTES)
+        } else {
+            (GRANT_TTL, GRANT_PKTS, GRANT_BYTES)
+        };
+        g.live.insert(ep, Grant { expires: now + ttl, pkts, bytes, bulk, session, _session_pin: pin });
         g.by_ep.insert(ep, now);
         g.by_owner.insert(owner, now);
         g.minute.push_back(now);
@@ -129,15 +192,23 @@ impl Grants {
         Ok(())
     }
 
+    fn has_bulk(&self, ep: &[u8; 32], session: Option<(usize, iroh::endpoint::PathId)>, now: Instant) -> bool {
+        self.0.lock().unwrap().live.get(ep).is_some_and(|v| v.bulk && v.session == session && session.is_some() && v.expires > now && v.pkts > 0)
+    }
+
     /// Ответ на запрос зонда от соединения `ep`: None - эха нет (нет разрешения, оно истекло, бюджет исчерпан, датаграмма не запрос).
     /// Ответ повторяет запрос байт в байт, кроме kind, и не длиннее его.
     pub fn echo(&self, ep: &[u8; 32], req: &[u8], now: Instant) -> Option<Vec<u8>> {
+        self.echo_for(ep, None, req, now)
+    }
+
+    fn echo_for(&self, ep: &[u8; 32], session: Option<(usize, iroh::endpoint::PathId)>, req: &[u8], now: Instant) -> Option<Vec<u8>> {
         if req.len() < HEAD || req.len() > MAX_LEN || req[..8] != MAGIC || req[8] != KIND_REQ {
             return None;
         }
         let mut g = self.0.lock().unwrap();
         let v = g.live.get_mut(ep)?;
-        if v.expires <= now || v.pkts == 0 || v.bytes < req.len() as u32 {
+        if (v.bulk && (session.is_none() || v.session != session)) || v.expires <= now || v.pkts == 0 || v.bytes < req.len() as u32 {
             return None;
         }
         v.pkts -= 1;
@@ -184,15 +255,19 @@ impl Filter {
         Filter { window: Instant::now(), in_window: 0, run: 0, dropped: 0, seen: 0 }
     }
 
-    /// Пропустить магическую датаграмму к `Grants::echo`? false - выше `MAGIC_RATE` в секунду: отбрасывается и считается.
+    /// Пропустить магическую датаграмму к `Grants::echo`? false - выше лимита в секунду: отбрасывается и считается.
     pub fn rate_ok(&mut self, now: Instant) -> bool {
+        self.rate_ok_limit(now, MAGIC_RATE)
+    }
+
+    pub fn rate_ok_limit(&mut self, now: Instant, limit: u32) -> bool {
         self.seen += 1;
         MAGIC_SEEN.fetch_add(1, Relaxed);
         if now.saturating_duration_since(self.window) >= Duration::from_secs(1) {
             self.window = now;
             self.in_window = 0;
         }
-        if self.in_window >= MAGIC_RATE {
+        if self.in_window >= limit {
             self.dropped += 1;
             MAGIC_DROPPED.fetch_add(1, Relaxed);
             return false;
@@ -203,20 +278,41 @@ impl Filter {
 
     /// Датаграмма принадлежит зонду? Тогда она обработана здесь (эхо или отброс) и в RNS не идёт.
     pub fn intercept(&mut self, conn: &Connection, datagram: &[u8]) -> bool {
-        self.intercept_at(conn.remote_id().as_bytes(), datagram, Instant::now(), |echo| {
-            // потеря эха - потеря одной пробы; ошибки отправки не фатальны
-            let _ = conn.send_datagram(bytes::Bytes::from(echo));
+        self.intercept_on_path(conn, iroh::endpoint::PathId::ZERO, datagram)
+    }
+
+    /// Обработка зонда с привязкой к конкретному аутентифицированному `PathId`:
+    /// ответы клиентской bulk-пробе принимаются только с этого `PathId`, а серверное
+    /// bulk-эхо уходит только закреплённой отправкой по тому же `PathId`.
+    pub fn intercept_on_path(&mut self, conn: &Connection, path: iroh::endpoint::PathId, datagram: &[u8]) -> bool {
+        if deliver_bulk_reply(conn.stable_id(), path, datagram) {
+            return true;
+        }
+        let session = Some((conn.stable_id(), path));
+        let now = Instant::now();
+        let is_bulk = grants().has_bulk(conn.remote_id().as_bytes(), session, now);
+        self.intercept_session(conn.remote_id().as_bytes(), session, datagram, now, |echo| {
+            if is_bulk {
+                let _ = conn.send_datagram_on_path(path, bytes::Bytes::from(echo));
+            } else {
+                let _ = conn.send_datagram(bytes::Bytes::from(echo));
+            }
         })
     }
 
     /// То же без соединения (для проверки): `send` получает эхо, если оно положено.
     pub fn intercept_at(&mut self, remote: &[u8; 32], datagram: &[u8], now: Instant, send: impl FnOnce(Vec<u8>)) -> bool {
+        self.intercept_session(remote, None, datagram, now, send)
+    }
+
+    fn intercept_session(&mut self, remote: &[u8; 32], session: Option<(usize, iroh::endpoint::PathId)>, datagram: &[u8], now: Instant, send: impl FnOnce(Vec<u8>)) -> bool {
         if datagram.len() < MAGIC.len() || datagram[..8] != MAGIC {
             self.run = 0;
             return false;
         }
-        if self.rate_ok(now) {
-            if let Some(echo) = grants().echo(remote, datagram, now) {
+        let limit = if grants().has_bulk(remote, session, now) { BULK_MAGIC_RATE } else { MAGIC_RATE };
+        if self.rate_ok_limit(now, limit) {
+            if let Some(echo) = grants().echo_for(remote, session, datagram, now) {
                 send(echo);
             }
         }
@@ -241,11 +337,15 @@ impl Filter {
 
 // ------------------------------------------------------------------------------------------------ провод запроса разрешения
 
-/// Запрос разрешения: `MAGIC | 'G' | 0 | nonce`.
+/// Запрос разрешения: `MAGIC | 'G' | 0 | nonce` (обычный) или `'B'` (>1 МиБ).
 pub fn grant_request(nonce: u64) -> Vec<u8> {
+    grant_request_kind(KIND_GREQ, nonce)
+}
+
+pub fn grant_request_kind(kind: u8, nonce: u64) -> Vec<u8> {
     let mut d = vec![0u8; HEAD];
     d[..8].copy_from_slice(&MAGIC);
-    d[8] = KIND_GREQ;
+    d[8] = kind;
     d[10..18].copy_from_slice(&nonce.to_le_bytes());
     d
 }
@@ -263,7 +363,15 @@ pub fn grant_reply(status: u8, nonce: &[u8]) -> Vec<u8> {
 /// Просит у сервера разрешение на зонд через `conn` (ещё не привязанное к RNS соединение). Ok - разрешено на `GRANT_TTL` с момента ответа;
 /// Err(None) - ответа нет за 2 с; Err(Some(код)) - отказ (1 слишком рано, 2 занято, 3 нет другого носителя).
 pub async fn request_grant(conn: &Connection, nonce: u64) -> Result<(), Option<u8>> {
-    conn.send_datagram(bytes::Bytes::from(grant_request(nonce))).map_err(|_| None)?;
+    request_grant_kind(conn, KIND_GREQ, nonce).await
+}
+
+pub async fn request_bulk_grant(conn: &Connection, nonce: u64) -> Result<(), Option<u8>> {
+    request_grant_kind(conn, KIND_BGREQ, nonce).await
+}
+
+async fn request_grant_kind(conn: &Connection, kind: u8, nonce: u64) -> Result<(), Option<u8>> {
+    conn.send_datagram(bytes::Bytes::from(grant_request_kind(kind, nonce))).map_err(|_| None)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         let r = tokio::time::timeout_at(deadline, conn.read_datagram()).await.map_err(|_| None)?.map_err(|_| None)?;
@@ -350,6 +458,121 @@ impl BulkReceipts {
 
     /// 1 MiB не проходит: требуется строго больше.
     pub fn passed(&self) -> bool { self.payload_bytes > 1024 * 1024 }
+}
+
+/// Прогнать объёмную (>1 МиБ) проверку ИСКЛЮЧИТЕЛЬНО по прямому пути `path` уже установленного
+/// соединения `conn`, не переключая выбранный путь (трафик VPN остаётся на транзите).
+/// Возвращает подтверждённые полезные байты (>1 МиБ в каждую сторону) только если и отправка,
+/// и все засчитанные эхо прошли именно через прямой IP-путь `path`.
+pub async fn run_bulk_on_path(conn: &Connection, path: iroh::endpoint::PathId, nonce: u64) -> Option<usize> {
+    struct Guard {
+        key: (usize, iroh::endpoint::PathId),
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            bulk_waiters().lock().unwrap().remove(&self.key);
+        }
+    }
+
+    let is_ip_alive = || conn.close_reason().is_none() && conn.paths().iter().any(|p| p.id() == path && p.is_ip());
+    if !is_ip_alive() {
+        return None;
+    }
+    let key = (conn.stable_id(), path);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    {
+        let mut w = bulk_waiters().lock().unwrap();
+        if w.contains_key(&key) || w.len() >= MAX_BULK_WAITERS {
+            return None;
+        }
+        w.insert(key, tx);
+    }
+    let _guard = Guard { key };
+
+    // Дождаться валидации пути в QUIC (до 3 с) и отправить запрос bulk-разрешения только по нему.
+    let req_bytes = bytes::Bytes::from(grant_request_kind(KIND_BGREQ, nonce));
+    let wait_ready = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if !is_ip_alive() {
+            return None;
+        }
+        match conn.send_datagram_on_path(path, req_bytes.clone()) {
+            Ok(true) => break,
+            Ok(false) if tokio::time::Instant::now() < wait_ready => tokio::time::sleep(Duration::from_millis(50)).await,
+            _ => return None,
+        }
+    }
+
+    let grant_dl = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let b = tokio::time::timeout_at(grant_dl, rx.recv()).await.ok()??;
+        if b.len() == HEAD && b[..8] == MAGIC && b[8] == KIND_GREP && b[10..18] == nonce.to_le_bytes() {
+            if b[9] != 0 {
+                return None;
+            }
+            break;
+        }
+    }
+
+    let len = conn.max_datagram_size().map(|m| m.min(MAX_LEN)).unwrap_or(0);
+    if len <= HEAD + 512 {
+        return None;
+    }
+    let payload_per = len - HEAD;
+    let count = ((1024 * 1024) / payload_per + 24).min(BULK_GRANT_PKTS as usize);
+    let mut receipts = BulkReceipts::new(nonce, len, count)?;
+    if count * payload_per <= 1024 * 1024 {
+        return None;
+    }
+
+    let total_dl = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut next_send = tokio::time::Instant::now();
+    let mut tail_dl: Option<tokio::time::Instant> = None;
+    loop {
+        if receipts.passed() {
+            return Some(receipts.payload_bytes());
+        }
+        if !is_ip_alive() || tokio::time::Instant::now() >= total_dl {
+            return None;
+        }
+        while let Ok(b) = rx.try_recv() {
+            receipts.accept(&b);
+            if receipts.passed() {
+                return Some(receipts.payload_bytes());
+            }
+        }
+        if let Some(d) = receipts.next_request() {
+            tokio::select! {
+                _ = tokio::time::sleep_until(next_send) => {
+                    match conn.send_datagram_on_path(path, bytes::Bytes::from(d)) {
+                        Ok(true) => {
+                            receipts.sent();
+                            next_send = tokio::time::Instant::now() + BULK_SPACING;
+                            if receipts.next_request().is_none() {
+                                tail_dl = Some(tokio::time::Instant::now() + BULK_REPLY_WAIT);
+                            }
+                        }
+                        Ok(false) => {
+                            // Очередь закреплённого пути (32 пакета) полна: ждём освобождения.
+                            next_send = tokio::time::Instant::now() + Duration::from_millis(5);
+                        }
+                        Err(_) => return None,
+                    }
+                }
+                msg = tokio::time::timeout_at(total_dl, rx.recv()) => match msg {
+                    Ok(Some(b)) => receipts.accept(&b),
+                    _ => return None,
+                },
+            }
+        } else {
+            let dl = tail_dl.unwrap_or(total_dl).min(total_dl);
+            match tokio::time::timeout_at(dl, rx.recv()).await {
+                Ok(Some(b)) => receipts.accept(&b),
+                _ => break,
+            }
+        }
+    }
+    receipts.passed().then(|| receipts.payload_bytes())
 }
 
 /// Прогнать зонд по ещё не привязанному к RNS соединению. Чётные запросы короткие, нечётные близки к MAX_LEN (ограничены `max_datagram_size`).
@@ -551,7 +774,7 @@ mod tests {
         g.grant(ep(1), ep(100), t0).unwrap();
         // бюджет пакетов
         for i in 0..GRANT_PKTS {
-            assert!(g.echo(&ep(1), &req(i % 8, 40), t0).is_some(), "эхо {i}");
+            assert!(g.echo(&ep(1), &req((i % 8) as u8, 40), t0).is_some(), "эхо {i}");
         }
         assert!(g.echo(&ep(1), &req(0, 40), t0).is_none(), "бюджет пакетов исчерпан");
         // бюджет байт: большие запросы кончаются раньше пакетов
@@ -563,6 +786,35 @@ mod tests {
         let g = Grants::default();
         g.grant(ep(1), ep(100), t0).unwrap();
         assert!(g.echo(&ep(1), &req(0, 40), t0 + GRANT_TTL).is_none(), "разрешение истекло");
+    }
+
+    #[test]
+    fn bulk_grant_is_bounded_and_does_not_bypass_normal_rate_limit() {
+        let p0 = iroh::endpoint::PathId::ZERO;
+        let p1 = iroh::endpoint::PathId::from(1u8);
+        let g = Grants::default();
+        let t = Instant::now();
+        g.grant(ep(1), ep(101), t).unwrap();
+        assert_eq!(g.grant_kind(ep(1), ep(101), Some((10, p0)), None, t + Duration::from_secs(10)), Err(Deny::TooSoon));
+        let t = t + GRANT_INTERVAL;
+        g.grant_kind(ep(1), ep(101), Some((10, p0)), None, t).unwrap();
+        assert!(g.has_bulk(&ep(1), Some((10, p0)), t));
+        assert!(!g.has_bulk(&ep(1), Some((10, p1)), t));
+        assert!(!g.has_bulk(&ep(1), Some((11, p0)), t));
+        assert!(!g.has_bulk(&ep(2), Some((10, p0)), t));
+        g.grant_kind(ep(2), ep(102), Some((20, p0)), None, t).unwrap();
+        assert_eq!(g.grant_kind(ep(3), ep(103), Some((30, p0)), None, t), Err(Deny::Busy));
+        let request = req(1, MAX_LEN);
+        assert!(g.echo_for(&ep(1), Some((10, p1)), &request, t).is_none(), "другой путь того же соединения");
+        assert!(g.echo_for(&ep(1), Some((11, p0)), &request, t).is_none(), "другое соединение того же ключа");
+        assert!(g.echo_for(&ep(1), None, &request, t).is_none(), "без привязки к соединению");
+        for _ in 0..BULK_GRANT_PKTS {
+            let echo = g.echo_for(&ep(1), Some((10, p0)), &request, t).unwrap();
+            assert_eq!(echo.len(), request.len());
+        }
+        assert!(g.echo_for(&ep(1), Some((10, p0)), &request, t).is_none());
+        assert!(!g.has_bulk(&ep(1), Some((10, p0)), t));
+        assert!(!g.has_bulk(&ep(2), Some((20, p0)), t + BULK_GRANT_TTL));
     }
 
     #[test]
@@ -684,6 +936,32 @@ mod tests {
         let port = server.bound_sockets()[0].port();
         let addr = EndpointAddr::new(server.id()).with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
         client.connect(addr, b"rns/0").await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bulk_grant_is_bound_to_one_real_tls_connection() {
+        let (server, client) = (endpoint().await, endpoint().await);
+        let (c1, s1) = tokio::join!(dial(&client, &server), async { server.accept().await.unwrap().await.unwrap() });
+        let (c2, s2) = tokio::join!(dial(&client, &server), async { server.accept().await.unwrap().await.unwrap() });
+        assert_eq!(s1.remote_id(), s2.remote_id());
+        assert_ne!(s1.stable_id(), s2.stable_id());
+        grants().grant_bulk(&s1, [0x53; 32], Instant::now()).unwrap();
+        let server_task = |conn: Connection| tokio::spawn(async move {
+            let mut filter = Filter::new();
+            if let Ok(d) = conn.read_datagram().await { assert!(filter.intercept(&conn, &d)); }
+        });
+        let (h1, h2) = (server_task(s1.clone()), server_task(s2.clone()));
+        let payload = bytes::Bytes::from(build(0, 42, MAX_LEN));
+        c2.send_datagram(payload.clone()).unwrap();
+        c1.send_datagram(payload).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(3), c1.read_datagram()).await.unwrap().unwrap();
+        assert!(echo_matches(&response, 0, 42, MAX_LEN));
+        assert!(tokio::time::timeout(Duration::from_millis(500), c2.read_datagram()).await.is_err(),
+            "второе TLS-соединение того же ключа не должно получить bulk-эхо");
+        h1.await.unwrap();
+        h2.await.unwrap();
+        c1.close(0u32.into(), b"done");
+        c2.close(0u32.into(), b"done");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
