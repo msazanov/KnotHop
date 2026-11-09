@@ -755,6 +755,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quic_close_diagnostic_uses_fixed_categories() {
+        use iroh::endpoint::ConnectionError as E;
+        assert_eq!(quic_close_kind(None), "not-closed");
+        assert_eq!(quic_close_kind(Some(&E::TimedOut)), "timeout");
+        assert_eq!(quic_close_kind(Some(&E::LocallyClosed)), "local-close");
+        assert_eq!(quic_close_kind(Some(&E::Reset)), "reset");
+    }
+
+    #[test]
     fn p2p_state_describes_selected_path_not_just_open_connection() {
         for kind in ["direct", "mesh", "relay", "reality"] {
             let info = serde_json::json!({"kind": kind});
@@ -2460,6 +2469,22 @@ enum Cur {
     Tcp { stop: tokio::sync::watch::Sender<bool>, done: tokio::task::JoinHandle<()> },
 }
 
+/// Только фиксированные категории: текст и коды закрытия от пира недоверенны и в журнал не попадают.
+fn quic_close_kind(reason: Option<&iroh::endpoint::ConnectionError>) -> &'static str {
+    use iroh::endpoint::ConnectionError as E;
+    match reason {
+        None => "not-closed",
+        Some(E::TimedOut) => "timeout",
+        Some(E::LocallyClosed) => "local-close",
+        Some(E::Reset) => "reset",
+        Some(E::ApplicationClosed(_)) => "peer-application-close",
+        Some(E::ConnectionClosed(_)) => "peer-transport-close",
+        Some(E::TransportError(_)) => "transport-error",
+        Some(E::VersionMismatch) => "version-mismatch",
+        Some(E::CidsExhausted) => "cids-exhausted",
+    }
+}
+
 impl Cur {
     /// Ждать, пока носитель не закончится сам. true - QUIC закрылся по таймауту простоя (пир молчит: UDP режется или сети нет), а не по воле одной из сторон.
     async fn ended(&mut self) -> bool {
@@ -2794,10 +2819,10 @@ impl Dialer {
             }
         }
         match &cur {
-            Cur::Quic(_) => {
+            Cur::Quic(conn) => {
                 ctl.set_mode("none");
                 ctl.rtt_us.store(0, Relaxed);
-                sh.note(format!("quic to {label} ended"));
+                sh.note(format!("quic to {label} ended: {}", quic_close_kind(conn.close_reason().as_ref())));
                 self.finish_quic(st, since);
             }
             Cur::Tcp { .. } => {
@@ -6388,7 +6413,10 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
                     wait = 2;
                     tried_in_round = 0;
                     drop(ctx);
-                    conn.closed().await;
+                    let reason = conn.closed().await;
+                    if let Some(ctx) = weak.upgrade() {
+                        ctx.sh.note(format!("mesh: сквозное QUIC к {name} завершено: {}", quic_close_kind(Some(&reason))));
+                    }
                     mx.close();
                 }
                 _ => {

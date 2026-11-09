@@ -2389,3 +2389,27 @@ async fn silent_transit_outage_gap_under_netem() {
     assert!(died.is_none(), "соединение умерло: {:?}", ca.close_reason());
     assert!(max_gap < Duration::from_secs(15), "разрыв {max_gap:?}");
 }
+
+/// Фиксирует текущее поведение: новое соединение с адресом «mesh + IP» начинает на IP без проверки объёмом.
+/// Соседские носители используют тот же селектор, поэтому требование «>1 МиБ» здесь пока не действует.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn initial_selection_with_ip_and_mesh_hints_reports_path() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    a.mesh.prepare(&e.id());
+    let target = ip(&e);
+    let addr = endpoint_addr_with(&e.id(), &[target]).unwrap();
+    let acc = async { tokio::time::timeout(Duration::from_secs(10), e.e2e.lock().await.recv()).await.unwrap().unwrap() };
+    let (c, _s) = tokio::join!(tokio::time::timeout(Duration::from_secs(10), a.ep.connect(addr, ALPN)), acc);
+    let ca = c.expect("connect timed out").expect("connect failed");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let paths: Vec<_> = ca.paths().iter().map(|p| (p.is_selected(), matches!(p.remote_addr(), TransportAddr::Ip(_)))).collect();
+    let confirmed = a.mesh.is_direct_confirmed(&target);
+    eprintln!("paths(selected, is_ip)={paths:?} direct_confirmed={confirmed}");
+    assert!(!confirmed, "объёмная проверка в этом сценарии не выполнялась");
+    assert!(paths.iter().any(|(sel, is_ip)| *sel && *is_ip), "текущее поведение: выбран IP без подтверждения");
+}
