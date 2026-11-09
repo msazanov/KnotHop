@@ -498,6 +498,10 @@ impl<'conn> Path<'conn> {
     pub fn ping(&self) -> bool {
         self.data.upgrade(self.conn).ping().is_ok()
     }
+    /// KnotHop: requeue in-flight packets after the custom transport changed its next hop.
+    pub fn knothop_requeue_after_hop_change(&self) -> usize {
+        self.data.upgrade(self.conn).knothop_requeue_after_hop_change()
+    }
 }
 
 /// A stream of [`PathList`] snapshots for a connection.

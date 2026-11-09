@@ -151,6 +151,8 @@ pub struct Counters {
     pub migration_changed: AtomicU64,
     /// Транзит запомнен как отказавший по его собственному уведомлению.
     pub unreach_marked: AtomicU64,
+    /// Пакеты, переочередённые после смены транзита.
+    pub rotate_requeued: AtomicU64,
     /// Соседские уведомления об отказе и реально снятые обратные пути.
     pub unreach_sent: AtomicU64,
     pub unreach_received: AtomicU64,
@@ -564,7 +566,7 @@ impl Mesh {
             "drop_send_err": c.drop_send_err.load(Relaxed), "rev_learned": c.rev_learned.load(Relaxed),
             "rev_conflict": c.rev_conflict.load(Relaxed), "unreach_sent": c.unreach_sent.load(Relaxed), "unreach_received": c.unreach_received.load(Relaxed), "unreach_removed": c.unreach_removed.load(Relaxed), "drop_id_ambiguous": c.drop_id_ambiguous.load(Relaxed), "drop_recursion": c.drop_recursion.load(Relaxed),
             "e2e_overflow": c.e2e_overflow.load(Relaxed), "drop_queue_full": c.drop_queue_full.load(Relaxed), "alt_hops": c.alt_hops.load(Relaxed), "gen_resets": c.gen_resets.load(Relaxed),
-            "migration_accepted": c.migration_accepted.load(Relaxed), "migration_changed": c.migration_changed.load(Relaxed), "unreach_marked": c.unreach_marked.load(Relaxed),
+            "migration_accepted": c.migration_accepted.load(Relaxed), "migration_changed": c.migration_changed.load(Relaxed), "unreach_marked": c.unreach_marked.load(Relaxed), "rotate_requeued": c.rotate_requeued.load(Relaxed),
             "egress_blocked": iroh::knothop::blocked_egress(), "rev_size": self.rev.lock().unwrap().len(), "e2e_conns": self.e2e.lock().unwrap().ids.len(),
         })
     }
@@ -1064,6 +1066,12 @@ impl Mesh {
                 if rotated {
                     retry_until = Some(now + Duration::from_secs(6));
                     retry_at = now + Duration::from_secs(1);
+                    // PathId тот же, а прежний хоп молчит: без этого повтор ждёт PTO с накопленным откатом,
+                    // и сторожок успевает сменить транзит снова, не дав новому получить данные.
+                    for p in conn.paths().iter().filter(|p| p.is_selected() && is_mesh_addr(p.remote_addr())) {
+                        self.c.rotate_requeued.fetch_add(p.knothop_requeue_after_hop_change() as u64, Relaxed);
+                        let _ = p.ping();
+                    }
                 }
                 #[cfg(test)]
                 eprintln!("mesh watchdog: rotate={rotated}, rx={}, tx={}, rtt_ms={}", st.frame_rx.authenticated_progress(), st.frame_tx.ack_eliciting_progress(), st.rtt.as_millis());
