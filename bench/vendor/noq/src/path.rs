@@ -182,13 +182,6 @@ impl Path {
         state.inner.knothop_recover_stalled_path(self.id(), now)
     }
 
-    /// KnotHop: requeue in-flight packets after the custom transport changed its next hop under this path.
-    pub fn knothop_requeue_after_hop_change(&self) -> usize {
-        let mut state = self.conn.lock_and_wake("requeue after hop change");
-        let now = state.runtime.now();
-        state.inner.knothop_requeue_after_hop_change(self.id(), now)
-    }
-
     /// Returns the [`PathStats`] for this path.
     pub fn stats(&self) -> PathStats {
         // The `expect` is safe:

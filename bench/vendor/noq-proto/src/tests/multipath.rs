@@ -144,33 +144,6 @@ fn pinned_probe_uses_backup_without_redirecting_application_datagrams() -> TestR
 }
 
 #[test]
-fn knothop_hop_change_requeues_in_flight_on_same_available_path() -> TestResult {
-    let mut pair = ConnPair::builder().enable_multipath().connect();
-    while pair.poll(Client).is_some() {}
-    while pair.poll(Server).is_some() {}
-    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
-    let msg = b"sent-before-the-transit-changed";
-    pair.send_stream(Client, stream).write(msg).unwrap();
-    pair.send_stream(Client, stream).finish().unwrap();
-    pair.drive_client();
-    let now = pair.time;
-    assert_eq!(pair.path_status(Client, PathId::ZERO)?, PathStatus::Available);
-    let requeued = pair.conn_mut(Client).knothop_requeue_after_hop_change(PathId::ZERO, now);
-    assert!(requeued > 0, "неподтверждённые пакеты пути должны быть переочередены без второго пути");
-    assert_eq!(pair.conn_mut(Client).knothop_requeue_after_hop_change(PathId::ZERO, now), 0, "повтор ничего не дублирует");
-    pair.drive();
-    assert!(!pair.is_closed(Client) && !pair.is_closed(Server));
-    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
-    let mut recv = pair.recv_stream(Server, stream);
-    let mut chunks = recv.read(true).unwrap();
-    let mut received = Vec::new();
-    while let Ok(Some(chunk)) = chunks.next(usize::MAX) { received.extend_from_slice(&chunk.bytes); }
-    let _ = chunks.finalize();
-    assert_eq!(received, msg, "данные приложения не дублируются");
-    Ok(())
-}
-
-#[test]
 fn knothop_stall_recovery_survives_late_original_packet_and_ack() -> TestResult {
     let mut pair = ConnPair::builder().enable_multipath().connect();
     let server_addr = pair.routes.public_server_addr();

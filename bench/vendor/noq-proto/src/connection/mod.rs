@@ -853,23 +853,6 @@ impl Connection {
                 && self.path(*id).is_some_and(|p| p.local_status() == PathStatus::Available)) {
             return 0;
         }
-        self.knothop_requeue_in_flight(path_id, now)
-    }
-
-    /// KnotHop: под этим путём сменился следующий хоп пользовательского транспорта (транзит mesh),
-    /// а `PathId` остался прежним. Отправленное через прежний хоп уже не дойдёт, ждать PTO с накопленным
-    /// откатом незачем. Вызывающий ограничивает частоту (смена транзита); лимиты повторов QUIC не меняются.
-    pub fn knothop_requeue_after_hop_change(&mut self, path_id: PathId, now: Instant) -> usize {
-        if self.abandoned_paths.contains(&path_id) || self.path(path_id).is_none() {
-            return 0;
-        }
-        let count = self.knothop_requeue_in_flight(path_id, now);
-        self.path_data_mut(path_id).pto_count = 0;
-        self.set_loss_detection_timer(now, path_id);
-        count
-    }
-
-    fn knothop_requeue_in_flight(&mut self, path_id: PathId, now: Instant) -> usize {
         // MTU-зонд принадлежит конкретному пути и не является данными потока;
         // оставляем его штатному обработчику обнаружения потерь.
         let mtu_probe = self.path_data(path_id).mtud.in_flight_mtu_probe();
