@@ -83,6 +83,10 @@ const ROUTE_TTL: Duration = Duration::from_secs(2);
 const HOP_REFRESH: Duration = Duration::from_millis(500);
 const HOP_MAX_AGE: Duration = Duration::from_secs(5);
 const HOP_MAX: usize = 256;
+/// Транзит, выбранный сторожком застоя, не закрепляется навсегда: после этого срока решение снова принимает маршрут RNS.
+const STALL_HOP_TTL: Duration = Duration::from_secs(300);
+/// Сколько не выбирать повторно транзит, отказавший для этого назначения (застой или явное «нет пути»).
+const FAILED_VIA_TTL: Duration = Duration::from_secs(60);
 /// Сколько сквозных соединений и пиров с ними помечаем (больше - соединение закрывается: непомеченное могло бы стать «соседом» mesh).
 const E2E_MAX: usize = 256;
 const BUCKET_MAX_NBR: usize = 256;
@@ -145,6 +149,8 @@ pub struct Counters {
     /// Принятые доказательства смены транзита и те из них, что действительно изменили маршрут.
     pub migration_accepted: AtomicU64,
     pub migration_changed: AtomicU64,
+    /// Смена транзита по явному отказу текущего транзита.
+    pub unreach_rotated: AtomicU64,
     /// Соседские уведомления об отказе и реально снятые обратные пути.
     pub unreach_sent: AtomicU64,
     pub unreach_received: AtomicU64,
@@ -229,7 +235,9 @@ pub struct Mesh {
     ride_cache: Mutex<HashMap<usize, (bool, Instant)>>,
     /// сдвиг выбора альтернативного транзита по назначению (растёт после неудачной попытки соединения)
     alt_rot: Mutex<HashMap<Key, u32>>,
-    stall_hops: Mutex<HashMap<Key, Key>>,
+    stall_hops: Mutex<HashMap<Key, (Key, Instant)>>,
+    /// (назначение, транзит) -> до какого момента не выбирать при смене транзита
+    failed_via: Mutex<HashMap<(Key, Key), Instant>>,
     /// Прямые адреса выходов, реально подтверждённые двусторонней передачей >1 МиБ через этот конкретный IP-путь.
     confirmed_direct: Mutex<HashMap<std::net::SocketAddr, Instant>>,
     hop_pending: Mutex<std::collections::HashSet<Key>>,
@@ -305,6 +313,7 @@ impl Mesh {
             ride_cache: Default::default(),
             alt_rot: Default::default(),
             stall_hops: Default::default(),
+            failed_via: Default::default(),
             confirmed_direct: Default::default(),
             hop_pending: Default::default(),
             hop_req: Mutex::new(hop_tx),
@@ -537,6 +546,7 @@ impl Mesh {
             self.rev.lock().unwrap().clear();
             self.verified_rev.lock().unwrap().clear();
             self.stall_hops.lock().unwrap().clear();
+            self.failed_via.lock().unwrap().clear();
             self.c.gen_resets.fetch_add(1, Relaxed);
         }
     }
@@ -554,7 +564,7 @@ impl Mesh {
             "drop_send_err": c.drop_send_err.load(Relaxed), "rev_learned": c.rev_learned.load(Relaxed),
             "rev_conflict": c.rev_conflict.load(Relaxed), "unreach_sent": c.unreach_sent.load(Relaxed), "unreach_received": c.unreach_received.load(Relaxed), "unreach_removed": c.unreach_removed.load(Relaxed), "drop_id_ambiguous": c.drop_id_ambiguous.load(Relaxed), "drop_recursion": c.drop_recursion.load(Relaxed),
             "e2e_overflow": c.e2e_overflow.load(Relaxed), "drop_queue_full": c.drop_queue_full.load(Relaxed), "alt_hops": c.alt_hops.load(Relaxed), "gen_resets": c.gen_resets.load(Relaxed),
-            "migration_accepted": c.migration_accepted.load(Relaxed), "migration_changed": c.migration_changed.load(Relaxed),
+            "migration_accepted": c.migration_accepted.load(Relaxed), "migration_changed": c.migration_changed.load(Relaxed), "unreach_rotated": c.unreach_rotated.load(Relaxed),
             "egress_blocked": iroh::knothop::blocked_egress(), "rev_size": self.rev.lock().unwrap().len(), "e2e_conns": self.e2e.lock().unwrap().ids.len(),
         })
     }
@@ -735,6 +745,17 @@ impl Mesh {
             self.c.unreach_removed.fetch_add(1, Relaxed);
             self.warm(&dst);
         }
+        // Транзит сам сообщил, что не может довести наши кадры до `dst`. Ждать сторожка застоя незачем;
+        // решает только инициатор сквозного соединения. Сосед может увести трафик лишь от самого себя.
+        if self.hop_peer(&dst) == Some(*prev) && self.initiates_to(&dst) && self.rotate_stalled(&dst) {
+            self.c.unreach_rotated.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Есть живое сквозное соединение к `dst`, начатое этим узлом.
+    fn initiates_to(&self, dst: &Key) -> bool {
+        let connections: Vec<_> = self.e2e.lock().unwrap().conns.values().map(|(c, _)| c.clone()).collect();
+        connections.iter().any(|c| c.remote_id().as_bytes() == dst && c.close_reason().is_none() && matches!(c.side(), iroh::endpoint::Side::Client))
     }
 
     /// Доказательство приходит от последнего TLS-аутентифицированного соседа.
@@ -886,7 +907,14 @@ impl Mesh {
     fn next_hop_origin(&self, now: Instant, dst: &Key, policy: &dyn Policy) -> Option<Key> {
         // Локальное решение о застое важнее старого подтверждения от пира:
         // иначе подтверждённый, но замолчавший хоп отменял бы переключение.
-        let forced = self.stall_hops.lock().unwrap().get(dst).copied();
+        let forced = {
+            let mut pins = self.stall_hops.lock().unwrap();
+            match pins.get(dst).copied() {
+                Some((_, until)) if now >= until => { pins.remove(dst); None }
+                Some((via, _)) => Some(via),
+                None => None,
+            }
+        };
         if let Some(via) = forced {
             if policy.is_transit(&via) && policy.holds_rights(&via) && self.neighbor(&via).is_ok() { return Some(via); }
         }
@@ -955,6 +983,17 @@ impl Mesh {
         candidates.sort();
         candidates.dedup();
         if candidates.is_empty() { return false; }
+        {
+            let now = Instant::now();
+            let mut failed = self.failed_via.lock().unwrap();
+            failed.retain(|_, until| now < *until);
+            if let Some(o) = old {
+                if failed.len() < HOP_MAX { failed.insert((*dst, o), now + FAILED_VIA_TTL); }
+            }
+            // Если отказали все, выбирать из всех: остаться совсем без транзита хуже.
+            let fresh: Vec<_> = candidates.iter().copied().filter(|k| !failed.contains_key(&(*dst, *k))).collect();
+            if !fresh.is_empty() { candidates = fresh; }
+        }
         let idx = {
             let mut r = self.alt_rot.lock().unwrap();
             if r.len() >= 64 && !r.contains_key(dst) { r.clear(); }
@@ -965,8 +1004,12 @@ impl Mesh {
         };
         let via = candidates[idx % candidates.len()];
         let mut forced = self.stall_hops.lock().unwrap();
-        if forced.len() >= HOP_MAX && !forced.contains_key(dst) { return false; }
-        forced.insert(*dst, via);
+        let now = Instant::now();
+        if forced.len() >= HOP_MAX && !forced.contains_key(dst) {
+            forced.retain(|_, (_, until)| now < *until);
+            if forced.len() >= HOP_MAX { return false; }
+        }
+        forced.insert(*dst, (via, now + STALL_HOP_TTL));
         drop(forced);
         self.warm(dst);
         true

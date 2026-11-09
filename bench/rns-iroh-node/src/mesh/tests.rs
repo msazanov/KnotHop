@@ -473,7 +473,7 @@ async fn established_mesh_recovers_from_silent_transit_blackhole() {
     eprintln!("a_hop_new={}, e_hop_new={}, e_verified_new={}, a_forced_new={}",
         a.mesh.hop_peer(&e.id()) == Some(t2.id()), e.mesh.hop_peer(&a.id()) == Some(t2.id()),
         e.mesh.verified_rev.lock().unwrap().get(&a.id()).is_some_and(|(via, _)| *via == t2.id()),
-        a.mesh.stall_hops.lock().unwrap().get(&e.id()) == Some(&t2.id()));
+        a.mesh.stall_hops.lock().unwrap().get(&e.id()).map(|(via, _)| *via) == Some(t2.id()));
     assert!(t1.dropped.load(Relaxed) > 0, "должна быть реальная потеря кадров");
     result.expect("сквозной поток должен восстановиться через второй транзит при молчаливой потере");
     assert_eq!(a.mesh.hop_peer(&e.id()), Some(t2.id()));
@@ -2248,4 +2248,57 @@ async fn e2e_sides_do_not_chase_each_other_between_transits() {
     assert_eq!(a_changes, 0, "первый хоп инициатора не должен следовать за отвечающим");
     assert_eq!(a.mesh.hop_peer(&e.id()), Some(t1.id()));
     assert_eq!(e.mesh.hop_peer(&a.id()), Some(t1.id()), "отвечающий идёт через транзит инициатора");
+}
+
+/// После срока жизни закрепления решение снова за маршрутом; до срока закрепление действует.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stall_pin_expires_and_returns_to_routed_transit() {
+    let (a, t1, t2, e) = (node().await, node().await, node().await, node().await);
+    link(&a, &t1).await;
+    link(&a, &t2).await;
+    link(&t1, &e).await;
+    link(&t2, &e).await;
+    allow_all(&[&a, &t1, &t2, &e]);
+    t1.set_transit(true);
+    t2.set_transit(true);
+    route(&a, &e, &t1);
+    let now = Instant::now();
+    a.mesh.stall_hops.lock().unwrap().insert(e.id(), (t2.id(), now + STALL_HOP_TTL));
+    assert_eq!(a.mesh.next_hop_origin(now, &e.id(), a.pol.as_ref()), Some(t2.id()), "в пределах срока действует закрепление");
+    let later = now + STALL_HOP_TTL;
+    assert_eq!(a.mesh.next_hop_origin(later, &e.id(), a.pol.as_ref()), Some(t1.id()), "после срока снова маршрут RNS");
+    assert!(a.mesh.stall_hops.lock().unwrap().get(&e.id()).is_none(), "просроченная запись удаляется");
+}
+
+/// Транзит без носителя к выходу отвечает «нет пути»: инициатор сразу уходит на другой транзит и не возвращается на отказавший.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_unreachable_from_current_transit_rotates_initiator_immediately() {
+    let (a, dead, live, e) = (node_bound_mode(true, [127, 0, 0, 1].into(), true).await, node().await, node().await, node_bound_mode(true, [127, 0, 0, 1].into(), true).await);
+    link(&a, &live).await;
+    link(&live, &e).await;
+    allow_all(&[&a, &dead, &live, &e]);
+    live.set_transit(true);
+    route(&a, &e, &live);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert!(a.mesh.mark_e2e(&ca));
+    assert!(e.mesh.mark_e2e(&ce));
+    // Транзит появляется уже после соединения: у него нет носителя к выходу.
+    link(&a, &dead).await;
+    dead.set_transit(true);
+    route(&a, &e, &dead);
+    a.mesh.routes.lock().unwrap().clear();
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(dead.id()));
+    let t = Instant::now();
+    while a.mesh.hop_peer(&e.id()) == Some(dead.id()) {
+        assert!(t.elapsed() < Duration::from_secs(5), "явный отказ должен сменить транзит: {}", a.mesh.stats());
+        a.mesh.send_payload(&e.id(), b"x");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(live.id()));
+    assert_eq!(a.mesh.c.unreach_rotated.load(Relaxed), 1);
+    assert!(a.mesh.failed_via.lock().unwrap().contains_key(&(e.id(), dead.id())), "отказавший транзит запомнен");
+    echo(&ca, &ce).await;
+    // Отвечающая сторона маршрут не перехватывает: чужое уведомление на неё не действует.
+    assert_eq!(e.mesh.c.unreach_rotated.load(Relaxed), 0);
 }
