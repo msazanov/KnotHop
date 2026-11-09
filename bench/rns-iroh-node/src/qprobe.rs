@@ -951,6 +951,12 @@ mod tests {
             if let Ok(d) = conn.read_datagram().await { assert!(filter.intercept(&conn, &d)); }
         });
         let (h1, h2) = (server_task(s1.clone()), server_task(s2.clone()));
+        // MAX_LEN превышает начальный размер датаграммы: дождаться, пока MTU вырастет на обоих соединениях.
+        let t = Instant::now();
+        while c1.max_datagram_size().unwrap_or(0) < MAX_LEN || c2.max_datagram_size().unwrap_or(0) < MAX_LEN {
+            assert!(t.elapsed() < Duration::from_secs(5), "MTU не вырос");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let payload = bytes::Bytes::from(build(0, 42, MAX_LEN));
         c2.send_datagram(payload.clone()).unwrap();
         c1.send_datagram(payload).unwrap();

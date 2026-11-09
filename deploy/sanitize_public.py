@@ -37,7 +37,7 @@ EXACT_EXCLUDES = {
     "AGENTS.md", "bench/AWG.md", "bench/Dockerfile.awg", "deploy/hosts.tsv",
     "deploy/push-report.json", "deploy-pilot", "deploy-0013/node.json",
     "deploy-0013/public_rns.txt", "deploy-0013/SHA256SUMS",
-    "docs/experiments-log.md", "docs/benchmarks-1core.md",
+    "docs/experiments-log.md", "docs/host-issues.md", "docs/benchmarks-1core.md",
     "docs/benchmarks-lev-iroh.md", "docs/README.md", "docs/development.md",
     "deploy/README.md", "bench/android/exits.txt",
 }

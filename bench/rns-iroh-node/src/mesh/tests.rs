@@ -2296,3 +2296,96 @@ async fn explicit_unreachable_only_excludes_transit_from_stall_rotation() {
     e.mesh.on_frame(&live.id(), &unreachable(&a));
     assert_eq!(e.mesh.c.unreach_marked.load(Relaxed), 0);
 }
+
+/// Разрыв обмена в обе стороны при молчаливом отказе транзита на 30 с. Профиль сети задаётся снаружи (`tc netem` на lo).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "требуется отдельный netns с разрешённым iptables"]
+async fn silent_transit_outage_gap_under_netem() {
+    let me_ns = std::fs::read_link("/proc/self/ns/net").unwrap();
+    let host_ns = std::env::var("KNOTHOP_TEST_HOST_NETNS").expect("передайте inode сетевого пространства хоста до unshare");
+    assert_ne!(me_ns.to_string_lossy(), host_ns, "правила разрешены только в отдельном netns");
+    let (a, t1, t2, e) = (node_bound_mode(true, [127, 0, 0, 1].into(), true).await, node().await, node().await, node_bound_mode(true, [127, 0, 0, 1].into(), true).await);
+    link(&a, &t1).await;
+    link(&a, &t2).await;
+    link(&t1, &e).await;
+    link(&t2, &e).await;
+    // Транзиты без пути к выходу, как узел с одним TCP-носителем на пилоте: сосед есть, переслать некуда.
+    let dead_n: usize = std::env::var("KNOTHOP_TEST_DEAD_TRANSITS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut dead = Vec::new();
+    for _ in 0..dead_n {
+        let d = node().await;
+        link(&a, &d).await;
+        d.set_transit(true);
+        dead.push(d);
+    }
+    let mut all: Vec<&Node> = vec![&a, &t1, &t2, &e];
+    all.extend(dead.iter());
+    allow_all(&all);
+    t1.set_transit(true);
+    t2.set_transit(true);
+    route(&a, &e, &t1);
+    for aa in a.ep.bound_sockets() {
+        for ee in e.ep.bound_sockets() {
+            if aa.is_ipv4() != ee.is_ipv4() { continue; }
+            let tool = if aa.is_ipv4() { "iptables" } else { "ip6tables" };
+            let (ap, ep) = (aa.port().to_string(), ee.port().to_string());
+            for (src, dst) in [(&ap, &ep), (&ep, &ap)] {
+                assert!(std::process::Command::new(tool).args(["-I", "OUTPUT", "-p", "udp", "--sport", src, "--dport", dst, "-j", "DROP"]).status().unwrap().success());
+            }
+        }
+    }
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert!(a.mesh.mark_e2e(&ca));
+    assert!(e.mesh.mark_e2e(&ce));
+    stream_echo(&ca, &ce).await;
+    tokio::spawn(a.mesh.clone().watch_mesh_stall(ca.clone()));
+    let echo_conn = ce.clone();
+    tokio::spawn(async move { while let Ok(d) = echo_conn.read_datagram().await { let _ = echo_conn.send_datagram(d); } });
+    let t0 = Instant::now();
+    let last: Arc<Mutex<(Instant, Duration, u64)>> = Arc::new(Mutex::new((t0, Duration::ZERO, 0)));
+    let outage_first: Arc<Mutex<Option<Instant>>> = Default::default();
+    let outage_at: Arc<Mutex<Option<Instant>>> = Default::default();
+    let (reader, l2, of, oa) = (ca.clone(), last.clone(), outage_first.clone(), outage_at.clone());
+    tokio::spawn(async move {
+        while reader.read_datagram().await.is_ok() {
+            let now = Instant::now();
+            let mut g = l2.lock().unwrap();
+            let gap = now.saturating_duration_since(g.0);
+            if g.2 > 0 && oa.lock().unwrap().is_some() && gap > g.1 { g.1 = gap; }
+            g.0 = now;
+            g.2 += 1;
+            if let Some(at) = *oa.lock().unwrap() {
+                if now.saturating_duration_since(at) > Duration::from_millis(300) { of.lock().unwrap().get_or_insert(now); }
+            }
+        }
+    });
+    let sender = ca.clone();
+    tokio::spawn(async move {
+        let mut n = 0u64;
+        while sender.close_reason().is_none() {
+            let _ = sender.send_datagram(Bytes::copy_from_slice(&n.to_le_bytes()));
+            n += 1;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let baseline = last.lock().unwrap().2;
+    let hop_before = a.mesh.hop_peer(&e.id());
+    t1.drop_every.store(1, Relaxed);
+    let began = Instant::now();
+    *outage_at.lock().unwrap() = Some(began);
+    let (mut changes, mut prev, mut died) = (0u32, hop_before, None);
+    while began.elapsed() < Duration::from_secs(40) {
+        if began.elapsed() >= Duration::from_secs(30) { t1.drop_every.store(0, Relaxed); }
+        let now = a.mesh.hop_peer(&e.id());
+        if now != prev { changes += 1; eprintln!("hop change at {:.1}s -> {}", began.elapsed().as_secs_f32(), if now == Some(t2.id()) { "t2" } else if now == Some(t1.id()) { "t1" } else { "none" }); prev = now; }
+        if died.is_none() && ca.close_reason().is_some() { died = Some(began.elapsed()); }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (_, max_gap, total) = *last.lock().unwrap();
+    let first = outage_first.lock().unwrap().map(|t| t.saturating_duration_since(began));
+    eprintln!("RESULT baseline_echoes={baseline} total_echoes={total} max_gap_ms={} first_echo_after_outage_ms={:?} hop_changes={changes} died_at={died:?} close={:?}", max_gap.as_millis(), first.map(|d| d.as_millis()), ca.close_reason());
+    eprintln!("exit: migration_accepted={} migration_changed={} rev_conflict={} a_stats={}", e.mesh.c.migration_accepted.load(Relaxed), e.mesh.c.migration_changed.load(Relaxed), e.mesh.c.rev_conflict.load(Relaxed), a.mesh.stats());
+    assert!(died.is_none(), "соединение умерло: {:?}", ca.close_reason());
+    assert!(max_gap < Duration::from_secs(15), "разрыв {max_gap:?}");
+}

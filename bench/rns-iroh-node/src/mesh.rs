@@ -759,6 +759,10 @@ impl Mesh {
         }
     }
 
+    fn via_failed(&self, dst: &Key, via: &Key, now: Instant) -> bool {
+        self.failed_via.lock().unwrap().get(&(*dst, *via)).is_some_and(|until| now < *until)
+    }
+
     /// Есть живое сквозное соединение к `dst`, начатое этим узлом.
     fn initiates_to(&self, dst: &Key) -> bool {
         let connections: Vec<_> = self.e2e.lock().unwrap().conns.values().map(|(c, _)| c.clone()).collect();
@@ -1032,6 +1036,7 @@ impl Mesh {
         let mut retry_until: Option<Instant> = None;
         let mut retry_at = Instant::now();
         let mut selected_ip: Option<std::net::SocketAddr> = None;
+        let (mut rotated_rx, mut next_rotate) = (0u64, Instant::now());
         loop {
             tick.tick().await;
             if conn.close_reason().is_some() { break; }
@@ -1059,11 +1064,18 @@ impl Mesh {
                 // прямому адресу требуется повторная проверка >1 МиБ перед следующим возвратом.
                 self.revoke_direct(&sa);
             }
-            if watch.observe(now, st.frame_rx.authenticated_progress(), st.frame_tx.ack_eliciting_progress(), st.rtt) && retry_until.is_none() {
+            let rx_now = st.frame_rx.authenticated_progress();
+            // После смены транзита новый сам ответил «нет пути», и данных через него не пришло: окно ожидания незачем досиживать.
+            // Без условия на приём уведомление бросало бы рабочий транзит.
+            let refused = retry_until.is_some() && now >= next_rotate && rx_now == rotated_rx
+                && self.hop_peer(&dst).is_some_and(|hop| self.via_failed(&dst, &hop, now));
+            if refused || (watch.observe(now, rx_now, st.frame_tx.ack_eliciting_progress(), st.rtt) && retry_until.is_none()) {
                 let rotated = self.rotate_stalled(&dst);
                 if rotated {
                     retry_until = Some(now + Duration::from_secs(6));
                     retry_at = now + Duration::from_secs(1);
+                    rotated_rx = rx_now;
+                    next_rotate = now + Duration::from_secs(1);
                 }
                 #[cfg(test)]
                 eprintln!("mesh watchdog: rotate={rotated}, rx={}, tx={}, rtt_ms={}", st.frame_rx.authenticated_progress(), st.frame_tx.ack_eliciting_progress(), st.rtt.as_millis());
