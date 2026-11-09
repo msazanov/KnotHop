@@ -2194,3 +2194,58 @@ fn only_mesh_custom_addr_is_mesh() {
     assert!(!is_mesh_addr(&TransportAddr::Custom(crate::reality_carrier::addr_of(1))));
     assert!(!is_mesh_addr(&TransportAddr::Ip("192.0.2.1:47001".parse().unwrap())));
 }
+
+/// Доказательство приходит примерно раз в секунду и при неизменном транзите. Сброс кэша хопа на
+/// каждом из них отбрасывал исходящие кадры как `drop_no_route` до следующего пересчёта.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_migration_proof_keeps_hop_cache_and_traffic() {
+    let (a, t, e) = (node().await, node().await, node().await);
+    link(&a, &t).await;
+    link(&t, &e).await;
+    allow_all(&[&a, &t, &e]);
+    t.set_transit(true);
+    route(&a, &e, &t);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert!(e.mesh.mark_e2e(&ce));
+    e.mesh.sync_gen(e.pol.as_ref());
+    let mut secret = [0u8; 32];
+    ca.export_keying_material(&mut secret, migration::LABEL, b"").unwrap();
+    let proof = |seq| Bytes::from(migration::encode(&secret, &a.id(), &e.id(), &t.id(), seq).unwrap());
+    e.mesh.on_frame(&t.id(), &proof(1));
+    assert_eq!(e.mesh.hop_peer(&a.id()), Some(t.id()), "смена транзита применяется без окна потерь");
+    let drops = e.mesh.c.drop_no_route.load(Relaxed);
+    e.mesh.on_frame(&t.id(), &proof(2));
+    assert_eq!(e.mesh.hop_peer(&a.id()), Some(t.id()), "повтор доказательства не должен сбрасывать хоп");
+    e.mesh.send_payload(&a.id(), b"x");
+    assert_eq!(e.mesh.c.drop_no_route.load(Relaxed), drops, "кадр не должен теряться из-за повтора");
+}
+
+/// Инициатор решает, отвечающий следует за ним. Если следуют оба, разные начальные маршруты
+/// заставляют стороны меняться транзитами друг за другом.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_sides_do_not_chase_each_other_between_transits() {
+    let (a, t1, t2, e) = (node_bound_mode(true, [127, 0, 0, 1].into(), true).await, node().await, node().await, node_bound_mode(true, [127, 0, 0, 1].into(), true).await);
+    link(&a, &t1).await;
+    link(&a, &t2).await;
+    link(&t1, &e).await;
+    link(&t2, &e).await;
+    allow_all(&[&a, &t1, &t2, &e]);
+    t1.set_transit(true);
+    t2.set_transit(true);
+    route(&a, &e, &t1);
+    route(&e, &a, &t2);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert!(a.mesh.mark_e2e(&ca));
+    assert!(e.mesh.mark_e2e(&ce));
+    let (mut a_changes, mut last) = (0, a.mesh.hop_peer(&e.id()));
+    for _ in 0..50 {
+        a.mesh.warm(&e.id());
+        e.mesh.warm(&a.id());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = a.mesh.hop_peer(&e.id());
+        if now != last { a_changes += 1; last = now; }
+    }
+    assert_eq!(a_changes, 0, "первый хоп инициатора не должен следовать за отвечающим");
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t1.id()));
+    assert_eq!(e.mesh.hop_peer(&a.id()), Some(t1.id()), "отвечающий идёт через транзит инициатора");
+}

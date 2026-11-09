@@ -142,6 +142,9 @@ pub struct Counters {
     pub rev_learned: AtomicU64,
     /// запись обратной таблицы не заменена: прежний сосед жив, а новый не источник
     pub rev_conflict: AtomicU64,
+    /// Принятые доказательства смены транзита и те из них, что действительно изменили маршрут.
+    pub migration_accepted: AtomicU64,
+    pub migration_changed: AtomicU64,
     /// Соседские уведомления об отказе и реально снятые обратные пути.
     pub unreach_sent: AtomicU64,
     pub unreach_received: AtomicU64,
@@ -551,6 +554,7 @@ impl Mesh {
             "drop_send_err": c.drop_send_err.load(Relaxed), "rev_learned": c.rev_learned.load(Relaxed),
             "rev_conflict": c.rev_conflict.load(Relaxed), "unreach_sent": c.unreach_sent.load(Relaxed), "unreach_received": c.unreach_received.load(Relaxed), "unreach_removed": c.unreach_removed.load(Relaxed), "drop_id_ambiguous": c.drop_id_ambiguous.load(Relaxed), "drop_recursion": c.drop_recursion.load(Relaxed),
             "e2e_overflow": c.e2e_overflow.load(Relaxed), "drop_queue_full": c.drop_queue_full.load(Relaxed), "alt_hops": c.alt_hops.load(Relaxed), "gen_resets": c.gen_resets.load(Relaxed),
+            "migration_accepted": c.migration_accepted.load(Relaxed), "migration_changed": c.migration_changed.load(Relaxed),
             "egress_blocked": iroh::knothop::blocked_egress(), "rev_size": self.rev.lock().unwrap().len(), "e2e_conns": self.e2e.lock().unwrap().ids.len(),
         })
     }
@@ -729,7 +733,7 @@ impl Mesh {
         };
         if removed {
             self.c.unreach_removed.fetch_add(1, Relaxed);
-            self.hops.lock().unwrap().remove(&dst);
+            self.warm(&dst);
         }
     }
 
@@ -748,7 +752,8 @@ impl Mesh {
         let connections: Vec<_> = self.e2e.lock().unwrap().conns.iter()
             .map(|(sid, (conn, _))| (*sid, conn.clone())).collect();
         for (sid, conn) in connections {
-            if conn.remote_id().as_bytes() != &src || conn.close_reason().is_some() { continue; }
+            // Следует только отвечающая сторона: если следуют обе, разные начальные маршруты заставляют их меняться транзитами бесконечно.
+            if conn.remote_id().as_bytes() != &src || conn.close_reason().is_some() || !matches!(conn.side(), iroh::endpoint::Side::Server) { continue; }
             let mut key = [0u8; 32];
             if conn.export_keying_material(&mut key, migration::LABEL, b"").is_err() { continue; }
             let mut e = self.e2e.lock().unwrap();
@@ -757,10 +762,16 @@ impl Mesh {
             if policy.generation() != generation { return; }
             let mut verified = self.verified_rev.lock().unwrap();
             if !verified.contains_key(&src) && verified.len() >= E2E_MAX { return; }
-            verified.insert(src, (*prev, sid));
+            let previous = verified.insert(src, (*prev, sid));
             drop(verified);
             drop(e);
-            self.hops.lock().unwrap().remove(&src);
+            self.c.migration_accepted.fetch_add(1, Relaxed);
+            // Доказательства идут и при неизменном транзите; запись хопа заменяется на месте,
+            // потому что между удалением и пересчётом `send_payload` теряет все кадры.
+            if previous != Some((*prev, sid)) {
+                self.c.migration_changed.fetch_add(1, Relaxed);
+                self.warm(&src);
+            }
             return;
         }
     }
@@ -795,7 +806,8 @@ impl Mesh {
         }
         let connections: Vec<_> = self.e2e.lock().unwrap().conns.values().map(|(c, _)| c.clone()).collect();
         for conn in connections {
-            if conn.remote_id().as_bytes() != dst || conn.close_reason().is_some() { continue; }
+            // Маршрут сквозного соединения определяет его инициатор (см. `accept_migration`).
+            if conn.remote_id().as_bytes() != dst || conn.close_reason().is_some() || !matches!(conn.side(), iroh::endpoint::Side::Client) { continue; }
             let mut key = [0u8; 32];
             if conn.export_keying_material(&mut key, migration::LABEL, b"").is_err() { continue; }
             let Ok(seq) = self.migration_seq.fetch_update(Relaxed, Relaxed, |n| n.checked_add(1)) else { return };
@@ -956,7 +968,6 @@ impl Mesh {
         if forced.len() >= HOP_MAX && !forced.contains_key(dst) { return false; }
         forced.insert(*dst, via);
         drop(forced);
-        self.hops.lock().unwrap().remove(dst);
         self.warm(dst);
         true
     }
