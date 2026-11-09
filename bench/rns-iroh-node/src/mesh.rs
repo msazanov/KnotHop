@@ -149,8 +149,8 @@ pub struct Counters {
     /// Принятые доказательства смены транзита и те из них, что действительно изменили маршрут.
     pub migration_accepted: AtomicU64,
     pub migration_changed: AtomicU64,
-    /// Смена транзита по явному отказу текущего транзита.
-    pub unreach_rotated: AtomicU64,
+    /// Транзит запомнен как отказавший по его собственному уведомлению.
+    pub unreach_marked: AtomicU64,
     /// Соседские уведомления об отказе и реально снятые обратные пути.
     pub unreach_sent: AtomicU64,
     pub unreach_received: AtomicU64,
@@ -564,7 +564,7 @@ impl Mesh {
             "drop_send_err": c.drop_send_err.load(Relaxed), "rev_learned": c.rev_learned.load(Relaxed),
             "rev_conflict": c.rev_conflict.load(Relaxed), "unreach_sent": c.unreach_sent.load(Relaxed), "unreach_received": c.unreach_received.load(Relaxed), "unreach_removed": c.unreach_removed.load(Relaxed), "drop_id_ambiguous": c.drop_id_ambiguous.load(Relaxed), "drop_recursion": c.drop_recursion.load(Relaxed),
             "e2e_overflow": c.e2e_overflow.load(Relaxed), "drop_queue_full": c.drop_queue_full.load(Relaxed), "alt_hops": c.alt_hops.load(Relaxed), "gen_resets": c.gen_resets.load(Relaxed),
-            "migration_accepted": c.migration_accepted.load(Relaxed), "migration_changed": c.migration_changed.load(Relaxed), "unreach_rotated": c.unreach_rotated.load(Relaxed),
+            "migration_accepted": c.migration_accepted.load(Relaxed), "migration_changed": c.migration_changed.load(Relaxed), "unreach_marked": c.unreach_marked.load(Relaxed),
             "egress_blocked": iroh::knothop::blocked_egress(), "rev_size": self.rev.lock().unwrap().len(), "e2e_conns": self.e2e.lock().unwrap().ids.len(),
         })
     }
@@ -745,10 +745,17 @@ impl Mesh {
             self.c.unreach_removed.fetch_add(1, Relaxed);
             self.warm(&dst);
         }
-        // Транзит сам сообщил, что не может довести наши кадры до `dst`. Ждать сторожка застоя незачем;
-        // решает только инициатор сквозного соединения. Сосед может увести трафик лишь от самого себя.
-        if self.hop_peer(&dst) == Some(*prev) && self.initiates_to(&dst) && self.rotate_stalled(&dst) {
-            self.c.unreach_rotated.fetch_add(1, Relaxed);
+        // Транзит сообщил, что не довёл кадр до `dst`: не брать его при следующей смене. Само уведомление транзит не меняет:
+        // оно бывает и при временной причине (просадка MTU, смена носителя), а работающий путь бросать нельзя (W v0.1.68–69: метание
+        // транзита каждые 10–30 с). Застой определяет сторожок по реальному приёму. Сосед может пометить только самого себя.
+        if self.initiates_to(&dst) {
+            let now = Instant::now();
+            let mut failed = self.failed_via.lock().unwrap();
+            if failed.len() >= HOP_MAX { failed.retain(|_, until| now < *until); }
+            if failed.len() < HOP_MAX {
+                failed.insert((dst, *prev), now + FAILED_VIA_TTL);
+                self.c.unreach_marked.fetch_add(1, Relaxed);
+            }
         }
     }
 

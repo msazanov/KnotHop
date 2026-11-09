@@ -2270,35 +2270,29 @@ async fn stall_pin_expires_and_returns_to_routed_transit() {
     assert!(a.mesh.stall_hops.lock().unwrap().get(&e.id()).is_none(), "просроченная запись удаляется");
 }
 
-/// Транзит без носителя к выходу отвечает «нет пути»: инициатор сразу уходит на другой транзит и не возвращается на отказавший.
+/// Уведомление «нет пути» не уводит с рабочего транзита, но отказавший транзит не выбирается при настоящем застое.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn explicit_unreachable_from_current_transit_rotates_initiator_immediately() {
-    let (a, dead, live, e) = (node_bound_mode(true, [127, 0, 0, 1].into(), true).await, node().await, node().await, node_bound_mode(true, [127, 0, 0, 1].into(), true).await);
+async fn explicit_unreachable_only_excludes_transit_from_stall_rotation() {
+    let (a, cur, dead, live, e) = (node_bound_mode(true, [127, 0, 0, 1].into(), true).await, node().await, node().await, node().await, node_bound_mode(true, [127, 0, 0, 1].into(), true).await);
+    link(&a, &cur).await;
+    link(&a, &dead).await;
     link(&a, &live).await;
+    link(&cur, &e).await;
     link(&live, &e).await;
-    allow_all(&[&a, &dead, &live, &e]);
-    live.set_transit(true);
-    route(&a, &e, &live);
+    allow_all(&[&a, &cur, &dead, &live, &e]);
+    for t in [&cur, &dead, &live] { t.set_transit(true); }
+    route(&a, &e, &cur);
     let (ca, ce) = e2e_connect(&a, &e).await;
     assert!(a.mesh.mark_e2e(&ca));
     assert!(e.mesh.mark_e2e(&ce));
-    // Транзит появляется уже после соединения: у него нет носителя к выходу.
-    link(&a, &dead).await;
-    dead.set_transit(true);
-    route(&a, &e, &dead);
-    a.mesh.routes.lock().unwrap().clear();
-    a.mesh.prepare(&e.id());
-    assert_eq!(a.mesh.hop_peer(&e.id()), Some(dead.id()));
-    let t = Instant::now();
-    while a.mesh.hop_peer(&e.id()) == Some(dead.id()) {
-        assert!(t.elapsed() < Duration::from_secs(5), "явный отказ должен сменить транзит: {}", a.mesh.stats());
-        a.mesh.send_payload(&e.id(), b"x");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(a.mesh.hop_peer(&e.id()), Some(live.id()));
-    assert_eq!(a.mesh.c.unreach_rotated.load(Relaxed), 1);
-    assert!(a.mesh.failed_via.lock().unwrap().contains_key(&(e.id(), dead.id())), "отказавший транзит запомнен");
-    echo(&ca, &ce).await;
-    // Отвечающая сторона маршрут не перехватывает: чужое уведомление на неё не действует.
-    assert_eq!(e.mesh.c.unreach_rotated.load(Relaxed), 0);
+    let unreachable = |dst: &Node| { let mut b = vec![TAG, 0]; b.extend_from_slice(&id_of(&dst.id())); Bytes::from(b) };
+    a.mesh.on_frame(&cur.id(), &unreachable(&e));
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(cur.id()), "уведомление само по себе не меняет транзит");
+    a.mesh.on_frame(&dead.id(), &unreachable(&e));
+    assert!(a.mesh.failed_via.lock().unwrap().contains_key(&(e.id(), dead.id())));
+    assert!(a.mesh.rotate_stalled(&e.id()));
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(live.id()), "при застое отказавшие транзиты пропускаются");
+    // Отвечающая сторона ничего не запоминает: маршрут определяет инициатор.
+    e.mesh.on_frame(&live.id(), &unreachable(&a));
+    assert_eq!(e.mesh.c.unreach_marked.load(Relaxed), 0);
 }
