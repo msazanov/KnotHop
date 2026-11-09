@@ -121,9 +121,29 @@ pub(super) fn forget_failed_path(failed: usize, current: Option<usize>) -> bool 
     current == Some(failed)
 }
 
+/// Сколько клиент ждёт установления Link, ответа авторизации и проверки выхода.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LinkWait {
+    pub(super) establish_s: u64,
+    pub(super) auth_s: u64,
+    pub(super) probe_s: u64,
+}
+
+/// Выбранному пользователем выходу замены нет. Ему нужно хватить на повтор запроса Link ядром (12–15 с) и на повтор
+/// LRRTT (не раньше 10 с); без этого перегруженный выход или потеря одного пакета срывают каждую попытку.
+/// В авто-режиме выгоднее быстро перейти к другому выходу.
+pub(super) const fn link_wait(pinned: bool) -> LinkWait {
+    if pinned { LinkWait { establish_s: 20, auth_s: 15, probe_s: 8 } } else { LinkWait { establish_s: 6, auth_s: 6, probe_s: 3 } }
+}
+
+/// Предел паузы между попытками: выбранный выход пробуем часто, другой выход за него не подключится.
+pub(super) const fn backoff_cap_s(pinned: bool) -> u64 {
+    if pinned { 30 } else { 300 }
+}
+
 impl ExitBackoff {
-    pub(super) fn failed(&mut self, dest: [u8; 16], now: Instant) -> Duration {
-        let secs = self.0.get(&dest).map(|(s, _)| s.saturating_mul(2).min(300)).unwrap_or(10);
+    pub(super) fn failed(&mut self, dest: [u8; 16], now: Instant, cap_s: u64) -> Duration {
+        let secs = self.0.get(&dest).map(|(s, _)| s.saturating_mul(2).min(cap_s)).unwrap_or(10.min(cap_s));
         self.0.insert(dest, (secs, now + Duration::from_secs(secs)));
         Duration::from_secs(secs)
     }
@@ -150,8 +170,26 @@ impl ExitBackoff {
 }
 
 #[cfg(test)]
+impl ExitBackoff {
+    fn failed_default(&mut self, dest: [u8; 16], now: Instant) -> Duration { self.failed(dest, now, 300) }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_exit_keeps_retrying_often_and_waits_for_core_retries() {
+        let mut b = ExitBackoff::default();
+        let (d, t) = ([9; 16], Instant::now());
+        let cap = backoff_cap_s(true);
+        let seq: Vec<u64> = (0..6).map(|_| b.failed(d, t, cap).as_secs()).collect();
+        assert_eq!(seq, vec![10, 20, 30, 30, 30, 30]);
+        let w = link_wait(true);
+        // повтор LINK_REQUEST ядром на 1 хопе: 12 с и джиттер до 15 с; повтор LRRTT: не раньше 10 с
+        assert!(w.establish_s > 15 && w.auth_s > 10, "{w:?}");
+        assert_eq!(link_wait(false), LinkWait { establish_s: 6, auth_s: 6, probe_s: 3 });
+    }
 
     #[test]
     fn discovery_uses_neighbors_even_with_a_direct_carrier() {
@@ -167,7 +205,7 @@ mod tests {
         let d = [1; 16];
         for secs in [10, 20, 40, 80, 160, 300, 300] {
             assert!(b.ready(&d, t));
-            assert_eq!(b.failed(d, t), Duration::from_secs(secs));
+            assert_eq!(b.failed_default(d, t), Duration::from_secs(secs));
             assert!(!b.ready(&d, t + Duration::from_secs(secs - 1)));
             t += Duration::from_secs(secs);
             assert!(b.ready(&d, t));
@@ -178,13 +216,13 @@ mod tests {
     fn exit_backoff_success_is_per_exit_and_restores_fast_retry() {
         let mut b = ExitBackoff::default();
         let t = Instant::now();
-        b.failed([1; 16], t);
-        b.failed([1; 16], t);
-        b.failed([2; 16], t);
+        b.failed_default([1; 16], t);
+        b.failed_default([1; 16], t);
+        b.failed_default([2; 16], t);
         b.succeeded(&[1; 16]);
         assert!(b.ready(&[1; 16], t));
         assert!(!b.ready(&[2; 16], t));
-        assert_eq!(b.failed([1; 16], t), Duration::from_secs(10));
+        assert_eq!(b.failed_default([1; 16], t), Duration::from_secs(10));
         assert_eq!(b.remaining(&[2; 16], t + Duration::from_secs(4)), Duration::from_secs(6));
     }
 
@@ -202,14 +240,14 @@ mod tests {
         let mut b = ExitBackoff::default();
         let t = Instant::now();
         let d = [3; 16];
-        b.failed(d, t);
+        b.failed_default(d, t);
         b.healthy(&d, t + Duration::from_secs(10), t + Duration::from_secs(100));
-        assert_eq!(b.failed(d, t + Duration::from_secs(100)), Duration::from_secs(20));
+        assert_eq!(b.failed_default(d, t + Duration::from_secs(100)), Duration::from_secs(20));
         let connected = t + Duration::from_secs(120);
         b.healthy(&d, connected, connected + Duration::from_secs(299));
-        assert_eq!(b.failed(d, connected + Duration::from_secs(299)), Duration::from_secs(40));
+        assert_eq!(b.failed_default(d, connected + Duration::from_secs(299)), Duration::from_secs(40));
         b.healthy(&d, connected, connected + Duration::from_secs(300));
-        assert_eq!(b.failed(d, connected + Duration::from_secs(301)), Duration::from_secs(10));
+        assert_eq!(b.failed_default(d, connected + Duration::from_secs(301)), Duration::from_secs(10));
     }
 
     #[test]

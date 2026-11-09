@@ -6102,8 +6102,8 @@ async fn wait_scoped_path(node: &Arc<Node>, gate: &path::PathGate, dest: &Destin
 }
 
 /// Путь до узла и установленный Link (без identify).
-async fn open_link(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usize>) -> Result<(LinkId, Arc<leviculum_std::LinkHandle>)> {
-    open_link_wait(ctx, cand, avoid_iface, 6, leviculum_std::api::LinkCipher::Gcm).await
+async fn open_link(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usize>, establish_s: u64) -> Result<(LinkId, Arc<leviculum_std::LinkHandle>)> {
+    open_link_wait(ctx, cand, avoid_iface, establish_s, leviculum_std::api::LinkCipher::Gcm).await
 }
 
 async fn open_link_wait(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usize>, est_s: u64, cipher: leviculum_std::api::LinkCipher) -> Result<(LinkId, Arc<leviculum_std::LinkHandle>)> {
@@ -6184,7 +6184,8 @@ impl Drop for ExitProbeGuard<'_> {
 }
 
 /// Подключиться к выходу: путь, Link, identify, AUTH_OK и проверенная датаграмма.
-async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usize>) -> Result<(LinkId, Arc<leviculum_std::LinkHandle>)> {
+async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<usize>, pinned: bool) -> Result<(LinkId, Arc<leviculum_std::LinkHandle>)> {
+    let wait = path::link_wait(pinned);
     if ctx.c13.is_some() && !exit_eligible(ctx, cand) {
         bail!("{} не имеет действующего права/политики EXIT в общей сети", cand.name);
     }
@@ -6199,13 +6200,13 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     } else if mesh_first_eligible(ctx, cand) {
         mesh_carrier(ctx, cand);
     }
-    let (id, handle) = match open_link(ctx, cand, avoid_iface).await {
+    let (id, handle) = match open_link(ctx, cand, avoid_iface, wait.establish_s).await {
         Ok(v) => v,
         // Link не поднялся (нет пути/не установился): если к выходу нет своего QUIC — один раз пробуем через mesh-носитель
         Err(e) if !blocked && mesh_first_eligible(ctx, cand) => {
             ctx.sh.note(format!("{}: Link не поднялся ({e:#}), строю mesh-носитель и повторяю", cand.name));
             if !mesh_first(ctx, cand).await { return Err(e); }
-            open_link(ctx, cand, avoid_iface).await?
+            open_link(ctx, cand, avoid_iface, wait.establish_s).await?
         }
         Err(e) => return Err(e),
     };
@@ -6224,7 +6225,7 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
         // повтор T_USE после identify: если первый пакет отстал, узел уже увидит намерение стать клиентом
         send_ctl(&ctx.node, id, T_USE, &client_info_body(&ctx.identity, &ctx.state)).await;
     }
-    let reply = match tokio::time::timeout(Duration::from_secs(6), rx).await {
+    let reply = match tokio::time::timeout(Duration::from_secs(wait.auth_s), rx).await {
         Ok(Ok(Ok(v))) => v,
         Ok(Ok(Err(why))) => {
             let _ = ctx.node.engine().close_link(&id).await;
@@ -6269,7 +6270,7 @@ async fn connect_exit(ctx: &Arc<ClientCtx>, cand: &CServer, avoid_iface: Option<
     // Выход обязан ответить эхом nonce по этому Link за 3 с с отправки пробы (как прежние 3 x 1 с). Ответ с чужим nonce, повтор старого
     // и ответ другого Link отвергает `on_pong_client`. Channel надёжен: датаграммы Link пробой больше не проверяются, качество QUIC-носителя
     // дальше смотрят статистика QUIC и пейсер.
-    match tokio::time::timeout_at(probe_at + Duration::from_secs(3), &mut prx).await {
+    match tokio::time::timeout_at(probe_at + Duration::from_secs(wait.probe_s), &mut prx).await {
         Ok(Ok(())) => probe.ready = true,
         _ => {}
     }
@@ -6599,7 +6600,7 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
             ctx.rpending.lock().unwrap().insert(d);
             let c2 = ctx.clone();
             tokio::spawn(async move {
-                let r = tokio::time::timeout(Duration::from_secs(25), connect_exit(&c2, &cand, None)).await;
+                let r = tokio::time::timeout(Duration::from_secs(25), connect_exit(&c2, &cand, None, false)).await;
                 c2.rpending.lock().unwrap().remove(&d);
                 match r {
                     Ok(Ok((id, handle))) => {
@@ -6666,7 +6667,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
             let av = avoid.get(&c.dest).copied();
             // Старый Link обслуживает штатный keepalive RNS и во время подключения нового.
             let t_conn = Instant::now();
-            let result = connect_exit(&ctx, &c, av).await;
+            let result = connect_exit(&ctx, &c, av, want == Some(c.dest)).await;
             if crate::debug() {
                 ctx.sh.note(format!("подключение к {}: {} за {} мс", c.name, if result.is_ok() { "успех" } else { "неудача" }, t_conn.elapsed().as_millis()));
             }
@@ -6697,7 +6698,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
                     // после смены носителя этот выход пробуем снова сразу, без бана (пока не истёк срок keep_trying)
                     let keep = keep_trying.get(&c.dest).map(|t| *t > Instant::now()).unwrap_or(false);
                     if !keep {
-                        let delay = banned.failed(c.dest, Instant::now());
+                        let delay = banned.failed(c.dest, Instant::now(), path::backoff_cap_s(want == Some(c.dest)));
                         ctx.sh.note(format!("{}: повторная проверка через {} с", c.name, delay.as_secs()));
                     }
                     let cc = ctx.carriers.lock().unwrap().get(&c.dest).cloned();
@@ -6958,7 +6959,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         } else if !user {
             // Отказавший выход отступает независимо от работающего запасного.
             ctx.lk_fail.lock().unwrap().insert(cand.dest, (Instant::now(), reason.chars().take(80).collect()));
-            banned.failed(cand.dest, Instant::now());
+            banned.failed(cand.dest, Instant::now(), path::backoff_cap_s(want == Some(cand.dest)));
             if let Some(i) = ctx.node.engine().with_link(&id, |s| s.attached_interface()).flatten() {
                 avoid.insert(cand.dest, i);
                 let dest = DestinationHash::new(cand.dest);
