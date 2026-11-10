@@ -2337,6 +2337,28 @@ async fn carrier_backup_hop_is_kept_after_pin_expires() {
     assert_eq!(a.mesh.hop_peer(&e.id()), Some(other), "истёкшее закрепление не возвращает к `alt_transit`, пока транзит работает");
 }
 
+/// Закрепление на транзите, потерявшем носитель, снимается сразу: вернувшийся мигающий носитель не перехватывает трафик обратно.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stall_pin_is_dropped_when_its_transit_loses_the_carrier() {
+    let (a, t1, t2, e) = (node().await, node().await, node().await, node().await);
+    link(&a, &t1).await;
+    link(&a, &t2).await;
+    link(&t1, &e).await;
+    link(&t2, &e).await;
+    allow_all(&[&a, &t1, &t2, &e]);
+    t1.set_transit(true);
+    t2.set_transit(true);
+    route(&a, &e, &t1);
+    let now = Instant::now();
+    a.mesh.stall_hops.lock().unwrap().insert(e.id(), (t2.id(), now + STALL_HOP_TTL));
+    assert_eq!(a.mesh.next_hop_origin(now, &e.id(), a.pol.as_ref()), Some(t2.id()));
+    let gone = a.nbrs.write().unwrap().remove(&t2.id()).expect("носитель к t2");
+    assert_eq!(a.mesh.next_hop_origin(now, &e.id(), a.pol.as_ref()), Some(t1.id()));
+    assert!(a.mesh.stall_hops.lock().unwrap().get(&e.id()).is_none(), "закрепление на транзите без носителя снято");
+    a.nbrs.write().unwrap().insert(t2.id(), gone);
+    assert_eq!(a.mesh.next_hop_origin(now, &e.id(), a.pol.as_ref()), Some(t1.id()), "вернувшийся носитель не перехватывает трафик");
+}
+
 /// Уведомление «нет пути» не уводит с рабочего транзита, но отказавший транзит не выбирается при настоящем застое.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_unreachable_only_excludes_transit_from_stall_rotation() {

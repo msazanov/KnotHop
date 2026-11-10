@@ -945,6 +945,10 @@ impl Mesh {
         };
         if let Some(via) = forced {
             if policy.is_transit(&via) && policy.holds_rights(&via) && self.neighbor(&via).is_ok() { return Some((via, "stall")); }
+            // Закреплённый транзит потерял носитель/право: закрепление снимаем сразу. Иначе оно 300 с перехватывает трафик всякий раз,
+            // когда мигающий носитель снова жив (полевой журнал 10.11: uae ↔ de каждые 3–15 с, de с QUIC то есть, то нет).
+            let mut pins = self.stall_hops.lock().unwrap();
+            if pins.get(dst).is_some_and(|(v, _)| *v == via) { pins.remove(dst); }
         }
         let verified = self.verified_rev.lock().unwrap().get(dst).copied();
         if let Some((via, sid)) = verified {
