@@ -38,6 +38,8 @@ pub const PN_FETCH_SERVER_MS: u64 = 120_000;
 /// Не чаще раза в 30 с, как бы ни менялся выбор PN.
 const PN_FETCH_SPACING_MS: u64 = 30_000;
 const PN_REFRESH_MS: u64 = 5_000;
+/// Пересборка списка PN (доверенные + до 24 услышанных публичных) не чаще.
+const PN_LIST_MS: u64 = 5_000;
 /// Стоимость stamp, которую готовы майнить: чужой анонс не должен сжигать CPU (особенно телефона).
 const PN_MAX_STAMP_COST: u8 = 16;
 const PN_KEYS_MAX: usize = 256;
@@ -99,6 +101,7 @@ pub struct AdminProcessor {
     pn_nodes: BTreeSet<DestinationHash>,
     pn_trusted: BTreeSet<DestinationHash>,
     pn_checked_ms: u64,
+    pn_list_ms: u64,
     pn_fetch_due: bool,
     pn_health: PnHealth,
     /// исходы копий на PN, собранные из событий роутера (`absorb`), разбираются в `sync_tick`
@@ -221,6 +224,7 @@ impl AdminProcessor {
             pn_nodes: BTreeSet::new(),
             pn_trusted: BTreeSet::new(),
             pn_checked_ms: 0,
+            pn_list_ms: 0,
             pn_fetch_due: false,
             pn_health: PnHealth::default(),
             pn_outcomes: Vec::new(),
@@ -376,14 +380,21 @@ impl AdminProcessor {
                     }
                 }
                 self.pn_trusted = view.nodes;
+                self.pn_list_ms = 0;
             }
         }
-        // публичные PN годятся только для служебных LXMF (шифротекст + stamp); их список ограничен, чужой анонс не вытесняет доверенных
-        let own = DestinationHash::new(own_pn_destination(&self.identity));
-        let public: Vec<DestinationHash> = router.known_propagation_nodes().map(|k| k.destination).filter(|n| *n != own && !self.pn_trusted.contains(n)).take(24).collect();
-        self.pn_nodes = self.pn_trusted.iter().copied().chain(public).collect();
+        // публичные PN годятся только для служебных LXMF (шифротекст + stamp); их список ограничен, чужой анонс не вытесняет доверенных.
+        // Пересборка — не чаще раза в PN_LIST_MS: обход всех известных PN публичной сети на каждом такте ядра стоил CPU
+        // перегруженного выхода (fin1 10.11), а список меняется только с анонсами PN (раз в минуты).
         let wall = super::now_ms() as u64 / 1000;
-        self.pn_health.prune(wall, &self.pn_nodes);
+        let first_public = self.pn_nodes.len() <= self.pn_trusted.len() && router.known_propagation_nodes().next().is_some();
+        if self.pn_list_ms == 0 || first_public || now.saturating_sub(self.pn_list_ms) >= PN_LIST_MS {
+            self.pn_list_ms = now.max(1);
+            let own = DestinationHash::new(own_pn_destination(&self.identity));
+            let public: Vec<DestinationHash> = router.known_propagation_nodes().map(|k| k.destination).filter(|n| *n != own && !self.pn_trusted.contains(n)).take(24).collect();
+            self.pn_nodes = self.pn_trusted.iter().copied().chain(public).collect();
+            self.pn_health.prune(wall, &self.pn_nodes);
+        }
         // выбранный вслепую узел (анонса не слышали) уступает узлу с услышанным анонсом PN
         let blind = router.outbound_propagation_node().is_some_and(|c| router.known_propagation_node(&c).is_none())
             && router.known_propagation_nodes().next().is_some();
