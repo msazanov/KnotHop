@@ -3034,7 +3034,11 @@ mod keepalive_pacer_tests {
 
 fn spawn_ctl(node: &Arc<Node>, link: LinkId, ty: u8, body: Vec<u8>) {
     let node = node.clone();
-    tokio::spawn(async move { send_ctl(&node, link, ty, &body).await });
+    // Отправка по Link синхронно берёт замок ядра RNS. Под нагрузкой поток ядра держит его секундами, и рабочий поток tokio,
+    // ждущий на нём, останавливал рантайм (fin1 10.11: оба рабочих потока по 10–11 с на замке — QUIC туннеля не обслуживался).
+    // Ждать замок — в пуле блокирующих потоков, не на рабочем.
+    let rt = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || rt.block_on(send_ctl(&node, link, ty, &body)));
 }
 
 // ------------------------------------------------------------------------------------------------ сервер
@@ -3229,8 +3233,6 @@ struct NodeCtx {
     neigh: Mutex<HashMap<[u8; 16], Neighbor>>,
     tun: Option<Arc<TunState>>,
     started: Instant,
-    /// когда (мс unix) выдать внеочередной анонс; 0 - не нужно. Внеочередной анонс не чаще раза в минуту.
-    ours_online: std::sync::atomic::AtomicUsize,
     listen_port: u16,
     /// идентификаторы интерфейсов публичной сети RNS (их выдаёт spawn_interface; по имени узнавать нельзя: интерфейс называется `tcp_client_N`)
     public_ids: Mutex<HashSet<usize>>,
@@ -3246,11 +3248,6 @@ struct T13 {
 
 impl NodeCtx {
     /// Индексы интерфейсов, не относящихся к публичной сети RNS (QUIC-связи с нашими узлами и клиентами).
-    fn our_ifaces(&self) -> Vec<usize> {
-        let p = self.public_ids.lock().unwrap();
-        self.node.engine().interface_stats().iter().filter(|i| i.online && !p.contains(&i.interface_id.0)).map(|i| i.interface_id.0).collect()
-    }
-
     fn iface_is_public(&self, idx: usize) -> bool {
         self.public_ids.lock().unwrap().contains(&idx)
     }
@@ -3692,7 +3689,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
         announce_s: a.announce_s, dead: Duration::from_secs(a.dead_s), path_gate: path::PathGate::default(), client_info: Mutex::new(HashMap::new()), peer_clients: Mutex::new(HashMap::new()),
         links: Mutex::new(HashMap::new()), neigh: Mutex::new(HashMap::new()),
         tun, started: Instant::now(),
-        ours_online: Default::default(), listen_port: a.port, public_ids: Mutex::new(HashSet::new()),
+        listen_port: a.port, public_ids: Mutex::new(HashSet::new()),
         t13,
     });
     if ctx.tun.is_some() {
@@ -4702,10 +4699,6 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
                 let c = ctx.clone();
                 tokio::spawn(async move { connect_neighbor(c, d).await });
             }
-        }
-        // появился новый наш интерфейс (QUIC-связь): сообщить о себе
-        let n_ours = ctx.our_ifaces().len();
-        if n_ours > ctx.ours_online.swap(n_ours, Relaxed) {
         }
         // адреса с интерфейсов (нет явного advertise): раз в 60 с перепроверяем, при смене IP объявляем заново (0014 R4)
         if tick % 120 == 0 {
