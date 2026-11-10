@@ -4615,14 +4615,20 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
     let mut last_wake = Instant::now();
     let mut last_snap = Instant::now();
     while !fin.exists() {
+        // Тело цикла (замки, обход соседей) — отдельно от сна: прежняя единая «задержка» смешивала долгое тело (блокировка внутри
+        // процесса) с поздним пробуждением (CPU/планировщик) и подписывала всё как «процесс стоял». Конец тела — здесь (у тела есть `continue`).
+        let body_end = Instant::now();
+        let body = body_end.duration_since(last_wake);
         tokio::time::sleep(Duration::from_millis(500)).await;
         tick += 1;
         let now = Instant::now();
-        // Задержка тика: цикл спит 500 мс; если проснулся намного позже, процесс стоял (CPU/диск/планировщик), и таймауты Link могут быть следствием этого.
+        // Позднее пробуждение: таймер сна 500 мс сработал намного позже — процесс не получал CPU (или стоял на диске).
+        let late = now.duration_since(body_end).saturating_sub(Duration::from_millis(500));
         let lag = now.duration_since(last_wake).saturating_sub(Duration::from_millis(500));
         last_wake = now;
         if lag >= Duration::from_secs(3) || (crate::debug() && lag >= Duration::from_secs(1)) {
-            ctx.sh.note(format!("главный цикл опоздал на {} мс (процесс стоял: нагрузка хоста или диск); {}", lag.as_millis(), crate::host_pressure()));
+            ctx.sh.note(format!("главный цикл опоздал на {} мс (пробуждение позже на {} мс, тело цикла {} мс); {}",
+                lag.as_millis(), late.as_millis(), body.as_millis(), crate::host_pressure()));
         }
         if crate::debug() && now.duration_since(last_snap) >= Duration::from_secs(10) {
             last_snap = now;
