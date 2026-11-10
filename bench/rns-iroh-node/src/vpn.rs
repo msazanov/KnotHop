@@ -6413,7 +6413,19 @@ fn mesh_carrier(ctx: &Arc<ClientCtx>, cand: &CServer) {
                     wait = 2;
                     tried_in_round = 0;
                     drop(ctx);
-                    let reason = conn.closed().await;
+                    let reason = loop {
+                        tokio::select! {
+                            r = conn.closed() => break r,
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                                let Some(ctx) = weak.upgrade() else { continue };
+                                for e in m.take_hop_events() {
+                                    let label = |k: Option<[u8; 32]>| k.map_or("—".to_string(), |k| ctx.servers.lock().unwrap().iter()
+                                        .find(|s| s.key == k).map_or_else(|| mesh_label(&k), |s| s.name.clone()));
+                                    ctx.sh.note(format!("mesh: хоп к {}: {} → {} ({}) {}", label(Some(e.dst)), label(e.old), label(e.new), e.why, e.detail));
+                                }
+                            }
+                        }
+                    };
                     if let Some(ctx) = weak.upgrade() {
                         ctx.sh.note(format!("mesh: сквозное QUIC к {name} завершено: {}", quic_close_kind(Some(&reason))));
                     }

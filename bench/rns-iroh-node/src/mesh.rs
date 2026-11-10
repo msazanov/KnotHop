@@ -165,6 +165,9 @@ pub struct Counters {
     pub drop_queue_full: AtomicU64,
     /// путь mesh тёплого запасного пути: кадров через альтернативный транзит
     pub alt_hops: AtomicU64,
+    /// смены первого хопа своих кадров (любая причина) и срабатывания сторожка застоя
+    pub hop_changes: AtomicU64,
+    pub stall_rotations: AtomicU64,
     /// сколько раз кэши решений сброшены сменой поколения прав
     pub gen_resets: AtomicU64,
 }
@@ -223,6 +226,7 @@ pub struct Mesh {
     /// Подтверждённый сквозной TLS миграционный маршрут: действует только
     /// пока живо соответствующее соединение и не сменилось поколение прав.
     verified_rev: Mutex<HashMap<Key, (Key, usize)>>,
+    hop_events: Mutex<std::collections::VecDeque<HopEvent>>,
     unreach_sent: Mutex<HashMap<(Key, Key), Instant>>,
     /// кэш маршрутов RNS (путь меняется редко, а запрос таблицы путей дорог): 2 с
     routes: Mutex<HashMap<Key, (Option<Key>, Instant)>>,
@@ -304,6 +308,7 @@ impl Mesh {
             auth: Default::default(),
             rev: Default::default(),
             verified_rev: Default::default(),
+            hop_events: Default::default(),
             unreach_sent: Default::default(),
             routes: Default::default(),
             hops: Default::default(),
@@ -563,7 +568,7 @@ impl Mesh {
             "drop_no_route": c.drop_no_route.load(Relaxed), "drop_no_quic": c.drop_no_quic.load(Relaxed), "drop_mtu": c.drop_mtu.load(Relaxed),
             "drop_send_err": c.drop_send_err.load(Relaxed), "rev_learned": c.rev_learned.load(Relaxed),
             "rev_conflict": c.rev_conflict.load(Relaxed), "unreach_sent": c.unreach_sent.load(Relaxed), "unreach_received": c.unreach_received.load(Relaxed), "unreach_removed": c.unreach_removed.load(Relaxed), "drop_id_ambiguous": c.drop_id_ambiguous.load(Relaxed), "drop_recursion": c.drop_recursion.load(Relaxed),
-            "e2e_overflow": c.e2e_overflow.load(Relaxed), "drop_queue_full": c.drop_queue_full.load(Relaxed), "alt_hops": c.alt_hops.load(Relaxed), "gen_resets": c.gen_resets.load(Relaxed),
+            "e2e_overflow": c.e2e_overflow.load(Relaxed), "drop_queue_full": c.drop_queue_full.load(Relaxed), "alt_hops": c.alt_hops.load(Relaxed), "hop_changes": c.hop_changes.load(Relaxed), "stall_rotations": c.stall_rotations.load(Relaxed), "gen_resets": c.gen_resets.load(Relaxed),
             "migration_accepted": c.migration_accepted.load(Relaxed), "migration_changed": c.migration_changed.load(Relaxed), "unreach_marked": c.unreach_marked.load(Relaxed),
             "egress_blocked": iroh::knothop::blocked_egress(), "rev_size": self.rev.lock().unwrap().len(), "e2e_conns": self.e2e.lock().unwrap().ids.len(),
         })
@@ -916,6 +921,11 @@ impl Mesh {
     /// Следующий хоп для СВОИХ кадров (poll_send). Если до `dst` есть прямой носитель (путь IP), mesh - запасной путь и обязан идти МИМО него: через
     /// альтернативный транзит (`alt_transit`). Иначе - путь RNS или обратная таблица, как при пересылке.
     fn next_hop_origin(&self, now: Instant, dst: &Key, policy: &dyn Policy) -> Option<Key> {
+        self.hop_origin_why(now, dst, policy).map(|(k, _)| k)
+    }
+
+    /// `next_hop_origin` с причиной выбора (для журнала смен хопа): stall | verified | alt-direct | rns | alt.
+    fn hop_origin_why(&self, now: Instant, dst: &Key, policy: &dyn Policy) -> Option<(Key, &'static str)> {
         // Локальное решение о застое важнее старого подтверждения от пира:
         // иначе подтверждённый, но замолчавший хоп отменял бы переключение.
         let forced = {
@@ -927,34 +937,34 @@ impl Mesh {
             }
         };
         if let Some(via) = forced {
-            if policy.is_transit(&via) && policy.holds_rights(&via) && self.neighbor(&via).is_ok() { return Some(via); }
+            if policy.is_transit(&via) && policy.holds_rights(&via) && self.neighbor(&via).is_ok() { return Some((via, "stall")); }
         }
         let verified = self.verified_rev.lock().unwrap().get(dst).copied();
         if let Some((via, sid)) = verified {
             let live = self.e2e.lock().unwrap().conns.contains_key(&sid);
             if live && policy.holds_rights(dst)
                 && policy.holds_rights(&via) && policy.is_transit(&via) && self.neighbor(&via).is_ok() {
-                return Some(via);
+                return Some((via, "verified"));
             }
         }
         if self.carrier(dst).is_some() {
             let k = self.alt_transit(dst, policy)?;
             self.c.alt_hops.fetch_add(1, Relaxed);
-            return Some(k);
+            return Some((k, "alt-direct"));
         }
         // Нет ни прямого носителя, ни маршрута RNS через наш QUIC-носитель, ни обратной записи (прямой путь к выходу закрыт, путь RNS идёт через TCP
         // публичного хаба): первым хопом берём транзит с живым QUIC. Это подсказка, не право: пересылку разрешает сам транзит (`may_forward`).
         let routed = self.next_hop_via(now, dst, policy);
         if routed.is_some_and(|k| self.neighbor(&k).is_ok()) {
-            return routed;
+            return routed.map(|k| (k, "rns"));
         }
         if let Some(k) = self.alt_transit(dst, policy) {
             self.c.alt_hops.fetch_add(1, Relaxed);
-            return Some(k);
+            return Some((k, "alt"));
         }
         // Сохраняем диагностическую причину (нет QUIC / слишком мал MTU),
         // когда подходящего запасного транзита тоже нет.
-        routed
+        routed.map(|k| (k, "rns"))
     }
 
     /// Следующая попытка соединения с `dst` идёт через другой транзит (после неудачи; сдвиг в списке кандидатов `alt_transit`).
@@ -1070,7 +1080,12 @@ impl Mesh {
             let refused = retry_until.is_some() && now >= next_rotate && rx_now == rotated_rx
                 && self.hop_peer(&dst).is_some_and(|hop| self.via_failed(&dst, &hop, now));
             if refused || (watch.observe(now, rx_now, st.frame_tx.ack_eliciting_progress(), st.rtt) && retry_until.is_none()) {
+                let old = self.hop_peer(&dst);
+                let gap = watch.pending_since.map_or(0, |s| now.saturating_duration_since(s).as_millis());
                 let rotated = self.rotate_stalled(&dst);
+                self.c.stall_rotations.fetch_add(1, Relaxed);
+                self.push_hop_event(HopEvent { dst, old, new: None, why: "stall-detect",
+                    detail: format!("{} без приёма {gap} мс, rtt {} мс, сменён={rotated}", if refused { "отказ транзита," } else { "застой:" }, st.rtt.as_millis()) });
                 if rotated {
                     retry_until = Some(now + Duration::from_secs(6));
                     retry_at = now + Duration::from_secs(1);
@@ -1317,7 +1332,8 @@ impl Mesh {
         let Some(policy) = self.policy() else { return };
         self.sync_gen(policy.as_ref());
         let now = Instant::now();
-        let res = match self.next_hop_origin(now, dst, policy.as_ref()) {
+        let chosen = self.hop_origin_why(now, dst, policy.as_ref());
+        let res = match chosen.map(|(k, _)| k) {
             None => Err(HopErr::NoRoute),
             Some(next) => self
                 .neighbor(&next)
@@ -1335,9 +1351,27 @@ impl Mesh {
             }
         }
         let proof_hop = res.as_ref().ok().cloned();
+        let old = h.get(dst).and_then(|e| e.res.as_ref().ok().map(|x| x.peer));
         h.insert(*dst, HopEntry { res, at: now });
         drop(h);
+        if let (Some(hop), Some((_, why))) = (&proof_hop, chosen) {
+            if old.is_some_and(|o| o != hop.peer) {
+                self.c.hop_changes.fetch_add(1, Relaxed);
+                self.push_hop_event(HopEvent { dst: *dst, old, new: Some(hop.peer), why, detail: String::new() });
+            }
+        }
         if let Some(hop) = proof_hop { self.send_migration(dst, &hop.peer, &hop.conn); }
+    }
+
+    fn push_hop_event(&self, e: HopEvent) {
+        let mut q = self.hop_events.lock().unwrap();
+        if q.len() >= HOP_EVENTS_MAX { q.pop_front(); }
+        q.push_back(e);
+    }
+
+    /// Забрать накопленные события смены хопа (для журнала клиента). Ключи — только идентификаторы узлов, без адресов.
+    pub fn take_hop_events(&self) -> Vec<HopEvent> {
+        self.hop_events.lock().unwrap().drain(..).collect()
     }
 
     fn warm_if_stale(&self, now: Instant, dst: &Key) {
@@ -1439,6 +1473,18 @@ struct HopEntry {
     res: Result<HopConn, HopErr>,
     at: Instant,
 }
+
+/// Смена первого хопа своих кадров к `dst` (или срабатывание сторожка застоя): для журнала клиента.
+pub struct HopEvent {
+    pub dst: Key,
+    pub old: Option<Key>,
+    pub new: Option<Key>,
+    /// stall | verified | alt-direct | rns | alt | stall-detect
+    pub why: &'static str,
+    pub detail: String,
+}
+
+const HOP_EVENTS_MAX: usize = 32;
 
 #[derive(Default)]
 struct StallWatch {
