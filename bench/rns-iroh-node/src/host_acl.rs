@@ -183,7 +183,10 @@ fn is_public(ip: u32) -> bool { !is_private_or_special(ip) }
 // The nft worker never runs on the packet path and never logs addresses or nft's
 // diagnostics (which contain the input script). Kernel leases are defense in
 // depth; the per-Link TUN ACL remains authoritative, including for active flows.
-const NFT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+// 2 с, не 500 мс: на загруженном хосте с Nice=10 очистка пустых наборов идёт 200–550 мс даже от root без nice (fin1 10.11),
+// тайм-аут убивал nft на полпути — работа впустую, неудача и немедленный повтор (13 неудач в минуту, 11 % CPU cgroup knothopd).
+// Долгая публикация задерживает только сам поток nft; истёкшая 3-секундная аренда закрывает доступ (fail-closed).
+const NFT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const NFT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 const NFT_MIN_UPDATE: std::time::Duration = std::time::Duration::from_millis(100);
 // Холодный exec nft на загруженном 1-CPU хосте (Nice=10) дольше штатных 500 мс: стартовая очистка получает запас и повторы.
