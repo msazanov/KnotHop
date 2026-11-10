@@ -366,6 +366,11 @@ fn nft_batch(pool: (u32, u8), clients: &HashSet<u32>, inventory: &Inventory) -> 
         bail!("invalid or oversized host-access nft snapshot");
     }
     let mut script = NFT_CLEAR.to_owned();
+    // Правило требует и источник в host_access_v4, и назначение в host_access_dest_v4: без клиентов набор назначений ничего не
+    // разрешает. Не публикуем его, иначе ежесекундное продление его аренды запускало nft и при пустом доступе (fin1 10.11).
+    if clients.is_empty() {
+        return Ok(script);
+    }
     for (name, entries) in [("host_access_v4", clients), ("host_access_dest_v4", &inventory.host_allow)] {
         if entries.is_empty() { continue; }
         let mut entries: Vec<_> = entries.iter().copied().collect();
@@ -507,6 +512,7 @@ mod tests {
         // Revoke/disconnect clears clients without retaining any previous source.
         let revoke = nft_batch(pool, &HashSet::new(), &inv).unwrap();
         assert!(!revoke.contains("add element inet knothop host_access_v4"));
+        assert_eq!(revoke, NFT_CLEAR, "без клиентов набор назначений не публикуется: правило требует оба набора");
         assert_eq!(nft_batch(pool, &HashSet::new(), &Inventory::default()).unwrap(), NFT_CLEAR);
         let mut bad = inv.clone();
         bad.host_allow.insert(ip("10.1.2.4"));
