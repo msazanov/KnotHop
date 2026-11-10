@@ -268,6 +268,20 @@ impl leviculum_std::api::CoreProcessor for PnProcessor {
     }
 }
 
+/// Наибольшая стоимость ключа пиринга, которую объявивший её PN может потребовать от нас. Ключ подбирается перебором SHA-256
+/// (~2^cost попыток) в отдельном потоке; штатный предел 26 на сервере с 1 CPU отнимал у транзита VPN до половины процессора
+/// часами (perf на uae 10.11: 41 % — `sha256_compress` потока добычи). 18 — стоимость Python LXMF по умолчанию, наши PN объявляют 1.
+pub const PN_REMOTE_PEERING_COST_MAX: u8 = 18;
+
+/// Таблица пиров PN на диске: добытые ключи пиринга переживают перезапуск (раньше `MemoryPeerStore` — перебор заново
+/// после каждого рестарта и каждого релиза автообновления). Файл не читается — таблица пустая, как в памяти.
+fn peer_store(dir: &Path) -> Box<dyn leviculum_lxmf::peering::PeerStore + Send> {
+    match dir.parent().map(|p| p.join("pn-peers.msgpack")).map(leviculum_std::FilePeerStore::open) {
+        Some(Ok(s)) => Box::new(s),
+        _ => Box::new(leviculum_lxmf::peering::MemoryPeerStore::default()),
+    }
+}
+
 /// Штатный PN engine, а не ещё один протокол хранилища. Только серверы; постоянный store вне стираемого lev-role,
 /// `PN_CAP_BYTES`, bounded transfer/fetch. Возвращается сразу: хранилище открывается и подрезается в потоке `lxmf-pn-load`.
 pub fn propagation_processor(state: &Path, identity: Identity) -> anyhow::Result<PnProcessor> { spawn_pn(state, identity, PnLimits::auto(state), None) }
@@ -275,7 +289,7 @@ pub fn propagation_processor(state: &Path, identity: Identity) -> anyhow::Result
 /// `hold` — тестовые ворота: фон не начинает загрузку, пока не придёт сигнал (или не закроется канал).
 fn spawn_pn(state: &Path, identity: Identity, limits: PnLimits, hold: Option<mpsc::Receiver<()>>) -> anyhow::Result<PnProcessor> {
     use lnpnd::engine::{Engine, EngineConfig};
-    use leviculum_lxmf::{PropagationNodeConfig, peering::{PeeringConfig, MemoryPeerStore}};
+    use leviculum_lxmf::{PropagationNodeConfig, peering::PeeringConfig};
     use leviculum_std::FilePropagationStore;
     use std::{os::unix::fs::PermissionsExt, sync::atomic::Ordering::Relaxed};
     let dir = state.join("lxmf/propagation");
@@ -304,8 +318,8 @@ fn spawn_pn(state: &Path, identity: Identity, limits: PnLimits, hold: Option<mps
             node_config: PropagationNodeConfig { transfer_limit_kb:16, sync_limit_kb:64,
                 serve_cap_bytes:Some(64*1024), message_expiry_secs:MESSAGE_EXPIRY_S, name:None, ..Default::default() },
             announce_interval_secs:600, announce_delay_secs:if cfg!(test) {2} else {20}, announce_at_start:false,
-            peering:PeeringConfig { max_peers:8, max_inbound_syncs:2, ..Default::default() },
-            peer_store:Box::new(MemoryPeerStore::default()), control_allowed:vec![], auth_allowed:None,
+            peering:PeeringConfig { max_peers:8, max_inbound_syncs:2, remote_peering_cost_max:PN_REMOTE_PEERING_COST_MAX, ..Default::default() },
+            peer_store:peer_store(&dir), control_allowed:vec![], auth_allowed:None,
             mailbox:None, store_limit_bytes:limits.cap_bytes, delivery_limit_kb:8,
         });
         st.trimmed.store(trimmed as u64, Relaxed);
@@ -353,6 +367,30 @@ mod tests {
         assert_eq!(PnLimits::for_cap(PN_CAP_BYTES), PnLimits::default());
         let auto = PnLimits::auto(&std::env::temp_dir());
         assert!(auto.cap_bytes >= PN_CAP_BYTES && auto.cap_bytes <= PN_CAP_AUTO_MAX);
+    }
+
+    #[test]
+    fn pn_peering_keys_survive_restart_and_cost_is_capped() {
+        use leviculum_lxmf::peering::{PeerRecord, PeerTraffic};
+        assert!(PN_REMOTE_PEERING_COST_MAX <= 18, "дорогой ключ пиринга отнимает CPU у транзита на 1-CPU узлах");
+        let tmp = std::env::temp_dir().join(format!("kh-pn-peers-{}-{}", std::process::id(), now_secs()));
+        let dir = tmp.join("lxmf/propagation");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = PeerRecord {
+            destination_hash: [5; 16], identity_hash: Some([6; 16]), public_keys: Some([7; 64]),
+            peering_key: Some(([9; 32], 18)), transfer_limit_kb: 4, sync_limit_kb: 32, stamp_cost: 16,
+            stamp_cost_flexibility: 3, peering_cost: 18, peering_timebase: 1, last_heard: 2, cursor: 0,
+            is_static: false, traffic: PeerTraffic::default(),
+        };
+        {
+            let mut s = peer_store(&dir);
+            s.save(&rec).unwrap();
+        } // Drop дописывает файл
+        let got = peer_store(&dir).load_all().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].peering_key, Some(([9; 32], 18)), "добытый ключ пиринга не должен теряться при рестарте");
+        assert!(tmp.join("lxmf/pn-peers.msgpack").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
