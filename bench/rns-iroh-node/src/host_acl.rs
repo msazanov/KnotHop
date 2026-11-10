@@ -264,6 +264,7 @@ impl NftHostAccess {
         std::thread::Builder::new().name("host-nft-refresh".into()).spawn(move || {
             let mut failing = false;
             let mut next_update = std::time::Instant::now();
+            let mut last_empty_ok: Option<std::time::Instant> = None;
             loop {
                 // Coalesce event storms: at most ten publications/s, including
                 // authenticated reconnect churn; unauthenticated close is not a wakeup.
@@ -283,7 +284,19 @@ impl NftHostAccess {
                     Some((clients, inventory)) => nft_batch(self.pool, &clients, &inventory),
                     None => Ok(NFT_CLEAR.to_owned()),
                 };
+                // Пустой снимок уже опубликован: наборы очищены, аренд для продления нет. Запуск `nft` каждую секунду разбирает весь
+                // набор правил хоста (fin1 10.11: 11 % CPU cgroup knothopd). Повтор очистки — раз в NFT_EMPTY_REPUBLISH; любое
+                // изменение или непустой снимок публикуются как раньше.
+                let now = std::time::Instant::now();
+                if skip_empty_republish(script.as_deref().ok(), last_empty_ok, now) {
+                    drop(tun);
+                    next_update = now + NFT_MIN_UPDATE;
+                    let _ = recv.recv_timeout(NFT_TICK);
+                    continue;
+                }
+                let empty = script.as_deref().is_ok_and(|s| s == NFT_CLEAR);
                 let success = script.and_then(|script| run_nft(self.program, &script, NFT_TIMEOUT)).is_ok();
+                last_empty_ok = (success && empty).then_some(now);
                 use std::sync::atomic::Ordering::Relaxed;
                 if success {
                     NFT_PUBLISH_OK.fetch_add(1, Relaxed);
@@ -305,6 +318,14 @@ impl NftHostAccess {
         }).context("start host-access nft worker")?;
         Ok(())
     }
+}
+
+/// Пустые наборы, уже очищенные успешной публикацией, переочищаются не чаще этого.
+const NFT_EMPTY_REPUBLISH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Пропустить публикацию: снимок пуст (только очистка), прошлая публикация была той же очисткой и успешной, и она свежая.
+fn skip_empty_republish(script: Option<&str>, last_empty_ok: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    script == Some(NFT_CLEAR) && last_empty_ok.is_some_and(|t| now.saturating_duration_since(t) < NFT_EMPTY_REPUBLISH)
 }
 
 fn authorized_clients(
@@ -403,6 +424,21 @@ mod tests {
     use super::*;
 
     fn ip(s: &str) -> u32 { u32::from(s.parse::<Ipv4Addr>().unwrap()) }
+
+    #[test]
+    fn empty_snapshot_is_not_republished_every_tick_but_changes_and_leases_are() {
+        let t0 = std::time::Instant::now();
+        // первая очистка публикуется всегда
+        assert!(!skip_empty_republish(Some(NFT_CLEAR), None, t0));
+        // повтор пустого снимка после успешной очистки — пропуск до NFT_EMPTY_REPUBLISH
+        assert!(skip_empty_republish(Some(NFT_CLEAR), Some(t0), t0 + std::time::Duration::from_secs(5)));
+        assert!(!skip_empty_republish(Some(NFT_CLEAR), Some(t0), t0 + NFT_EMPTY_REPUBLISH));
+        // непустой снимок (аренды клиентов) публикуется каждый раз
+        let leased = format!("{NFT_CLEAR}add element inet knothop host_access_v4 {{ 10.0.0.2 timeout 3s }}\n");
+        assert!(!skip_empty_republish(Some(&leased), Some(t0), t0));
+        // ошибка сборки снимка не пропускается: путь отказа очищает наборы
+        assert!(!skip_empty_republish(None, Some(t0), t0));
+    }
 
     #[test]
     fn destination_classes_keep_remote_private_and_other_clients_denied() {
