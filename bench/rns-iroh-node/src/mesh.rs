@@ -87,6 +87,10 @@ const HOP_MAX: usize = 256;
 const STALL_HOP_TTL: Duration = Duration::from_secs(300);
 /// Сколько не выбирать повторно транзит, отказавший для этого назначения (застой или явное «нет пути»).
 const FAILED_VIA_TTL: Duration = Duration::from_secs(60);
+/// Потолок нарастающей пометки повторно отказывающего транзита (60 с, 2, 4, 8 мин, 15 мин).
+const FAILED_VIA_TTL_MAX: Duration = Duration::from_secs(15 * 60);
+/// Столько подряд принимать через новый хоп, чтобы считать его рабочим и простить прежние отказы.
+const VIA_PROVEN_AFTER: Duration = Duration::from_secs(20);
 /// Сколько сквозных соединений и пиров с ними помечаем (больше - соединение закрывается: непомеченное могло бы стать «соседом» mesh).
 const E2E_MAX: usize = 256;
 const BUCKET_MAX_NBR: usize = 256;
@@ -242,6 +246,9 @@ pub struct Mesh {
     stall_hops: Mutex<HashMap<Key, (Key, Instant)>>,
     /// (назначение, транзит) -> до какого момента не выбирать при смене транзита
     failed_via: Mutex<HashMap<(Key, Key), Instant>>,
+    /// подряд отказов транзита к dst: срок пометки растёт вдвое (`FAILED_VIA_TTL` .. `FAILED_VIA_TTL_MAX`); сброс — после
+    /// `VIA_PROVEN_AFTER` приёма через него. Иначе неисправный сосед (de 10.11) снова попадал в ротацию каждые 60 с.
+    via_fails: Mutex<HashMap<(Key, Key), u32>>,
     /// Прямые адреса выходов, реально подтверждённые двусторонней передачей >1 МиБ через этот конкретный IP-путь.
     confirmed_direct: Mutex<HashMap<std::net::SocketAddr, Instant>>,
     hop_pending: Mutex<std::collections::HashSet<Key>>,
@@ -319,6 +326,7 @@ impl Mesh {
             alt_rot: Default::default(),
             stall_hops: Default::default(),
             failed_via: Default::default(),
+            via_fails: Default::default(),
             confirmed_direct: Default::default(),
             hop_pending: Default::default(),
             hop_req: Mutex::new(hop_tx),
@@ -552,6 +560,7 @@ impl Mesh {
             self.verified_rev.lock().unwrap().clear();
             self.stall_hops.lock().unwrap().clear();
             self.failed_via.lock().unwrap().clear();
+            self.via_fails.lock().unwrap().clear();
             self.c.gen_resets.fetch_add(1, Relaxed);
         }
     }
@@ -758,10 +767,25 @@ impl Mesh {
             let mut failed = self.failed_via.lock().unwrap();
             if failed.len() >= HOP_MAX { failed.retain(|_, until| now < *until); }
             if failed.len() < HOP_MAX {
-                failed.insert((dst, *prev), now + FAILED_VIA_TTL);
+                failed.insert((dst, *prev), now + self.failed_ttl(&dst, prev));
                 self.c.unreach_marked.fetch_add(1, Relaxed);
             }
         }
+    }
+
+    /// Отказ транзита `via` к `dst`: следующий срок пометки (вдвое длиннее предыдущего подряд идущего отказа).
+    fn failed_ttl(&self, dst: &Key, via: &Key) -> Duration {
+        let mut f = self.via_fails.lock().unwrap();
+        if f.len() >= HOP_MAX * 4 && !f.contains_key(&(*dst, *via)) { f.clear(); }
+        let n = f.entry((*dst, *via)).or_insert(0);
+        let ttl = FAILED_VIA_TTL.saturating_mul(1u32 << (*n).min(5)).min(FAILED_VIA_TTL_MAX);
+        *n = n.saturating_add(1);
+        ttl
+    }
+
+    /// Через `via` к `dst` устойчиво принимаем: прежние отказы прощены.
+    fn via_proven(&self, dst: &Key, via: &Key) {
+        self.via_fails.lock().unwrap().remove(&(*dst, *via));
     }
 
     fn via_failed(&self, dst: &Key, via: &Key, now: Instant) -> bool {
@@ -1032,7 +1056,7 @@ impl Mesh {
             let mut failed = self.failed_via.lock().unwrap();
             failed.retain(|_, until| now < *until);
             if let Some(o) = old {
-                if failed.len() < HOP_MAX { failed.insert((*dst, o), now + FAILED_VIA_TTL); }
+                if failed.len() < HOP_MAX { failed.insert((*dst, o), now + self.failed_ttl(dst, &o)); }
             }
             // Если отказали все, выбирать из всех: остаться совсем без транзита хуже.
             let fresh: Vec<_> = candidates.iter().copied().filter(|k| !failed.contains_key(&(*dst, *k))).collect();
@@ -1070,6 +1094,8 @@ impl Mesh {
         let mut retry_at = Instant::now();
         let mut selected_ip: Option<std::net::SocketAddr> = None;
         let (mut rotated_rx, mut next_rotate) = (0u64, Instant::now());
+        // (хоп, с какого момента, приём на тот момент, уже прощён): устойчивый приём через хоп снимает его прежние отказы
+        let mut on_hop: Option<(Key, Instant, u64, bool)> = None;
         loop {
             tick.tick().await;
             if conn.close_reason().is_some() { break; }
@@ -1098,6 +1124,16 @@ impl Mesh {
                 self.revoke_direct(&sa);
             }
             let rx_now = st.frame_rx.authenticated_progress();
+            match (self.hop_peer(&dst), on_hop.as_mut()) {
+                (Some(h), Some((cur, since, rx0, done))) if *cur == h => {
+                    if !*done && now.saturating_duration_since(*since) >= VIA_PROVEN_AFTER && rx_now > *rx0 && watch.pending_since.is_none() {
+                        self.via_proven(&dst, &h);
+                        *done = true;
+                    }
+                }
+                (Some(h), _) => on_hop = Some((h, now, rx_now, false)),
+                (None, _) => on_hop = None,
+            }
             // После смены транзита новый сам ответил «нет пути», и данных через него не пришло: окно ожидания незачем досиживать.
             // Без условия на приём уведомление бросало бы рабочий транзит.
             let refused = retry_until.is_some() && now >= next_rotate && rx_now == rotated_rx
@@ -1106,6 +1142,7 @@ impl Mesh {
                 let old = self.hop_peer(&dst);
                 let gap = watch.pending_since.map_or(0, |s| now.saturating_duration_since(s).as_millis());
                 let rotated = self.rotate_stalled(&dst);
+                on_hop = None;
                 self.c.stall_rotations.fetch_add(1, Relaxed);
                 self.push_hop_event(HopEvent { dst, old, new: None, why: "stall-detect",
                     detail: format!("{} без приёма {gap} мс, rtt {} мс, сменён={rotated}", if refused { "отказ транзита," } else { "застой:" }, st.rtt.as_millis()) });
@@ -1130,8 +1167,12 @@ impl Mesh {
         let mut backoff = Duration::from_secs(30);
         let mut next_try = Instant::now() + Duration::from_millis(400);
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if conn.close_reason().is_some() { break; }
+            // Закрытие — по событию, время попытки — до замка соединения: `close_reason()` берёт его, и опрос раз в 500 мс при паузе
+            // в 30+ с был лишним ожиданием рабочего потока tokio на вытесненном драйвере соединения (fin1 10.11: до 2,2 с).
+            tokio::select! {
+                _ = conn.closed() => break,
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
             if Instant::now() < next_try { continue; }
             let paths = conn.paths();
             if !paths.iter().any(|p| p.is_selected() && is_mesh_addr(p.remote_addr())) {

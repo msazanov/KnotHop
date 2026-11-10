@@ -2360,6 +2360,18 @@ async fn stall_pin_is_dropped_when_its_transit_loses_the_carrier() {
     assert_eq!(a.mesh.next_hop_origin(now, &e.id(), a.pol.as_ref()), Some(t1.id()), "вернувшийся носитель не перехватывает трафик");
 }
 
+/// Повторно отказывающий транзит помечается всё дольше (до 15 мин), устойчивый приём через него прощает отказы.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeatedly_failing_transit_is_excluded_longer_until_proven() {
+    let a = node().await;
+    let (dst, bad, good) = ([7u8; 32], [8u8; 32], [9u8; 32]);
+    let secs: Vec<u64> = (0..7).map(|_| a.mesh.failed_ttl(&dst, &bad).as_secs()).collect();
+    assert_eq!(secs, vec![60, 120, 240, 480, 900, 900, 900], "срок пометки растёт вдвое до потолка");
+    assert_eq!(a.mesh.failed_ttl(&dst, &good).as_secs(), 60, "счёт ведётся по паре (dst, транзит)");
+    a.mesh.via_proven(&dst, &bad);
+    assert_eq!(a.mesh.failed_ttl(&dst, &bad).as_secs(), 60, "после подтверждённой работы — снова с минуты");
+}
+
 /// Уведомление «нет пути» не уводит с рабочего транзита, но отказавший транзит не выбирается при настоящем застое.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_unreachable_only_excludes_transit_from_stall_rotation() {

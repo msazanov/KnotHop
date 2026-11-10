@@ -4632,6 +4632,9 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
             ctx.debug_snapshot();
         }
 
+        // Тело — синхронные замки (соседи, Link, ядро RNS, перепись интерфейсов). На рабочем потоке tokio их ожидание под нагрузкой
+        // останавливало остальные задачи, включая QUIC туннеля (fin1 10.11). `block_in_place` отдаёт эти задачи другому потоку.
+        blocking_section(|| {
         // сторож слушателя: если сокет пропал (смена сетевых интерфейсов и т. п.), завершаемся - systemd перезапустит
         if tick % 10 == 0 {
             if !ctx.ep.bound_sockets().iter().any(|a| a.port() == ctx.listen_port) {
@@ -4859,6 +4862,16 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
                 "pn": lxmf_sync::pn_status(), "table": ctx.t13.as_ref().map(|t| { let p = t.peers.lock().unwrap(); serde_json::json!({"peers": p.live().count(), "contacts": p.contact_list().len(), "controllers": p.controllers().len(), "transit": p.config().transit_enabled, "exit": p.config().exit_enabled}) })});
             crate::bgwrite::put(&ctx.state.join("status.json"), st.to_string().into_bytes(), Duration::from_secs(20));
         }
+        });
+    }
+}
+
+/// Синхронный участок с замками внутри async-задачи: на многопоточном рантайме — `block_in_place` (задачи этого рабочего
+/// потока переходят к другому), иначе (однопоточный рантайм тестов) — как есть.
+fn blocking_section<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
     }
 }
 
