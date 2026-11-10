@@ -11,6 +11,16 @@ pub fn presence(authenticated_contact: bool, reporters: usize) -> &'static str {
     if authenticated_contact { "alive" } else if reporters > 0 { "reported" } else { "unknown" }
 }
 
+/// Присутствие с локальной пометкой: «dead» — только наше собственное заключение (не ответил ни напрямую, ни через транзит, и
+/// никто из соседей его недавно не видел); любое свидетельство сильнее. «seen» — сосед слышал его недавно, но живого Link нет.
+pub fn presence_local(authenticated_contact: bool, reporters: usize, seen_recently: bool, marked_dead: bool) -> &'static str {
+    match presence(authenticated_contact, reporters) {
+        "unknown" if seen_recently => "seen",
+        "unknown" if marked_dead => "dead",
+        p => p,
+    }
+}
+
 /// Per admitted client; a hidden UI needs no continuous topology/RTT updates.
 pub struct Subscription {
     visible: bool,
@@ -89,6 +99,15 @@ mod tests {
         assert!(!((received + Duration::from_secs(90)).duration_since(received) < ttl));
         assert_eq!(presence(false, usize::from(Duration::from_secs(90) < ttl)), "unknown");
         assert_eq!(report_ttl(&json!({"ttl": u64::MAX})), Duration::from_secs(210));
+    }
+
+    #[test]
+    fn local_dead_mark_yields_to_any_evidence() {
+        assert_eq!(presence_local(false, 0, false, true), "dead");
+        assert_eq!(presence_local(false, 0, true, true), "seen", "сосед видел недавно — не мёртв");
+        assert_eq!(presence_local(false, 1, false, true), "reported");
+        assert_eq!(presence_local(true, 0, false, true), "alive");
+        assert_eq!(presence_local(false, 0, false, false), "unknown", "отсутствие сведений — не смерть");
     }
 
     #[test]

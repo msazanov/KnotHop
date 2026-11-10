@@ -5,6 +5,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 
 final class Util {
+    /** «N с» / «N мин» для подписи «сосед видел … назад». */
+    static String agoText(long seconds) {
+        if (seconds < 0) seconds = 0;
+        return seconds < 90 ? seconds + " с" : (seconds / 60) + " мин";
+    }
+
     /** Лабораторная сборка (build.sh с KNOTHOP_LAB=1 меняет значение): управление по интентам и подробные логи. В обычной сборке выключено. */
     static final boolean LAB_BUILD = false;
 

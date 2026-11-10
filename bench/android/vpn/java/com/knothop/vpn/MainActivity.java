@@ -1023,7 +1023,12 @@ public class MainActivity extends Activity {
             JSONObject e = ex.optJSONObject(i);
             if (e == null) continue;
             String dest = e.optString("d", ""), name = TopologyView.shortName(e.optString("n", "?"));
-            String state = dest.equals(activeDest) ? "связь установлена" : "fail".equals(e.optString("lk")) ? "нет связи" : "доступность неизвестна";
+            String presence = e.optString("presence", "unknown");
+            String state = dest.equals(activeDest) ? "связь установлена"
+                : "dead".equals(presence) ? "не отвечает, соседи не видели (выберите, чтобы проверить снова)"
+                : "seen".equals(presence) && !e.isNull("seen_s") ? "сосед видел " + Util.agoText(e.optLong("seen_s")) + " назад"
+                : "reported".equals(presence) ? "жив по данным соседей"
+                : "fail".equals(e.optString("lk")) ? "нет связи" : "доступность неизвестна";
             String detail = "";
             if (Util.debug) {
                 String vis = e.optString("vis", "none"), carrier = TopologyView.carrierName(e.optString("c", "none"));

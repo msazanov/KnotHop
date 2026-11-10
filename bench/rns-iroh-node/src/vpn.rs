@@ -634,6 +634,8 @@ const T_NBRS: u8 = 16;     // выход -> клиент: соседи с жив
 // 17 свободен: бывший T_DIR; адреса соседей приходят в `accept` (контакты), каталога нет (ADR 0028)
 /// Advisory observations are bounded by both count and negotiated Channel MDU.
 const NBRS_MAX: usize = crate::observations::MAX_NEIGHBORS;
+/// Сосед без Link, услышанный не раньше этого, сообщается клиенту как «видел N с назад».
+const NBR_SEEN_MAX: Duration = Duration::from_secs(600);
 const T_OBSERVE: u8 = 21; // admitted client -> exit: UI visible (one byte 0/1), request fresh T_NBRS
 /// сосед-сервер -> сосед-сервер: клиенты-узлы (якорь/TRANSIT/EXIT) с их именем {"c":[{"k","n"}]};
 /// получатель проверяет права ключа по своим записям, держит не дольше CINFO_TTL; только для отображения
@@ -1527,11 +1529,15 @@ pub struct CarrierCtl {
     pub up_epoch: std::sync::atomic::AtomicU32,
     /// подряд неудачных наборов (QUIC и TCP) на данный момент: по нему статус P2P-контакта говорит «не отвечает», а не «подключаюсь»
     pub misses: std::sync::atomic::AtomicU32,
+    /// Клиент, узел с ролями (EXIT/TRANSIT): «жив ли он где-то ещё» — сквозное соединение через транзит, свежий контакт или
+    /// сосед недавно его видел. Только при `false` недозвон делает узел мёртвым (`Liveness::missed`); узел за DPI, живой через
+    /// транзит, мёртвым не становится. `None` — прежнее поведение (ровный темп 2 с без пометки).
+    pub elsewhere: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
 }
 
 impl CarrierCtl {
     fn new() -> Arc<Self> {
-        Arc::new(Self { prefer_tcp: AtomicBool::new(false), mode: Mutex::new("none"), dead: AtomicBool::new(false), switches: Default::default(), generation: Default::default(), fails: Default::default(), rtt_us: Default::default(), label: Mutex::new(String::new()), peer: Mutex::new(String::new()), silence: Mutex::new(None), joint_fail: Mutex::new(None), up_epoch: Default::default(), misses: Default::default() })
+        Arc::new(Self { prefer_tcp: AtomicBool::new(false), mode: Mutex::new("none"), dead: AtomicBool::new(false), switches: Default::default(), generation: Default::default(), fails: Default::default(), rtt_us: Default::default(), label: Mutex::new(String::new()), peer: Mutex::new(String::new()), silence: Mutex::new(None), joint_fail: Mutex::new(None), up_epoch: Default::default(), misses: Default::default(), elsewhere: Mutex::new(None) })
     }
     fn set_mode(&self, m: &'static str) {
         // `generation` тут не растёт: смена носителя интерфейс пира (`mux.rs`) не пересоздаёт и Link не рвёт; растёт `Dialer::mux_for`
@@ -1749,6 +1755,38 @@ mod liveness_tests {
             assert_eq!(c.missed(&sh, &cc, "x"), Duration::from_secs(2));
         }
         assert!(!c.dead && !cc.dead.load(Relaxed));
+    }
+
+    #[test]
+    fn role_node_dies_only_when_not_alive_elsewhere_and_wakes_on_attempt() {
+        let sh = Shared::new();
+        let book = Addrs::new(vec!["a".into()]);
+        // жив через транзит (или сосед видел): прямой недозвон его не убивает, темп прежний
+        let cc = CarrierCtl::new();
+        *cc.elsewhere.lock().unwrap() = Some(Arc::new(|| true));
+        let mut l = Liveness { may_die: false, miss: 0, dead: false, seen_gen: book.epoch() };
+        for _ in 0..DEAD_AFTER * 2 {
+            assert_eq!(l.missed(&sh, &cc, "fin"), Duration::from_secs(2));
+        }
+        assert!(!l.dead && !cc.dead.load(Relaxed), "узел за DPI, живой через транзит, — не мёртв");
+        // нигде не жив: после DEAD_AFTER промахов — мёртв, редкая перепроверка
+        let cc = CarrierCtl::new();
+        let alive = Arc::new(AtomicBool::new(false));
+        let a2 = alive.clone();
+        *cc.elsewhere.lock().unwrap() = Some(Arc::new(move || a2.load(Relaxed)));
+        let mut l = Liveness { may_die: false, miss: 0, dead: false, seen_gen: book.epoch() };
+        for _ in 1..DEAD_AFTER {
+            assert_eq!(l.missed(&sh, &cc, "de"), Duration::from_secs(2));
+        }
+        assert_eq!(l.missed(&sh, &cc, "de"), ROLE_DEAD_RECHECK);
+        assert!(l.dead && cc.dead.load(Relaxed));
+        // ручной выбор / смена сети / свидетельство соседа будят (Addrs::wake): пометка снята, счёт заново
+        book.wake();
+        assert!(l.woken(&cc, book.epoch()) && !l.dead && !cc.dead.load(Relaxed) && l.miss == 0);
+        // сосед видел его: снова не умирает
+        alive.store(true, Relaxed);
+        for _ in 0..DEAD_AFTER * 2 { l.missed(&sh, &cc, "de"); }
+        assert!(!l.dead);
     }
 }
 
@@ -2222,6 +2260,8 @@ const DEAD_AFTER: u32 = 8;
 const MISS_BASE_MS: u64 = 2_000;
 /// Страховка от потерянного анонса: мёртвого соседа раз в час проверяем одной попыткой.
 const DEAD_RECHECK: Duration = Duration::from_secs(3600);
+/// Мёртвый узел с ролями у клиента перепроверяется чаще соседа-узла: выход нужен пользователю.
+const ROLE_DEAD_RECHECK: Duration = Duration::from_secs(600);
 
 fn miss_pause(miss: u32) -> Duration {
     let k = u64::from(miss.clamp(1, DEAD_AFTER));
@@ -2263,7 +2303,20 @@ impl Liveness {
         self.miss = self.miss.saturating_add(1);
         ctl.misses.store(self.miss, Relaxed);
         if !self.may_die {
-            // клиент и seed: прежний ровный темп, телефон после смены сети не должен ждать минутами
+            // Узел с ролями у клиента: ровный темп 2 с (после смены сети не ждать минутами), пока он не признан мёртвым — не
+            // отвечает DEAD_AFTER наборов подряд И не жив нигде ещё. Мёртвый перепроверяется раз в ROLE_DEAD_RECHECK; будят его
+            // смена сети, свежий анонс, сосед, видевший его недавно, и ручной выбор (`Addrs::wake`).
+            let elsewhere = ctl.elsewhere.lock().unwrap().clone();
+            if let Some(f) = elsewhere {
+                if self.miss >= DEAD_AFTER && !f() {
+                    if !self.dead {
+                        self.dead = true;
+                        ctl.dead.store(true, Relaxed);
+                        sh.note(format!("{label}: не отвечает ни напрямую, ни через транзит, соседи его не видели — считаю мёртвым (перепроверка раз в {} мин, при смене сети, анонсе или ручном выборе)", ROLE_DEAD_RECHECK.as_secs() / 60));
+                    }
+                    return ROLE_DEAD_RECHECK;
+                }
+            }
             return Duration::from_secs(2);
         }
         if self.miss >= DEAD_AFTER {
@@ -2406,7 +2459,7 @@ async fn dial_direct(ep: Endpoint, node: Arc<Node>, sh: Arc<Shared>, label: Stri
                     }
                     let p = live.missed(sh, ctl, label);
                     // переход на TCP не откладываем: «лучше в обход, чем разрыв»; у мёртвого соседа - ждём анонса
-                    let p = if ctl.prefer_tcp.load(Relaxed) && p < DEAD_RECHECK { Duration::from_secs(2) } else { p };
+                    let p = if ctl.prefer_tcp.load(Relaxed) && !live.dead { Duration::from_secs(2) } else { p };
                     d.book.pause(p).await;
                 }
             }
@@ -3374,6 +3427,17 @@ impl NodeCtx {
         // соседи-транзиты - серверы (телефон транзитом пока не бывает)
         let mut out: Vec<serde_json::Value> = v.iter().take(NBRS_MAX)
             .map(|(d, r, nm)| serde_json::json!({"d": hex(d), "r": r.map(|x| x.round() as i64), "n": nm.chars().take(32).collect::<String>()})).collect();
+        // Соседи без живого Link, но аутентифицированно слышанные недавно: «видел N с назад» ("s":1, "a" — секунды). Не ребро, а
+        // подсказка клиенту, что узел жив (снимает его локальную пометку «мёртв»); давнее молчание не сообщаем — отсутствие не смерть.
+        let linked: HashSet<[u8; 16]> = v.iter().map(|x| x.0).collect();
+        let now = Instant::now();
+        let mut seen: Vec<([u8; 16], u64, String)> = self.neigh.lock().unwrap().values()
+            .filter(|nb| !linked.contains(&nb.dest) && now.duration_since(nb.last_heard) <= NBR_SEEN_MAX)
+            .map(|nb| (nb.dest, now.duration_since(nb.last_heard).as_secs(), nb.name.clone()))
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        out.extend(seen.iter().take(NBRS_MAX.saturating_sub(out.len()))
+            .map(|(d, a, nm)| serde_json::json!({"d": hex(d), "s": 1, "a": a, "n": nm.chars().take(32).collect::<String>()})));
         // Клиенты с правами узла сети (якорь, TRANSIT или EXIT), например телефон-админ - свои и сообщённые соседями (T_CINFO):
         // только имя ("c":1), ребром соседа они не становятся. Рядовых пользователей (только USE) другим клиентам не раскрываем.
         let mut cl: Vec<([u8; 16], String)> = self.node_clients().into_iter().map(|(pk, n)| (dest_from_pub_tag(&pk, T13_TAG), n)).collect();
@@ -5118,9 +5182,22 @@ struct NbrReport {
     received: Instant,
     ttl: Duration,
     neighbors: Vec<([u8; 16], Option<f64>)>,
+    /// соседи без живого Link, которых выход аутентифицированно слышал: (dest, секунд назад на момент отчёта)
+    seen: Vec<([u8; 16], u64)>,
 }
 impl NbrReport {
     fn fresh(&self) -> bool { self.received.elapsed() < self.ttl }
+    /// Сколько секунд назад этот отчёт свидетельствует о живом `dest` (живой Link — на момент отчёта).
+    fn seen_ago(&self, dest: &[u8; 16]) -> Option<u64> {
+        let base = self.received.elapsed().as_secs();
+        if self.neighbors.iter().any(|(d, _)| d == dest) { return Some(base); }
+        self.seen.iter().find(|(d, _)| d == dest).map(|(_, a)| base.saturating_add(*a))
+    }
+}
+
+/// Самое свежее свидетельство соседей о живом `dest` (секунд назад) среди свежих отчётов, не старше `NBR_SEEN_MAX`.
+fn nbr_seen_ago(reports: &NbrsMap, dest: &[u8; 16]) -> Option<u64> {
+    reports.values().filter(|r| r.fresh()).filter_map(|r| r.seen_ago(dest)).filter(|a| *a <= NBR_SEEN_MAX.as_secs()).min()
 }
 type NbrsMap = HashMap<[u8; 16], NbrReport>;
 
@@ -5275,6 +5352,24 @@ impl ClientCtx {
     }
 
     /// Общее хранилище адресов выхода для диалера (создаётся по требованию).
+    /// Узел жив где-то ещё, кроме прямого набора: сквозное соединение/носитель к его ключу, свежий контакт с ним как с выходом,
+    /// успешный Link недавно или сосед видел его не раньше `NBR_SEEN_MAX`. Отсутствие всего этого — ещё не смерть: решает
+    /// вместе с серией недозвонов `Liveness::missed`.
+    fn alive_elsewhere(&self, dest: &[u8; 16], key: &[u8; 32]) -> bool {
+        if dataplane::plane().has_carrier(key) { return true; }
+        if self.cur.lock().unwrap().is_some_and(|c| c.0 == *dest)
+            && (now_ms() as u64).saturating_sub(self.last_pong.load(Relaxed)) <= NBR_SEEN_MAX.as_millis() as u64 { return true; }
+        if self.qstat.lock().unwrap().get(dest).and_then(|q| q.last_ok).is_some_and(|t| t.elapsed() <= NBR_SEEN_MAX) { return true; }
+        nbr_seen_ago(&self.nbrs.lock().unwrap(), dest).is_some()
+    }
+
+    /// Снять пометку «мёртв» и набрать сразу (ручной выбор, смена сети, свидетельство соседа).
+    fn wake_dead(&self, dest: &[u8; 16]) {
+        if self.carriers.lock().unwrap().get(dest).is_some_and(|c| c.dead.load(Relaxed)) {
+            self.book_for(dest).wake();
+        }
+    }
+
     fn book_for(&self, dest: &[u8; 16]) -> Arc<Addrs> {
         self.books.lock().unwrap().entry(*dest).or_insert_with(|| Addrs::new(vec![])).clone()
     }
@@ -5392,6 +5487,9 @@ impl ClientCtx {
         // свежие отчёты других выходов (T_NBRS): какие ноды они видят живым соседом
         let nbr_reports = self.nbrs.lock().unwrap().iter().filter(|(_, report)| report.fresh())
             .map(|(x, report)| (*x, report.neighbors.iter().map(|(d, _)| *d).collect::<Vec<_>>())).collect::<Vec<_>>();
+        // «видели N с назад» по свежим отчётам соседей и локальная пометка «мёртв» (дозвон: не ответил ни напрямую, ни через транзит)
+        let seen_ago: HashMap<[u8; 16], u64> = { let r = self.nbrs.lock().unwrap(); servers.iter().filter_map(|e| nbr_seen_ago(&r, &e.dest).map(|a| (e.dest, a))).collect() };
+        let dead: HashSet<[u8; 16]> = self.carriers.lock().unwrap().iter().filter(|(_, c)| c.dead.load(Relaxed)).map(|(d, _)| *d).collect();
         let exits: Vec<serde_json::Value> = servers.iter().map(|e| {
             let is_cur = cur.map(|c| c.0 == e.dest).unwrap_or(false);
             // ra: сколько других нод сейчас сообщают, что видят эту ноду живым соседом
@@ -5452,8 +5550,9 @@ impl ClientCtx {
             // RNS path/carrier caches are not proof of a live node. Missing observations
             // cannot establish global death: another (unobserved) neighbour may see it.
             let contact = is_cur && (now_ms() as u64).saturating_sub(self.last_pong.load(Relaxed)) <= self.contact_window_ms.load(Relaxed).max(self.fail_ms);
-            let presence = crate::observations::presence(contact, ra);
-            serde_json::json!({"n": self.shown_name(e), "d": hex(&e.dest), "h": hops.or(e.hops), "r": e.rtt_ms, "s": if is_cur { "current" } else { e.state.as_str() }, "pinned": e.pinned, "presence": presence,
+            let seen_s = seen_ago.get(&e.dest).copied();
+            let presence = crate::observations::presence_local(contact, ra, seen_s.is_some(), dead.contains(&e.dest));
+            serde_json::json!({"n": self.shown_name(e), "d": hex(&e.dest), "h": hops.or(e.hops), "r": e.rtt_ms, "s": if is_cur { "current" } else { e.state.as_str() }, "pinned": e.pinned, "presence": presence, "seen_s": seen_s,
                 "v": carrier != "none", "c": carrier, "lk": lk, "why": why,
                 "pr": pr, "id": id, "adm": adm, "ra": ra,
                 "vis": vis, "nh": nh.map(|n| hex(&n)), "q": {"ok": q.ok, "fail": q.fail, "rtt": rtt, "pc": pc, "age": age}})
@@ -5776,6 +5875,7 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
             for link in links { spawn_ctl(&c2.node, link, T_OBSERVE, vec![u8::from(visible)]); }
         }
     });
+    tokio::spawn(liveness_waker(Arc::downgrade(&ctx)));
     client_supervisor(ctx.clone()).await;
     drop(public_handles);
     ep.close().await;
@@ -5802,13 +5902,22 @@ fn on_nbrs_client(ctx: &ClientCtx, link: LinkId, body: &[u8]) {
             }
             // клиент выхода с правами узла (телефон-админ): только имя, не ребро соседства
             if x["c"].as_u64() == Some(1) { return None; }
+            // «видел N с назад» — не ребро
+            if x["s"].as_u64() == Some(1) { return None; }
             Some((dest, x["r"].as_f64().filter(|r| *r >= 0.0)))
+        }).collect()
+    }).unwrap_or_default();
+    let seen: Vec<([u8; 16], u64)> = v["n"].as_array().map(|a| {
+        a.iter().take(NBRS_MAX).filter(|x| x["s"].as_u64() == Some(1)).filter_map(|x| {
+            let dest = dest32(x["d"].as_str().filter(|d| d.len() == 32 && d.bytes().all(|b| b.is_ascii_hexdigit()))?)?;
+            if !known.contains(&dest) { return None; }
+            Some((dest, x["a"].as_u64()?.min(NBR_SEEN_MAX.as_secs())))
         }).collect()
     }).unwrap_or_default();
     let mut reports = ctx.nbrs.lock().unwrap();
     reports.retain(|_, r| r.fresh());
     if reports.len() < 32 || reports.contains_key(&source) {
-        reports.insert(source, NbrReport { received: Instant::now(), ttl: crate::observations::report_ttl(&v), neighbors: list });
+        reports.insert(source, NbrReport { received: Instant::now(), ttl: crate::observations::report_ttl(&v), neighbors: list, seen });
     }
 }
 
@@ -5853,6 +5962,10 @@ fn start_dialer(ctx: &Arc<ClientCtx>, s: &CServer) {
     ctx.carriers.lock().unwrap().insert(s.dest, cc.clone());
     // контакт без ролей (P2P): после DEAD_AFTER промахов не долбим его каждые 2 с, а перепроверяем реже и при новых адресах (`Liveness`)
     let p2p = is_p2p_server(ctx, s);
+    if !p2p {
+        let (weak, dest, key) = (Arc::downgrade(ctx), s.dest, s.key);
+        *cc.elsewhere.lock().unwrap() = Some(Arc::new(move || weak.upgrade().is_some_and(|c| c.alive_elsewhere(&dest, &key))));
+    }
     tokio::spawn(dial_direct(ctx.ep.clone(), ctx.node.clone(), ctx.sh.clone(), s.name.clone(), id, book, alive, cc, p2p));
 }
 
@@ -6671,6 +6784,29 @@ async fn route_manager(ctx: Arc<ClientCtx>) {
     }
 }
 
+/// Будит мёртвые узлы: при смене сети — все (достижимость могла измениться), раз в 10 с — те, кого видит сосед или кто жив
+/// через транзит. Сам набор и снятие пометки делает дозвон (`Liveness::woken`).
+async fn liveness_waker(weak: std::sync::Weak<ClientCtx>) {
+    let mut net = crate::mobile::network_changes();
+    loop {
+        let changed = tokio::select! {
+            r = net.changed() => { if r.is_err() { return; } true }
+            _ = tokio::time::sleep(Duration::from_secs(10)) => false,
+        };
+        let Some(ctx) = weak.upgrade() else { return };
+        let dead: Vec<[u8; 16]> = ctx.carriers.lock().unwrap().iter().filter(|(_, c)| c.dead.load(Relaxed)).map(|(d, _)| *d).collect();
+        if dead.is_empty() { continue; }
+        let keys: HashMap<[u8; 16], [u8; 32]> = ctx.servers.lock().unwrap().iter().map(|s| (s.dest, s.key)).collect();
+        for d in dead {
+            if changed || keys.get(&d).is_some_and(|k| ctx.alive_elsewhere(&d, k)) {
+                let name = ctx.servers.lock().unwrap().iter().find(|s| s.dest == d).map(|s| s.name.clone()).unwrap_or_else(|| hex(&d)[..8].to_string());
+                ctx.sh.note(format!("{name}: {}, снимаю пометку «мёртв» и набираю", if changed { "сеть сменилась" } else { "жив по свидетельству соседа или через транзит" }));
+                ctx.book_for(&d).wake();
+            }
+        }
+    }
+}
+
 async fn client_supervisor(ctx: Arc<ClientCtx>) {
     let fin = ctx.state.join("fin");
     let sel_file = ctx.state.join("select");
@@ -6683,6 +6819,7 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
     let mut primary: Option<[u8;16]> = None;
     let mut pending_reason: Option<String> = None;
     let mut keep_trying: HashMap<[u8; 16], Instant> = HashMap::new();
+    let mut last_want: Option<[u8; 16]> = None;
     // QAB-M2: перенос на QUIC не удался, а прежний Link мог быть вытеснен сервером; когда начался перенос; восстановленный выход и время
         while !fin.exists() {
         // У пира снова появился носитель (после перерыва без носителя): отступ выхода, набранный за время без связи (10 -> 20 -> ... с на неудачных попытках
@@ -6697,6 +6834,11 @@ async fn client_supervisor(ctx: Arc<ClientCtx>) {
         }
         // выбор пользователя: "auto" или хеш выхода
         let want: Option<[u8; 16]> = std::fs::read_to_string(&sel_file).ok().and_then(|t| dest32(t.trim()));
+        // Ручной выбор узла — новая попытка: пометка «мёртв» снимается, набор сразу; ответит — статус обновится.
+        if want != last_want {
+            if let Some(d) = want { ctx.wake_dead(&d); }
+            last_want = want;
+        }
         // выход, на котором только что сменили носитель, идёт первым
         let keep_first: Option<[u8; 16]> = keep_trying.iter().find(|(_, t)| **t > Instant::now()).map(|(d, _)| *d);
         let mut cands = candidates(&ctx, &banned, want.or(keep_first));
