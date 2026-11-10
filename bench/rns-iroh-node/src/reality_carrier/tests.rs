@@ -262,7 +262,14 @@ async fn quic_over_reality_only_and_probe_gets_cover() {
     assert!(c.paths().iter().all(|p| matches!(p.remote_addr(), TransportAddr::Custom(_))), "IP-путей нет");
 
     // датаграммы туда и обратно (размер как у IP-пакета TUN с меткой)
-    let max = c.max_datagram_size().expect("датаграммы включены");
+    // PMTUD поднимает MTU пути после рукопожатия: под нагрузкой CI первый замер бывает 1162 — ждём, а не требуем сразу
+    let max = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let m = c.max_datagram_size().expect("датаграммы включены");
+            if m >= 1200 { return m; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.unwrap_or_else(|_| c.max_datagram_size().unwrap_or(0));
     assert!(max >= 1200, "max_datagram_size {max}");
     eprintln!("reality path: max_datagram_size={max}, mtu={:?}", c.paths().iter().find(|p| p.is_selected()).map(|p| p.stats().current_mtu));
     let pkt: Vec<u8> = (0..max.min(1328)).map(|i| (i % 251) as u8).collect();
