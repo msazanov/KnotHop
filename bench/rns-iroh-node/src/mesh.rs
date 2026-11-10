@@ -753,7 +753,7 @@ impl Mesh {
         // Транзит сообщил, что не довёл кадр до `dst`: не брать его при следующей смене. Само уведомление транзит не меняет:
         // оно бывает и при временной причине (просадка MTU, смена носителя), а работающий путь бросать нельзя (W v0.1.68–69: метание
         // транзита каждые 10–30 с). Застой определяет сторожок по реальному приёму. Сосед может пометить только самого себя.
-        if self.initiates_to(&dst) {
+        if self.originates_to(&dst) {
             let now = Instant::now();
             let mut failed = self.failed_via.lock().unwrap();
             if failed.len() >= HOP_MAX { failed.retain(|_, until| now < *until); }
@@ -772,6 +772,13 @@ impl Mesh {
     fn initiates_to(&self, dst: &Key) -> bool {
         let connections: Vec<_> = self.e2e.lock().unwrap().conns.values().map(|(c, _)| c.clone()).collect();
         connections.iter().any(|c| c.remote_id().as_bytes() == dst && c.close_reason().is_none() && matches!(c.side(), iroh::endpoint::Side::Client))
+    }
+
+    /// Мы инициатор соединения с `dst`, которое едет по mesh: сквозного либо собственного носителя с тёплым mesh-путём
+    /// (дозвон клиента; у обоих работают сторожок застоя и миграция).
+    fn originates_to(&self, dst: &Key) -> bool {
+        // сырой носитель: `carrier()` отбрасывает именно тот случай, что нужен, — носитель, выбравший mesh-путь
+        self.initiates_to(dst) || (self.carriers)(dst).is_some_and(|c| c.close_reason().is_none() && matches!(c.side(), iroh::endpoint::Side::Client))
     }
 
     /// Доказательство приходит от последнего TLS-аутентифицированного соседа.
@@ -953,7 +960,7 @@ impl Mesh {
         // (`stall`, `via_failed`), проверенная миграция (`verified`) или потеря права/носителя у самого транзита.
         // Только у инициатора сквозного соединения: у него работают сторожок и пометка `unreachable`; отвечающая сторона следует за ним
         // (`verified`) и уходит со старого транзита снятием обратной записи по `unreachable`.
-        if let Some(cur) = self.hop_peer(dst).filter(|_| self.initiates_to(dst)) {
+        if let Some(cur) = self.hop_peer(dst).filter(|_| self.originates_to(dst)) {
             if cur != *dst && policy.is_transit(&cur) && policy.holds_rights(&cur) && self.neighbor(&cur).is_ok()
                 && !self.via_failed(dst, &cur, now) {
                 return Some((cur, "keep"));

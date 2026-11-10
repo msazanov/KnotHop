@@ -2311,6 +2311,32 @@ async fn working_transit_is_kept_when_route_changes_or_pin_expires() {
     drop(ce);
 }
 
+/// Запасной mesh-путь собственного носителя клиента (ветка `alt-direct`) тоже не прыгает: после истечения закрепления сторожка
+/// хоп остаётся на рабочем транзите, а не возвращается к выбору `alt_transit` (сдвиг по составу соседей).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn carrier_backup_hop_is_kept_after_pin_expires() {
+    let (a, t1, t2, e) = (node().await, node().await, node().await, node().await);
+    link(&a, &t1).await;
+    link(&a, &t2).await;
+    link(&t1, &e).await;
+    link(&t2, &e).await;
+    link(&a, &e).await;
+    allow_all(&[&a, &t1, &t2, &e]);
+    t1.set_transit(true);
+    t2.set_transit(true);
+    let raw = (a.mesh.carriers)(&e.id()).expect("прямой носитель");
+    assert!(matches!(raw.side(), iroh::endpoint::Side::Client), "испытание про носитель, который набрал клиент");
+    a.mesh.prepare(&e.id());
+    let alt = a.mesh.hop_peer(&e.id()).expect("хоп запасного пути");
+    let other = if alt == t1.id() { t2.id() } else { t1.id() };
+    a.mesh.stall_hops.lock().unwrap().insert(e.id(), (other, Instant::now() + Duration::from_millis(200)));
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(other));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(other), "истёкшее закрепление не возвращает к `alt_transit`, пока транзит работает");
+}
+
 /// Уведомление «нет пути» не уводит с рабочего транзита, но отказавший транзит не выбирается при настоящем застое.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_unreachable_only_excludes_transit_from_stall_rotation() {
