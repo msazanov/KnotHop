@@ -272,10 +272,16 @@ async fn quic_over_reality_only_and_probe_gets_cover() {
     }).await.unwrap_or_else(|_| c.max_datagram_size().unwrap_or(0));
     assert!(max >= 1200, "max_datagram_size {max}");
     eprintln!("reality path: max_datagram_size={max}, mtu={:?}", c.paths().iter().find(|p| p.is_selected()).map(|p| p.stats().current_mtu));
-    let pkt: Vec<u8> = (0..max.min(1328)).map(|i| (i % 251) as u8).collect();
+    // Размер — по текущему пределу перед каждой отправкой: под нагрузкой CI потеря проб PMTUD откатывает MTU к базовому
+    // между замером и отправкой (CI 10.11: TooLarge сразу после max ≥ 1200).
+    let pkt_for = |conn: &iroh::endpoint::Connection| -> Vec<u8> {
+        (0..conn.max_datagram_size().unwrap_or(0).min(1328)).map(|i| (i % 251) as u8).collect()
+    };
+    let pkt = pkt_for(&c);
     c.send_datagram(Bytes::from(pkt.clone())).unwrap();
     let got = tokio::time::timeout(Duration::from_secs(5), s.read_datagram()).await.unwrap().unwrap();
     assert_eq!(&got[..], &pkt[..]);
+    let pkt = pkt_for(&s);
     s.send_datagram(Bytes::from(pkt.clone())).unwrap();
     let got = tokio::time::timeout(Duration::from_secs(5), c.read_datagram()).await.unwrap().unwrap();
     assert_eq!(&got[..], &pkt[..]);
