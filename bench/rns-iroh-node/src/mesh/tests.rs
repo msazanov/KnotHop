@@ -888,7 +888,8 @@ async fn pinned_probe_crosses_direct_path_while_mesh_keeps_traffic() {
     }).await.unwrap();
     assert_eq!(&data[..], b"direct-probe");
     assert!(ce.paths().iter().any(|p| p.id() == path && matches!(p.remote_addr(), TransportAddr::Ip(_))),
-        "выход принял пробу по IP-пути, а не через транзит");
+        "выход принял пробу по IP-пути, а не через транзит: принят по {path:?}; пути выхода {:?}",
+        ce.paths().iter().map(|p| (p.id(), matches!(p.remote_addr(), TransportAddr::Ip(_)), p.is_selected())).collect::<Vec<_>>());
     assert!(mesh_selected(&ca), "проба не переключила VPN на непроверенный IP");
     eprintln!("transit_fwd_during_probe={}", t.mesh.c.fwd.load(Relaxed) - fwd_before);
 }

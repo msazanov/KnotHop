@@ -273,6 +273,12 @@ impl leviculum_std::api::CoreProcessor for PnProcessor {
 /// часами (perf на uae 10.11: 41 % — `sha256_compress` потока добычи). 18 — стоимость Python LXMF по умолчанию, наши PN объявляют 1.
 pub const PN_REMOTE_PEERING_COST_MAX: u8 = 18;
 
+/// Пиринг PN только с непосредственными соседями (1 хоп): наши узлы соседствуют напрямую (интерфейс на пира), публичные PN —
+/// за хабами (≥2). Штатная глубина 4 подписывала узел на поток публичного LXMF: fin1 10.11 принимал ~640 сообщений/мин, проверка
+/// их штампов — треть CPU knothopd на перегруженном выходе. Узел остаётся релеем LXMF для соседей (0016); пир за пределом
+/// отключается при своём следующем анонсе, его синхронизация отвергается.
+pub const PN_AUTOPEER_MAXDEPTH: u8 = 1;
+
 /// Таблица пиров PN на диске: добытые ключи пиринга переживают перезапуск (раньше `MemoryPeerStore` — перебор заново
 /// после каждого рестарта и каждого релиза автообновления). Файл не читается — таблица пустая, как в памяти.
 fn peer_store(dir: &Path) -> Box<dyn leviculum_lxmf::peering::PeerStore + Send> {
@@ -327,7 +333,8 @@ fn spawn_pn(state: &Path, identity: Identity, limits: PnLimits, hold: Option<mps
             node_config: PropagationNodeConfig { transfer_limit_kb:16, sync_limit_kb:64,
                 serve_cap_bytes:Some(64*1024), message_expiry_secs:MESSAGE_EXPIRY_S, name:None, ..Default::default() },
             announce_interval_secs:600, announce_delay_secs:if cfg!(test) {2} else {20}, announce_at_start:false,
-            peering:PeeringConfig { max_peers:8, max_inbound_syncs:2, remote_peering_cost_max:PN_REMOTE_PEERING_COST_MAX, ..Default::default() },
+            peering:PeeringConfig { max_peers:8, max_inbound_syncs:2, remote_peering_cost_max:PN_REMOTE_PEERING_COST_MAX,
+                autopeer_maxdepth:PN_AUTOPEER_MAXDEPTH, ..Default::default() },
             peer_store:peer_store(&dir), control_allowed:vec![], auth_allowed:None,
             mailbox:None, store_limit_bytes:limits.cap_bytes, delivery_limit_kb:8,
         });
@@ -395,6 +402,7 @@ mod tests {
     fn pn_peering_keys_survive_restart_and_cost_is_capped() {
         use leviculum_lxmf::peering::{PeerRecord, PeerTraffic};
         assert!(PN_REMOTE_PEERING_COST_MAX <= 18, "дорогой ключ пиринга отнимает CPU у транзита на 1-CPU узлах");
+        assert_eq!(PN_AUTOPEER_MAXDEPTH, 1, "пиринг PN только с непосредственными соседями: поток публичного LXMF стоил трети CPU выхода");
         let tmp = std::env::temp_dir().join(format!("kh-pn-peers-{}-{}", std::process::id(), now_secs()));
         let dir = tmp.join("lxmf/propagation");
         std::fs::create_dir_all(&dir).unwrap();
