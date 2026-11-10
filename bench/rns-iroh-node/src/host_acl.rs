@@ -306,7 +306,9 @@ impl NftHostAccess {
                     NFT_FALLBACK_CLEARS.fetch_add(1, Relaxed);
                     // Atomic nft transactions leave the old state on failure.
                     // Clear it immediately; even if that fails leases expire.
-                    let _ = self.clear();
+                    // Успешная очистка для пустого снимка и есть нужное состояние: иначе под нагрузкой (тайм-аут nft 500 мс)
+                    // пропуск никогда не включался и nft запускался каждую секунду дважды (fin1 10.11: 13 неудач в минуту).
+                    if self.clear().is_ok() && empty { last_empty_ok = Some(now); }
                     if !failing { eprintln!("HOST_ACCESS nft update failed; host TCP remains fail-closed"); }
                 }
                 failing = !success;

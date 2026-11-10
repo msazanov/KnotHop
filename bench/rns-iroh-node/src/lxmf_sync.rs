@@ -282,6 +282,14 @@ fn peer_store(dir: &Path) -> Box<dyn leviculum_lxmf::peering::PeerStore + Send> 
     }
 }
 
+/// Фоновая работа PN (загрузка хранилища, проверка штампов входящих сообщений, добыча ключа пиринга) — с наименьшим приоритетом
+/// внутри процесса: потоки движка порождаются из этого и в Linux наследуют nice. На fin1 (2 CPU, PSI 60–90 %) проверка штампов
+/// после рестарта брала 31 % CPU knothopd, а главный цикл и пересылка туннеля опаздывали на секунды. Приоритет службы не меняется.
+fn background_priority() {
+    // which=PRIO_PROCESS, who=0 — вызывающий поток (в Linux nice поточный); повышение nice не требует прав
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19); }
+}
+
 /// Штатный PN engine, а не ещё один протокол хранилища. Только серверы; постоянный store вне стираемого lev-role,
 /// `PN_CAP_BYTES`, bounded transfer/fetch. Возвращается сразу: хранилище открывается и подрезается в потоке `lxmf-pn-load`.
 pub fn propagation_processor(state: &Path, identity: Identity) -> anyhow::Result<PnProcessor> { spawn_pn(state, identity, PnLimits::auto(state), None) }
@@ -302,6 +310,7 @@ fn spawn_pn(state: &Path, identity: Identity, limits: PnLimits, hold: Option<mps
     let (tx, rx) = mpsc::sync_channel(1);
     let st = status.clone();
     std::thread::Builder::new().name("lxmf-pn-load".into()).spawn(move || {
+        background_priority();
         if let Some(hold) = hold { let _ = hold.recv(); }
         let t0 = std::time::Instant::now();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -367,6 +376,19 @@ mod tests {
         assert_eq!(PnLimits::for_cap(PN_CAP_BYTES), PnLimits::default());
         let auto = PnLimits::auto(&std::env::temp_dir());
         assert!(auto.cap_bytes >= PN_CAP_BYTES && auto.cap_bytes <= PN_CAP_AUTO_MAX);
+    }
+
+    #[test]
+    fn pn_background_priority_is_inherited_by_engine_threads() {
+        let nice = || unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let (own, child) = std::thread::spawn(move || {
+            background_priority();
+            let own = nice();
+            (own, std::thread::spawn(move || nice()).join().unwrap())
+        }).join().unwrap();
+        assert_eq!(own, 19, "поток PN — наименьший приоритет");
+        assert_eq!(child, 19, "потоки движка (проверка штампов, добыча ключа) наследуют nice");
+        assert!(nice() < 19, "остальные потоки процесса не затронуты");
     }
 
     #[test]
