@@ -947,6 +947,18 @@ impl Mesh {
                 return Some((via, "verified"));
             }
         }
+        // Работающий транзит не бросаем ради пересчёта: смена маршрута RNS, состава соседей с QUIC (сдвиг `alt_transit`) или истечение
+        // закрепления сторожка уводили живое соединение на непроверенный хоп (полевой журнал 10.11: nl1 → ru1 по `rns` через 1 с после
+        // установления, затем 3–4 с застоя на ru1 и de; повтор каждые `STALL_HOP_TTL`). Хоп меняют только сторожок застоя/отказа
+        // (`stall`, `via_failed`), проверенная миграция (`verified`) или потеря права/носителя у самого транзита.
+        // Только у инициатора сквозного соединения: у него работают сторожок и пометка `unreachable`; отвечающая сторона следует за ним
+        // (`verified`) и уходит со старого транзита снятием обратной записи по `unreachable`.
+        if let Some(cur) = self.hop_peer(dst).filter(|_| self.initiates_to(dst)) {
+            if cur != *dst && policy.is_transit(&cur) && policy.holds_rights(&cur) && self.neighbor(&cur).is_ok()
+                && !self.via_failed(dst, &cur, now) {
+                return Some((cur, "keep"));
+            }
+        }
         if self.carrier(dst).is_some() {
             let k = self.alt_transit(dst, policy)?;
             self.c.alt_hops.fetch_add(1, Relaxed);

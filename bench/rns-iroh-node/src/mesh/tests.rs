@@ -2270,6 +2270,47 @@ async fn stall_pin_expires_and_returns_to_routed_transit() {
     assert!(a.mesh.stall_hops.lock().unwrap().get(&e.id()).is_none(), "просроченная запись удаляется");
 }
 
+/// Живое сквозное соединение инициатора не уходит с рабочего транзита, когда маршрут RNS сменился или истекло закрепление
+/// сторожка (полевой журнал 10.11: nl1 → ru1 по `rns`, затем застой); уходит только при пометке транзита отказавшим.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn working_transit_is_kept_when_route_changes_or_pin_expires() {
+    let (a, t1, t2, e) = (node_bound_mode(true, [127, 0, 0, 1].into(), true).await, node().await, node().await, node_bound_mode(true, [127, 0, 0, 1].into(), true).await);
+    link(&a, &t1).await;
+    link(&a, &t2).await;
+    link(&t1, &e).await;
+    link(&t2, &e).await;
+    allow_all(&[&a, &t1, &t2, &e]);
+    t1.set_transit(true);
+    t2.set_transit(true);
+    route(&a, &e, &t1);
+    let (ca, ce) = e2e_connect(&a, &e).await;
+    assert!(a.mesh.mark_e2e(&ca), "как в vpn.rs: клиент помечает своё сквозное соединение");
+    echo(&ca, &ce).await;
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t1.id()));
+    // маршрут RNS теперь указывает на t2: рабочий t1 сохраняется (кэш маршрутов сброшен — проверяется именно липкость)
+    route(&a, &e, &t2);
+    a.mesh.routes.lock().unwrap().clear();
+    assert_eq!(a.mesh.next_hop_via(Instant::now(), &e.id(), a.pol.as_ref()), Some(t2.id()), "маршрут действительно сменился");
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t1.id()), "смена маршрута RNS не уводит с рабочего транзита");
+    // сторожок перевёл на t2; после истечения закрепления остаёмся на t2, а не возвращаемся к маршруту
+    let now = Instant::now();
+    a.mesh.stall_hops.lock().unwrap().insert(e.id(), (t2.id(), now + Duration::from_millis(200)));
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t2.id()));
+    route(&a, &e, &t1);
+    a.mesh.routes.lock().unwrap().clear();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t2.id()), "истёкшее закрепление не возвращает на маршрут, пока t2 работает");
+    echo(&ca, &ce).await;
+    // пометка отказавшим снимает липкость
+    a.mesh.failed_via.lock().unwrap().insert((e.id(), t2.id()), Instant::now() + FAILED_VIA_TTL);
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t1.id()), "отказавший транзит не удерживается");
+    drop(ce);
+}
+
 /// Уведомление «нет пути» не уводит с рабочего транзита, но отказавший транзит не выбирается при настоящем застое.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_unreachable_only_excludes_transit_from_stall_rotation() {
