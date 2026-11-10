@@ -52,6 +52,7 @@ mod dataplane;
 mod pmtu;
 mod mesh;
 mod reality_carrier;
+mod rtwatch;
 pub use vpn::{VpnCli, VpnCmd};
 
 /// Fixed non-shell admin CLI bridge used by the Android JNI wrapper.

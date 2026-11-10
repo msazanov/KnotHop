@@ -3771,6 +3771,7 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
     sh.note(format!("публичных узлов RNS подключено: {} из {}", public_handles.len(), public.len()));
     tokio::spawn(node_events(ctx.clone(), events));
     tokio::spawn(node_housekeeping(ctx.clone()));
+    { let sh = ctx.sh.clone(); crate::rtwatch::start(Arc::new(move |m| sh.note(m))); }
 
     // анонс: с прогревом, пока соседи подключаются
     let mut last = Instant::now() - Duration::from_secs(3600);
