@@ -4712,6 +4712,17 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
                 lost_listener = 0;
             }
         }
+        // смены хопа и принятые миграции (mesh): в журнал с именами соседей
+        if let Some(m) = mesh::global() {
+            let events = m.take_hop_events();
+            if !events.is_empty() {
+                let n = ctx.neigh.lock().unwrap();
+                let label = |k: Option<[u8; 32]>| k.map_or("—".to_string(), |k| n.values().find(|nb| nb.key == k).map_or_else(|| mesh_label(&k), |nb| nb.name.clone()));
+                let lines: Vec<String> = events.iter().map(|e| format!("mesh: хоп к {}: {} → {} ({}) {}", label(Some(e.dst)), label(e.old), label(e.new), e.why, e.detail)).collect();
+                drop(n);
+                for l in lines { ctx.sh.note(l); }
+            }
+        }
         // смена носителя у пира: Link на прежнем носителе закрываем сразу и переподключаемся без ожидания таймаута «сосед не отвечает»
         let flipped: Vec<(LinkId, String)> = {
             let mut n = ctx.neigh.lock().unwrap();
@@ -5876,6 +5887,21 @@ pub async fn run_client13(a: ClientArgs) -> Result<()> {
         }
     });
     tokio::spawn(liveness_waker(Arc::downgrade(&ctx)));
+    {
+        // смены хопа для всех соединений (носители с тёплым mesh-путём тоже), не только сквозных
+        let weak = Arc::downgrade(&ctx);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let (Some(ctx), Some(m)) = (weak.upgrade(), mesh::global()) else { if weak.strong_count() == 0 { return } else { continue } };
+                for e in m.take_hop_events() {
+                    let label = |k: Option<[u8; 32]>| k.map_or("—".to_string(), |k| ctx.servers.lock().unwrap().iter()
+                        .find(|s| s.key == k).map_or_else(|| mesh_label(&k), |s| s.name.clone()));
+                    ctx.sh.note(format!("mesh: хоп к {}: {} → {} ({}) {}", label(Some(e.dst)), label(e.old), label(e.new), e.why, e.detail));
+                }
+            }
+        });
+    }
     client_supervisor(ctx.clone()).await;
     drop(public_handles);
     ep.close().await;

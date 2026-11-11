@@ -838,6 +838,8 @@ impl Mesh {
             // потому что между удалением и пересчётом `send_payload` теряет все кадры.
             if previous != Some((*prev, sid)) {
                 self.c.migration_changed.fetch_add(1, Relaxed);
+                // журнал отвечающей стороны: за клиентом перешли на его новый транзит (иначе асимметрию путей не видно)
+                self.push_hop_event(HopEvent { dst: src, old: previous.map(|(v, _)| v), new: Some(*prev), why: "migrated", detail: String::new() });
                 self.warm(&src);
             }
             return;
