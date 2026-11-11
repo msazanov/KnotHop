@@ -153,10 +153,19 @@ final class AppUpdater {
 
     /** HTTPS-соединение с ручными редиректами (до 5), каждый шаг - только https и только хосты GitHub. */
     private static HttpURLConnection open(String url) throws IOException {
+        // сначала физическая сеть, при сетевой ошибке - обычный маршрут (через VPN): проверки адреса, суммы и подписи те же
+        IOException last = null;
+        for (int route = 0; route < PhysNet.routes(); route++) {
+            try { return open(url, route); } catch (IOException e) { last = e; }
+        }
+        throw last != null ? last : new IOException("нет сети");
+    }
+
+    private static HttpURLConnection open(String url, int route) throws IOException {
         for (int i = 0; i <= 5; i++) {
             URL u = new URL(url);
             if (!"https".equals(u.getProtocol()) || !hostOk(u.getHost())) throw new IOException("небезопасный адрес");
-            HttpURLConnection c = (HttpURLConnection) PhysNet.open(u);
+            HttpURLConnection c = (HttpURLConnection) PhysNet.open(u, route);
             c.setInstanceFollowRedirects(false);
             c.setConnectTimeout(15000);
             c.setReadTimeout(30000);

@@ -40,12 +40,27 @@ final class PhysNet {
 
     /** Соединение через физическую сеть (DNS тоже её); если физической сети нет, обычный путь. */
     static URLConnection open(URL url) throws IOException {
-        Network n = null;
+        Network n = physical();
+        return n != null ? n.openConnection(url) : url.openConnection();
+    }
+
+    private static Network physical() {
         try {
             Context c = Util.app;
-            if (c != null) n = find((ConnectivityManager) c.getSystemService(Context.CONNECTIVITY_SERVICE));
+            if (c != null) return find((ConnectivityManager) c.getSystemService(Context.CONNECTIVITY_SERVICE));
         } catch (Throwable ignored) { }
-        return n != null ? n.openConnection(url) : url.openConnection();
+        return null;
+    }
+
+    /**
+     * Сколько разных путей стоит пробовать: 2, если есть физическая сеть (тогда второй путь - обычный маршрут процесса, то есть
+     * через VPN, когда он поднят), иначе 1. Провайдер может резать GitHub на физической сети, а через туннель он доступен.
+     */
+    static int routes() { return physical() != null ? 2 : 1; }
+
+    /** Путь `route`: 0 - как {@link #open}, 1 - обычный маршрут процесса (через VPN, если он есть). */
+    static URLConnection open(URL url, int route) throws IOException {
+        return route == 0 ? open(url) : url.openConnection();
     }
 
     /** Короткая человеческая причина сетевой ошибки (без имён классов и адресов). */
