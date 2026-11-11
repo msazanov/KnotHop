@@ -767,7 +767,7 @@ impl Mesh {
             let mut failed = self.failed_via.lock().unwrap();
             if failed.len() >= HOP_MAX { failed.retain(|_, until| now < *until); }
             if failed.len() < HOP_MAX {
-                failed.insert((dst, *prev), now + self.failed_ttl(&dst, prev));
+                failed.insert((dst, *prev), now + FAILED_VIA_TTL);
                 self.c.unreach_marked.fetch_add(1, Relaxed);
             }
         }
@@ -1040,7 +1040,12 @@ impl Mesh {
     /// Выбор другого доступного первого хопа после застоя; RNS-маршрут остаётся
     /// подсказкой, но не должен немедленно вернуть нас на тот же чёрный ход.
     /// Перебор круговой (`alt_rot`), чтобы при 3+ транзитах не зациклиться между двумя.
-    fn rotate_stalled(&self, dst: &Key) -> bool {
+    fn rotate_stalled(&self, dst: &Key) -> bool { self.rotate_hop(dst, true) }
+
+    /// Смена хопа сторожком. `escalate` — настоящий застой (нет приёма): отказавший транзит помечается нарастающим сроком.
+    /// Отказ сразу после смены («нет пути» от нового транзита) — фиксированные `FAILED_VIA_TTL`: «нет пути» бывает и временным,
+    /// а нарастание за секунды перекидки исключало исправные транзиты на минуты (Honor 11.11, es ↔ uae раз в секунду).
+    fn rotate_hop(&self, dst: &Key, escalate: bool) -> bool {
         let Some(policy) = self.policy() else { return false };
         self.sync_gen(policy.as_ref());
         let old = self.hop_peer(dst);
@@ -1056,11 +1061,19 @@ impl Mesh {
             let mut failed = self.failed_via.lock().unwrap();
             failed.retain(|_, until| now < *until);
             if let Some(o) = old {
-                if failed.len() < HOP_MAX { failed.insert((*dst, o), now + self.failed_ttl(dst, &o)); }
+                let ttl = if escalate { self.failed_ttl(dst, &o) } else { FAILED_VIA_TTL };
+                if failed.len() < HOP_MAX { failed.insert((*dst, o), now + ttl); }
             }
-            // Если отказали все, выбирать из всех: остаться совсем без транзита хуже.
+            // Если отказали все, выбирать из всех: остаться совсем без транзита хуже. Тогда — наименее отказывавший, а не
+            // следующий по кругу: иначе выбор снова попадал на только что отказавший и через секунду — новый «отказ».
             let fresh: Vec<_> = candidates.iter().copied().filter(|k| !failed.contains_key(&(*dst, *k))).collect();
-            if !fresh.is_empty() { candidates = fresh; }
+            if !fresh.is_empty() {
+                candidates = fresh;
+            } else {
+                let fails = self.via_fails.lock().unwrap();
+                let least = candidates.iter().map(|k| fails.get(&(*dst, *k)).copied().unwrap_or(0)).min().unwrap_or(0);
+                candidates.retain(|k| fails.get(&(*dst, *k)).copied().unwrap_or(0) == least);
+            }
         }
         let idx = {
             let mut r = self.alt_rot.lock().unwrap();
@@ -1141,7 +1154,7 @@ impl Mesh {
             if refused || (watch.observe(now, rx_now, st.frame_tx.ack_eliciting_progress(), st.rtt) && retry_until.is_none()) {
                 let old = self.hop_peer(&dst);
                 let gap = watch.pending_since.map_or(0, |s| now.saturating_duration_since(s).as_millis());
-                let rotated = self.rotate_stalled(&dst);
+                let rotated = self.rotate_hop(&dst, !refused);
                 on_hop = None;
                 self.c.stall_rotations.fetch_add(1, Relaxed);
                 self.push_hop_event(HopEvent { dst, old, new: None, why: "stall-detect",

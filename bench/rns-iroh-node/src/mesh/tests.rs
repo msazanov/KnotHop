@@ -2372,6 +2372,30 @@ async fn repeatedly_failing_transit_is_excluded_longer_until_proven() {
     assert_eq!(a.mesh.failed_ttl(&dst, &bad).as_secs(), 60, "после подтверждённой работы — снова с минуты");
 }
 
+/// Отказ сразу после смены не наращивает срок пометки; когда помечены все, берётся наименее отказывавший, а не следующий по кругу.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refusal_rotation_does_not_escalate_and_prefers_least_failed() {
+    let (a, t1, t2, t3, e) = (node().await, node().await, node().await, node().await, node().await);
+    for t in [&t1, &t2, &t3] { link(&a, t).await; link(t, &e).await; t.set_transit(true); }
+    allow_all(&[&a, &t1, &t2, &t3, &e]);
+    route(&a, &e, &t1);
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t1.id()));
+    // отказы без застоя: счёт не растёт
+    for _ in 0..4 { assert!(a.mesh.rotate_hop(&e.id(), false)); }
+    assert!(a.mesh.via_fails.lock().unwrap().is_empty(), "«нет пути»/отказ после смены не наращивает срок");
+    // настоящие застои: t1 и t2 много раз, t3 один раз; все помечены — выбор падает на t3 (наименьший счёт)
+    for _ in 0..3 { let _ = a.mesh.failed_ttl(&e.id(), &t1.id()); let _ = a.mesh.failed_ttl(&e.id(), &t2.id()); }
+    let _ = a.mesh.failed_ttl(&e.id(), &t3.id());
+    let far = Instant::now() + Duration::from_secs(600);
+    for t in [&t1, &t2, &t3] { a.mesh.failed_via.lock().unwrap().insert((e.id(), t.id()), far); }
+    a.mesh.stall_hops.lock().unwrap().insert(e.id(), (t1.id(), far));
+    a.mesh.prepare(&e.id());
+    assert!(a.mesh.rotate_hop(&e.id(), false));
+    a.mesh.prepare(&e.id());
+    assert_eq!(a.mesh.hop_peer(&e.id()), Some(t3.id()), "при всех помеченных — наименее отказывавший");
+}
+
 /// Уведомление «нет пути» не уводит с рабочего транзита, но отказавший транзит не выбирается при настоящем застое.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_unreachable_only_excludes_transit_from_stall_rotation() {
