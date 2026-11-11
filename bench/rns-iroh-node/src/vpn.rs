@@ -1758,6 +1758,15 @@ mod liveness_tests {
     }
 
     #[test]
+    fn neighbor_link_retries_back_off_and_dead_waits_longest() {
+        let s: Vec<u64> = (0..10).map(|k| neighbor_link_pause(k, false, false).as_secs()).collect();
+        assert_eq!(s, vec![3, 6, 12, 24, 48, 96, 192, 300, 300, 300]);
+        let up: Vec<u64> = (0..6).map(|k| neighbor_link_pause(k, true, false).as_secs()).collect();
+        assert_eq!(up, vec![3, 6, 12, 24, 24, 24], "носитель поднят — восстановиться быстро");
+        assert_eq!(neighbor_link_pause(0, true, true).as_secs(), 300, "мёртвый по дозвону — редко");
+    }
+
+    #[test]
     fn role_node_dies_only_when_not_alive_elsewhere_and_wakes_on_attempt() {
         let sh = Shared::new();
         let book = Addrs::new(vec!["a".into()]);
@@ -3255,6 +3264,18 @@ struct Neighbor {
     /// когда текущий Link допущен: потери считаются только по пингам этого Link (старый Link на отключённом интерфейсе даёт ложные потери)
     admitted_at: Instant,
     seen_gen: u32,
+    /// подряд неудачных попыток Link к соседу: пауза перед следующей растёт (`neighbor_link_pause`); сброс — успех или свежий анонс
+    link_fails: u32,
+}
+
+/// Пауза перед следующей попыткой Link к соседу: 3 с, вдвое после каждой неудачи; потолок 24 с, пока прямой носитель к соседу
+/// поднят (путь есть — восстановиться быстро), 5 мин без носителя; соседу, которого дозвон признал мёртвым, — сразу 5 мин.
+/// Иначе недоступный сосед (es 11.11) получал попытку Link с запросом пути каждые 3 с.
+fn neighbor_link_pause(fails: u32, carrier_up: bool, dead: bool) -> Duration {
+    const MAX: Duration = Duration::from_secs(300);
+    if dead { return MAX; }
+    let cap = if carrier_up { Duration::from_secs(24) } else { MAX };
+    Duration::from_secs(3).saturating_mul(1u32 << fails.min(7)).min(cap)
 }
 
 struct NodeCtx {
@@ -3958,7 +3979,7 @@ fn on_announce(ctx: &Arc<NodeCtx>, ann: &leviculum_std::ReceivedAnnounce) {
         let mut n = ctx.neigh.lock().unwrap();
         let e = n.entry(dest).or_insert_with(|| Neighbor { dest, key, pk, name: name.clone().unwrap_or_else(|| "?".into()), ep: ep.clone(), addrs: Addrs::new(addrs.clone()), tags: tags.clone(), accepts_links, last_announce: Instant::now(),
             link: None, last_heard: Instant::now() - Duration::from_secs(3600), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(),
-            last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0 });
+            last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0, link_fails: 0 });
         if let Some(n) = name.clone() {
             e.name = n;
         }
@@ -3973,6 +3994,7 @@ fn on_announce(ctx: &Arc<NodeCtx>, ann: &leviculum_std::ReceivedAnnounce) {
         // свежий анонс (не ответ на запрос пути из чужого кэша) - узел жив: снять «мёртв» и набрать сразу
         if !ann.is_path_response() {
             e.addrs.wake();
+            e.link_fails = 0;
         }
     }
     // lc=false is an opt-out from being selected as a server neighbor, not a grant or
@@ -4065,6 +4087,7 @@ async fn connect_neighbor(ctx: Arc<NodeCtx>, dest: [u8; 16]) {
     .await;
     match res {
         Ok(id) => {
+            if let Some(nb) = ctx.neigh.lock().unwrap().get_mut(&dest) { nb.link_fails = 0; }
             // 0013: роль не зависит от инициативы. Сначала identify (ответчик узнаёт нас), затем обе стороны обмениваются цепочками прав
             ctx.links.lock().unwrap().insert(id, LinkInfo { role: Role::Unknown, since: Instant::now(), last_heard: Instant::now(), peer_pk: Some(pk), want_use: false, cbc_only: false, iface: None, ctrl: CtrlBucket::new(Instant::now()), observation: Default::default(), diag: 0 });
             let c = ctx.clone();
@@ -4082,6 +4105,7 @@ async fn connect_neighbor(ctx: Arc<NodeCtx>, dest: [u8; 16]) {
             if let Some(nb) = ctx.neigh.lock().unwrap().get_mut(&dest) {
                 nb.connecting = false;
                 nb.last_try = Instant::now(); // backoff starts at failure, not before the 20 s wait
+                nb.link_fails = nb.link_fails.saturating_add(1);
             }
         }
     }
@@ -4355,7 +4379,7 @@ fn admit_neighbor_state(n: &mut HashMap<[u8; 16], Neighbor>, link: LinkId, dest:
     let mut key = [0u8; 32];
     key.copy_from_slice(&pk[32..64]);
     let e = n.entry(dest).or_insert_with(|| Neighbor { dest, key, pk: *pk, name: "?".into(), ep: String::new(), addrs: Addrs::new(vec![]), tags: vec![], accepts_links: true, last_announce: Instant::now(),
-        link: None, last_heard: Instant::now(), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(), last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0 });
+        link: None, last_heard: Instant::now(), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(), last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0, link_fails: 0 });
     if let Some(old) = e.link {
         if old != link {
             let keep_new = link.as_bytes() < old.as_bytes();
@@ -4418,7 +4442,7 @@ impl NodeCtx {
             book.rl_fill(&rl);
             n.insert(dest, Neighbor { dest, key, pk: c.pk, name: c.name, ep, addrs: book, tags: vec![], accepts_links: true, last_announce: Instant::now(),
                 link: None, last_heard: Instant::now() - Duration::from_secs(3600), rtt_ms: None, connecting: false, dialer: None, first_seen: Instant::now(),
-                last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0 });
+                last_try: Instant::now() - Duration::from_secs(3600), ctl: CarrierCtl::new(), loss: PingBook::default(), qmon: QuicMon::default(), admitted_at: Instant::now(), seen_gen: 0, link_fails: 0 });
         }
     }
 
@@ -4766,7 +4790,8 @@ async fn node_housekeeping(ctx: Arc<NodeCtx>) {
             let go = {
                 let mut n = ctx.neigh.lock().unwrap();
                 match n.get_mut(&d) {
-                    Some(nb) if nb.link.is_none() && !nb.connecting && init && nb.last_try.elapsed() >= Duration::from_secs(3) => {
+                    Some(nb) if nb.link.is_none() && !nb.connecting && init
+                        && nb.last_try.elapsed() >= neighbor_link_pause(nb.link_fails, *nb.ctl.mode.lock().unwrap() != "none", nb.ctl.dead.load(Relaxed)) => {
                         nb.connecting = true;
                         nb.last_try = Instant::now();
                         true
