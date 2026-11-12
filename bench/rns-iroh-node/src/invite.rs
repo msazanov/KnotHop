@@ -121,7 +121,8 @@ fn fixed<const N: usize>(j: &serde_json::Value, k: &str) -> Option<[u8; N]> {
 /// `lan` (только нода-клиент): дополнительно принимаются литеральные частные IPv4 и ULA IPv6 (`vpn::sane_hint_addr_lan`). Это синтаксис;
 /// решение «набирать ли» принимается позже, на момент набора, по подсетям текущих интерфейсов (ADR 0028 §2.4a, п.5 AGENTS).
 pub(crate) fn clean_hints(v: &serde_json::Value, lan: bool) -> Vec<String> {
-    let ok = |s: &str| if lan { crate::vpn::sane_hint_addr_lan(s) } else { crate::vpn::sane_hint_addr(s) };
+    // от контакта — только литеральные IP:порт, имена не разрешаем (SA-18)
+    let ok = |s: &str| if lan { crate::vpn::sane_hint_literal_lan(s) } else { crate::vpn::sane_hint_literal(s) };
     let all: Vec<String> = v.as_array().map(|a| a.iter().filter_map(|s| s.as_str()).filter(|s| s.len() <= 80 && ok(s)).map(String::from).collect()).unwrap_or_default();
     peers::balance_hints(all, peers::MAX_CONTACT_HINTS)
 }

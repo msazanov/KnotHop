@@ -3,10 +3,10 @@
 Один workflow `.github/workflows/ci.yml` с четырьмя группами job:
 
 - **Тесты** (`tests`) - на каждом `push`, `pull_request` и ручном запуске: `cargo test --lib`, Python-тесты `deploy/test_push.py` и `deploy/test_sanitize_public.py` (unittest), `bash -n` и ShellCheck (уровень warning) для `deploy/*.sh` и `bench/android/build.sh`.
-- **Сборки** (`host`, `u2204`, `apk`) - только на `main` (push или ручной запуск с `main`) и только после успешных тестов.
+- **Сборки** (`host`, `u2204`, `apk` → `apk-sign`) - только на `main` (push или ручной запуск с `main`) и только после успешных тестов.
 - **Релиз** (`release`) - только на `main`. Тег `v0.1.<номер запуска>`, релиз с `knothopd`, `knothopd-u2204`, `knothop.apk`, `SHA256SUMS` и `FORK-MANIFEST.txt`. Это единственная job с правом `contents: write`.
 
-Права по умолчанию - `contents: read`. Секреты подписи читаются только в job `apk` и только на `main`; `pull_request` их не получает.
+Права по умолчанию - `contents: read`. Секреты подписи читаются только в job `apk-sign` и только на `main`; `pull_request` их не получает. Job `apk` собирает неподписанный APK (`KNOTHOP_UNSIGNED=1`) без секретов; `apk-sign` ничего не собирает, только `apksigner` (SA-08: код зависимостей при сборке не видит ключ). `leviculum-sync.yml`: слияние и тесты апстрима — в job `verify` с токеном только на чтение и без deploy key, запись — в `publish`, который код кандидата не исполняет (SA-07).
 
 ## Форк Leviculum
 

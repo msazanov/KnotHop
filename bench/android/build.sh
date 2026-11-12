@@ -141,6 +141,15 @@ bash "$HERE/../../deploy/fork-manifest.sh" "$W/FORK-MANIFEST.txt"
 cp "$W/FORK-MANIFEST.txt" "$W/stage/FORK-MANIFEST.txt"
 ( cd "$W/stage" && zip -q "$W/base.apk" FORK-MANIFEST.txt )
 "$BT/zipalign" -f -p 4 "$W/base.apk" "$W/aligned.apk"
+# KNOTHOP_UNSIGNED=1: только выровненный неподписанный APK ($OUT/knothop-unsigned.apk). CI подписывает его в отдельной job, где нет
+# сборки и чужих build.rs: процесс, запущенный зависимостью при сборке, не должен дожить до шага с релизным ключом (SA-08).
+if [ "${KNOTHOP_UNSIGNED:-0}" = 1 ]; then
+  if [ -n "${KNOTHOP_KS:-}" ] || [ -n "${KNOTHOP_KS_PASS:-}" ]; then echo "KNOTHOP_UNSIGNED не сочетается с ключом подписи" >&2; exit 1; fi
+  cp "$W/aligned.apk" "$OUT/${APK%.apk}-unsigned.apk"
+  cp "$W/FORK-MANIFEST.txt" "$OUT/FORK-MANIFEST.txt"
+  ls -l "$OUT/${APK%.apk}-unsigned.apk"
+  exit 0
+fi
 SIGNED="$OUT/$APK"
 if [ -n "${KNOTHOP_KS:-}" ]; then
   "$BT/apksigner" sign --ks "$KNOTHOP_KS" --ks-type PKCS12 --ks-key-alias "$KNOTHOP_KEY_ALIAS" \

@@ -16,7 +16,10 @@ pub const MAX_OPS: usize = 24;
 /// Команды живут до 7 суток (офлайн-нода получит их с PN, ADR §2.3).
 pub const MAX_EXP_S: u64 = 7 * 24 * 3600;
 const CLOCK_SKEW_S: u64 = 60;
-const MAX_JOURNAL: usize = 512;
+/// Журнал `(актор, requestid)` защищает от повтора команд до их `exp` (до 7 суток): живые записи не вытесняются (SA-09).
+/// Переполнение — отказ нового запроса без применения; предел на актора — чтобы один админ не занял журнал целиком.
+const MAX_JOURNAL: usize = 512; // × MAX_REPLY_KEEP ≈ 1,5 МБ: укладывается в предел чтения файла (2 МиБ), журнал переживает перезапуск
+const MAX_JOURNAL_PER_ACTOR: usize = 128;
 const MAX_OUTBOX: usize = 256;
 const MAX_REPLY_KEEP: usize = 3000;
 const PUSH_EVERY: Duration = Duration::from_secs(600);
@@ -48,6 +51,16 @@ pub struct State {
     nodes: Mutex<BTreeMap<String, (u64, serde_json::Value)>>,
     pushed: Mutex<Option<Instant>>,
     enq: Mutex<std::collections::HashMap<String, Instant>>,
+    /// SA-17: время последней записи status-cache.json и признак несохранённых изменений
+    nodes_saved: Mutex<Option<Instant>>,
+    nodes_dirty: std::sync::atomic::AtomicBool,
+}
+
+/// SA-17: в кэше статусов нужны роли, controllers, peers, invites (их читает приложение); `contacts` чужой ноды не нужны.
+fn trim_status(s: &serde_json::Value) -> serde_json::Value {
+    let mut s = s.clone();
+    if let Some(o) = s.as_object_mut() { o.remove("contacts"); }
+    s
 }
 
 fn read_json(dir: &Path, name: &str) -> serde_json::Value {
@@ -59,12 +72,26 @@ impl State {
         let journal = read_json(dir, "cmd-journal.json").as_array().map(|a| a.iter().filter_map(|e| Some(JEntry {
             actor: e["a"].as_str()?.into(), rid: e["r"].as_str()?.into(), exp: e["e"].as_u64()?, reply: e["p"].as_str()?.into() })).collect()).unwrap_or_default();
         let outbox = read_json(dir, "cmd-outbox.json").as_array().map(|a| a.iter().filter_map(|e| {
-            let c = OutCmd { rid: e["rid"].as_str()?.into(), target: unhex(e["t"].as_str()?).try_into().ok()?, exp: e["exp"].as_u64()?, content: e["c"].as_str()?.into(),
+            let mut c = OutCmd { rid: e["rid"].as_str()?.into(), target: unhex(e["t"].as_str()?).try_into().ok()?, exp: e["exp"].as_u64()?, content: e["c"].as_str()?.into(),
                 state: e["s"].as_str()?.into(), results: e["res"].clone(), updated: e["u"].as_u64().unwrap_or(0) };
+            if c.state != "pending" { c.content.clear(); } // SA-15: старые записи с окончательным состоянием тоже затираем
             Some((c.rid.clone(), c))
         }).collect()).unwrap_or_default();
         let nodes = read_json(dir, "status-cache.json").as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), (v["at"].as_u64().unwrap_or(0), v["status"].clone()))).collect()).unwrap_or_default();
-        State { dir: dir.to_path_buf(), journal: Mutex::new(journal), outbox: Mutex::new(outbox), nodes: Mutex::new(nodes), pushed: Mutex::new(None), enq: Mutex::new(Default::default()) }
+        State { dir: dir.to_path_buf(), journal: Mutex::new(journal), outbox: Mutex::new(outbox), nodes: Mutex::new(nodes), pushed: Mutex::new(None), enq: Mutex::new(Default::default()),
+            nodes_saved: Mutex::new(None), nodes_dirty: Default::default() }
+    }
+
+    /// SA-17: запись status-cache.json не чаще раза в минуту; в памяти уже обновлено, остаток дописывает `cmd_tick`.
+    fn save_nodes_soft(&self, n: &BTreeMap<String, (u64, serde_json::Value)>) {
+        let mut t = self.nodes_saved.lock().unwrap();
+        if t.is_some_and(|x| x.elapsed() < Duration::from_secs(60)) {
+            self.nodes_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        *t = Some(Instant::now());
+        self.nodes_dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.save_nodes(n);
     }
 
     fn save_journal(&self, j: &[JEntry]) {
@@ -73,7 +100,8 @@ impl State {
     }
 
     fn save_outbox(&self, o: &BTreeMap<String, OutCmd>) {
-        let v: Vec<_> = o.values().map(|c| serde_json::json!({"rid": c.rid, "t": hex(&c.target), "exp": c.exp, "c": c.content, "s": c.state, "res": c.results, "u": c.updated})).collect();
+        // SA-15: тело (в нём пин `invite.redeem`) хранится только пока команда ждёт ответа
+        let v: Vec<_> = o.values().map(|c| serde_json::json!({"rid": c.rid, "t": hex(&c.target), "exp": c.exp, "c": if c.state == "pending" { c.content.as_str() } else { "" }, "s": c.state, "res": c.results, "u": c.updated})).collect();
         let _ = crate::lxmf_admin::write_private_atomic(&self.dir.join("cmd-outbox.json"), &serde_json::to_vec(&v).unwrap());
     }
 
@@ -230,7 +258,8 @@ impl Core {
         }
         let Some(actor_hash) = peers::hash_of(&pk) else { return };
         let actor = Actor::Peer(actor_hash);
-        if self.peers.lock().unwrap().authority(&actor) == 0 {
+        // команды — только от держателей ADD/REMOVE/CONFIG: пир с одним USE не тратит журнал и не получает ответов (SA-09)
+        if self.peers.lock().unwrap().authority(&actor) & (peers::ADD | peers::REMOVE | peers::CONFIG) == 0 {
             return;
         }
         let now = now_s();
@@ -249,18 +278,26 @@ impl Core {
             self.reply(pk, rid, "expired", &[], None);
             return;
         }
+        // место в журнале — до применения: команду, которую нельзя запомнить, нельзя и применять (иначе её повтор пройдёт снова)
+        let mut jr = self.cmd.journal.lock().unwrap();
+        jr.retain(|e| e.exp + CLOCK_SKEW_S + 3600 > now);
+        if jr.len() >= MAX_JOURNAL || jr.iter().filter(|e| e.actor == actor_s).count() >= MAX_JOURNAL_PER_ACTOR {
+            drop(jr);
+            self.reply(pk, rid, "rejected", &[OpResult::rej("journal_full")], None);
+            return;
+        }
         let (results, changed, status) = self.apply_ops(&actor, ops, seq);
         let state = if results.iter().all(|r| matches!(r.state, "applied" | "unchanged")) { "applied" } else if results.iter().any(|r| r.state == "stale") { "stale" } else { "rejected" };
+        let has_status = status.is_some();
         let body = self.reply(pk, rid, state, &results, status);
-        if body.len() <= MAX_REPLY_KEEP || state != "applied" {
-            let mut jr = self.cmd.journal.lock().unwrap();
-            jr.retain(|e| e.exp + 3600 > now);
-            if jr.len() >= MAX_JOURNAL {
-                jr.remove(0);
-            }
-            jr.push(JEntry { actor: actor_s, rid: rid.to_string(), exp, reply: if body.len() <= MAX_REPLY_KEEP { body } else { String::new() } });
-            self.cmd.save_journal(&jr);
-        }
+        // большой ответ (страница статуса) хранится без `status`: запись о применении нужна всегда
+        let keep = if body.len() <= MAX_REPLY_KEEP || !has_status { body } else {
+            serde_json::to_string(&serde_json::json!({"v": 1, "requestid": rid, "pk": hex(&self.me_pk), "target": hex(&self.me_hash), "state": state,
+                "results": results.iter().map(|x| x.json()).collect::<Vec<_>>()})).unwrap()
+        };
+        jr.push(JEntry { actor: actor_s, rid: rid.to_string(), exp, reply: keep });
+        self.cmd.save_journal(&jr);
+        drop(jr);
         if changed {
             self.changed();
             // держатели CONFIG узнают об изменении сразу, не дожидаясь периода (в т.ч. новые роли TRANSIT/EXIT для выбора PN и выхода)
@@ -284,8 +321,8 @@ impl Core {
             {
                 let mut n = self.cmd.nodes.lock().unwrap();
                 if n.len() < 256 || n.contains_key(&hex(&from)) {
-                    n.insert(hex(&from), (now, j["status"].clone()));
-                    self.cmd.save_nodes(&n);
+                    n.insert(hex(&from), (now, trim_status(&j["status"])));
+                    self.cmd.save_nodes_soft(&n);
                 }
             }
             self.note_roles(&from, &j["status"]);
@@ -301,6 +338,7 @@ impl Core {
         if c.state == "pending" {
             c.state = j["state"].as_str().unwrap_or("rejected").to_string();
             c.results = j["results"].clone();
+            c.content.clear(); // SA-15
             c.updated = now;
             if j["status"].is_object() {
                 {
@@ -405,6 +443,7 @@ impl Core {
         for c in ob.values_mut().filter(|c| c.state == "pending") {
             if c.exp <= now {
                 c.state = "expired".into();
+                c.content.clear(); // SA-15
                 c.updated = now;
                 dirty = true;
                 continue;
@@ -423,6 +462,11 @@ impl Core {
             self.cmd.save_outbox(&ob);
         }
         drop(ob);
+        // SA-17: отложенная запись кэша статусов
+        if self.cmd.nodes_dirty.load(std::sync::atomic::Ordering::Relaxed) {
+            let n = self.cmd.nodes.lock().unwrap();
+            self.cmd.save_nodes_soft(&n);
+        }
         self.maybe_push();
     }
 
@@ -714,10 +758,28 @@ mod tests {
         let user = node("usr", false);
         s.core.peers.lock().unwrap().peer_set(&Actor::Local, user.core.me_pk, USE, "u", 1, 1).unwrap();
         user.core.submit(s.core.me_hash, vec![serde_json::json!({"op": "config.set", "exit_enabled": true})], 3600).unwrap();
-        // пользователь не имеет полномочий вообще: тоже молчание (authority == 0)
+        // держатель одного USE команд не подаёт: молчание, журнал не тратится (SA-09)
         deliver(&user, &s);
         assert!(!s.core.peers.lock().unwrap().config().exit_enabled);
+        assert!(s.out.lock().unwrap().is_empty(), "USE без ADD/REMOVE/CONFIG — молчание");
+        assert!(s.core.cmd.journal.lock().unwrap().is_empty(), "и без записи в журнал");
         let _ = a;
+    }
+
+    #[test]
+    fn full_journal_rejects_without_applying_and_never_evicts_live_entries() {
+        let (a, s) = pair();
+        let actor = hex(&a.core.me_hash);
+        let far = now_s() + 3600;
+        {
+            let mut j = s.core.cmd.journal.lock().unwrap();
+            for i in 0..MAX_JOURNAL_PER_ACTOR { j.push(JEntry { actor: actor.clone(), rid: format!("{i:032x}"), exp: far, reply: String::new() }); }
+        }
+        a.core.submit(s.core.me_hash, vec![serde_json::json!({"op": "config.set", "exit_enabled": true})], 3600).unwrap();
+        deliver(&a, &s);
+        assert!(!s.core.peers.lock().unwrap().config().exit_enabled, "журнал актора полон — команда не применена");
+        assert_eq!(s.core.cmd.journal.lock().unwrap().len(), MAX_JOURNAL_PER_ACTOR, "живые записи не вытеснены");
+        assert!(String::from_utf8_lossy(&s.out.lock().unwrap().last().unwrap().2).contains("journal_full"));
     }
 
     #[test]

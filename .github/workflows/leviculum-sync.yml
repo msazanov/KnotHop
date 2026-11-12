@@ -10,6 +10,9 @@ name: Синхронизация Leviculum
 # В main ничего не сливается само: релиз с main раскатывается на узлы автообновлением, а код апстрима чужой.
 # PR, открытый GITHUB_TOKEN, не запускает CI сам: после ревью запустите вручную
 #   gh workflow run ci.yml -R msazanov/KnotHop --ref <ветка PR>   (тесты), слияние и релиз - решение человека.
+# Разделение (SA-07, 12.11): слияние, сборка и тесты чужого кода - в job `verify` без секретов и с токеном только на чтение
+# (build.rs/тесты апстрима не видят ни GITHUB_TOKEN с записью, ни deploy key). Job `publish` кода кандидата не исполняет:
+# проверяет формат выходов, переносит ветку git-бандлом, пушит её в форк и открывает PR/issue.
 # Запись в форк - deploy key с правом записи, добавленный только в msazanov/leviculum; приватная часть - секрет
 # LEVICULUM_FORK_DEPLOY_KEY (в репозитории и коммитах её нет). Замена: удалить ключ в Settings > Deploy keys форка, создать новый.
 # Для PR включено Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests".
@@ -20,21 +23,25 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
 
 concurrency:
   group: leviculum-sync
   cancel-in-progress: false
 
 jobs:
-  sync:
-    name: Слияние апстрима
+  verify:
+    name: Слияние и проверка апстрима (без секретов)
     runs-on: ubuntu-24.04
-    env:
-      GH_TOKEN: ${{ github.token }}
-      HAS_FORK_KEY: ${{ secrets.LEVICULUM_FORK_DEPLOY_KEY != '' }}
+    permissions:
+      contents: read
+    outputs:
+      state: ${{ steps.prep.outputs.state }}
+      upstream: ${{ steps.prep.outputs.upstream }}
+      conflicts: ${{ steps.prep.outputs.conflicts }}
+      candidate: ${{ steps.prep.outputs.candidate }}
+      branch: ${{ steps.prep.outputs.branch }}
+      verified: ${{ steps.verify.outcome }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
         with:
@@ -51,7 +58,7 @@ jobs:
           ref: ${{ steps.pin.outputs.sha }}
           path: leviculum
           fetch-depth: 0
-          ssh-key: ${{ secrets.LEVICULUM_FORK_DEPLOY_KEY }}
+          persist-credentials: false
       - name: Настроить Rust
         run: rustup toolchain install stable --profile minimal
       - name: Слияние апстрима
@@ -60,26 +67,14 @@ jobs:
       - name: Уже актуально
         if: steps.prep.outputs.state == 'uptodate'
         run: echo "Форк содержит апстрим ${{ steps.prep.outputs.upstream }}, делать нечего." >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Конфликт - открыть issue
-        if: steps.prep.outputs.state == 'conflict'
+      - name: Сводка кандидата и бандл ветки (до исполнения кода кандидата)
+        if: steps.prep.outputs.state == 'merged'
         env:
-          UP: ${{ steps.prep.outputs.upstream }}
-          FILES: ${{ steps.prep.outputs.conflicts }}
+          BRANCH: ${{ steps.prep.outputs.branch }}
         run: |
-          short="${UP:0:8}"
-          if [ -n "$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "Конфликт слияния Leviculum $short in:title" --json number --jq '.[].number')" ]; then
-            echo "issue для $short уже открыт"; exit 0
-          fi
-          {
-            echo "Слияние апстрима Leviculum \`$UP\` в закреплённый форк \`${{ steps.pin.outputs.sha }}\` даёт конфликты."
-            echo
-            echo "Конфликтные файлы: \`${FILES//,/\`, \`}\`"
-            echo
-            echo "Слить вручную в клоне форка (\`git merge upstream/master\`), проверить крипто и Link, обновить \`deploy/leviculum.ref\`."
-          } > "$RUNNER_TEMP/issue.md"
-          gh issue create -R "$GITHUB_REPOSITORY" --title "Конфликт слияния Leviculum $short" --body-file "$RUNNER_TEMP/issue.md"
-
+          mkdir -p "$RUNNER_TEMP/out"
+          bash deploy/leviculum-sync.sh body leviculum > "$RUNNER_TEMP/out/pr-body.md"
+          git -C leviculum bundle create "$RUNNER_TEMP/out/candidate.bundle" "$BRANCH"
       - name: Сборка и тесты кандидата
         id: verify
         if: steps.prep.outputs.state == 'merged'
@@ -92,12 +87,77 @@ jobs:
           {
             bash bench/check_fork_graph.sh
             bash bench/cargo_fork.sh rns-iroh-node test --locked --lib
-          } 2>&1 | tee "$RUNNER_TEMP/verify.log"
+          } 2>&1 | tail -n 60 > "$RUNNER_TEMP/out/verify-tail.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4.6.2
+        if: steps.prep.outputs.state == 'merged'
+        with:
+          name: leviculum-candidate
+          path: ${{ runner.temp }}/out/
+          retention-days: 7
+
+  publish:
+    name: PR и issue (код кандидата не исполняется)
+    needs: verify
+    if: always() && needs.verify.outputs.upstream != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HAS_FORK_KEY: ${{ secrets.LEVICULUM_FORK_DEPLOY_KEY != '' }}
+      STATE: ${{ needs.verify.outputs.state }}
+      UP: ${{ needs.verify.outputs.upstream }}
+      FILES: ${{ needs.verify.outputs.conflicts }}
+      CAND: ${{ needs.verify.outputs.candidate }}
+      BRANCH: ${{ needs.verify.outputs.branch }}
+      VERIFIED: ${{ needs.verify.outputs.verified }}
+    steps:
+      - name: Проверить выходы verify
+        id: check
+        run: |
+          # verify исполнял чужой код и мог подменить выходы: только ожидаемые форматы
+          [[ "$STATE" =~ ^(uptodate|conflict|merged)$ ]] || { echo "state: неожиданное значение" >&2; exit 1; }
+          [[ "$UP" =~ ^[0-9a-f]{40}$ ]] || { echo "upstream: не SHA-1" >&2; exit 1; }
+          if [ "$STATE" = merged ]; then
+            [[ "$CAND" =~ ^[0-9a-f]{40}$ ]] || { echo "candidate: не SHA-1" >&2; exit 1; }
+            [[ "$BRANCH" =~ ^knothop/upstream-[0-9]{8}-[0-9a-f]{8}$ ]] || { echo "branch: неожиданное имя" >&2; exit 1; }
+          fi
+          [[ "$FILES" =~ ^[A-Za-z0-9._/,+-]*$ ]] || { echo "conflicts: неожиданные символы" >&2; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+        with:
+          persist-credentials: false
+      - name: Закреплённый коммит форка
+        id: pin
+        run: echo "sha=$(tr -d '[:space:]' < deploy/leviculum.ref)" >> "$GITHUB_OUTPUT"
+
+      - name: Конфликт - открыть issue
+        if: env.STATE == 'conflict'
+        env:
+          PIN: ${{ steps.pin.outputs.sha }}
+        run: |
+          short="${UP:0:8}"
+          if [ -n "$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "Конфликт слияния Leviculum $short in:title" --json number --jq '.[].number')" ]; then
+            echo "issue для $short уже открыт"; exit 0
+          fi
+          {
+            echo "Слияние апстрима Leviculum \`$UP\` в закреплённый форк \`$PIN\` даёт конфликты."
+            echo
+            echo "Конфликтные файлы: \`${FILES//,/\`, \`}\`"
+            echo
+            echo "Слить вручную в клоне форка (\`git merge upstream/master\`), проверить крипто и Link, обновить \`deploy/leviculum.ref\`."
+          } > "$RUNNER_TEMP/issue.md"
+          gh issue create -R "$GITHUB_REPOSITORY" --title "Конфликт слияния Leviculum $short" --body-file "$RUNNER_TEMP/issue.md"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # закреплённый SHA, v4.3.0
+        if: env.STATE == 'merged'
+        with:
+          name: leviculum-candidate
+          path: ${{ runner.temp }}/in
 
       - name: Проверки не прошли - открыть issue
-        if: steps.prep.outputs.state == 'merged' && steps.verify.outcome == 'failure'
-        env:
-          UP: ${{ steps.prep.outputs.upstream }}
+        if: env.STATE == 'merged' && env.VERIFIED == 'failure'
         run: |
           short="${UP:0:8}"
           if [ -n "$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "Слияние Leviculum $short не проходит проверки in:title" --json number --jq '.[].number')" ]; then
@@ -109,28 +169,35 @@ jobs:
             echo
             echo "Хвост журнала:"
             echo '```'
-            tail -n 60 "$RUNNER_TEMP/verify.log"
+            head -c 20000 "$RUNNER_TEMP/in/verify-tail.log" | tr -d '`'
             echo '```'
           } > "$RUNNER_TEMP/issue.md"
           gh issue create -R "$GITHUB_REPOSITORY" --title "Слияние Leviculum $short не проходит проверки" --body-file "$RUNNER_TEMP/issue.md"
 
       - name: Сводка кандидата
-        if: steps.prep.outputs.state == 'merged' && steps.verify.outcome == 'success'
-        run: |
-          bash deploy/leviculum-sync.sh body leviculum | tee "$RUNNER_TEMP/pr-body.md" >> "$GITHUB_STEP_SUMMARY"
+        if: env.STATE == 'merged' && env.VERIFIED == 'success'
+        run: head -c 60000 "$RUNNER_TEMP/in/pr-body.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # закреплённый SHA, v4
+        if: env.STATE == 'merged' && env.VERIFIED == 'success' && env.HAS_FORK_KEY == 'true'
+        with:
+          repository: msazanov/leviculum
+          ref: ${{ steps.pin.outputs.sha }}
+          path: leviculum
+          fetch-depth: 0
+          ssh-key: ${{ secrets.LEVICULUM_FORK_DEPLOY_KEY }}
       - name: Ветка в форк и PR
-        if: steps.prep.outputs.state == 'merged' && steps.verify.outcome == 'success' && env.HAS_FORK_KEY == 'true'
-        env:
-          UP: ${{ steps.prep.outputs.upstream }}
-          CAND: ${{ steps.prep.outputs.candidate }}
-          BRANCH: ${{ steps.prep.outputs.branch }}
+        if: env.STATE == 'merged' && env.VERIFIED == 'success' && env.HAS_FORK_KEY == 'true'
         run: |
           short="${UP:0:8}"
           pr_branch="sync/leviculum-$short"
-          if git ls-remote --exit-code --heads origin "$pr_branch" >/dev/null 2>&1; then
+          if git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" "$pr_branch" >/dev/null 2>&1; then
             echo "PR-ветка $pr_branch уже есть, пропуск"; exit 0
           fi
-          git -C leviculum push origin "$BRANCH"
+          # ветка из бандла: только объекты и ссылка, без исполнения кода; вершина обязана совпасть с заявленным кандидатом
+          git -C leviculum bundle verify "$RUNNER_TEMP/in/candidate.bundle" >/dev/null
+          git -C leviculum fetch "$RUNNER_TEMP/in/candidate.bundle" "refs/heads/$BRANCH:refs/heads/$BRANCH"
+          [ "$(git -C leviculum rev-parse "refs/heads/$BRANCH")" = "$CAND" ] || { echo "бандл не совпадает с кандидатом" >&2; exit 1; }
+          git -C leviculum push origin "refs/heads/$BRANCH:refs/heads/$BRANCH"
           git config user.name knothop-sync
           git config user.email knothop-sync@users.noreply.github.com
           git switch -c "$pr_branch"
@@ -139,16 +206,15 @@ jobs:
           git commit -m "Leviculum: слияние апстрима $short (кандидат ${CAND:0:8})"
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin "$pr_branch"
+          head -c 60000 "$RUNNER_TEMP/in/pr-body.md" > "$RUNNER_TEMP/pr-body.md"
           gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$pr_branch" \
             --title "Leviculum: слияние апстрима $short" --body-file "$RUNNER_TEMP/pr-body.md"
       - name: Без секрета записи в форк
-        if: steps.prep.outputs.state == 'merged' && steps.verify.outcome == 'success' && env.HAS_FORK_KEY != 'true'
+        if: env.STATE == 'merged' && env.VERIFIED == 'success' && env.HAS_FORK_KEY != 'true'
         run: |
           echo "Кандидат зелёный, но секрета LEVICULUM_FORK_DEPLOY_KEY нет, ветку в форк и PR не создаю." >> "$GITHUB_STEP_SUMMARY"
       - name: Закрыть заменённые PR и issue
-        if: always() && steps.prep.outputs.upstream != ''
-        env:
-          UP: ${{ steps.prep.outputs.upstream }}
+        if: always() && steps.check.outcome == 'success'
         run: |
           # Ежедневный запуск: открытым остаётся только то, что относится к текущему апстриму; прежнее - устарело.
           short="${UP:0:8}"

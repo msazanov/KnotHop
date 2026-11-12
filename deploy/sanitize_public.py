@@ -33,6 +33,15 @@ CODE_SUFFIXES = {
     ".gradle", ".json", ".yml", ".yaml", ".properties", ".cfg", ".conf",
     ".ini", ".lock", ".mk", ".c", ".h", ".cpp", ".js", ".kt", ".go",
 }
+# SA-21: шаблоны секретов в итоговом дереве (значения не печатаются, только счётчики по файлам)
+SECRET_RES = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}"),
+    re.compile(r"\bxox[bp]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
+
 EXACT_EXCLUDES = {
     "AGENTS.md", "bench/AWG.md", "bench/Dockerfile.awg", "deploy/hosts.tsv",
     "deploy/push-report.json", "deploy-pilot", "deploy-0013/node.json",
@@ -81,7 +90,9 @@ def should_exclude(rel: Path) -> bool:
         return True
     if any(part in EXCLUDED_DIRS for part in rel.parts) or rel.suffix.lower() in EXCLUDED_SUFFIXES:
         return True
-    if rel.name in {"identity.key", "group.key", "trust.json", "peers.json", "pending-invite.json", "cmd-journal.json", "cmd-outbox.json", "status-cache.json", "node.json", "known_hosts", "enroll-join.json"}:
+    if rel.name in {"identity.key", "group.key", "trust.json", "peers.json", "pending-invite.json", "cmd-journal.json", "cmd-outbox.json", "status-cache.json", "node.json", "enroll-join.json"}:
+        return True
+    if rel.name.startswith("known_hosts"):  # SA-21: по маске (known_hosts.old, known_hosts-pilot и т. п.)
         return True
     if (rel.name.startswith("invite") and rel.as_posix() != "bench/rns-iroh-node/src/invite.rs") or rel.name.endswith(".profile"):
         return True
@@ -411,10 +422,14 @@ def scan(tree: Path, source: Path, fork: Path | None = None) -> int:
     for path in tree.rglob("*"):
         if not path.is_file():
             continue
+        if path.name.startswith("known_hosts"):
+            findings[path.relative_to(tree).as_posix()] = 1
+            continue
         text = text_or_none(path)
         if text is None:
             continue
         hits = len(BRAND_RE.findall(text))
+        hits += sum(len(r.findall(text)) for r in SECRET_RES)
         # Exact locally-derived private values only. Public services, special-use ranges,
         # and ordinary identifiers are not findings.
         for kind, values in tokens.items():

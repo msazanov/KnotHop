@@ -307,6 +307,13 @@ vpn_on_one() {
     # ModeSlider: тап выбирает ближайшую точку (Откл./Сеть/VPN); свайп сдвигает только за ручку, поэтому тап.
     # Верхняя треть View — полоса с ручкой; 90 % ширины — точка VPN не у края экрана (MIUI съедает краевой тап как жест).
     ad "$s" input tap $(( x1 + w * 90 / 100 )) $(( y1 + (y2 - y1) / 3 )) || true
+    sleep 2
+    if xml=$(ui_dump "$s") && [ "$(ui_mode "$xml")" = off ]; then
+      # MIUI (2 Xiaomi, 12.11) не доносит `input tap` до ModeSlider, перетаскивание доходит. Ручка «Откл.» — на 0,42 высоты View
+      # от левого края (отступ в dp, как и высота; замер на трёх телефонах); тянем её к точке VPN.
+      local hx=$(( x1 + (y2 - y1) * 42 / 100 )) hy=$(( y1 + (y2 - y1) / 3 )) tx=$(( x1 + w * 90 / 100 ))
+      ad "$s" "input motionevent DOWN $hx $hy; input motionevent MOVE $(( (hx + tx) / 2 )) $hy; input motionevent MOVE $tx $hy; input motionevent UP $tx $hy" || true
+    fi
   fi
   i=0
   while [ "$i" -lt "$TRIES" ]; do

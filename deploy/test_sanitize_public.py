@@ -113,6 +113,23 @@ class SanitizeTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 sp.check_fork_pin(src, Path(tmp))
 
+    def test_secret_patterns_and_known_hosts_mask_are_findings(self):
+        """SA-21: шаблоны секретов в итоговом дереве дают находку; known_hosts* исключается по маске."""
+        self.assertTrue(sp.should_exclude(Path("deploy/known_hosts.old")))
+        self.assertTrue(sp.should_exclude(Path("known_hosts")))
+        secrets = ["-----BEGIN " + "OPENSSH PRIVATE KEY-----", "ghp_" + "a" * 36, "github_pat_" + "A" * 30, "xoxb-" + "1" * 12, "AKIA" + "A" * 16]
+        for s in secrets:
+            with tempfile.TemporaryDirectory() as tmp:
+                src, dst = Path(tmp) / "src", Path(tmp) / "dst"
+                make_source(src)
+                write(dst, "docs/x.txt", f"значение {s}\n")
+                self.assertEqual(sp.scan(dst, src), 1, s[:8])
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "src", Path(tmp) / "dst"
+            make_source(src)
+            write(dst, "docs/x.txt", "обычный текст ghp_ без токена\n")
+            self.assertEqual(sp.scan(dst, src), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

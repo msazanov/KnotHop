@@ -721,22 +721,18 @@ fn write_atomic(p: &Path, data: &[u8]) {
     }
 }
 
-fn secure_write(p: &Path, data: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(p)?;
-    f.write_all(data)?;
-    Ok(())
-}
-
+/// Identity ноды: права на других нодах привязаны к хешу этого ключа, поэтому новый ключ создаётся только при его отсутствии
+/// (`NotFound`). Любая другая ошибка (чтение, права шире 0600, чужой владелец, symlink, порча) — отказ запуска, а не тихая замена
+/// (SA-10). Новый ключ пишется атомарно: временный файл 0600 + fsync + rename.
 fn load_or_create_identity(state: &Path) -> Result<Identity> {
     let p = state.join("identity.key");
-    if let Ok(t) = std::fs::read_to_string(&p) {
+    if let Some(b) = peers::read_private(&p, 4096)? {
+        let t = std::str::from_utf8(&b).map_err(|_| anyhow::anyhow!("identity.key: не текст"))?;
         let id = Identity::from_private_key_bytes(&unhex(t.trim())).map_err(|e| anyhow::anyhow!("identity.key: {e:?}"))?;
         return Ok(id);
     }
     let id = leviculum_std::api::generate_identity();
-    secure_write(&p, hex(&id.private_key_bytes().map_err(|e| anyhow::anyhow!("{e:?}"))?).as_bytes())?;
+    peers::write_atomic(&p, hex(&id.private_key_bytes().map_err(|e| anyhow::anyhow!("{e:?}"))?).as_bytes())?;
     Ok(id)
 }
 
@@ -1198,6 +1194,27 @@ mod tests {
     }
 
     #[test]
+    fn identity_is_created_only_when_missing_and_never_replaced_on_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kh-ident-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("identity.key");
+        let id = load_or_create_identity(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(load_or_create_identity(&dir).unwrap().public_key_bytes(), id.public_key_bytes(), "повторный запуск — тот же ключ");
+        let before = std::fs::read(&p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_or_create_identity(&dir).is_err(), "права шире 0600 — отказ");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&p, b"\xff\xfe").unwrap();
+        assert!(load_or_create_identity(&dir).is_err(), "порча — отказ, не новый ключ");
+        assert_eq!(std::fs::read(&p).unwrap(), b"\xff\xfe", "файл не перезаписан");
+        std::fs::write(&p, &before).unwrap();
+        assert_eq!(load_or_create_identity(&dir).unwrap().public_key_bytes(), id.public_key_bytes());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn offline_issue_works_for_own_node_without_running_core_and_refuses_foreign() {
         let dir = std::env::temp_dir().join(format!("kh-offissue-{}-{}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1246,6 +1263,14 @@ mod tests {
         assert_ne!(t13, *old_name.hash().as_bytes(), "0013 больше не использует имя knothopvpn");
         let legacy = Destination::new(Some(Identity::from_public_key_bytes(&pk).unwrap()), Direction::Out, DestinationType::Single, "knothopvpn", &["node", "grp"]).unwrap();
         assert_eq!(dest_from_pub_tag(&pk, "grp"), *legacy.hash().as_bytes());
+    }
+
+    /// SA-18: подсказка контакта — только литеральный IP:порт, имена не принимаются
+    #[test]
+    fn contact_hints_are_literal_ip_only() {
+        for ok in ["8.8.8.8:47001", "[2001:4860:4860::8888]:443"] { assert!(sane_hint_literal(ok), "{ok}"); assert!(sane_hint_literal_lan(ok), "{ok}"); }
+        for bad in ["example.com:443", "node-1.example.org:47001", "127.0.0.1:1", "10.0.0.1:80"] { assert!(!sane_hint_literal(bad), "{bad}"); }
+        assert!(!sane_hint_literal_lan("example.com:443"));
     }
 
     #[test]
@@ -2234,6 +2259,16 @@ pub(crate) fn sane_hint_addr(a: &str) -> bool {
     port.parse::<u16>().is_ok_and(|p| p != 0)
         && !host.is_empty()
         && host.split('.').all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
+/// SA-18: подсказка ОТ КОНТАКТА — только литеральный `IP:порт` (имя заставило бы узел резолвить DNS по чужой воле; имена — лишь из конфига узла).
+pub(crate) fn sane_hint_literal(a: &str) -> bool {
+    a.parse::<SocketAddr>().is_ok() && sane_hint_addr(a)
+}
+
+/// То же с литеральными адресами локальной сети (`sane_hint_addr_lan` и так не принимает имён, кроме общего фильтра).
+pub(crate) fn sane_hint_literal_lan(a: &str) -> bool {
+    a.parse::<SocketAddr>().is_ok() && sane_hint_addr_lan(a)
 }
 
 /// Разрешить адрес `host:порт` (IP или доменное имя) в список сокетов; IPv4 вперёд. Вызывается при каждой попытке, поэтому смена IP у домена подхватывается.
@@ -3726,6 +3761,10 @@ async fn node_main(mut a: NodeArgs) -> Result<()> {
             let (hs, _) = core.join_adopt(&invite_raw, adopt).context("приглашение")?;
             eprintln!("Приглашение принято к исполнению: нод {} (первая {}); {}", hs.len(), hex(&hs[0]),
                 match adopt { invite::ADOPT_FORCE => "выдавший станет управляющим (--accept-manage)", invite::ADOPT_IF_EMPTY => "выдавший станет управляющим нодой после погашения", _ => "нода уже управляется: управление не выдаётся без --accept-manage" });
+            // SA-16: пары уже в приватной очереди — файл с пинами стираем (stdin не трогаем; при ошибке `?` выше файл остаётся)
+            if let Some(f) = a.invite_file.as_ref().filter(|f| f.as_path() != Path::new("-")) {
+                if let Err(e) = std::fs::remove_file(f) { eprintln!("invite-file {}: не удалось стереть: {e}", f.display()); }
+            }
         }
         Some(T13 { peers: table, core })
     };
@@ -4431,7 +4470,7 @@ impl NodeCtx {
         let mut n = self.neigh.lock().unwrap();
         for c in contacts {
             let dest = dest_from_pub_tag(&c.pk, &self.tag);
-            let hints: Vec<String> = c.hints.iter().filter(|a| sane_hint_addr(a)).cloned().collect();
+            let hints: Vec<String> = c.hints.iter().filter(|a| sane_hint_literal(a)).cloned().collect(); // SA-18
             // клиент (телефон), объявивший себя в accept/ack, не сосед-транзит: сервер его не набирает (P2P набирают сами клиенты)
             if c.pk == self.my_pk || hints.is_empty() || c.client { continue; }
             let rl = reality_carrier::RealityHint::from_json(&c.rl);
@@ -5469,7 +5508,7 @@ impl ClientCtx {
                 continue;
             }
             let key: [u8; 32] = pk[32..64].try_into().unwrap();
-            let addrs: Vec<String> = peers::balance_hints(addrs.into_iter().filter(|a| sane_hint_addr_lan(a)).collect(), peers::MAX_CONTACT_HINTS);
+            let addrs: Vec<String> = peers::balance_hints(addrs.into_iter().filter(|a| sane_hint_literal_lan(a)).collect(), peers::MAX_CONTACT_HINTS); // SA-18
             if let Some(e) = s.iter_mut().find(|e| e.dest == dest) {
                 e.pk = Some(pk);
                 // имя, сохранённое с прошлого допуска: пока узел не отвечал в этой сессии, в записи только короткий dest

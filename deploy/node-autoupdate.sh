@@ -32,12 +32,27 @@ want_from_sums() { # SUMS ВАРИАНТ: ровно одна строка с н
 
 variant_ok() { [[ ${1:-} == knothopd || ${1:-} == knothopd-u2204 ]]; }
 
+# SA-20: защита от отката. Версия бинарника в нём не зашита (`--version` нет), поэтому берём тег релиза из редиректа
+# `releases/latest` (vX.Y.Z) и помним последний установленный тег в $VERFILE; тег старее запомненного — отказ.
+VERFILE="$DIR/autoupdate.version"
+latest_tag() { # печатает vX.Y.Z или ничего
+  local u; u=$(curl --silent --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 30 -o /dev/null -w '%{redirect_url}' "https://github.com/$REPO/releases/latest") || return 1
+  [[ $u =~ /releases/tag/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]] && printf '%s' "${BASH_REMATCH[1]}"
+}
+ver_older() { # A B: истина, если A строго старее B (sort -V)
+  [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1) == "$1" ]]
+}
+tag_exists() { # vX.Y.Z: 0 — релиз есть, 1 — удалён (404), 2 — неизвестно (сеть)
+  local c; c=$(curl --silent --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 30 -o /dev/null -w '%{http_code}' "https://github.com/$REPO/releases/tag/$1") || return 2
+  case $c in 200) return 0 ;; 404) return 1 ;; *) return 2 ;; esac
+}
+
 cmd_run() {
   [[ $EUID -eq 0 ]] || { log "нужен root"; return 1; }
   variant_ok "${KH_VARIANT:-}" || { log "KH_VARIANT не задан или неверен"; return 1; }
   [[ -e $OFF ]] && { log "отключено ($OFF)"; return 0; }
   exec 9>"$LOCK"; flock -n 9 || { log "другой проход уже идёт"; return 0; }
-  local sums want have got restarts0
+  local sums want have got restarts0 tag prev
   sums=$(mktemp -p "$DIR" .autoupdate-sums.XXXXXX) || return 1
   SUMS_FILE=$sums   # trap EXIT срабатывает уже после выхода из функции: локальная переменная к тому времени недоступна
   trap 'rm -f "${SUMS_FILE:-}" "$TMP"' EXIT
@@ -47,9 +62,27 @@ cmd_run() {
   if [[ $want == "$have" ]]; then
     # ручной запуск печатает одну строку; запуск таймером/юнитом (systemd задаёт INVOCATION_ID) молчит
     [[ -n ${INVOCATION_ID:-} ]] || log "актуально: ${want:0:12}"
+    [[ -s $VERFILE ]] || { tag=$(latest_tag) && printf '%s\n' "$tag" >"$VERFILE"; } || true   # SA-20: первая отметка версии на актуальном узле
     return 0
   fi
-  log "установлен ${have:0:12}, в релизе ${want:0:12}: обновляю $KH_VARIANT"
+  # SA-20: только вперёд. Тег не определился — отказ (fail-closed); тег старее последнего установленного — отказ с записью в журнал.
+  tag=$(latest_tag) || tag=
+  [[ -n $tag ]] || { log "не удалось определить тег latest, обновление отложено (защита от отката)"; return 1; }
+  prev=$(head -c 64 "$VERFILE" 2>/dev/null | tr -d '[:space:]')
+  if [[ $prev =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && ver_older "$tag" "$prev"; then
+    # штатный откат владельца — удалить плохой релиз на GitHub (AGENTS.md): тогда установленный тег исчез и откат разрешён;
+    # если релиз $prev на месте, «latest» старее него — подмена или ошибка, не ставим
+    tag_exists "$prev"; case $? in
+      1) log "релиз $prev удалён: откат на $tag разрешён" ;;
+      0) log "ОТКАЗ: latest=$tag старее установленного $prev, а релиз $prev существует — откат не ставлю (SA-20)"; return 1 ;;
+      *) log "не удалось проверить релиз $prev, обновление отложено"; return 1 ;;
+    esac
+  fi
+  BASE="https://github.com/$REPO/releases/download/$tag"   # тег фиксируем: SHA256SUMS и бинарник из одного релиза
+  fetch "$BASE/SHA256SUMS" "$sums" 4096 30 || { log "SHA256SUMS $tag недоступен, повтор позже"; return 1; }
+  want=$(want_from_sums "$sums" "$KH_VARIANT") || { log "в SHA256SUMS $tag нет единственной строки для $KH_VARIANT"; return 1; }
+  [[ $want == "$have" ]] && { printf '%s\n' "$tag" >"$VERFILE"; return 0; }
+  log "установлен ${have:0:12} (последний тег ${prev:-неизвестен}), в релизе $tag ${want:0:12}: обновляю $KH_VARIANT"
   rm -f "$TMP"
   fetch "$BASE/$KH_VARIANT" "$TMP" "$MAX_BIN" 900 || { log "скачивание не удалось"; return 1; }
   got=$(sha "$TMP")
@@ -64,7 +97,8 @@ cmd_run() {
   for _ in $(seq 1 18); do
     sleep 5
     if [[ $(systemctl is-active "$UNIT") == active && $(sha "/proc/$(systemctl show "$UNIT" -p MainPID --value)/exe") == "$want" ]]; then
-      log "готово: ${want:0:12}, служба active (рестартов с замены: $(( $(systemctl show "$UNIT" -p NRestarts --value) - restarts0 )))"
+      printf '%s\n' "$tag" >"$VERFILE"   # SA-20: запомнить установленный тег
+      log "готово: $tag ${want:0:12}, служба active (рестартов с замены: $(( $(systemctl show "$UNIT" -p NRestarts --value) - restarts0 )))"
       return 0
     fi
   done

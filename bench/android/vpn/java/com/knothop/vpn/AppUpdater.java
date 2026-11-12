@@ -148,7 +148,8 @@ final class AppUpdater {
     // ---- сеть
 
     private static boolean hostOk(String h) {
-        return h != null && (h.equals("github.com") || h.endsWith(".github.com") || h.endsWith(".githubusercontent.com"));
+        // SA-23: только фактические хосты релизов GitHub (github.com -> release-assets/objects.githubusercontent.com)
+        return "github.com".equals(h) || "objects.githubusercontent.com".equals(h) || "release-assets.githubusercontent.com".equals(h);
     }
 
     /** HTTPS-соединение с ручными редиректами (до 5), каждый шаг - только https и только хосты GitHub. */
@@ -387,12 +388,17 @@ final class AppUpdater {
                 id = pi.createSession(sp0);
                 PackageInstaller.Session s = pi.openSession(id);
                 try {
+                    // SA-23: хеш считается по тем самым байтам, что уходят установщику (нет окна между проверкой и commit)
+                    String want = sp.getString("upd_sha", "");
+                    if (!HEX64.matcher(want).matches()) throw new Refusal("Нет контрольной суммы обновления. Обновление отменено.");
+                    MessageDigest md = MessageDigest.getInstance("SHA-256");
                     try (InputStream in = new FileInputStream(apk); OutputStream out = s.openWrite("knothop.apk", 0, apk.length())) {
                         byte[] buf = new byte[65536];
                         int n;
-                        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                        while ((n = in.read(buf)) > 0) { md.update(buf, 0, n); out.write(buf, 0, n); }
                         s.fsync(out);
                     }
+                    if (!hex(md.digest()).equalsIgnoreCase(want)) throw new Refusal("Файл обновления изменился перед установкой. Обновление отменено.");
                     // Явный получатель (не exported); FLAG_MUTABLE нужен PackageInstaller с API 31, чтобы система дописала статус в интент.
                     Intent cb = new Intent(act, UpdateInstallReceiver.class).setAction(ACTION_RESULT);
                     int fl = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
@@ -407,7 +413,7 @@ final class AppUpdater {
                 });
             } catch (Exception e) {
                 if (id >= 0) { try { pi.abandonSession(id); } catch (Exception ignored) { } }
-                fail("Не удалось передать файл установщику: " + e.getClass().getSimpleName());
+                fail(e instanceof Refusal ? e.getMessage() : "Не удалось передать файл установщику: " + e.getClass().getSimpleName());
             }
         }, "knothop-update-install").start();
     }

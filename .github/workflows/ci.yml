@@ -146,7 +146,7 @@ jobs:
           if-no-files-found: error
 
   apk:
-    name: VPN APK (релизная подпись)
+    name: VPN APK (сборка без ключа)
     needs: tests
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
@@ -187,21 +187,10 @@ jobs:
           "$SDKM" 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0' 'ndk;29.0.14206865'
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-linux-android
-      - name: Ключ подписи во временный файл
-        env:
-          KEYSTORE_B64: ${{ secrets.KNOTHOP_KEYSTORE_B64 }}
-        run: |
-          set -o pipefail
-          umask 077
-          ks="$RUNNER_TEMP/knothop-release.p12"
-          printf '%s' "$KEYSTORE_B64" | base64 -d > "$ks"
-          [ -s "$ks" ] || { echo "KNOTHOP_KEYSTORE_B64 не задан или пуст" >&2; exit 1; }
-          echo "KNOTHOP_KS=$ks" >> "$GITHUB_ENV"
-      - name: Собрать VPN APK с релизной подписью
+      - name: Собрать неподписанный VPN APK (секретов в job нет)
         working-directory: bench/android
         env:
-          KNOTHOP_KS_PASS: ${{ secrets.KNOTHOP_KEYSTORE_PASS }}
-          KNOTHOP_KEY_ALIAS: ${{ secrets.KNOTHOP_KEY_ALIAS }}
+          KNOTHOP_UNSIGNED: '1'
           KNOTHOP_VERSION_CODE: ${{ github.run_number }}
           KNOTHOP_VERSION_NAME: 0.1.${{ github.run_number }}
           KNOTHOP_LAB: '0'
@@ -212,14 +201,46 @@ jobs:
           export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
           ./build.sh vpn
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4
+        with:
+          name: apk-unsigned
+          path: ${{ runner.temp }}/apk-out/knothop-unsigned.apk
+          if-no-files-found: error
+
+  apk-sign:
+    # Отдельная job (SA-08): здесь нет cargo/javac/скриптов зависимостей, только apksigner из SDK раннера; ключ живёт в этой job.
+    name: VPN APK (релизная подпись)
+    needs: apk
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # закреплённый SHA, v4.3.0
+        with:
+          name: apk-unsigned
+          path: ${{ runner.temp }}/in
+      - name: Подписать релизным ключом
+        env:
+          KEYSTORE_B64: ${{ secrets.KNOTHOP_KEYSTORE_B64 }}
+          KNOTHOP_KS_PASS: ${{ secrets.KNOTHOP_KEYSTORE_PASS }}
+          KNOTHOP_KEY_ALIAS: ${{ secrets.KNOTHOP_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ks="$RUNNER_TEMP/knothop-release.p12"
+          trap 'rm -f "$ks"' EXIT
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$ks"
+          [ -s "$ks" ] || { echo "KNOTHOP_KEYSTORE_B64 не задан или пуст" >&2; exit 1; }
+          : "${KNOTHOP_KEY_ALIAS:?нужен KNOTHOP_KEY_ALIAS}" "${KNOTHOP_KS_PASS:?нужен KNOTHOP_KS_PASS}"
+          mkdir -p "$RUNNER_TEMP/apk-out"
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          "$BT/apksigner" sign --ks "$ks" --ks-type PKCS12 --ks-key-alias "$KNOTHOP_KEY_ALIAS" \
+            --ks-pass env:KNOTHOP_KS_PASS --key-pass env:KNOTHOP_KS_PASS \
+            --out "$RUNNER_TEMP/apk-out/knothop.apk" "$RUNNER_TEMP/in/knothop-unsigned.apk"
       - name: Проверить подпись APK
         run: |
           apk="$RUNNER_TEMP/apk-out/knothop.apk"
           # SHA-256 сертификата подписи публичен: печатаем в журнал для сверки релиза
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk"
-      - name: Удалить ключ подписи
-        if: always()
-        run: rm -f "$RUNNER_TEMP/knothop-release.p12"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # закреплённый SHA, v4
         with:
           name: apk
@@ -228,7 +249,7 @@ jobs:
 
   release:
     name: Релиз на GitHub
-    needs: [host, u2204, apk]
+    needs: [host, u2204, apk-sign]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     # единственная job с правом записи: создаёт тег и релиз; релизы выпускаются по очереди

@@ -153,7 +153,7 @@ fn sane_name(s: &str) -> String {
 
 // ------------------------------------------------------------------------------------------------ файл
 
-fn write_atomic(p: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(p: &Path, data: &[u8]) -> Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("state");
     let tmp = p.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
@@ -164,9 +164,9 @@ fn write_atomic(p: &Path, data: &[u8]) -> Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             o.mode(0o600);
         }
-        let mut f = o.open(&tmp).context("peers.json: временный файл")?;
-        f.write_all(data).and_then(|_| f.sync_all()).context("peers.json: запись")?;
-        std::fs::rename(&tmp, p).context("peers.json: замена")?;
+        let mut f = o.open(&tmp).with_context(|| format!("{name}: временный файл"))?;
+        f.write_all(data).and_then(|_| f.sync_all()).with_context(|| format!("{name}: запись"))?;
+        std::fs::rename(&tmp, p).with_context(|| format!("{name}: замена"))?;
         if let Some(d) = p.parent() {
             if let Ok(f) = std::fs::File::open(d) {
                 let _ = f.sync_all();
@@ -349,7 +349,7 @@ impl Peers {
         let s = |x: &serde_json::Value, k: &str| x[k].as_str().unwrap_or("").to_string();
         for p in v["peers"].as_array().ok_or_else(|| anyhow!("peers.json: нет peers"))? {
             let pk = pk_of(&p["pk"])?;
-            let rights = p["rights"].as_u64().ok_or_else(|| anyhow!("peers.json: rights"))? as u16;
+            let rights = p["rights"].as_u64().and_then(|r| u16::try_from(r).ok()).ok_or_else(|| anyhow!("peers.json: rights вне u16"))?; // SA-26: не усекать молча
             if rights & !KNOWN != 0 || !is_hash_str(&s(p, "by")) {
                 bail!("peers.json: запись права/by");
             }
@@ -376,7 +376,7 @@ impl Peers {
                 _ => bail!("peers.json: state приглашения"),
             };
             let inv = Invite {
-                pid, key, rights: (i["rights"].as_u64().unwrap_or(0) as u16) & KNOWN,
+                pid, key, rights: i["rights"].as_u64().and_then(|r| u16::try_from(r).ok()).ok_or_else(|| anyhow!("peers.json: rights приглашения вне u16"))? & KNOWN,
                 created: i["created"].as_u64().unwrap_or(0), expires: i["expires"].as_u64().unwrap_or(0), issuer: s(i, "issuer"), state,
             };
             if !is_hash_str(&inv.issuer) || t.invites.insert(pid, inv).is_some() {
@@ -654,6 +654,10 @@ impl Peers {
                 if old.rights & !rights != 0 {
                     return Err("no_authority");
                 }
+                // надгробие (отзыв) снимает только CONFIG/Local: ADD не «воскрешает» отозванного (SA-13)
+                if old.rights == 0 {
+                    return Err("no_authority");
+                }
             }
         }
         if let Some(old) = self.peers.get(&h) {
@@ -817,6 +821,15 @@ impl Peers {
         let old = self.peers.get(&h).cloned();
         if old.is_none() && self.peers.len() >= MAX_PEERS {
             return Redeem::Silent;
+        }
+        // отозванный ключ (надгробие) поднимает только приглашение, выпущенное после отзыва держателем CONFIG (или локально):
+        // утёкшее старое приглашение или выпущенное держателем одного ADD отзыв не отменяет (SA-13)
+        if let Some(o) = old.as_ref().filter(|o| o.rights == 0) {
+            let by_config = inv.issuer == "local"
+                || unhex(&inv.issuer).try_into().ok().is_some_and(|ih: Hash| self.rights(&ih) & CONFIG != 0);
+            if inv.created <= o.at || !by_config {
+                return Redeem::Used;
+            }
         }
         let rights = inv.rights | old.as_ref().map_or(0, |o| o.rights);
         let seq = old.as_ref().map_or(now, |o| now.max(o.seq + 1));
@@ -1117,6 +1130,33 @@ mod tests {
         let (pin, pid) = open_invite(&mut t, USE);
         assert!(matches!(t.redeem(&pid, &a, "adm", T0 + 1, good(pin)), Redeem::Accepted { .. }));
         assert_eq!(t.rights(&hh(&a)), PRESET_ADMIN);
+    }
+
+    /// SA-13: надгробие снимает только CONFIG/Local; старое приглашение и приглашение держателя одного ADD отзыв не отменяют.
+    #[test]
+    fn tombstone_is_lifted_only_by_config_or_a_fresh_config_invite() {
+        let (mut t, _) = table();
+        let (_, n) = ident();
+        let h = hh(&n);
+        let (pin_old, pid_old) = open_invite(&mut t, USE);
+        t.peer_set(&Actor::Local, n, USE, "ph", T0 + 1, T0 + 1).unwrap();
+        t.peer_remove(&Actor::Local, &h, T0 + 2, T0 + 2).unwrap();
+        // держатель ADD (без CONFIG) не воскрешает
+        let (_, ad) = ident();
+        t.peer_set(&Actor::Local, ad, USE | ADD, "ad", T0 + 3, T0 + 3).unwrap();
+        assert_eq!(t.peer_set(&Actor::Peer(hh(&ad)), n, USE, "", T0 + 4, T0 + 4), Err("no_authority"));
+        // приглашение, выпущенное до отзыва
+        assert_eq!(t.redeem(&pid_old, &n, "ph", T0 + 5, good(pin_old)), Redeem::Used);
+        // свежее приглашение держателя одного ADD
+        let pin_a = [9u8; 16];
+        t.invite_add(&Actor::Peer(hh(&ad)), pin_id(&pin_a), pin_key(&pin_a), USE, INVITE_DEFAULT_MS, T0 + 6).unwrap();
+        assert_eq!(t.redeem(&pin_id(&pin_a), &n, "ph", T0 + 7, good(pin_a)), Redeem::Used);
+        assert_eq!(t.rights(&h), 0, "отзыв устоял");
+        // свежее приглашение Local (админ ноды) — поднимает
+        let pin_l = [10u8; 16];
+        t.invite_add(&Actor::Local, pin_id(&pin_l), pin_key(&pin_l), USE, INVITE_DEFAULT_MS, T0 + 8).unwrap();
+        assert!(matches!(t.redeem(&pin_id(&pin_l), &n, "ph", T0 + 9, good(pin_l)), Redeem::Accepted { .. }));
+        assert_eq!(t.rights(&h), USE);
     }
 
     #[test]
