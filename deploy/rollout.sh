@@ -22,7 +22,8 @@ HOSTS="${HOSTS_FILE:-$HERE/hosts.tsv}"
 RD="${RD_DIR:-/root/knothop-stage}"
 
 [ -f "$HOSTS" ] || { echo "нет $HOSTS: скопируйте deploy/hosts.tsv.example и заполните"; exit 1; }
-[ -f "$DIST/SHA256SUMS" ] || { echo "нет dist/SHA256SUMS: выполните deploy/build.sh"; exit 1; }
+# autoupdate берёт скрипт из репозитория, а не из dist: сборка для него не нужна
+[ "${1:-}" = autoupdate ] || [ -f "$DIST/SHA256SUMS" ] || { echo "нет dist/SHA256SUMS: выполните deploy/build.sh"; exit 1; }
 
 sum_of() { awk -v f="$1" '$2==f{print $1}' "$DIST/SHA256SUMS"; }
 rows() { grep -vE '^\s*(#|$)' "$HOSTS"; }
