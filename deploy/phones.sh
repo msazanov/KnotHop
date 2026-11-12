@@ -163,6 +163,24 @@ bounds_of() {
   printf '%s %s %s %s' "$x1" "$y1" "$x2" "$y2"
 }
 
+# Регулятор режима: подпись «Режим работы» (APK ≥ 0.1.102); иначе первый широкий android.view.View приложения
+# после строки режима («Отключено»/«В сети нод…»/«VPN включён»). SeekBar — для старых APK.
+slider_bounds() {
+  bounds_of "$1" 'content-desc="Режим работы"' && return 0
+  bounds_of "$1" 'class="android.widget.SeekBar"' && return 0
+  local node
+  node=$(grep -oE '<node [^>]*>' <<<"$1" | awk '
+    /text="(Отключено|В сети нод|VPN включён|VPN не работает)/ { seen = 1; next }
+    seen && /class="android.view.View"/ && /package="com.knothop.vpn"/ {
+      if (match($0, /bounds="\[[0-9]+,[0-9]+\]\[[0-9]+,[0-9]+\]"/)) {
+        split(substr($0, RSTART + 9, RLENGTH - 10), v, /[^0-9]+/)
+        if (v[3] - v[1] >= 400) { print; exit }
+      }
+    }') || true
+  [ -n "$node" ] || return 1
+  bounds_of "$node" 'class="android.view.View"'
+}
+
 # Системный диалог разрешения уведомлений (permissioncontroller, кнопка «Разрешить»): закрыть тапом по bounds.
 # Другие системные диалоги (VPN consent, приглашения) не трогаем: о них сообщает vpn_on_one.
 dismiss_notif() {
@@ -278,23 +296,17 @@ vpn_on_one() {
   if [ "$mode" = vpn ]; then
     echo "  режим «VPN включён», но tun не появился: жду"
   else
-    if ! b=$(bounds_of "$xml" 'class="android.widget.SeekBar"'); then
-      echo "  SeekBar режима не найден или bounds некорректны (откройте KnotHop вручную)"; return 1
+    if ! b=$(slider_bounds "$xml"); then
+      echo "  регулятор режима не найден или bounds некорректны (откройте KnotHop вручную)"; return 1
     fi
     read -r x1 y1 x2 y2 <<<"$b"
     w=$(( x2 - x1 ))
     if [ "$w" -lt 120 ]; then
-      echo "  SeekBar слишком узкий ($w px): включите VPN вручную"; return 1
+      echo "  регулятор режима слишком узкий ($w px): включите VPN вручную"; return 1
     fi
-    cy=$(( (y1 + y2) / 2 ))
-    # свайп от левой части SeekBar к правой: край экрана не трогаем (MIUI принимает его за «назад/домой»)
-    ad "$s" input swipe $(( x1 + w / 4 )) "$cy" $(( x1 + w * 9 / 10 )) "$cy" 500 || true
-    # MIUI то принимает свайп, то тап (W136: свайп; 03.11 на 2 Xiaomi — только тап): режим не сдвинулся — тап у правого конца полосы
-    sleep 2
-    if xml=$(ui_dump "$s") && [ "$(ui_mode "$xml")" = off ]; then
-      # 95 % ширины: у самого края (≈50 px от края экрана, 2510DRA23E) MIUI съедает тап как жест
-      ad "$s" input tap $(( x1 + w * 95 / 100 )) "$cy" || true
-    fi
+    # ModeSlider: тап выбирает ближайшую точку (Откл./Сеть/VPN); свайп сдвигает только за ручку, поэтому тап.
+    # Верхняя треть View — полоса с ручкой; 90 % ширины — точка VPN не у края экрана (MIUI съедает краевой тап как жест).
+    ad "$s" input tap $(( x1 + w * 90 / 100 )) $(( y1 + (y2 - y1) / 3 )) || true
   fi
   i=0
   while [ "$i" -lt "$TRIES" ]; do

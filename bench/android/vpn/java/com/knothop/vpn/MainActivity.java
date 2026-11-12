@@ -409,6 +409,7 @@ public class MainActivity extends Activity {
         p.addView(top);
         modeSlider = new ModeSlider(this);
         modeSlider.setListener(m -> applyMode(m));
+        modeSlider.setContentDescription("Режим работы");   // для чтения с экрана и deploy/phones.sh
         p.addView(modeSlider, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         return p;
     }

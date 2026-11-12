@@ -1058,7 +1058,7 @@ impl Mesh {
         candidates.sort();
         candidates.dedup();
         if candidates.is_empty() { return false; }
-        {
+        let all_failed = {
             let now = Instant::now();
             let mut failed = self.failed_via.lock().unwrap();
             failed.retain(|_, until| now < *until);
@@ -1071,12 +1071,14 @@ impl Mesh {
             let fresh: Vec<_> = candidates.iter().copied().filter(|k| !failed.contains_key(&(*dst, *k))).collect();
             if !fresh.is_empty() {
                 candidates = fresh;
+                false
             } else {
                 let fails = self.via_fails.lock().unwrap();
                 let least = candidates.iter().map(|k| fails.get(&(*dst, *k)).copied().unwrap_or(0)).min().unwrap_or(0);
                 candidates.retain(|k| fails.get(&(*dst, *k)).copied().unwrap_or(0) == least);
+                true
             }
-        }
+        };
         let idx = {
             let mut r = self.alt_rot.lock().unwrap();
             if r.len() >= 64 && !r.contains_key(dst) { r.clear(); }
@@ -1094,6 +1096,12 @@ impl Mesh {
         }
         forced.insert(*dst, (via, now + STALL_HOP_TTL));
         drop(forced);
+        if all_failed {
+            // Выбран заведомо помеченный (лучше, чем остаться без транзита): старая пометка снимается, иначе проверка «отказа»
+            // через секунду принимала её за новый отказ и меняла хоп по кругу (fin1 12.11: nl1↔uae раз в 1–1,5 с, ~60 с без связи).
+            // Новый отказ — только по новому уведомлению от него или по застою; счётчик нарастания (`via_fails`) сохраняется.
+            self.failed_via.lock().unwrap().remove(&(*dst, via));
+        }
         self.warm(dst);
         true
     }

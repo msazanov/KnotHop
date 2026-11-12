@@ -2394,6 +2394,10 @@ async fn refusal_rotation_does_not_escalate_and_prefers_least_failed() {
     assert!(a.mesh.rotate_hop(&e.id(), false));
     a.mesh.prepare(&e.id());
     assert_eq!(a.mesh.hop_peer(&e.id()), Some(t3.id()), "при всех помеченных — наименее отказывавший");
+    let now = Instant::now();
+    assert!(!a.mesh.via_failed(&e.id(), &t3.id(), now), "выбранному из помеченных старая пометка снята: иначе «отказ» через секунду и маятник");
+    assert!(a.mesh.via_failed(&e.id(), &t1.id(), now) && a.mesh.via_failed(&e.id(), &t2.id(), now), "остальные пометки сохранены");
+    assert_eq!(a.mesh.via_fails.lock().unwrap().get(&(e.id(), t3.id())), Some(&1), "счёт нарастания не прощается");
 }
 
 /// Уведомление «нет пути» не уводит с рабочего транзита, но отказавший транзит не выбирается при настоящем застое.

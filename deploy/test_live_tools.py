@@ -41,7 +41,7 @@ def render():
     return ('<?xml version="1.0"?><hierarchy rotation="0">'
             '<node package="com.knothop.vpn" text="" bounds="[0,0][1080,2400]">'
             '<node text="%s" bounds="[20,2200][1060,2260]"/>%s'
-            '<node class="android.widget.SeekBar" bounds="[40,2300][1040,2360]"/>'
+            '<node class="android.view.View" package="com.knothop.vpn" content-desc="Режим работы" bounds="[40,2300][1040,2420]"/>'
             '</node></hierarchy>' % (title, conn))
 
 args = sys.argv[1:]
@@ -113,9 +113,12 @@ if len(args) >= 3 and args[0] == "-s":
             sys.exit(rc)
         if cmd.startswith("input "):
             if cmd.startswith("input tap"):
-                (state / "notif_done").touch()
-            elif cmd.startswith("input swipe") and os.environ.get("MOCK_SWIPE_OK") == "1":
-                mode_file.write_text("vpn", encoding="utf-8")
+                x, y = (int(v) for v in cmd.split()[2:4])
+                # тап по правой части регулятора режима (ModeSlider: ближайшая точка - VPN)
+                if 2300 <= y <= 2420 and x >= 840 and os.environ.get("MOCK_SWIPE_OK") == "1":
+                    mode_file.write_text("vpn", encoding="utf-8")
+                else:
+                    (state / "notif_done").touch()
             sys.exit(0)
         if cmd.startswith("am start"):
             sys.exit(0)
