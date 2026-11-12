@@ -9,6 +9,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# версия Rust закреплена (SA-19, 12.11); та же, что у локальных сборок
+env:
+  RUST_VERSION: '1.99.0'
+
 permissions:
   contents: read
 
@@ -45,7 +49,7 @@ jobs:
           key: tests-${{ runner.os }}-${{ hashFiles('bench/rns-iroh-node/Cargo.lock') }}
           restore-keys: tests-${{ runner.os }}-
       - name: Настроить Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
       - name: Граф Leviculum (один leviculum-core, оба Cargo.lock актуальны)
         env:
           LEVICULUM_FORK: ${{ github.workspace }}/leviculum
@@ -101,7 +105,7 @@ jobs:
       - name: Системные зависимости
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev binutils
       - name: Настроить Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
       - name: Собрать knothopd и FORK-MANIFEST
         env:
           LEVICULUM_FORK: ${{ github.workspace }}/leviculum
@@ -185,7 +189,7 @@ jobs:
           yes | "$SDKM" --licenses >/dev/null
           set -o pipefail
           "$SDKM" 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0' 'ndk;29.0.14206865'
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
           rustup target add aarch64-linux-android
       - name: Собрать неподписанный VPN APK (секретов в job нет)
         working-directory: bench/android

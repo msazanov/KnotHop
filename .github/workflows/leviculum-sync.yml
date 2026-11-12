@@ -22,6 +22,10 @@ on:
     - cron: '17 4 * * *'
   workflow_dispatch:
 
+# версия Rust закреплена (SA-19, 12.11); та же, что у локальных сборок
+env:
+  RUST_VERSION: '1.99.0'
+
 permissions:
   contents: read
 
@@ -60,7 +64,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Настроить Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
       - name: Слияние апстрима
         id: prep
         run: bash deploy/leviculum-sync.sh prepare leviculum

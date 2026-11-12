@@ -39,7 +39,7 @@ final class TopologyView extends View {
         int hops = -1;
         double rtt = -1;
         String lk = "none", why = "";   // состояние RNS Link к узлу: up | fail | none; причина последнего отказа
-        String presence = "unknown";   // alive | reported | unknown; absence of reports is not death
+        String presence = "unknown";   // alive | reported | seen | dead | unknown; dead — локальная пометка (не отвечает, соседи не видели)
         String rules = "", extraVia = "";
         boolean extraLink, extraFlow, extraPathKnown;
         int ra;                         // сколько выходов сообщают, что видят узел живым соседом
@@ -582,10 +582,17 @@ final class TopologyView extends View {
                 p.setColor(up ? GraphColors.active(Ui.dark(getContext())) : Ui.warn(getContext()));
                 // current.via относится к выбранному пути данных; RNS nh может быть другим.
                 Node hop = via;
-                if (hop != null) {
+                if (hop != null && hop != n) {
+                    // весь маршрут данных: телефон -> транзит -> выход (раньше рисовался только первый отрезок)
                     c.drawLine(px, py, hop.x, hop.y, p);
-                } else if ("direct".equals(currentQuicKind)) {
+                    c.drawLine(hop.x, hop.y, n.x, n.y, p);
+                } else if ("direct".equals(currentQuicKind) || viaDest.isEmpty()) {
                     c.drawLine(px, py, n.x, n.y, p);
+                } else {
+                    // транзит известен, но его нет на схеме (не выход): путь есть, промежуточный узел не показан — пунктир того же цвета
+                    p.setPathEffect(new DashPathEffect(new float[]{10 * d, 6 * d}, 0));
+                    c.drawLine(px, py, n.x, n.y, p);
+                    p.setPathEffect(null);
                 }
             } else if (n.extraLink && n.extraPathKnown) {
                 p.setStrokeWidth((n.extraFlow ? 4f : 2.5f) * d);
@@ -636,11 +643,22 @@ final class TopologyView extends View {
                 p.setColor(0x552E9E4F);
                 c.drawCircle(n.x, n.y, r + 6 * d, p);
             }
-            drawBadge(c, n, n.x, n.y, r, false);
+            // мёртвый (не отвечает и соседи не видели): затемнён, пунктирный серый контур и крест — отличим от живых
+            boolean dead = "dead".equals(n.presence) && !isCur && !n.isVia;
+            drawBadge(c, n, n.x, n.y, r, dead);
             p.setStyle(Paint.Style.STROKE);
             p.setStrokeWidth((isCur ? 3 : 1.5f) * d);
-            p.setColor(isCur || n.isVia ? Ui.green(getContext()) : Ui.ink(getContext(), 0xFF444444));
+            p.setColor(isCur || n.isVia ? Ui.green(getContext()) : dead ? 0xFF8E8E93 : Ui.ink(getContext(), 0xFF444444));
+            if (dead) p.setPathEffect(new DashPathEffect(new float[]{4 * d, 4 * d}, 0));
             c.drawCircle(n.x, n.y, r, p);
+            if (dead) {
+                p.setPathEffect(null);
+                p.setStrokeWidth(2.5f * d);
+                p.setColor(0xFFD9534F);
+                float k = r * 0.45f;
+                c.drawLine(n.x - k, n.y - k, n.x + k, n.y + k, p);
+                c.drawLine(n.x - k, n.y + k, n.x + k, n.y - k, p);
+            }
             // Номер связывает кружок с читаемой строкой ниже; длинного текста поверх соседей нет.
             float bx = n.x + r * 0.72f, by = n.y - r * 0.72f;
             p.setStyle(Paint.Style.FILL);

@@ -41,7 +41,8 @@ pub const INVITE_MAX_MS: u64 = 7 * 24 * 3600 * 1000;
 /// Закрытые приглашения хранятся для аудита, потом GC.
 pub const INVITE_AUDIT_MS: u64 = 7 * 24 * 3600 * 1000;
 /// seq — время в мс; запись из далёкого будущего не принимаем (иначе актор мог бы заранее занять слот записи).
-pub const SEQ_FUTURE_MS: u64 = 10 * 60 * 1000;
+/// Часы всех устройств сети обязаны быть верными (владелец 12.11; пояса не важны — seq в UTC мс): допуск на расхождение — минута (SA-13).
+pub const SEQ_FUTURE_MS: u64 = 60 * 1000;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_HINTS: usize = 3;
 const MAX_NAME: usize = 48;
@@ -598,8 +599,11 @@ impl Peers {
 
     /// Допуск соседа-сервера (Link между нодами): таблица знает его с ненулевыми правами, и хотя бы одна сторона - транзит
     /// (у нас включён `transit_enabled` либо он сам объявил роль TRANSIT в `accept`).
+    /// Сосед-сервер. Решает только таблица этой ноды (SA-11, владелец 12.11): роль, которую контакт заявил о себе сам
+    /// (`ack`/`accept`/`status.push`), прав не даёт. Нода без транзита принимает соседа, только если ему здесь выдан TRANSIT.
     pub fn admits_server(&self, pk: &Pk) -> bool {
-        self.rights_pk(pk) != 0 && (self.cfg.transit_enabled || self.roles_of_key(&key_of(pk)) & TRANSIT != 0)
+        let r = self.rights_pk(pk);
+        r != 0 && (self.cfg.transit_enabled || r & TRANSIT != 0)
     }
 
     /// Допуск VPN-клиента (ADR 0028 §3.2): на этой ноде включён `exit_enabled`, а у клиента есть USE.
@@ -1130,6 +1134,22 @@ mod tests {
         let (pin, pid) = open_invite(&mut t, USE);
         assert!(matches!(t.redeem(&pid, &a, "adm", T0 + 1, good(pin)), Redeem::Accepted { .. }));
         assert_eq!(t.rights(&hh(&a)), PRESET_ADMIN);
+    }
+
+    /// SA-11: соседа-сервера допускает только своя таблица; заявленная контактом роль TRANSIT прав не даёт.
+    #[test]
+    fn server_neighbor_is_admitted_by_own_table_not_by_claimed_role() {
+        let (mut t, _) = table();
+        t.set_config(&Actor::Local, Some(false), None).unwrap();
+        let (_, p) = ident();
+        t.peer_set(&Actor::Local, p, USE, "ph", T0 + 1, T0 + 1).unwrap();
+        t.contact_set(p, "ph", vec![], "invite", 0, TRANSIT, T0 + 1).unwrap();
+        assert!(!t.admits_server(&p), "своя роль контакта — не полномочие");
+        t.peer_set(&Actor::Local, p, USE | TRANSIT, "ph", T0 + 2, T0 + 2).unwrap();
+        assert!(t.admits_server(&p), "TRANSIT в таблице этой ноды — допуск");
+        t.set_config(&Actor::Local, Some(true), None).unwrap();
+        let (_, q) = ident();
+        assert!(!t.admits_server(&q), "без записи — нет");
     }
 
     /// SA-13: надгробие снимает только CONFIG/Local; старое приглашение и приглашение держателя одного ADD отзыв не отменяют.

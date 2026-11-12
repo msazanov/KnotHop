@@ -2330,7 +2330,8 @@ impl TunState {
                     return;
                 }
             }
-            if !self.host_acl_ready.load(Relaxed) {
+            // nft-изоляции клиентов нет (таблицу стёрли в рантайме): клиентский трафик не пропускаем (SA-12)
+            if !self.host_acl_ready.load(Relaxed) || host_acl::isolation_lost() {
                 self.c.unauth_drops.fetch_add(1, Relaxed);
                 return;
             }

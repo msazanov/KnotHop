@@ -214,12 +214,44 @@ pub(crate) fn nft_stats() -> serde_json::Value {
     use std::sync::atomic::Ordering::Relaxed;
     serde_json::json!({
         "active": NFT_WAKE.get().is_some(),
+        "isolation_lost": isolation_lost(), "isolation_losses": ISOLATION_LOSSES.load(Relaxed),
         "publish_ok": NFT_PUBLISH_OK.load(Relaxed), "publish_fail": NFT_PUBLISH_FAIL.load(Relaxed),
         "fallback_clears": NFT_FALLBACK_CLEARS.load(Relaxed), "last_ok_ms": NFT_LAST_OK_MS.load(Relaxed),
     })
 }
 
 /// One writer, fresh snapshots only, bounded CLI lifetime, no shell or PATH lookup.
+/// SA-12: изоляция клиентов выхода — nft-таблица `knothop`, которую ставит хост (юнит `knothop-hostfix`, как PostUp у wg-quick).
+/// knothopd проверяет её сам: если таблицы/правила изоляции нет, трафик клиентов в TUN не пропускается (fail-closed),
+/// пока хост её не вернёт. Тайм-аут nft (нагрузка) — «неизвестно», состояние не меняется.
+static ISOLATION_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ISOLATION_LOSSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const ISOLATION_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+const ISOLATION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Метка правила в `deploy-0013/knothop.nft` (forward): по ней видно, что загружена именно наша изоляция.
+const ISOLATION_MARK: &str = "client->internal";
+
+pub(crate) fn isolation_lost() -> bool { ISOLATION_LOST.load(std::sync::atomic::Ordering::Relaxed) }
+
+/// Some(true) — цепочка на месте с меткой изоляции; Some(false) — nft ответил, а цепочки/метки нет; None — не узнали.
+fn isolation_present(program: &str) -> Option<bool> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(program).args(["list", "chain", "inet", "knothop", "forward"]).env_clear()
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let deadline = std::time::Instant::now() + ISOLATION_CHECK_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => { let _ = child.kill(); let _ = child.try_wait(); return None; }
+        }
+    };
+    if !status.success() { return Some(false); }
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut std::io::Read::take(child.stdout.take()?, 256 * 1024), &mut out).ok()?;
+    Some(out.contains(ISOLATION_MARK))
+}
+
 pub(crate) struct NftHostAccess {
     program: &'static str,
     pool: (u32, u8),
@@ -264,6 +296,23 @@ impl NftHostAccess {
         let (send, recv) = std::sync::mpsc::sync_channel(1);
         // knothopd runs one node per process; do not silently install two writers.
         NFT_WAKE.set(send).map_err(|_| anyhow::anyhow!("nft worker already configured"))?;
+        let program = self.program;
+        std::thread::Builder::new().name("host-nft-guard".into()).spawn(move || {
+            use std::sync::atomic::Ordering::Relaxed;
+            loop {
+                match isolation_present(program) {
+                    Some(false) => if !ISOLATION_LOST.swap(true, Relaxed) {
+                        ISOLATION_LOSSES.fetch_add(1, Relaxed);
+                        eprintln!("изоляция клиентов: nft-таблицы knothop нет — трафик клиентов остановлен до её возврата (SA-12)");
+                    },
+                    Some(true) => if ISOLATION_LOST.swap(false, Relaxed) {
+                        eprintln!("изоляция клиентов: nft-таблица knothop на месте — трафик клиентов возобновлён");
+                    },
+                    None => {}
+                }
+                std::thread::sleep(ISOLATION_CHECK_EVERY);
+            }
+        }).context("start nft isolation guard")?;
         std::thread::Builder::new().name("host-nft-refresh".into()).spawn(move || {
             let mut failing = false;
             let mut next_update = std::time::Instant::now();
@@ -619,9 +668,9 @@ mod tests {
     #[test]
     fn nft_stats_carry_only_counters() {
         let stats = nft_stats();
-        for key in ["active", "publish_ok", "publish_fail", "fallback_clears", "last_ok_ms"] {
+        for key in ["active", "publish_ok", "publish_fail", "fallback_clears", "last_ok_ms", "isolation_lost", "isolation_losses"] {
             assert!(stats.get(key).is_some(), "{key}");
         }
-        assert_eq!(stats.as_object().unwrap().len(), 5);
+        assert_eq!(stats.as_object().unwrap().len(), 7);
     }
 }

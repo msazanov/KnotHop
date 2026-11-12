@@ -45,14 +45,14 @@ u2204)
   docker build -q -t knothop-build:u2204 -f "$HERE/Dockerfile.u2204" "$HERE" >/dev/null
   # toolchain ставит rustup-init внутри контейнера в том CARGO_VOL; сам rustup-init берём с хоста по SHA-256
   if [ ! -x "$CARGO_VOL/bin/cargo" ]; then
-    RUSTUP_URL="https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init"
+    RUSTUP_URL="https://static.rust-lang.org/rustup/archive/1.29.3/x86_64-unknown-linux-gnu/rustup-init"   # версия и сумма закреплены (SA-19)
     curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location -o "$TARGET/rustup-init" "$RUSTUP_URL"
-    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location -o "$TARGET/rustup-init.sha256" "$RUSTUP_URL.sha256"
-    (cd "$TARGET" && echo "$(cut -d' ' -f1 rustup-init.sha256)  rustup-init" | sha256sum -c -)
+    # сумма закреплена в репозитории (SA-19): сумма с того же сервера не защищает от его подмены
+    (cd "$TARGET" && echo "${RUSTUP_INIT_SHA256:-b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55}  rustup-init" | sha256sum -c -)
     chmod 0755 "$TARGET/rustup-init"
     docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/cargo -e RUSTUP_HOME=/cargo/rustup \
       -v "$CARGO_VOL:/cargo" -v "$TARGET/rustup-init:/rustup-init:ro" knothop-build:u2204 \
-      /rustup-init -y --profile minimal --default-toolchain stable --no-modify-path
+      /rustup-init -y --profile minimal --default-toolchain "${RUST_VERSION:-1.99.0}" --no-modify-path
   fi
   # те же исходники, что и на хосте: рабочее дерево и форк монтируются по тем же путям
   docker run --rm --user "$(id -u):$(id -g)" \

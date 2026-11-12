@@ -1,3 +1,4 @@
 # Сборщик knothopd под glibc 2.35 (de, Ubuntu 22.04). Rust берётся из тома CARGO_HOME/RUSTUP_HOME, здесь только компилятор C и компоновщик.
-FROM ubuntu:22.04
+# образ закреплён по digest (SA-19, 12.11); обновлять осознанно
+FROM ubuntu:22.04@sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates git cmake && rm -rf /var/lib/apt/lists/*
