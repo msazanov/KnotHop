@@ -268,7 +268,7 @@ cmd_install() {
 
 # Включение VPN одного телефона. Успех — только режим «VPN включён» в UI и tun>0.
 vpn_on_one() {
-  local s=$1 xml mode tun b x1 y1 x2 y2 cy w i pkg
+  local s=$1 xml mode tun b x1 y1 x2 y2 w i pkg
   echo "== $s"
   if ! tun=$(tun_count "$s"); then
     echo "  adb не ответил (offline/unauthorized?): проверьте adb devices"; return 1
