@@ -226,7 +226,7 @@ pub(crate) fn nft_stats() -> serde_json::Value {
 /// пока хост её не вернёт. Тайм-аут nft (нагрузка) — «неизвестно», состояние не меняется.
 static ISOLATION_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ISOLATION_LOSSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-const ISOLATION_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+const ISOLATION_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 const ISOLATION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Метка правила в `deploy-0013/knothop.nft` (forward): по ней видно, что загружена именно наша изоляция.
 const ISOLATION_MARK: &str = "client->internal";
@@ -243,7 +243,7 @@ fn isolation_present(program: &str) -> Option<bool> {
         match child.try_wait() {
             Ok(Some(st)) => break st,
             Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
-            _ => { let _ = child.kill(); let _ = child.try_wait(); return None; }
+            _ => { kill_and_reap(child); return None; }
         }
     };
     if !status.success() { return Some(false); }
@@ -468,14 +468,18 @@ fn run_nft(program: &str, script: &str, timeout: std::time::Duration) -> Result<
         }
     })();
     if result.is_err() {
-        let _ = child.kill();
-        // Ограниченное ожидание: процесс в состоянии D не должен подвесить единственный worker.
-        for _ in 0..50 {
-            if !matches!(child.try_wait(), Ok(None)) { break; }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+        kill_and_reap(child);
     }
     result
+}
+
+/// Убить `nft` по тайм-ауту и обязательно подобрать: без `wait` убитый процесс остаётся зомби у knothopd навсегда
+/// (fin1 13.11: 18 зомби за сутки — тайм-ауты под голоданием CPU). Ожидание — в отдельном потоке: процесс в состоянии D
+/// не должен подвесить единственный worker.
+fn kill_and_reap(mut child: std::process::Child) {
+    let _ = child.kill();
+    if matches!(child.try_wait(), Ok(Some(_))) { return; }
+    let _ = std::thread::Builder::new().name("nft-reap".into()).spawn(move || { let _ = child.wait(); });
 }
 
 #[cfg(test)]

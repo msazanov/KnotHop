@@ -60,7 +60,7 @@ class PushTests(unittest.TestCase):
         self._td.cleanup()
 
     def test_allowlist_exact_and_variants(self):
-        self.assertEqual(set(push.ALLOWLIST), {"es", "uae", "by", "ru1", "nl1", "de", "fin1", "us"})
+        self.assertEqual(set(push.ALLOWLIST), {"uae", "by", "ru1", "nl1", "de", "fin1", "us"})
         self.assertEqual(push.ALLOWLIST["de"][1], "knothopd-u2204")
         self.assertEqual(push.ALLOWLIST["nl1"][3], "de")
         self.assertEqual(push.ALLOWLIST["fin1"][3], "de")
@@ -77,7 +77,7 @@ class PushTests(unittest.TestCase):
             root = Path(td); inv = root / "inventory"; inv.mkdir(); ssh = root / ".ssh"; ssh.mkdir()
             identity = ssh / "id"; identity.touch()
             kh = ssh / "known_hosts"; kh.touch()
-            (inv / "es.known_hosts").touch(); (inv / "us.known_hosts").touch(); (inv / "fin1.known_hosts").touch()
+            (inv / "us.known_hosts").touch(); (inv / "fin1.known_hosts").touch()
             targets = {f"KNOTHOP_SSH_TARGET_{node.upper()}": f"deploy@{node}.example.invalid" for node in push.ALLOWLIST}
             with patch.object(push, "IDENTITY", identity), patch.object(push, "KH", kh), patch.object(push, "INV", inv), \
                  patch.dict(push.os.environ, targets):
@@ -86,7 +86,6 @@ class PushTests(unittest.TestCase):
                     self.assertIn("BatchMode=yes", args)
                     self.assertIn("StrictHostKeyChecking=yes", args)
                 self.assertIn(f"UserKnownHostsFile={inv / 'us.known_hosts'}", push.ssh_args("us"))
-                self.assertIn(f"UserKnownHostsFile={inv / 'es.known_hosts'}", push.ssh_args("es"))
                 self.assertIn(f"UserKnownHostsFile={inv / 'fin1.known_hosts'}", push.ssh_args("fin1"))
                 self.assertIn(f"UserKnownHostsFile={kh}", push.ssh_args("uae"))
                 self.assertEqual(push.ssh_args("ru1")[-1], targets["KNOTHOP_SSH_TARGET_RU1"])
@@ -102,7 +101,7 @@ class PushTests(unittest.TestCase):
         report = self.root / "report.json"
         with patch.object(push, "ssh_args", side_effect=AssertionError("SSH validation must not connect")):
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(push.main(["--nodes", "es", "de", "--report", str(report)]), 0)
+                self.assertEqual(push.main(["--nodes", "us", "de", "--report", str(report)]), 0)
         data = json.loads(report.read_text())
         self.assertEqual(data["status"], "dry-run")
         self.assertEqual([r["variant"] for r in data["results"]], ["knothopd", "knothopd-u2204"])
@@ -114,7 +113,7 @@ class PushTests(unittest.TestCase):
         calls = []
         with patch.object(push, "ssh_args", return_value=["ssh"]):
             with self.assertRaises(push.RolloutError) as caught:
-                push.invoke("es", "knothopd", True, self.payloads, self.expected, runner=lambda *a, **k: calls.append(a))
+                push.invoke("us", "knothopd", True, self.payloads, self.expected, runner=lambda *a, **k: calls.append(a))
         self.assertEqual(calls, [])
         self.assertEqual(caught.exception.row["status"], "failed")
         self.assertEqual(caught.exception.row["rollback"], "not-needed")
@@ -159,7 +158,7 @@ class PushTests(unittest.TestCase):
             return completed('PUSH_RESULT {"status":"failed","rollback":"verified","detail":"health gate"}\n', 1)
         with patch.object(push, "ssh_args", return_value=["ssh", "target"]):
             with self.assertRaises(push.RolloutError) as caught:
-                push.invoke("es", "knothopd", True, self.payloads, self.expected, runner=failed)
+                push.invoke("us", "knothopd", True, self.payloads, self.expected, runner=failed)
             self.assertEqual(caught.exception.row["rollback"], "verified")
 
     def test_strict_pass_accepts_valid_structured_result(self):
@@ -168,7 +167,7 @@ class PushTests(unittest.TestCase):
             seen.update(kwargs)
             return completed("PUSH_RESULT " + json.dumps(pass_payload(self.expected["knothopd"])) + "\n")
         with patch.object(push, "ssh_args", return_value=["ssh", "target"]):
-            result = push.invoke("es", "knothopd", True, self.payloads, self.expected, runner=success)
+            result = push.invoke("us", "knothopd", True, self.payloads, self.expected, runner=success)
         self.assertEqual(seen["timeout"], 300)
         self.assertEqual(result["status"], "pass")
         self.assertEqual(result["pid"], 42)
@@ -196,7 +195,7 @@ class PushTests(unittest.TestCase):
                     return completed("PUSH_RESULT " + json.dumps(payload) + "\n")
                 with patch.object(push, "ssh_args", return_value=["ssh", "target"]):
                     with self.assertRaises(push.RolloutError) as caught:
-                        push.invoke("es", "knothopd", True, self.payloads, self.expected, runner=success)
+                        push.invoke("us", "knothopd", True, self.payloads, self.expected, runner=success)
                 self.assertEqual(caught.exception.row["status"], "unknown")
                 self.assertEqual(caught.exception.row["rollback"], "unknown")
 
@@ -211,7 +210,7 @@ class PushTests(unittest.TestCase):
             with self.subTest(label):
                 with patch.object(push, "ssh_args", return_value=["ssh", "target"]):
                     with self.assertRaises(push.RolloutError) as caught:
-                        push.invoke("es", "knothopd", True, self.payloads, self.expected,
+                        push.invoke("us", "knothopd", True, self.payloads, self.expected,
                                     runner=lambda cmd, **k: completed(line + "\n"))
                 self.assertEqual(caught.exception.row["status"], "unknown")
 
@@ -222,7 +221,7 @@ class PushTests(unittest.TestCase):
             raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
         with patch.object(push, "ssh_args", return_value=["ssh", "target"]):
             with self.assertRaises(push.RolloutError) as caught:
-                push.invoke("es", "knothopd", True, self.payloads, self.expected, runner=timed_out)
+                push.invoke("us", "knothopd", True, self.payloads, self.expected, runner=timed_out)
         self.assertEqual(seen["timeout"], 300)
         self.assertEqual(caught.exception.row["status"], "unknown")
         self.assertEqual(caught.exception.row["rollback"], "unknown")
@@ -257,8 +256,8 @@ class PushTests(unittest.TestCase):
             raise push.RolloutError("canary failed")
         with patch.object(push, "ssh_args", return_value=["ssh"]), patch.object(push, "invoke", side_effect=fake_invoke):
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(push.main(["--apply", "--nodes", "es", "uae", "--report", str(self.root / "r.json")]), 1)
-        self.assertEqual(calls, ["es"])
+                self.assertEqual(push.main(["--apply", "--nodes", "us", "uae", "--report", str(self.root / "r.json")]), 1)
+        self.assertEqual(calls, ["us"])
 
 
 class RolloutShellTests(unittest.TestCase):

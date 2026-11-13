@@ -19,12 +19,12 @@ from datetime import datetime, timezone
 
 HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist"
-IDENTITY = Path.home() / ".ssh" / "id_ed25519"
+# вход на узлы — только ops с ключом KnotHop-rog (решение владельца 13.11); KNOTHOP_SSH_IDENTITY переопределяет
+IDENTITY = Path(os.environ.get("KNOTHOP_SSH_IDENTITY", Path.home() / ".ssh" / "KnotHop-rog"))
 KH = Path.home() / ".ssh" / "known_hosts"
 INV = Path(os.environ.get("KNOTHOP_INVENTORY", Path.home() / ".config/knothop/inventory"))
 # (ssh target, binary variant, known_hosts: "known_hosts" = KH, иначе имя файла в INV, jump через de)
 ALLOWLIST = {
-    "es": ("<user@node-ip>", "knothopd", "es.known_hosts", None),
     "uae": ("<user@node-ip>", "knothopd", "known_hosts", None),
     "by": ("<user@node-ip>", "knothopd", "known_hosts", None),
     "ru1": ("<user@node-ip>", "knothopd", "known_hosts", None),
@@ -224,7 +224,7 @@ def main(argv=None) -> int:
     p.add_argument("--dry-run", action="store_true", help="default; local validation only")
     p.add_argument("--apply", action="store_true", help="perform SSH rollout")
     p.add_argument("--nodes", nargs="+", choices=sorted(ALLOWLIST), default=list(ALLOWLIST))
-    p.add_argument("--canary", choices=sorted(ALLOWLIST), default="es")
+    p.add_argument("--canary", choices=sorted(ALLOWLIST), default="us")
     p.add_argument("--jobs", type=int, default=3)
     p.add_argument("--report", type=Path, default=HERE / "push-report.json")
     args = p.parse_args(argv)

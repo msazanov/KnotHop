@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Сборка тестового APK (arm64-v8a) без Gradle: cargo (NDK clang) -> javac -> d8 -> aapt2 -> zipalign -> apksigner.
+# Сборка APK (arm64-v8a и armeabi-v7a; KNOTHOP_ABIS) без Gradle: cargo (NDK clang) -> javac -> d8 -> aapt2 -> zipalign -> apksigner.
 # Использование: build.sh [meas|vpn]   (meas - приложение замеров, vpn - VPN-приложение)
 # Результат: $OUT/knothop-meas.apk или $OUT/knothop.apk (по умолчанию ~/.cache/knothop-android/)
 # Окружение: KNOTHOP_KS/KNOTHOP_KEY_ALIAS/KNOTHOP_KS_PASS - релизная подпись (PKCS12), KNOTHOP_RELEASE=1 берёт
@@ -79,6 +79,37 @@ fork_patch_init "$FORK"
     "${FORK_PATCH_ARGS[@]}" )
 SO="$TARGET_DIR/aarch64-linux-android/release/libknothopmeas.so"
 ls -l "$SO"
+# 32-битный ARM (armeabi-v7a): телефоны на Android 10/12 с 32-битной системой не ставят APK без своей .so
+# (INSTALL_FAILED_NO_MATCHING_ABIS). KNOTHOP_ABIS="arm64-v8a" — только 64 бита (быстрее для отладки).
+KNOTHOP_ABIS="${KNOTHOP_ABIS-arm64-v8a armeabi-v7a}"
+SO_V7=""
+if [[ " $KNOTHOP_ABIS " == *" armeabi-v7a "* ]]; then
+  echo "== Rust (armv7-linux-androideabi, API $API)"
+  CLANG_V7="$TOOLCHAIN/bin/armv7a-linux-androideabi${API}-clang"
+  [ -x "$CLANG_V7" ] || { echo "нет $CLANG_V7"; exit 1; }
+  # без --cfg aes_armv8/polyval_armv8: это ускорения только для aarch64
+  ( export CC_armv7_linux_androideabi="$CLANG_V7" AR_armv7_linux_androideabi="$TOOLCHAIN/bin/llvm-ar" \
+      CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$CLANG_V7" CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_AR="$TOOLCHAIN/bin/llvm-ar" \
+      RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+    cd "$HERE/native" && CARGO_TARGET_DIR="$TARGET_DIR-armv7" cargo build --release --target armv7-linux-androideabi "${EXTRA[@]}" \
+      "${FORK_PATCH_ARGS[@]}" )
+  SO_V7="$TARGET_DIR-armv7/armv7-linux-androideabi/release/libknothopmeas.so"
+  ls -l "$SO_V7"
+fi
+SO_X64=""
+if [[ " $KNOTHOP_ABIS " == *" x86_64 "* ]]; then
+  # только для эмулятора (проверка Android 10/12): KNOTHOP_ABIS="arm64-v8a armeabi-v7a x86_64"; в релиз не входит
+  echo "== Rust (x86_64-linux-android, API $API)"
+  CLANG_X64="$TOOLCHAIN/bin/x86_64-linux-android${API}-clang"
+  [ -x "$CLANG_X64" ] || { echo "нет $CLANG_X64"; exit 1; }
+  ( export CC_x86_64_linux_android="$CLANG_X64" AR_x86_64_linux_android="$TOOLCHAIN/bin/llvm-ar" \
+      CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$CLANG_X64" CARGO_TARGET_X86_64_LINUX_ANDROID_AR="$TOOLCHAIN/bin/llvm-ar" \
+      RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+    cd "$HERE/native" && CARGO_TARGET_DIR="$TARGET_DIR-x64" cargo build --release --target x86_64-linux-android "${EXTRA[@]}" \
+      "${FORK_PATCH_ARGS[@]}" )
+  SO_X64="$TARGET_DIR-x64/x86_64-linux-android/release/libknothopmeas.so"
+  ls -l "$SO_X64"
+fi
 
 echo "== Java"
 # ZXing Core 3.5.3 (Apache-2.0): кодирование и разбор QR приглашения, только для vpn; jar закреплён по sha256 (sha1 ca134921... совпадает с Maven Central)
@@ -121,6 +152,8 @@ fi
 SRC="$SRC_WORK"
 
 W="$OUT/work-$APP"; rm -rf "$W"; mkdir -p "$W/classes" "$W/dex" "$W/stage/lib/arm64-v8a"
+[ -z "$SO_V7" ] || mkdir -p "$W/stage/lib/armeabi-v7a"
+[ -z "$SO_X64" ] || mkdir -p "$W/stage/lib/x86_64"
 javac --release 8 -Xlint:-options -cp "$CP" -d "$W/classes" "$SRC"/java/$PKG/*.java
 DEXIN=$(find "$W/classes" -name '*.class'); [ "$APP" = vpn ] && DEXIN="$DEXIN $QR_JAR"
 "$BT/d8" --release --min-api $API --lib "$PLATFORM" --output "$W/dex" $DEXIN
@@ -135,6 +168,8 @@ fi
 cp "$W/dex/classes.dex" "$W/stage/"
 if [ "$APP" = vpn ]; then mkdir -p "$W/stage/assets"; cp "$HERE/LICENSE-ZXing.txt" "$W/stage/assets/"; fi
 cp "$SO" "$W/stage/lib/arm64-v8a/"
+[ -z "$SO_V7" ] || cp "$SO_V7" "$W/stage/lib/armeabi-v7a/"
+[ -z "$SO_X64" ] || cp "$SO_X64" "$W/stage/lib/x86_64/"
 # снимок состояния форка, из которого собрана .so
 bash "$HERE/../../deploy/fork-manifest.sh" "$W/FORK-MANIFEST.txt"
 ( cd "$W/stage" && zip -q -r "$W/base.apk" classes.dex lib && if [ -d assets ]; then zip -q -r "$W/base.apk" assets; fi )

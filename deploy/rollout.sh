@@ -8,7 +8,7 @@
 #   rollout.sh hostfix apply|persist|revert МЕТКА...   (нужен stage: скрипт и nft берутся с узла)
 #   rollout.sh autoupdate install|remove МЕТКА...   автообновление knothopd из релиза GitHub (node-autoupdate.sh); status [метки] - read-only
 # Список узлов - deploy/hosts.tsv, колонки через TAB:
-#   метка | ssh-цель | вариант бинарника (knothopd | knothopd-u2204) | [опции ssh/scp, через пробел, напр. operator@host -o UserKnownHostsFile=/путь/known_hosts]
+#   метка | ssh-цель | вариант бинарника (knothopd | knothopd-u2204) | [опции ssh/scp, через пробел, напр. -J root@host -o UserKnownHostsFile=/путь/known_hosts]
 # Пользователь, не равный root (user@host), получает sudo -n для всего, что пишет в /root или меняет систему; загрузка идёт в ~/.knothopd-up/ и
 # переносится под sudo. Опции из 4-й колонки ставятся ПЕРЕД умолчаниями (у ssh побеждает первое значение). Умолчания: BatchMode=yes,
 # StrictHostKeyChecking=yes (без TOFU: ключ узла должен быть в known_hosts заранее).
